@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use ahash::RandomState;
 use crossbeam_utils::CachePadded;
-use plat_audit::{AuditSink, Event, LimitKind};
+use plat_audit::{AuditSink, Event, LimitKind, TryEmit};
 use plat_common::config::{AuditMode, Config, Filtering, OverflowPolicy};
 use plat_common::{Clock, Counter, Counters, DropReason, Ipv6Cidr};
 use plat_packet::proto;
@@ -94,6 +94,10 @@ struct Block {
     used: [Box<[u64]>; 3],
     in_use: u32,
     empty_since: Option<u64>,
+    /// The release record was abandoned on a disconnected audit sink and
+    /// already counted as lost; later retries do not count it again
+    /// (NIST-401).
+    loss_counted: bool,
 }
 
 #[inline]
@@ -109,7 +113,7 @@ impl Block {
     fn new(r: BlockRef, size: u16, wall_us: u64, now: u64) -> Self {
         let words = usize::from(size).div_ceil(64);
         let mk = || vec![0u64; words].into_boxed_slice();
-        Self { r, wall_us, used: [mk(), mk(), mk()], in_use: 0, empty_since: Some(now) }
+        Self { r, wall_us, used: [mk(), mk(), mk()], in_use: 0, empty_since: Some(now), loss_counted: false }
     }
 
     /// Allocates a random free port offset (RFC 6056 style randomisation
@@ -213,6 +217,9 @@ pub struct State {
     /// One randomly keyed hasher shared by every per-BIB map (cloning is a
     /// copy; `RandomState::new()` per BIB would be wasted work).
     hasher: RandomState,
+    /// Cumulative `SweepStats::releases_deferred` (SEC-302), exported to
+    /// `/metrics`. Written by the sweeper only.
+    releases_deferred: AtomicU64,
 }
 
 /// Rate-limit slots for `Limit` records, indexed by `LimitKind as usize`.
@@ -252,6 +259,7 @@ impl State {
             // SEC-010: seed from the OS RNG (ahash runtime-rng), not the clock.
             seed: CachePadded::new(AtomicU64::new(RandomState::new().hash_one(Clock::wall_us()) | 1)),
             hasher: RandomState::new(),
+            releases_deferred: AtomicU64::new(0),
         }
     }
 
@@ -362,6 +370,8 @@ impl State {
             let mut gs = self.subs.lock(&sub);
             let is_new = !gs.contains_key(&sub);
             if is_new {
+                // POAM: POAM-013 no aggregate-prefix limit: one short client
+                // prefix can fill the subscriber table up to max_subscribers.
                 // COMPLIANCE MAPPING:
                 // - NIST 800-53: SC-5 - bounded subscriber table; both
                 //   rejections are read-only (PERF-101), so a flood of new
@@ -593,6 +603,8 @@ impl State {
     /// COMPLIANCE MAPPING:
     /// - NIST 800-53: SC-10 (Network Disconnect) - idle sessions removed
     /// - RFC 6146 §3.5.4 - session and BIB lifetime
+    // POAM: POAM-012 the sweeper walks every BIB under each shard lock on
+    // every pass; no per-shard expiry hint or per-pass time budget yet.
     pub fn sweep(&self) -> SweepStats {
         let now = self.clock.now_ms();
         let mut st = SweepStats::default();
@@ -658,7 +670,7 @@ impl State {
         for i in 0..self.subs.shard_count() {
             let mut g = self.subs.lock_index(i);
             g.retain(|sub, s| {
-                s.blocks.retain(|b| {
+                s.blocks.retain_mut(|b| {
                     let release =
                         b.in_use == 0 && b.empty_since.is_some_and(|t| now.saturating_sub(t) >= BLOCK_LINGER_MS);
                     if !release {
@@ -675,8 +687,11 @@ impl State {
                     //   down, crash in the flush window) shows as a sequence
                     //   gap and `audit_output_failure` (AU-5).
                     // - NIST 800-53: AU-5, SI-4 - `try_emit`: a deferred
-                    //   release is retried, not counted as lost (NIST-201).
-                    let queued = self.audit.try_emit(Event::PortBlockRelease {
+                    //   release is retried; a full queue is never counted as
+                    //   lost (NIST-201), and a disconnected sink (logger
+                    //   stopped) counts the abandoned record exactly once
+                    //   per quarantined block (NIST-401).
+                    let outcome = self.audit.try_emit(Event::PortBlockRelease {
                         ts_us: wall,
                         sub: *sub,
                         sub_len: self.sub_len,
@@ -685,9 +700,20 @@ impl State {
                         port_hi: lo + (self.pool.block_size() - 1),
                         held_secs: (wall.saturating_sub(b.wall_us) / 1_000_000) as u32,
                     });
-                    if !queued {
-                        st.releases_deferred += 1;
-                        return true;
+                    match outcome {
+                        TryEmit::Queued => {}
+                        TryEmit::Full => {
+                            st.releases_deferred += 1;
+                            return true;
+                        }
+                        TryEmit::Disconnected => {
+                            if !b.loss_counted {
+                                b.loss_counted = true;
+                                self.audit.count_lost();
+                            }
+                            st.releases_deferred += 1;
+                            return true;
+                        }
                     }
                     self.pool.release(b.r);
                     st.blocks_released += 1;
@@ -700,6 +726,20 @@ impl State {
                 keep
             });
         }
+        // PERF-302: skip the shared-line RMW on the common no-deferral pass.
+        if st.releases_deferred != 0 {
+            self.releases_deferred.fetch_add(st.releases_deferred, Ordering::Relaxed);
+        }
         st
+    }
+
+    /// Port-block releases deferred since start because the release record
+    /// could not be queued (cumulative over sweeper passes).
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: SI-4, AU-5 - makes a quarantine that drains the pool
+    ///   visible as such (SEC-302)
+    pub fn releases_deferred_total(&self) -> u64 {
+        self.releases_deferred.load(Ordering::Relaxed)
     }
 }

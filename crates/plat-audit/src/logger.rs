@@ -907,6 +907,8 @@ impl SyslogOut {
         let n = batch.len() as u64;
         match self.conn {
             SyslogConn::Udp(ref s) => {
+                // POAM: POAM-018 one datagram (one syscall) per record; no
+                // sendmmsg / UDP GSO batching yet.
                 let mut lost = 0;
                 for (seq, ev) in batch {
                     self.format(*seq, node, ev, msg);

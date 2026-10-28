@@ -587,6 +587,39 @@ fn expired_unswept_session_is_not_revived() {
 
 // ------------------------------------------------- NIST-006a: release records
 
+/// NIST-401: with a disconnected audit sink (logger stopped) a quarantined
+/// block's release record is abandoned and counted as lost exactly once,
+/// not once per sweep pass; the block stays quarantined.
+#[test]
+fn disconnected_sink_counts_quarantined_release_once() {
+    let mut fx = fixture(&[]);
+    let s = sub(1, 1);
+    let total = fx.nat.state().pool.free_blocks();
+    udp_flow(&mut fx, s);
+    let Fx { nat, clock, rx, .. } = fx;
+    drop(rx);
+    let lost = || nat.state().audit().stats().lost.load(std::sync::atomic::Ordering::Relaxed);
+    clock.advance(Duration::from_secs(301));
+    // Expires the session/BIB (the BIB delete is lost); the block lingers.
+    assert_eq!(nat.state().sweep().releases_deferred, 0);
+    let base = lost();
+    let mut deferred = 0;
+    let mut first_pass = true;
+    for secs in [3, 61, 61, 61, 61] {
+        clock.advance(Duration::from_secs(secs));
+        let st = nat.state().sweep();
+        assert_eq!(st.blocks_released, 0);
+        deferred += st.releases_deferred;
+        if st.releases_deferred > 0 && first_pass {
+            first_pass = false;
+            assert_eq!(lost(), base + 1, "abandoned release counted on first attempt");
+        }
+    }
+    assert!(deferred >= 3, "release retried on several passes ({deferred})");
+    assert_eq!(lost(), base + 1, "abandoned release counted exactly once");
+    assert_eq!(nat.state().pool.free_blocks(), total - 1, "block stays quarantined");
+}
+
 /// NIST-006a: a block whose release record cannot be queued stays with its
 /// subscriber (quarantined) and is released on a later pass once the record
 /// is queued, so attribution windows never overlap in the queued stream.
@@ -613,6 +646,8 @@ fn block_is_not_reused_before_its_release_record_is_queued() {
         deferred += st.releases_deferred;
     }
     assert!(deferred >= 2, "release retried on several passes ({deferred})");
+    // SEC-302: the cumulative count (exported to /metrics) tracks every pass.
+    assert_eq!(fx.nat.state().releases_deferred_total(), deferred + first.releases_deferred);
     assert_eq!(lost(), lost_after_first, "deferred releases are not counted as lost");
     assert_eq!(fx.nat.state().pool.free_blocks(), total - 1, "quarantined while the queue is full");
     assert_eq!(fx.nat.state().subscriber_count(), 1);
@@ -723,4 +758,35 @@ fn in_prefix_error_source_with_nonzero_u_octet_is_dropped() {
     let router6 = 0x2001_0db8_ffff_0000_0000_0000_0000_0001u128;
     let r = run(&mut fx, &icmp6_err(router6, s64(SERVER), 1, 0, 0, &q));
     assert!(r.is_ok(), "{r:?}");
+}
+
+// ------------------------------------------------- SEC-301: own-slice spoof
+
+/// The example pool as a /24 cluster pool; the fixture node owns .0-.3.
+const CLUSTER_24: (&str, &str) = ("192.0.2.0/30", "192.0.2.0/24");
+
+/// SEC-301 (SC-7(5), BCP 38): under EIF, a wire packet whose source is in
+/// this node's own pool slice (e.g. subscriber B's live mapping) is spoofed,
+/// because own-node hairpins are looped back in-process. It is refused;
+/// the own-node hairpin and sources in other nodes' slices still work.
+#[test]
+fn wire_source_in_own_pool_slice_is_refused() {
+    let mut fx = fixture_strict(&[CLUSTER_24, EIF]);
+    let (a, b) = (sub(1, 1), sub(2, 1));
+    let oa = run(&mut fx, &udp6(a, 5353, GLOBAL, 53, b"q")).unwrap();
+    let (a4, ap) = (be32(&oa, 12), be16(&oa, 20));
+    let ob = run(&mut fx, &udp6(b, 6000, GLOBAL, 53, b"q")).unwrap();
+    let (b4, bp) = (be32(&ob, 12), be16(&ob, 20));
+    // Spoof of B's mapping, an arbitrary own-slice port, and src = dst = A.
+    for (src, sp) in [(b4, bp), (a4, 1), (a4, ap)] {
+        let r = run(&mut fx, &udp4(src, sp, a4, ap, b"spoof"));
+        assert_eq!(r.unwrap_err(), DropReason::SrcNotAllowed, "{src:08x}:{sp}");
+    }
+    // Another node's slice (cross-node hairpin) is still accepted.
+    let other = 0xc000_0264; // 192.0.2.100
+    let r = run(&mut fx, &udp4(other, 4444, a4, ap, b"peer")).unwrap();
+    assert_eq!(v6_ok(&r).src, synth(other));
+    // The own-node hairpin A -> B's mapping is still forwarded.
+    let hp = run(&mut fx, &udp6(a, 7000, b4, bp, b"hp")).unwrap();
+    assert_eq!((v6_ok(&hp).dst, be16(&hp, 42)), (b, 6000));
 }

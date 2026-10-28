@@ -186,6 +186,8 @@ impl Pool {
         }
     }
 
+    // POAM: POAM-010 no 120 s cool-down: a released block can be allocated
+    // again immediately (RFC 6888 REQ-12, RFC 7422 §2).
     pub fn release(&self, b: BlockRef) {
         let Some(m) = self.free.get(b.addr_idx as usize) else { return };
         let mut f = m.lock();

@@ -96,20 +96,36 @@ impl AuditSink {
     }
 
     /// Queues an event without blocking, for records the caller retries
-    /// (a quarantined port-block release): a full queue is **not** counted
-    /// as lost, because the record is re-created and queued on a later
-    /// attempt. Returns `false` when the event was not queued.
+    /// (a quarantined port-block release). Nothing is counted as lost here:
+    /// a full queue is retryable (the record is re-created and queued on a
+    /// later attempt), and a disconnected queue (logger stopped) is reported
+    /// as [`TryEmit::Disconnected`] so the caller counts the abandoned record
+    /// once per retried item via [`AuditSink::count_lost`], not once per
+    /// attempt (NIST-401).
     ///
     /// COMPLIANCE MAPPING:
     /// - NIST 800-53: AU-5, SI-4 - `lost` / `audit_queue_overflow` count
-    ///   only records that are really abandoned (NIST-201 / PERF-203)
+    ///   only records that are really abandoned, each exactly once
+    ///   (NIST-201 / PERF-203 / SEC-302 / NIST-401)
     #[inline]
-    pub fn try_emit(&self, ev: Event) -> bool {
-        let ok = self.tx.try_send(ev).is_ok();
-        if ok {
-            self.stats.enqueued.fetch_add(1, Ordering::Relaxed);
+    pub fn try_emit(&self, ev: Event) -> TryEmit {
+        match self.tx.try_send(ev) {
+            Ok(()) => {
+                self.stats.enqueued.fetch_add(1, Ordering::Relaxed);
+                TryEmit::Queued
+            }
+            Err(TrySendError::Full(_)) => TryEmit::Full,
+            Err(TrySendError::Disconnected(_)) => TryEmit::Disconnected,
         }
-        ok
+    }
+
+    /// Counts one abandoned record (see [`AuditSink::try_emit`]).
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: AU-5 - audit processing failure is counted
+    #[inline]
+    pub fn count_lost(&self) {
+        self.stats.lost.fetch_add(1, Ordering::Relaxed);
     }
 
     /// True when attribution records can be queued **and** the local audit
@@ -131,5 +147,43 @@ impl AuditSink {
 
     pub fn stats(&self) -> &Arc<AuditStats> {
         &self.stats
+    }
+}
+
+/// Outcome of [`AuditSink::try_emit`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TryEmit {
+    /// The record was queued.
+    Queued,
+    /// The queue is full; retry later (not a loss).
+    Full,
+    /// The logger has stopped; no retry can succeed. The caller counts the
+    /// abandoned record once with [`AuditSink::count_lost`].
+    Disconnected,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::LifecycleKind;
+
+    fn ev() -> Event {
+        Event::Lifecycle { ts_us: 0, kind: LifecycleKind::Start }
+    }
+
+    /// SEC-302 / NIST-401: `try_emit` never counts; a full queue is
+    /// retryable and a disconnect is reported for the caller to count once.
+    #[test]
+    fn try_emit_reports_full_and_disconnect_without_counting() {
+        let (sink, rx) = AuditSink::bounded(1);
+        assert_eq!(sink.try_emit(ev()), TryEmit::Queued);
+        assert_eq!(sink.try_emit(ev()), TryEmit::Full);
+        drop(rx);
+        assert_eq!(sink.try_emit(ev()), TryEmit::Disconnected);
+        assert_eq!(sink.try_emit(ev()), TryEmit::Disconnected);
+        assert_eq!(sink.stats().lost.load(Ordering::Relaxed), 0);
+        sink.count_lost();
+        assert_eq!(sink.stats().lost.load(Ordering::Relaxed), 1);
+        assert_eq!(sink.stats().enqueued.load(Ordering::Relaxed), 1);
     }
 }

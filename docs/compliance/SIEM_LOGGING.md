@@ -393,8 +393,14 @@ for `nat_port_block_release` (same address and range), `service_stop`,
 - Gauges `plat_sessions`, `plat_bibs`, `plat_pool_blocks_free`,
   `plat_pool_blocks_total`, `plat_audit_queue_depth`, `plat_audit_degraded`,
   `plat_audit_storage_low`.
+- Counter `plat_pool_releases_deferred_total`: port-block releases the
+  sweeper deferred because the `nat_port_block_release` record could not
+  yet be queued (the block stays out of the pool until it is).
 - Audit counters `plat_audit_enqueued_total`, `plat_audit_lost_total`
-  (records abandoned on a full queue), `plat_audit_written_total` (records
+  (records abandoned on a full queue, plus deferred port-block release
+  records that could not be queued because the sink is disconnected, i.e.
+  the logger has stopped, counted once per block; a deferred release that meets a full queue is
+  retried and not counted), `plat_audit_written_total` (records
   whose checkpoint was flushed; without a file, records handed to the syslog
   senders), `plat_audit_output_errors_total`, `plat_audit_file_lost_total`,
   `plat_audit_remote_lost_total`.
