@@ -37,6 +37,8 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 - `platd check-config --format text|env`.
 - `deploy/systemd/plat-tun-setup.sh`: TUN, routing and nftables setup run
   before the unprivileged daemon.
+- Zensical documentation site (`zensical.toml`, `make docs`, `make docs-serve`)
+  with a GitHub Pages workflow (`.github/workflows/docs.yml`).
 
 ### Changed
 

@@ -1,7 +1,8 @@
 # usg-plat quality gates (see .claude/skills/plat-workflow/references/quality-gates.md)
 LINUX_TARGET ?= aarch64-unknown-linux-gnu
+ZENSICAL ?= uvx zensical@0.0.73
 
-.PHONY: all check fmt clippy check-linux test bench security compliance-annotations release
+.PHONY: all check fmt clippy check-linux test bench security compliance-annotations release docs docs-serve
 
 all: check test
 
@@ -32,3 +33,9 @@ compliance-annotations:
 
 release:
 	cargo build --release -p platd
+
+docs:
+	$(ZENSICAL) build --clean
+
+docs-serve:
+	$(ZENSICAL) serve

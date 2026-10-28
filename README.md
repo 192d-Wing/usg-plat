@@ -5,6 +5,7 @@ Pure-Rust, multithreaded **464XLAT PLAT** (RFC 6877): stateful NAT64
 port allocation, high-speed SIEM attribution logging, and stateless cluster
 scale-out. Built for NIST SP 800-53 Rev 5 ATO readiness.
 
+<!-- --8<-- [start:quickstart] -->
 ## Quick start
 
 ```bash
@@ -65,6 +66,9 @@ Configuration changes to note when upgrading from an earlier build:
 - SIEM log schema is version 4; audit files written by schema 1 (chain v1) no
   longer verify.
 
+<!-- --8<-- [end:quickstart] -->
+
+<!-- --8<-- [start:performance] -->
 ## Measured performance
 
 Criterion point estimates from the round-2 performance re-check
@@ -94,7 +98,12 @@ queue to roughly 1–2 Mpps (general estimate, not measured in this project),
 so the engine is not the bottleneck; AF_XDP is the path beyond that
 (POAM-016).
 
+<!-- --8<-- [end:performance] -->
+
 ## Documentation
+
+Browse it as a site with `make docs-serve` (Zensical); it is published to
+https://192d-wing.github.io/usg-plat/ from `main`.
 
 - `ARCHITECTURE.md`: data path, concurrency, cluster design
 - `docs/compliance/SIEM_LOGGING.md`: log schema and SIEM correlation
