@@ -2,12 +2,19 @@
 
 ## Role
 
-```text
-  IPv6-only access            PLAT (this project)              IPv4 Internet
- ┌──────────────┐   v6    ┌──────────────────────────┐   v4   ┌────────────┐
- │ host ─ CLAT  │────────▶│ stateful NAT64 (RFC 6146) │──────▶│  server    │
- │ (RFC 6877)   │◀────────│ 64:ff9b:1::/96 ⇄ pool     │◀──────│            │
- └──────────────┘         └──────────────────────────┘        └────────────┘
+```mermaid
+flowchart LR
+    subgraph access["IPv6-only access"]
+        clat["host ─ CLAT<br/>(RFC 6877)"]
+    end
+    subgraph plat["PLAT (this project)"]
+        nat64["stateful NAT64 (RFC 6146)<br/>64:ff9b:1::/96 ⇄ pool"]
+    end
+    subgraph inet["IPv4 Internet"]
+        server["server"]
+    end
+    clat <-- "IPv6" --> nat64
+    nat64 <-- "IPv4" --> server
 ```
 
 A CLAT turns a host's IPv4 traffic into IPv6 addressed to the NAT64 prefix;
@@ -18,21 +25,29 @@ uses `64:ff9b:1::/96` (RFC 8215 local-use space); the Well-Known Prefix
 
 ## Data path
 
-```text
-            TUN plat0 (IFF_MULTI_QUEUE: kernel hashes flows to queues)
-     ┌────────────┬────────────┬────────────┬────────────┐
-     ▼            ▼            ▼            ▼            
-  worker 0     worker 1     worker 2  ...  worker N-1     one thread per CPU, pinned
-     │ read into buf[64..]  (64 B headroom for header growth)
-     │ parse  (plat-packet, bounds-checked)
-     │ policy (client prefix, RFC 6052 §3.1, non-global deny, filtering,
-     │         ICMP error validation)
-     │ state  (sharded BIB/session lookup; create on first packet)
-     │ rewrite in place (plat-xlat, RFC 1624 incremental checksums)
-     │ write back to the same queue: one packet (Verdict::Forward), the
-     │   IPv6 fragments of a DF=0 IPv4 packet (Verdict::ForwardFragments),
-     │   or a locally generated PTB / Frag-Needed
-     └── AuditSink::emit (try_send) ──▶ logger thread ──▶ file + syslog
+```mermaid
+flowchart TD
+    tun["TUN plat0 (IFF_MULTI_QUEUE)<br/>kernel hashes flows to queues"]
+    tun --> w0["worker 0"]
+    tun --> w1["worker 1"]
+    tun --> w2["worker 2"]
+    tun --> wn["… worker N-1"]
+
+    subgraph worker["each worker: one thread per CPU, pinned"]
+        direction TB
+        read["read into buf[64..]<br/>(64 B headroom for header growth)"]
+        parse["parse<br/>(plat-packet, bounds-checked)"]
+        policy["policy<br/>client prefix, RFC 6052 §3.1, non-global deny,<br/>filtering, ICMP error validation"]
+        state["state<br/>sharded BIB/session lookup; create on first packet"]
+        rewrite["rewrite in place<br/>(plat-xlat, RFC 1624 incremental checksums)"]
+        write["write back to the same queue:<br/>one packet (Verdict::Forward),<br/>IPv6 fragments of a DF=0 IPv4 packet (Verdict::ForwardFragments),<br/>or a locally generated PTB / Frag-Needed"]
+        read --> parse --> policy --> state --> rewrite --> write
+    end
+
+    w0 & w1 & w2 & wn --> read
+    write --> tx["same TUN queue (TX)"]
+    state -- "AuditSink::emit (try_send)" --> logger["logger thread"]
+    logger --> sinks["file + syslog"]
 ```
 
 - **No per-packet allocation.** Each worker owns a 64 KiB packet buffer, a
@@ -112,11 +127,20 @@ See `docs/compliance/SIEM_LOGGING.md` for the schema.
 
 ## Cluster scale-out
 
-```text
-                 ECMP (L3 hash on IPv6 source)            per-node IPv4 announcements
- subscribers ─▶ ┌───────┐ ┌───────┐ ┌───────┐ ◀── 192.0.2.0/26 ─ node 0
-                │ node0 │ │ node1 │ │ node2 │ ◀── 192.0.2.64/26 ─ node 1
-                └───────┘ └───────┘ └───────┘ ◀── 192.0.2.128/25 ─ node 2
+```mermaid
+flowchart LR
+    subs["subscribers"] --> ecmp{"ECMP<br/>(L3 hash on IPv6 source)"}
+    ecmp --> n0["node0"]
+    ecmp --> n1["node1"]
+    ecmp --> n2["node2"]
+    subgraph ann["per-node IPv4 announcements"]
+        p0["192.0.2.0/26"]
+        p1["192.0.2.64/26"]
+        p2["192.0.2.128/25"]
+    end
+    n0 -- "announces" --- p0
+    n1 -- "announces" --- p1
+    n2 -- "announces" --- p2
 ```
 
 - Every node reads the same `nat64.pool`, `cluster.node_count`, and its own
