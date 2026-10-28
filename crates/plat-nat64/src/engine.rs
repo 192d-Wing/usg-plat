@@ -66,6 +66,8 @@ impl WorkerCtx {
     }
 
     #[inline]
+    // POAM: POAM-011 the IPv4 Identification is a sequential per-worker
+    // counter, so a remote observer can infer a worker's packet rate.
     fn next_ident(&mut self) -> u16 {
         self.ident = self.ident.wrapping_add(1);
         self.ident
@@ -204,7 +206,7 @@ impl Nat64 {
     pub fn process(&self, buf: &mut [u8], start: usize, len: usize, ctx: &mut WorkerCtx) -> Verdict {
         let r = match buf.get(start).map(|b| b >> 4) {
             Some(6) => self.outbound_v6(buf, start, len, ctx),
-            Some(4) => self.inbound_v4(buf, start, len, ctx),
+            Some(4) => self.inbound_v4(buf, start, len, false, ctx),
             _ => Err(DropReason::Malformed),
         };
         match r {
@@ -315,7 +317,7 @@ impl Nat64 {
         if self.state.pool.index(dst4).is_some() {
             // RFC 6146 §3.8 hairpinning: loop the IPv4 result back inbound.
             ctx.counters.inc(Counter::Hairpin);
-            return self.inbound_v4(buf, s, l, ctx);
+            return self.inbound_v4(buf, s, l, true, ctx);
         }
         Ok(Out::Pkt(s, l))
     }
@@ -363,8 +365,10 @@ impl Nat64 {
         Self::emit_scratch(buf, start, n, ctx, Counter::IcmpErrorsGenerated)
     }
 
-    /// IPv4 → IPv6 (inbound to the CLAT side).
-    fn inbound_v4(&self, buf: &mut [u8], start: usize, len: usize, ctx: &mut WorkerCtx) -> R {
+    /// IPv4 → IPv6 (inbound to the CLAT side). `hairpin` is true only for
+    /// an own-node hairpin looped back in-process by `outbound_v6`; packets
+    /// read from the wire pass `false`.
+    fn inbound_v4(&self, buf: &mut [u8], start: usize, len: usize, hairpin: bool, ctx: &mut WorkerCtx) -> R {
         let pkt = buf.get(start..start + len).ok_or(DropReason::Malformed)?;
         let h = parse_v4(pkt).map_err(from_parse)?;
         if h.ttl <= 1 {
@@ -403,6 +407,16 @@ impl Nat64 {
         if src_refused {
             return Err(DropReason::SrcNotAllowed);
         }
+        // COMPLIANCE MAPPING:
+        // - NIST 800-53: SC-7, SC-7(5) - BCP 38 / RFC 2827: own-node
+        //   hairpins never touch the wire (`outbound_v6` loops them back
+        //   in-process), so a wire packet claiming this node's own pool slice
+        //   as its source is spoofed and refused (SEC-301). Other nodes'
+        //   slices stay accepted for cross-node hairpinning; the cluster edge
+        //   must filter the pool prefix as a source on external ingress.
+        if !hairpin && self.state.pool.index(h.src).is_some() {
+            return Err(DropReason::SrcNotAllowed);
+        }
         let (p, sport, dport, flags) = match l4 {
             L4::Tcp { sport, dport, flags } => (proto::TCP, sport, dport, flags),
             L4::Udp { sport, dport, .. } => (proto::UDP, sport, dport, 0),
@@ -422,6 +436,9 @@ impl Nat64 {
         let out_len = 40 + fh + h.payload_len();
         if out_len > usize::from(self.mtu6) || (!h.df && out_len > usize::from(self.frag6)) {
             if h.df {
+                // POAM: POAM-023 the session lookup above runs before this
+                // Fragmentation Needed decision, so a too-big DF packet
+                // refreshes (or, under EIF, creates) a session it never uses.
                 return self.frag_needed_v4(buf, start, &h, fh, ctx);
             }
             // COMPLIANCE MAPPING:

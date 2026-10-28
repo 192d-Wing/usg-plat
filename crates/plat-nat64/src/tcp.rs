@@ -1,4 +1,5 @@
-//! Simplified TCP session state machine (RFC 6146 §3.5.2).
+//! TCP session state machine (RFC 6146 §3.5.2), without simultaneous open:
+//! an unsolicited inbound SYN is dropped rather than held (POAM-008).
 
 /// Which side a packet came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1,0 +1,11 @@
+# NIST 800-53: SR-3 (Supply Chain Controls), SI-2 (Flaw Remediation).
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"

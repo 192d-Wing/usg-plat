@@ -388,6 +388,8 @@ pub struct AuditFileConfig {
     ///
     /// COMPLIANCE MAPPING:
     /// - NIST 800-53: AU-5(1) (Storage Capacity Warning), AU-4
+    // POAM: POAM-020 defaults to 0 (storage-capacity warning off); the SSP
+    // must require a non-zero value.
     #[serde(default)]
     pub min_free_bytes: u64,
 }

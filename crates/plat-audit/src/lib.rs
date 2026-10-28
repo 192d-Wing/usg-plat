@@ -33,7 +33,7 @@ pub mod verify;
 
 pub use event::{Event, LifecycleKind, LimitKind, PruneState, StorageState};
 pub use logger::{Logger, LoggerHandle, NodeIdent};
-pub use sink::{AuditSink, AuditStats};
+pub use sink::{AuditSink, AuditStats, TryEmit};
 
 /// Version of the SIEM record schema (`plat.schema`). Bump on any field
 /// or record-type change; downstream parsers key on it.
