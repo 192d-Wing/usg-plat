@@ -41,7 +41,7 @@ parking_lot = "0.12"
 proptest = "1"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.11"
-signal-hook = "0.3"
+signal-hook = "0.4"
 thiserror = "2"
 toml = "1.1"
 tracing = "0.1"
