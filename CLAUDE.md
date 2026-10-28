@@ -25,6 +25,7 @@ conversation acts as orchestrator and delegates to the subagents in
 - `/plat-workflow review [base-ref]`: review the current diff only
 - `/plat-workflow plan <task>`: plan only
 
+<!-- --8<-- [start:dev] -->
 ## Workspace
 
 | Crate | Role |
@@ -78,6 +79,8 @@ chain, 1 on a verification failure, an unverified tail (unless
    known gaps `// POAM:` and list them in `docs/compliance/POAM.md`.
 8. **Log schema is an interface.** Any change to SIEM field names bumps
    `plat_audit::LOG_SCHEMA_VERSION` and `docs/compliance/SIEM_LOGGING.md`.
+
+<!-- --8<-- [end:dev] -->
 
 ## NIST 800-53 Rev 5 focus for a boundary translator
 
