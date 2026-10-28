@@ -1,0 +1,68 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/plat-common",
+    "crates/plat-packet",
+    "crates/plat-xlat",
+    "crates/plat-nat64",
+    "crates/plat-audit",
+    "crates/plat-io",
+    "crates/plat-cluster",
+    "services/platd",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["usg-plat Contributors"]
+license = "Apache-2.0"
+rust-version = "1.88"
+# Internal crates are never published to crates.io (cargo-deny allow-wildcard-paths).
+publish = false
+
+[workspace.dependencies]
+plat-common = { path = "crates/plat-common", version = "0.1.0" }
+plat-packet = { path = "crates/plat-packet", version = "0.1.0" }
+plat-xlat = { path = "crates/plat-xlat", version = "0.1.0" }
+plat-nat64 = { path = "crates/plat-nat64", version = "0.1.0" }
+plat-audit = { path = "crates/plat-audit", version = "0.1.0" }
+plat-io = { path = "crates/plat-io", version = "0.1.0" }
+plat-cluster = { path = "crates/plat-cluster", version = "0.1.0" }
+
+ahash = "0.8"
+clap = { version = "4", features = ["derive"] }
+core_affinity = "0.8"
+criterion = { version = "0.5", default-features = false }
+crossbeam-channel = "0.5"
+crossbeam-utils = "0.8"
+hex = "0.4"
+libc = "0.2"
+parking_lot = "0.12"
+proptest = "1"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+signal-hook = "0.3"
+thiserror = "2"
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+indexing_slicing = "allow"
+
+[profile.release]
+# NIST 800-53: SI-7 - reproducible, hardened release build.
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = 1
+overflow-checks = false
+
+[profile.bench]
+inherits = "release"

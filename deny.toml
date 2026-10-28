@@ -1,0 +1,20 @@
+# NIST 800-53: SR-3, SA-12 (supply chain), CM-10 (software usage restrictions).
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+# Only licenses present in the dependency graph (CM-10). Add one here only
+# after review when a new dependency needs it.
+allow = ["Apache-2.0", "MIT", "BSD-3-Clause", "Unicode-3.0"]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Internal path dependencies carry a version and every crate is publish = false.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

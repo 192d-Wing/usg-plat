@@ -1,0 +1,103 @@
+# usg-plat example configuration.
+# NIST 800-53: CM-2 (Baseline Configuration), CM-6 (Configuration Settings).
+# Addresses below are documentation ranges (RFC 3849 / RFC 5737); replace them.
+
+[node]
+id = 0
+name = "plat-01"
+
+[cluster]
+# Nodes sharing nat64.pool. Each node owns a disjoint contiguous slice of the
+# pool and announces it upstream; see ARCHITECTURE.md "Cluster scale-out".
+node_count = 1
+
+[translation]
+# RFC 6052 prefix. This example uses a /96 inside the RFC 8215 local-use
+# prefix; the Well-Known Prefix 64:ff9b::/96 (RFC 6052 §2.1) is the usual
+# choice. Either way non-global IPv4 destinations are denied by default
+# (see allow_non_global_destinations).
+nat64_prefix = "64:ff9b:1::/96"
+client_prefixes = ["2001:db8:100::/40"]
+ipv6_mtu = 1500
+ipv4_mtu = 1500
+# RFC 7915 §4: DF=0 IPv4 packets larger than this (after translation) are
+# fragmented with IPv6 Fragment Headers.
+lowest_ipv6_mtu = 1280
+# Locally generated Packet Too Big / Fragmentation Needed, per worker per
+# second (0 disables).
+icmp_errors_per_sec = 100
+copy_tos = true
+# RFC 6052 §3.1 deviation switch (WKP only): translate ICMPv4 errors from
+# non-global router addresses. Keep false unless documented in the SSP.
+wkp_non_global_icmp_errors = false
+# SC-7: subscribers may not reach non-global IPv4 space (RFC 1918,
+# 100.64/10, 198.18/15, documentation ranges, ...) under any prefix. Set
+# true only for a network-specific prefix that must reach such space, and
+# record it in the SSP. Ignored (always denied) under the Well-Known Prefix.
+# While false, inbound data from non-global IPv4 sources is refused as well
+# (ICMP errors from such routers are still translated). The pool below is
+# exempt, so subscribers hairpin even with this non-global example pool; the
+# Well-Known Prefix requires a global pool.
+allow_non_global_destinations = false
+
+[nat64]
+pool = ["192.0.2.0/24"]
+port_min = 1024
+port_max = 65535
+port_block_size = 512
+max_blocks_per_subscriber = 4
+subscriber_prefix_len = 64
+paired_pooling = true
+filtering = "address_dependent"
+max_sessions = 4000000
+max_sessions_per_subscriber = 4000
+max_subscribers = 1000000
+table_shards = 1024
+
+[timeouts]
+udp_secs = 300
+tcp_established_secs = 7440
+tcp_transitory_secs = 240
+icmp_secs = 60
+
+[dataplane]
+interface = "plat0"
+workers = 0
+pin_cpus = true
+sweep_interval_ms = 1000
+
+[audit]
+# port_block: one record per block allocate/release (low volume, full attribution).
+# session: also one record per BIB create/delete.
+mode = "port_block"
+queue_capacity = 1048576
+# refuse_new_bindings: never create an unattributable mapping (AU-5).
+on_overflow = "refuse_new_bindings"
+batch_max = 4096
+flush_interval_ms = 100
+summary_interval_secs = 60
+
+[audit.file]
+path = "/var/log/plat/nat64-audit.jsonl"
+max_bytes = 1073741824
+# Rotated files kept (oldest deleted beyond this); 0 keeps all. Size the
+# volume for max_files x max_bytes, and archive to long-term storage before
+# deletion if retention (AU-11) requires it. While the file cannot be
+# written, new bindings are refused under refuse_new_bindings (AU-5).
+# Retention only deletes files that hold at least one checkpoint, only on a
+# size rotation, and writes an audit_retention_prune record first (AU-9).
+max_files = 0
+# AU-5(1): when the log volume has less free space than this, write an
+# audit_storage_threshold record, report /healthz 503 and refuse new
+# bindings (existing ones keep being logged). 0 disables. Keep it above
+# max_bytes plus a few minutes of peak record volume.
+min_free_bytes = 2147483648
+
+[[audit.syslog]]
+address = "198.51.100.10:514"
+transport = "udp"
+format = "json"
+app_name = "platd"
+
+[management]
+listen = "127.0.0.1:9464"

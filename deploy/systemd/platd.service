@@ -1,0 +1,62 @@
+# NIST 800-53: AC-6 (Least Privilege), CM-7 (Least Functionality), SC-39 (Process Isolation)
+# NIST 800-53: AU-8 - start only after the clock is synchronised.
+[Unit]
+Description=usg-plat 464XLAT PLAT / NAT64 translator
+Wants=network-online.target time-sync.target systemd-time-wait-sync.service
+After=network-online.target time-sync.target systemd-time-wait-sync.service
+
+[Service]
+Type=simple
+# Runs as root ('+' prefix) to create the persistent TUN owned by plat:plat.
+ExecStartPre=+/usr/libexec/plat/plat-tun-setup.sh /etc/plat/platd.toml
+ExecStart=/usr/bin/platd run --config /etc/plat/platd.toml
+Restart=on-failure
+RestartSec=2s
+User=plat
+Group=plat
+# No capabilities: the TUN device is owned by plat:plat, so attaching its
+# queues needs no privilege (AC-6).
+AmbientCapabilities=
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+UMask=0027
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateIPC=yes
+ProtectProc=invisible
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+# Allow-list first, then remove privileged and resource-control calls;
+# sched_setaffinity (in @resources) is re-added for dataplane.pin_cpus.
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallFilter=sched_setaffinity
+SystemCallErrorNumber=EPERM
+# SC-5 backstop against runaway memory or threads (tables and queues are
+# bounded by the config; size MemoryMax to about
+# nat64.max_sessions x 512 B + audit.queue_capacity x 64 B + 256 MiB).
+MemoryMax=8G
+TasksMax=1024
+# Audit logs readable by the service account only (AU-9); give a log
+# shipper access with an ACL rather than through the plat group.
+LogsDirectory=plat
+LogsDirectoryMode=0700
+ReadWritePaths=/var/log/plat
+DevicePolicy=closed
+DeviceAllow=/dev/net/tun rw
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

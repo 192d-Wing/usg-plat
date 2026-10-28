@@ -1,0 +1,27 @@
+[package]
+name = "platd"
+description = "usg-plat daemon: multithreaded 464XLAT PLAT / stateful NAT64"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+plat-common.workspace = true
+plat-xlat.workspace = true
+plat-nat64.workspace = true
+plat-audit.workspace = true
+plat-io.workspace = true
+plat-cluster.workspace = true
+clap.workspace = true
+core_affinity.workspace = true
+signal-hook.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+plat-packet.workspace = true
+
+[lints]
+workspace = true

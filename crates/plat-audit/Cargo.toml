@@ -1,0 +1,31 @@
+[package]
+name = "plat-audit"
+description = "Non-blocking, hash-chained NAT attribution logging with SIEM export for usg-plat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+plat-common.workspace = true
+crossbeam-channel.workspace = true
+crossbeam-utils.workspace = true
+hex.workspace = true
+sha2.workspace = true
+tracing.workspace = true
+
+# AU-5(1): free space on the log volume (safe `statvfs`, no `unsafe` here).
+# Same version the lock file already carries (via tempfile).
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", default-features = false, features = ["fs", "std"] }
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "audit"
+harness = false
+
+[lints]
+workspace = true
