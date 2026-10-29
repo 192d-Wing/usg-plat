@@ -2,7 +2,7 @@
 LINUX_TARGET ?= aarch64-unknown-linux-gnu
 ZENSICAL ?= uvx zensical@0.0.73
 
-.PHONY: all check fmt clippy check-linux check-notls test test-deploy bench security compliance-annotations release docs docs-serve
+.PHONY: all check fmt clippy check-linux check-notls test test-deploy bench security compliance-annotations release dist deb rpm packages docs docs-serve
 
 all: check test
 
@@ -58,6 +58,20 @@ compliance-annotations:
 
 release:
 	cargo build --release -p platd
+
+# Linux packages for the host architecture. Native build only: the AWS-LC
+# FIPS module is built with the host toolchain, never cross-linked (SC-13).
+# CI builds x86_64 and aarch64 on native runners (.github/workflows/packages.yml).
+dist:
+	cargo build --profile dist -p platd
+
+deb: dist
+	cargo deb -p platd --no-build --no-strip --profile dist
+
+rpm: dist
+	cargo generate-rpm -p services/platd --profile dist
+
+packages: deb rpm
 
 docs:
 	$(ZENSICAL) build --clean

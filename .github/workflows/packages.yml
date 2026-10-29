@@ -1,0 +1,65 @@
+# NIST 800-53: CM-2 (Baseline Configuration), SI-7 (Software Integrity),
+# SR-3 (Supply Chain Controls) - .deb and .rpm built natively per
+# architecture, so the AWS-LC FIPS module is compiled by the host toolchain
+# and never cross-linked (SC-13). Every third-party action is pinned to a full
+# commit SHA (tag in trailing comment); packaging tools are pinned versions.
+# The packages are not signed yet (SI-7 gap in NIST_800-53_MAPPING.md).
+name: Packages
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  packages:
+    name: deb + rpm (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain from rust-toolchain.toml
+        run: rustup toolchain install && rustup show
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: packages-${{ matrix.arch }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install AWS-LC FIPS build deps (CMake, Go, clang) and dpkg-dev
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake golang-go clang dpkg-dev
+      - name: Install packaging tools (pinned)
+        run: cargo install --locked cargo-deb@3.8.0 cargo-generate-rpm@0.21.1
+      - run: make packages
+      - name: Show package metadata and contents
+        run: |
+          for f in target/debian/*.deb; do dpkg-deb --info "$f"; dpkg-deb --contents "$f"; done
+          ls -l target/generate-rpm/*.rpm
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: platd-packages-${{ matrix.arch }}
+          path: |
+            target/debian/*.deb
+            target/generate-rpm/*.rpm
+          if-no-files-found: error
