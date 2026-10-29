@@ -190,14 +190,36 @@ Silicon development host (8 performance + 4 efficiency cores).
 | `audit/format_cef` (syslog sender thread) | 194 ns/record |
 | Logger end-to-end, file only (2 M records, review harness) | 641–648 k records/s |
 
-At production flow counts, shared-table scaling is limited by per-packet
-shard locks whose cache lines move between workers (POAM-015). UDP syslog sends one
-datagram per record, about 310 k records/s per destination (POAM-018).
+In these engine-only benches, shared-table scaling at high thread counts is
+limited by per-packet shard locks (POAM-015); with TUN I/O this cost is
+negligible (see below). UDP syslog sends one datagram per record, about
+310 k records/s per destination (POAM-018).
 
-These are engine numbers without kernel I/O. Linux TUN typically limits a
-queue to roughly 1–2 Mpps (general estimate, not measured in this project),
-so the engine is not the bottleneck; AF_XDP is the path beyond that
-(POAM-016).
+These are engine numbers without kernel I/O.
+
+### Linux TUN data plane (indicative only)
+
+> **Lima VM on Apple M2 Max, virtio, indicative only; validate on bare-metal
+> x86 with a real NIC before sizing.** 6 vCPU, Ubuntu 24.04.5 aarch64, kernel
+> 6.8; veth + multiqueue TUN, no NIC/RSS/IRQ cost; kernel pktgen shares the
+> vCPUs with `platd`; no hardware PMU; run-to-run noise about ±10%.
+
+Measured 2026-10-29 on `main` @a080417 (release build), UDP, 64 B and 512 B
+payloads, 8–49152 flows on one subscriber, `pin_cpus = true`.
+
+| Measurement | Result |
+|-------------|--------|
+| Per worker, v6→v4, worker at 100% CPU | about 0.45–0.62 Mpps (about 1.6–2.2 µs CPU per packet, kernel TUN work included); 512 B about 8% slower than 64 B |
+| Scaling 1 → 2 workers | about 1.75× (0.558 → 0.966 Mpps at 4096 flows; 0.482 → 0.859 at 49152) |
+| 4 workers | 1.05–1.60 Mpps; **generator-bound**, not a saturation point |
+| Return path v4→v6, 4 workers | 1.20 Mpps translated (workers 95–96%), cost symmetric with v6→v4 |
+| Worker CPU split (`perf record`, 1 worker saturated) | kernel 86% (TUN write + synchronous forwarding, TUN read, syscall entry/exit); engine + translation about 10%; lock operations about 0.7%, no futex/slow-path samples |
+
+`platd` drop counters stayed at 0; all loss under overload was counted as
+`plat_tun_tx_dropped_total` (kernel TUN queue full). Conclusion: on Linux TUN
+the per-packet syscalls dominate (POAM-016), and shard locks are not material
+at these rates (POAM-015). Raw results and the harness script are kept as
+run evidence (`target/agent-workflow/linux-perf/`), not in the repository.
 
 <!-- --8<-- [end:performance] -->
 
