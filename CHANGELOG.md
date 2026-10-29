@@ -4,6 +4,86 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 
 ## [Unreleased]
 
+### Linux validation (branch `fix/linux-validation`)
+
+Found by running `docs/compliance/LINUX_VERIFICATION.md` on Ubuntu 24.04.5
+aarch64 / systemd 255 (2026-10-29); results recorded there.
+
+#### Breaking / deploy changes (upgrade steps in README)
+
+- `platd.service` no longer uses `LogsDirectory=`/`LogsDirectoryMode=`.
+  `/var/log/plat` comes from the new tmpfiles.d entry
+  `deploy/systemd/plat.tmpfiles.conf` (install as
+  `/usr/lib/tmpfiles.d/plat.conf`): `d /var/log/plat 2750 plat plat-log`.
+  The directory must exist before the first start (`systemd-tmpfiles
+  --create`), otherwise the start fails with `226/NAMESPACE`.
+- New system group `plat-log`: audit files are `-rw-r----- plat:plat-log`
+  in a setgid 2750 directory. Log shippers and `verify-log` operators join
+  `plat-log` (replaces the ACL guidance); the setup script re-groups existing
+  files (bounded depth, `-xdev`, `plat`-owned regular files with one link).
+- nftables: the forward policy is written to `/etc/nftables.d/plat.nft`
+  and `include "/etc/nftables.d/*.nft"` is added once to
+  `/etc/nftables.conf` (an older exact `plat.nft` include is replaced), so
+  reload/restart of `nftables.service` restores it. Snapshot
+  `/etc/nftables.d/plat.nft.expected`.
+- New units `plat-fwguard.service` / `plat-fwguard.timer` (every 2 s, enable
+  on its own) and drop-in `nftables.service.d/plat-fwguard.conf`: disable
+  IPv4/IPv6 forwarding when `table inet plat` is missing or modified (fail
+  closed; journal message). Residual window for direct `nft` changes:
+  POAM-019.
+- `platd verify-log` exit code **3** for a recovery gap after a damaged
+  start, and new flag `--allow-recovery`; `--allow-gap` does not cover it.
+  Scripts that treat any non-zero exit as failure are unaffected; scripts
+  that expect only 0/1/2 must handle 3.
+- Unit: `Wants=`/`After=time-sync.target` only (no
+  `systemd-time-wait-sync.service`; enable `chrony-wait.service` or
+  `systemd-time-wait-sync.service` to match the time daemon);
+  `StartLimitIntervalSec=60`, `StartLimitBurst=5`; `RemoveIPC=yes`,
+  `ProcSubset=pid`; `MemoryMax` sizing comment now 800 B/session.
+
+#### Fixed (Linux validation)
+
+- `plat-tun-setup.sh` failed on every start because it rejected the
+  `PLAT_FIPS` / `PLAT_MGMT_TLS` keys of `check-config --format env`; it now
+  requires `PLAT_*=` lines and ignores unused keys.
+- Setup script removes every route on the TUN, of any protocol (was only
+  `proto boot`), and verifies all main-table routes.
+- Test-hook environment variables of the deploy scripts are honoured only
+  with `PLAT_TEST_MODE=1`.
+- Audit file: a failed batch write (short write, ENOSPC) is cut back to the
+  last durable checkpoint, so no torn record or record outside the chain
+  remains; a failed cut-back is reported (`truncate_failed`).
+- Every checkpoint is `fdatasync`ed and a new file's header is synced before
+  the rename (a power cut left a 0-byte live file).
+- Rotation never lets a file exceed `max_bytes` (batches are split), except
+  the single recovery batch after an outage.
+- No sequence-number reuse after an emptied or damaged newest file: durable
+  sequence lease `.<name>.seq` (blocks of 2^20; opened `O_NOFOLLOW`, must be a
+  regular file; failures retried, counted and audited; sequence exhaustion
+  fails closed without wrapping).
+- `verify-log`: an ENOSPC gap announced by `audit_output_failure` with the
+  exact `lost` count passes without `--allow-gap`; a partial line inside the
+  chain needs a matching `audit_recovery`; an `audit_recovery` after an
+  intact file is a broken link; stacked damage is reported as a recovery gap.
+- README install: the config is installed after `plat`/`plat-log` are created, as `root:plat 0640` (was `root:root`, unreadable by platd); `systemd-tmpfiles --create` runs before the first start; the post-start `curl` retries until the listener is up.
+- Prometheus `interface` label values are escaped.
+- Flaky test `rejection_flood_is_rate_limited_and_summarised`.
+
+#### Added (Linux validation)
+
+- Log schema **6**: record `audit_recovery` (`plat.reason`
+  `empty_file`/`missing_header`/`truncated_tail`,
+  `plat.audit.last_checkpoint_seq`, `plat.audit.max_seq`,
+  `plat.audit.lease_state` `ok`/`absent`/`corrupt`/`inflated`/`high`);
+  optional `plat.reason` on `audit_output_failure` (`truncate_failed`,
+  `seq_lease_failed`, `seq_exhausted`). See `SIEM_LOGGING.md`.
+- Metrics `plat_tun_rx_dropped_total{interface}`,
+  `plat_tun_tx_dropped_total{interface}` (Linux kernel TUN drops) and
+  `plat_audit_seq_lease_failures_total`.
+- `make test-deploy` (`sh -n`, shellcheck, stubbed run of the deploy
+  scripts against real `check-config` output; fails without shellcheck when
+  `CI=true`), run in the CI job `test (native Linux)`.
+
 ### Added
 
 - Revocation metrics (SI-4): `plat_ocsp_fetch_seconds` and

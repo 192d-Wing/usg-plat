@@ -44,16 +44,29 @@ enum Cmd {
     /// Verify the hash chain of audit log files (AU-9). Pass the live file
     /// and its rotated predecessors (any order) to check that they link
     /// into one chain.
+    ///
+    /// Exit codes: 0 verified (a gap is allowed only when an
+    /// `audit_output_failure` (recovered) record announces exactly its size,
+    /// or with the matching --allow-* flag); 1 verification failed; 2 I/O
+    /// error; 3 only a RECOVERY GAP remains (numbers skipped by a restart
+    /// after a damaged log, announced by `audit_recovery`: verify that range
+    /// against the remote copy, or pass --allow-recovery).
     VerifyLog {
         #[arg(required = true)]
         files: Vec<PathBuf>,
-        /// Accept records after the last checkpoint (live file, crash).
+        /// Accept records after the last checkpoint and a truncated final
+        /// line (live file, crash, short write).
         #[arg(long)]
         allow_tail: bool,
         /// Accept sequence gaps between files (records lost while the local
         /// file was not writable; see `audit_output_failure`).
         #[arg(long)]
         allow_gap: bool,
+        /// Accept a gap announced by an `audit_recovery` record (restart
+        /// after a damaged log) once the range was checked against the
+        /// remote copy: exit 0 with a warning instead of 3.
+        #[arg(long)]
+        allow_recovery: bool,
     },
 }
 
@@ -191,14 +204,36 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
-        Cmd::VerifyLog { files, allow_tail, allow_gap } => verify_log(&files, allow_tail, allow_gap),
+        Cmd::VerifyLog { files, allow_tail, allow_gap, allow_recovery } => {
+            verify_log(&files, Allow { tail: allow_tail, gap: allow_gap, recovery: allow_recovery })
+        }
     }
 }
 
+/// `verify-log` acceptance flags.
+#[derive(Debug, Clone, Copy, Default)]
+struct Allow {
+    tail: bool,
+    gap: bool,
+    recovery: bool,
+}
+
+/// `verify-log` exit code for a recovery gap without `--allow-recovery`.
+const EXIT_RECOVERY_GAP: u8 = 3;
+
 /// Exit 0: every file verifies and they form one chain; 1: verification
-/// failed (or an unverified tail / gap without the matching flag); 2: I/O.
-fn verify_log(files: &[PathBuf], allow_tail: bool, allow_gap: bool) -> ExitCode {
-    use plat_audit::verify::{LinkIssue, link, verify};
+/// failed (or an unverified tail / unexplained gap without the matching
+/// flag); 2: I/O; 3: otherwise verified, but a gap is accounted only by an
+/// `audit_recovery` record and `--allow-recovery` was not given (1 wins).
+///
+/// COMPLIANCE MAPPING:
+/// - NIST 800-53: AU-9, AU-6 - a range skipped after a damaged log is not
+///   reported as plain OK: the operator must check it against the remote
+///   copy (SEC-301).
+fn verify_log(files: &[PathBuf], allow: Allow) -> ExitCode {
+    use plat_audit::verify::{GapAccount, LinkIssue, link, verify};
+    let (allow_tail, allow_gap) = (allow.tail, allow.gap);
+    let mut recovery_gap = false;
     let mut reps = Vec::with_capacity(files.len());
     let mut failed = false;
     for f in files {
@@ -213,10 +248,18 @@ fn verify_log(files: &[PathBuf], allow_tail: bool, allow_gap: bool) -> ExitCode 
                     r.checkpoints,
                     r.unverified_tail
                 );
+                if r.truncated_tail_bytes > 0 {
+                    println!(
+                        "{}: {}: truncated tail: final partial line of {} bytes (short write or power cut)",
+                        if allow_tail { "TAIL" } else { "FAILED" },
+                        f.display(),
+                        r.truncated_tail_bytes
+                    );
+                }
                 if r.unverified_tail > 0 && !allow_tail {
                     println!("FAILED: {}: {} records after the last checkpoint", f.display(), r.unverified_tail);
-                    failed = true;
                 }
+                failed |= r.has_unverified_tail() && !allow_tail;
                 reps.push(r);
             }
             Ok(r) => {
@@ -232,7 +275,30 @@ fn verify_log(files: &[PathBuf], allow_tail: bool, allow_gap: bool) -> ExitCode 
     reps.sort_by_key(|r| r.next_seq);
     for issue in link(&reps) {
         match issue {
-            LinkIssue::Gap { first, last, .. } => {
+            // L12: a gap announced by the chain itself (a checkpointed
+            // `audit_output_failure` recovered record with exactly this
+            // `lost` count opening the next file) is a recorded loss, not a
+            // verification failure; any other gap still needs --allow-gap.
+            LinkIssue::Gap { index, first, last, accounted: Some(a @ GapAccount::OutputFailure) } => {
+                println!(
+                    "OK: accounted gap: {first}..={last} ({} lost, {} (recovered) at record {})",
+                    last - first + 1,
+                    a.record(),
+                    reps[index].next_seq
+                );
+            }
+            // SEC-301: a skip announced only by `audit_recovery` (rule b).
+            LinkIssue::Gap { index, first, last, accounted: Some(a @ GapAccount::Recovery) } => {
+                println!(
+                    "{}RECOVERY GAP {first}..={last} (restart after damaged log; verify against the remote copy): \
+                     {} at record {}",
+                    if allow.recovery { "WARNING: " } else { "" },
+                    a.record(),
+                    reps[index].next_seq
+                );
+                recovery_gap |= !allow.recovery;
+            }
+            LinkIssue::Gap { first, last, accounted: None, .. } => {
                 println!(
                     "{}: records {first}..={last} are not in these files",
                     if allow_gap { "GAP" } else { "FAILED" }
@@ -245,7 +311,13 @@ fn verify_log(files: &[PathBuf], allow_tail: bool, allow_gap: bool) -> ExitCode 
             }
         }
     }
-    if failed { ExitCode::from(1) } else { ExitCode::SUCCESS }
+    if failed {
+        ExitCode::from(1)
+    } else if recovery_gap {
+        ExitCode::from(EXIT_RECOVERY_GAP)
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 #[cfg(test)]
@@ -282,5 +354,203 @@ mod tests {
             let cfg = example(&[("interface = \"plat0\"", &format!("interface = \"{bad}\""))]);
             assert!(render_env(&cfg, &plat_cluster::owned(&cfg), true).is_err(), "{bad}");
         }
+    }
+
+    /// L12: a final partial line is an unverified (truncated) tail: exit 1
+    /// without `--allow-tail`, 0 with it; never a chain mismatch.
+    #[test]
+    fn verify_log_truncated_tail_needs_allow_tail() {
+        use plat_audit::{AuditSink, Event, LifecycleKind, Logger, NodeIdent};
+        let dir = std::env::temp_dir().join(format!("platd-verify-tail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.jsonl");
+        let mut cfg = example(&[]).audit;
+        cfg.syslog.clear();
+        cfg.file = Some(plat_common::config::AuditFileConfig {
+            path: path.clone(),
+            max_bytes: 1 << 30,
+            max_files: 0,
+            min_free_bytes: 0,
+        });
+        let (sink, rx) = AuditSink::bounded(64);
+        let node = NodeIdent { name: "plat-test".into(), id: 1, pid: 1 };
+        let h = Logger::new(cfg, node, rx, sink.stats().clone()).spawn().unwrap();
+        for _ in 0..3 {
+            sink.emit(Event::Lifecycle { ts_us: 0, kind: LifecycleKind::Start, fips: None });
+        }
+        drop(sink);
+        h.join();
+        let files = [path.clone()];
+        assert_eq!(verify_log(&files, Allow::default()), ExitCode::SUCCESS);
+        let text = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &text[..text.len() - 30]).unwrap();
+        assert_eq!(verify_log(&files, Allow::default()), ExitCode::from(1));
+        assert_eq!(verify_log(&files, Allow { tail: true, ..Allow::default() }), ExitCode::SUCCESS);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// L12: after an ENOSPC outage the next file opens with a recovered
+    /// `audit_output_failure` whose `lost` covers the sequence gap: strict
+    /// verify-log passes; the same gap without it, or with another count,
+    /// fails (and still passes with --allow-gap).
+    #[test]
+    fn verify_log_accepts_only_a_gap_announced_with_its_exact_size() {
+        use plat_audit::logger::{chain_seed, chain_step};
+        use plat_audit::verify::verify;
+        use plat_audit::{AuditSink, Event, LifecycleKind, Logger, NodeIdent};
+        use sha2::{Digest, Sha256};
+        let dir = std::env::temp_dir().join(format!("platd-verify-gap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.jsonl");
+        let mut cfg = example(&[]).audit;
+        cfg.syslog.clear();
+        cfg.file = Some(plat_common::config::AuditFileConfig {
+            path: path.clone(),
+            max_bytes: 1 << 30,
+            max_files: 0,
+            min_free_bytes: 0,
+        });
+        let (sink, rx) = AuditSink::bounded(64);
+        let node = NodeIdent { name: "plat-test".into(), id: 1, pid: 1 };
+        let h = Logger::new(cfg, node, rx, sink.stats().clone()).spawn().unwrap();
+        for _ in 0..3 {
+            sink.emit(Event::Lifecycle { ts_us: 0, kind: LifecycleKind::Start, fips: None });
+        }
+        drop(sink);
+        h.join();
+        let a = verify(std::io::BufReader::new(std::fs::File::open(&path).unwrap())).unwrap();
+        assert!(a.ok() && !a.has_unverified_tail(), "{a:?}");
+
+        // The file opened on recovery, 42 sequence numbers after `a`.
+        let next = a.last_seq + 43;
+        let recovered = |lost: Option<u64>| {
+            let header = format!(
+                "{{\"event.action\":\"audit_chain_continue\",\"plat.audit.prev_chain\":\"{}\",\
+                 \"plat.audit.prev_seq\":{},\"plat.audit.next_seq\":{next}}}\n",
+                a.final_chain, a.last_checkpoint_seq
+            );
+            let rec = match lost {
+                Some(n) => format!(
+                    "{{\"event.sequence\":{next},\"event.action\":\"audit_output_failure\",\
+                     \"plat.audit.destination\":\"file\",\"plat.audit.state\":\"recovered\",\"plat.audit.lost\":{n}}}\n"
+                ),
+                None => format!("{{\"event.sequence\":{next},\"event.action\":\"service_start\"}}\n"),
+            };
+            let digest: [u8; 32] = Sha256::digest(rec.as_bytes()).into();
+            let chain = chain_step(&chain_seed(header.as_bytes()), &digest, next, next);
+            let cp = format!(
+                "{{\"event.action\":\"audit_checkpoint\",\"plat.audit.seq_first\":{next},\"plat.audit.seq_last\":{next},\
+                 \"plat.audit.batch_sha256\":\"{}\",\"plat.audit.chain_sha256\":\"{}\"}}\n",
+                hex::encode(digest),
+                hex::encode(chain)
+            );
+            let p = dir.join("audit.jsonl.2");
+            std::fs::write(&p, format!("{header}{rec}{cp}")).unwrap();
+            [path.clone(), p]
+        };
+        assert_eq!(verify_log(&recovered(Some(42)), Allow::default()), ExitCode::SUCCESS);
+        for wrong in [None, Some(41), Some(43)] {
+            let files = recovered(wrong);
+            assert_eq!(verify_log(&files, Allow::default()), ExitCode::from(1), "{wrong:?}");
+            assert_eq!(verify_log(&files, Allow { gap: true, ..Allow::default() }), ExitCode::SUCCESS, "{wrong:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Runs the logger once on `path` with `n` lifecycle records.
+    fn log_once(path: &std::path::Path, n: usize) {
+        use plat_audit::{AuditSink, Event, LifecycleKind, Logger, NodeIdent};
+        let mut cfg = example(&[]).audit;
+        cfg.syslog.clear();
+        cfg.file = Some(plat_common::config::AuditFileConfig {
+            path: path.to_path_buf(),
+            max_bytes: 1 << 30,
+            max_files: 0,
+            min_free_bytes: 0,
+        });
+        let (sink, rx) = AuditSink::bounded(64);
+        let node = NodeIdent { name: "plat-test".into(), id: 1, pid: 1 };
+        let h = Logger::new(cfg, node, rx, sink.stats().clone()).spawn().unwrap();
+        for _ in 0..n {
+            sink.emit(Event::Lifecycle { ts_us: 0, kind: LifecycleKind::Start, fips: None });
+        }
+        drop(sink);
+        h.join();
+    }
+
+    /// L12 stacked damage (run 3): the live file is truncated mid-line,
+    /// start-up writes `truncated_tail` into a new file, that file is
+    /// emptied, start-up writes `empty_file` naming the same checkpoint. The
+    /// partial-line predecessor followed by the `empty_file` recovery is a
+    /// RECOVERY GAP (3, 0 with --allow-recovery; the partial line still
+    /// needs --allow-tail), never an unexplained break.
+    #[test]
+    fn verify_log_accepts_an_emptied_truncated_tail_recovery_file() {
+        let dir = std::env::temp_dir().join(format!("platd-verify-stacked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.jsonl");
+        let audit_files = || {
+            let mut v: Vec<_> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .filter(|p| p.file_name().is_some_and(|n| !n.to_string_lossy().starts_with('.')))
+                .collect();
+            v.sort();
+            v
+        };
+        log_once(&path, 3);
+        // Truncate the live file inside its last line, restart.
+        let text = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &text[..text.len() - 30]).unwrap();
+        log_once(&path, 2);
+        let files = audit_files();
+        assert_eq!(files.len(), 2, "{files:?}");
+        assert_eq!(verify_log(&files, Allow { tail: true, recovery: true, ..Allow::default() }), ExitCode::SUCCESS);
+        // Empty the new live file (holds the truncated_tail record), restart.
+        std::fs::File::create(&path).unwrap();
+        log_once(&path, 2);
+        let files = audit_files();
+        assert!(files.len() >= 2, "{files:?}");
+        assert_eq!(verify_log(&files, Allow::default()), ExitCode::from(1), "partial line needs --allow-tail");
+        assert_eq!(verify_log(&files, Allow { tail: true, ..Allow::default() }), ExitCode::from(EXIT_RECOVERY_GAP));
+        assert_eq!(
+            verify_log(&files, Allow { tail: true, gap: true, ..Allow::default() }),
+            ExitCode::from(EXIT_RECOVERY_GAP)
+        );
+        assert_eq!(verify_log(&files, Allow { tail: true, recovery: true, ..Allow::default() }), ExitCode::SUCCESS);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SEC-301: a gap accounted only by `audit_recovery` (restart after the
+    /// newest file was emptied) exits 3, or 0 with --allow-recovery; an
+    /// unexplained problem on top still exits 1. Exit 2: unreadable file.
+    #[test]
+    fn verify_log_recovery_gap_has_its_own_exit_code() {
+        let dir = std::env::temp_dir().join(format!("platd-verify-recovery-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.jsonl");
+        log_once(&path, 3);
+        let old = dir.join("audit.jsonl.1");
+        std::fs::rename(&path, &old).unwrap();
+        std::fs::File::create(&path).unwrap(); // power cut emptied the live file
+        log_once(&path, 2);
+        let files = [old.clone(), path.clone()];
+        assert_eq!(verify_log(&files, Allow::default()), ExitCode::from(EXIT_RECOVERY_GAP));
+        assert_eq!(verify_log(&files, Allow { gap: true, ..Allow::default() }), ExitCode::from(EXIT_RECOVERY_GAP));
+        assert_eq!(verify_log(&files, Allow { recovery: true, ..Allow::default() }), ExitCode::SUCCESS);
+        // Plus a partial final line (checkpoints intact): failure (1) wins
+        // over 3.
+        let mut text = std::fs::read(&path).unwrap();
+        text.extend_from_slice(b"{\"@timestamp\":\"20");
+        std::fs::write(&path, &text).unwrap();
+        assert_eq!(verify_log(&files, Allow::default()), ExitCode::from(1));
+        assert_eq!(verify_log(&files, Allow { tail: true, ..Allow::default() }), ExitCode::from(EXIT_RECOVERY_GAP));
+        // I/O error.
+        assert_eq!(verify_log(&[dir.join("missing")], Allow::default()), ExitCode::from(2));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

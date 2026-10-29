@@ -267,6 +267,9 @@ pub fn run(cfg: Config) -> ExitCode {
     let extra = tls.sections();
     #[cfg(not(feature = "tls"))]
     let extra = Vec::new();
+    // L17: kernel-side TUN drops (back-pressure) are otherwise invisible.
+    let mut extra = extra;
+    extra.push(metrics::tun_section(cfg.dataplane.interface.clone()));
     let src =
         metrics::Sources { nat: nat.clone(), workers: counters.clone(), audit: sink.clone(), fips: fips.active, extra };
     #[cfg(feature = "tls")]

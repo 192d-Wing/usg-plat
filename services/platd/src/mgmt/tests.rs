@@ -333,12 +333,16 @@ fn slow_client_does_not_block_others() {
 
 /// SC-5 / AU-5: a rejection flood is audited up to the bucket, the rest is
 /// counted, and one `management_connection_suppressed` summary follows.
+/// The window is longer than any test run, so a loaded host cannot split
+/// the flood across two windows; the summary comes from the flush at
+/// shutdown (the periodic path is covered by
+/// `reject_limiter_summarises_a_window_once`).
 #[test]
 fn rejection_flood_is_rate_limited_and_summarised() {
     let pki = Pki::new("mgmt-flood");
     let mut srv = Server::start(
         pki.mgmt(None, 4, Duration::from_secs(5)),
-        RejectLimiter::new(0.0, 2.0, Duration::from_millis(300)),
+        RejectLimiter::new(0.0, 2.0, Duration::from_secs(3600)),
     );
     for _ in 0..5 {
         assert!(get(srv.addr, pki.client(None), "/metrics").is_err());
@@ -347,6 +351,14 @@ fn rejection_flood_is_rate_limited_and_summarised() {
     while srv.stats.get(MgmtReason::NoClientCert) < 5 {
         assert!(t.elapsed() < Duration::from_secs(5));
         std::thread::sleep(Duration::from_millis(10));
+    }
+    let recs = srv.records(2, Duration::from_secs(3));
+    assert_eq!(recs.iter().filter_map(conn_of).count(), 2, "{recs:?}");
+    assert!(!recs.iter().any(|e| matches!(e, Event::ManagementSuppressed { .. })), "{recs:?}");
+    // Stop: the accept thread drains and flushes the summary.
+    srv.stop.store(true, Ordering::Relaxed);
+    if let Some(th) = srv.thread.take() {
+        th.join().unwrap();
     }
     let recs = srv.records(3, Duration::from_secs(3));
     assert_eq!(recs.iter().filter_map(conn_of).count(), 2, "{recs:?}");
@@ -358,6 +370,23 @@ fn rejection_flood_is_rate_limited_and_summarised() {
         })
         .collect();
     assert_eq!(summary, [3]);
+}
+
+/// AU-5: the periodic summary reports a window's suppressed records once,
+/// only after the window has ended, and nothing for an empty window.
+#[test]
+fn reject_limiter_summarises_a_window_once() {
+    let window = Duration::from_millis(50);
+    let l = RejectLimiter::new(0.0, 2.0, window);
+    let admitted = (0..5).filter(|_| l.admit()).count();
+    assert_eq!(admitted, 2);
+    std::thread::sleep(window + Duration::from_millis(10));
+    match l.summary(false) {
+        Some(Event::ManagementSuppressed { suppressed, .. }) => assert_eq!(suppressed, 3),
+        other => panic!("{other:?}"),
+    }
+    std::thread::sleep(window + Duration::from_millis(10));
+    assert!(l.summary(false).is_none(), "an empty window is not summarised");
 }
 
 /// SEC-001: one source address cannot hold more than `max_per_ip` slots,

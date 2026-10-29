@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use plat_audit::verify::{LinkIssue, VerifyReport, link, verify};
+use plat_audit::verify::{GapAccount, LinkIssue, VerifyReport, link, verify};
 use plat_audit::{AuditSink, AuditStats, Event, Logger, NodeIdent};
 use plat_common::config::{
     AuditConfig, AuditFileConfig, AuditMode, LogFormat, OverflowPolicy, SyslogConfig, SyslogTransport,
@@ -146,16 +146,22 @@ fn file_failure_degrades_fails_closed_and_recovers() {
 
     let lost = stats.file_lost.load(Ordering::Relaxed);
     let files = reports(&sub);
-    let newest = std::fs::read_to_string(&files.last().unwrap().0).unwrap();
-    let first_record = newest.lines().nth(1).unwrap();
-    assert!(first_record.contains("\"event.action\":\"audit_output_failure\""), "{first_record}");
+    // The file written on recovery (later ones may follow: rotation).
+    let texts: Vec<String> = files.iter().map(|(p, _)| std::fs::read_to_string(p).unwrap()).collect();
+    let first_record = texts
+        .iter()
+        .filter_map(|t| t.lines().nth(1))
+        .find(|l| l.contains("\"event.action\":\"audit_output_failure\""))
+        .expect("a file starts with audit_output_failure");
     assert!(first_record.contains("\"plat.audit.state\":\"recovered\""), "{first_record}");
     assert!(first_record.contains(&format!("\"plat.audit.lost\":{lost}")), "{first_record} lost={lost}");
     // Exactly one gap, of exactly the reported size; otherwise one chain.
     let is = issues(&files);
     assert_eq!(is.len(), 1, "{is:?}");
     match &is[0] {
-        LinkIssue::Gap { first, last, .. } => assert_eq!(last - first + 1, lost),
+        LinkIssue::Gap { first, last, accounted, .. } => {
+            assert!(last - first + 1 == lost && *accounted == Some(GapAccount::OutputFailure), "{is:?}")
+        }
         other => panic!("{other:?}"),
     }
 }
@@ -469,6 +475,12 @@ fn resume_follows_the_chain_when_names_are_out_of_order() {
     h.join();
     let run1 = reports(&dir);
     let run1_last = run1.iter().map(|(_, r)| r.last_seq).max().unwrap();
+    // A restart moves a live file holding records aside, so the live file
+    // removed below holds none (whatever the rotation boundaries were).
+    let (sink, rx) = AuditSink::bounded(16);
+    let h = Logger::new(cfg(&path, 4096, 0, vec![]), node(), rx, sink.stats().clone()).spawn().unwrap();
+    drop(sink);
+    h.join();
     std::fs::remove_file(&path).unwrap(); // live file lost
     shift_rotated_names(&dir, 0, true); // newest records under the oldest name
 
@@ -499,7 +511,11 @@ fn stalled_collector_never_stalls_the_local_file() {
     let path = dir.join("audit.jsonl");
     let (sink, rx) = AuditSink::bounded(1 << 14);
     let stats = sink.stats().clone();
-    let h = Logger::new(cfg(&path, 1 << 30, 0, vec![syslog]), node(), rx, stats.clone()).spawn().unwrap();
+    // Every checkpoint is synced (L12): use realistic batches so the
+    // timing measures the collector hand-off, not 1000 fsyncs.
+    let mut c = cfg(&path, 1 << 30, 0, vec![syslog]);
+    c.batch_max = 256;
+    let h = Logger::new(c, node(), rx, stats.clone()).spawn().unwrap();
     let t = Instant::now();
     for i in 0..8000u16 {
         assert!(sink.emit(ev(i)));

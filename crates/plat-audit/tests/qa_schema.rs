@@ -295,6 +295,6 @@ fn cap_never_splits_utf8_and_trailing_backslash_is_escaped() {
 }
 
 #[test]
-fn schema_version_is_5() {
-    assert_eq!(plat_audit::LOG_SCHEMA_VERSION, 5);
+fn schema_version_is_6() {
+    assert_eq!(plat_audit::LOG_SCHEMA_VERSION, 6);
 }

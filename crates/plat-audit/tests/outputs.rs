@@ -61,6 +61,8 @@ fn files(dir: &Path) -> Vec<PathBuf> {
         match name.strip_prefix("audit.jsonl.") {
             Some(ts) => rotated.push((ts.parse().unwrap(), p)),
             None if name == "audit.jsonl" => live = Some(p),
+            // Sequence high-water mark, not an audit file.
+            None if name == ".audit.jsonl.seq" => {}
             None => panic!("unexpected file {name}"),
         }
     }
@@ -133,7 +135,13 @@ fn existing_file_is_moved_aside_on_start() {
     assert_eq!(fs.len(), 2);
     assert_eq!(std::fs::read(&fs[0]).unwrap(), b"previous run, unverifiable tail\n", "old content preserved");
     let rep = verify(BufReader::new(std::fs::File::open(&path).unwrap())).unwrap();
-    assert!(rep.ok() && rep.records == 1, "{rep:?}");
+    // The previous file had no chain header: an `audit_recovery` record
+    // (schema 6) precedes the new record.
+    assert!(rep.ok() && rep.records == 2, "{rep:?}");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let first = text.lines().nth(1).unwrap();
+    assert!(first.contains("\"event.action\":\"audit_recovery\""), "{first}");
+    assert!(first.contains("\"plat.reason\":\"missing_header\""), "{first}");
 }
 
 #[test]

@@ -52,6 +52,87 @@ impl StorageState {
     }
 }
 
+/// Why start-up wrote an `audit_recovery` record (AU-5, AU-9): the newest
+/// audit file on disk did not end at a complete checkpoint, so records
+/// written after the last durable checkpoint may be lost (power cut).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryReason {
+    /// The newest file is empty (0 bytes).
+    EmptyFile,
+    /// The newest file has bytes but no complete `audit_chain_continue` header.
+    MissingHeader,
+    /// The newest file ends in a partial line.
+    TruncatedTail,
+}
+
+impl RecoveryReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::EmptyFile => "empty_file",
+            Self::MissingHeader => "missing_header",
+            Self::TruncatedTail => "truncated_tail",
+        }
+    }
+}
+
+/// State of the durable sequence high-water mark `.<name>.seq` when
+/// start-up read it (`plat.audit.lease_state` of `audit_recovery`; SEC-304).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaseState {
+    /// A regular file holding a number, used.
+    Ok,
+    /// No lease file (first start, or an installation from before it).
+    Absent,
+    /// Not a regular file (symlink, FIFO, directory), unreadable or
+    /// unparsable: ignored.
+    Corrupt,
+    /// Within the wrap guard but more than one lease above the highest
+    /// sequence in the files (files holding the top numbers were lost, or a
+    /// planted value): used anyway so no number is reused (SEC-302).
+    High,
+    /// Above the wrap guard (`u64::MAX - 2 * SEQ_LEASE`): ignored so a
+    /// planted value cannot burn the sequence space (SEC-302).
+    Inflated,
+}
+
+impl LeaseState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Absent => "absent",
+            Self::Corrupt => "corrupt",
+            Self::High => "high",
+            Self::Inflated => "inflated",
+        }
+    }
+}
+
+/// Specific cause of an `audit_output_failure` (`plat.reason`; schema 6).
+/// Absent for an ordinary write failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFailureReason {
+    /// A failed batch could not be cut back to the last durable checkpoint
+    /// (`set_len`/sync failed): the file may end in records outside the
+    /// chain (`verify-log` reports them as an unverified tail).
+    TruncateFailed,
+    /// The sequence high-water mark `.<name>.seq` could not be written
+    /// (once per failure streak; retried every flush interval, SEC-303).
+    SeqLeaseFailed,
+    /// The 64-bit sequence space is used up: the logger stops writing and
+    /// stays degraded (fail closed, SEC-302). Last numbered record.
+    SeqExhausted,
+}
+
+impl OutputFailureReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TruncateFailed => "truncate_failed",
+            Self::SeqLeaseFailed => "seq_lease_failed",
+            Self::SeqExhausted => "seq_exhausted",
+        }
+    }
+}
+
 /// Phase reported by `audit_retention_prune` (AU-9, AU-11). A deletion is
 /// first recorded as `Scheduled` (synced before the file is touched), then
 /// its result as `Deleted` or `Failed` in a later batch (NIST-202).
@@ -407,8 +488,9 @@ pub enum Event {
     /// written (`recovered == false`, sent to the remaining destinations)
     /// or is being written again (`recovered == true`, first record of the
     /// new file). `lost` records were not written to the file. Emitted by
-    /// the logger itself (AU-5).
-    OutputFailure { ts_us: u64, lost: u64, recovered: bool },
+    /// the logger itself (AU-5). `reason` names a specific cause
+    /// (`plat.reason`; schema 6), e.g. a failed cut-back of the file.
+    OutputFailure { ts_us: u64, lost: u64, recovered: bool, reason: Option<OutputFailureReason> },
     /// Records not delivered to a syslog collector (queue full, connection
     /// failure, reconnect back-off). Emitted by the logger itself into the
     /// local file (AU-5, AU-9(2)).
@@ -426,6 +508,21 @@ pub enum Event {
     /// with `chain_prefix` (the next file's header names the full chain
     /// value).
     RetentionPrune { ts_us: u64, rotated_us: u64, seq_first: u64, seq_last: u64, chain_prefix: u64, state: PruneState },
+    /// Start-up found the newest audit file empty, without a header, or
+    /// ending in a partial line (crash or power cut). `last_checkpoint_seq`
+    /// is the last durable checkpoint found on disk and `max_seq` the
+    /// highest sequence that may have been used (the highest seen, or the
+    /// durable high-water mark `.<name>.seq` if higher); numbering resumes
+    /// at `max_seq + 1`, so records `last_checkpoint_seq + 1..=max_seq` may
+    /// be lost and no number is reused. `lease_state` says whether the
+    /// high-water mark was used. First record of the new file (AU-5, AU-9).
+    AuditRecovery {
+        ts_us: u64,
+        reason: RecoveryReason,
+        last_checkpoint_seq: u64,
+        max_seq: u64,
+        lease_state: LeaseState,
+    },
     /// A management connection was accepted or rejected (AC-17, AU-2).
     ManagementConnection { ts_us: u64, conn: Arc<MgmtConnection> },
     /// Rejected-connection records suppressed by the rate limit over the
@@ -452,6 +549,7 @@ impl Event {
             | Event::RemoteLoss { ts_us, .. }
             | Event::StorageThreshold { ts_us, .. }
             | Event::RetentionPrune { ts_us, .. }
+            | Event::AuditRecovery { ts_us, .. }
             | Event::ManagementConnection { ts_us, .. }
             | Event::ManagementSuppressed { ts_us, .. }
             | Event::RevocationCheck { ts_us, .. }
@@ -475,6 +573,7 @@ impl Event {
             Event::RemoteLoss { .. } => "audit_remote_loss",
             Event::StorageThreshold { .. } => "audit_storage_threshold",
             Event::RetentionPrune { .. } => "audit_retention_prune",
+            Event::AuditRecovery { .. } => "audit_recovery",
             Event::ManagementConnection { .. } => "management_connection",
             Event::ManagementSuppressed { .. } => "management_connection_suppressed",
             Event::RevocationCheck { .. } => "tls_revocation_check",
@@ -495,6 +594,7 @@ impl Event {
             | Event::QueueOverflow { .. }
             | Event::OutputFailure { .. }
             | Event::RemoteLoss { .. }
+            | Event::AuditRecovery { .. }
             | Event::StorageThreshold { state: StorageState::Below | StorageState::Unknown, .. }
             | Event::RetentionPrune { state: PruneState::Failed, .. } => 4,
             Event::Lifecycle { .. }
@@ -522,6 +622,7 @@ impl Event {
             | Event::QueueOverflow { .. }
             | Event::OutputFailure { .. }
             | Event::RemoteLoss { .. }
+            | Event::AuditRecovery { .. }
             | Event::StorageThreshold { .. }
             | Event::RetentionPrune { .. } => Some("failure"),
             Event::ManagementConnection { conn, .. } => {
