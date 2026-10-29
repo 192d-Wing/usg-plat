@@ -1,9 +1,17 @@
 # usg-plat
 
-Pure-Rust, multithreaded **464XLAT PLAT** (RFC 6877): stateful NAT64
+Multithreaded **464XLAT PLAT** (RFC 6877): stateful NAT64
 (RFC 6146) with SIIT translation (RFC 7915), RFC 6052 address mapping, bulk
 port allocation, high-speed SIEM attribution logging, and stateless cluster
-scale-out. Built for NIST SP 800-53 Rev 5 ATO readiness.
+scale-out, with FIPS-mode TLS 1.3 for syslog and remote management. The data
+plane is pure Rust; cryptography uses the AWS-LC FIPS module through
+`aws-lc-rs`. Built for NIST SP 800-53 Rev 5 ATO readiness.
+
+Build requirements: the pinned Rust toolchain plus **CMake, Go ≥ 1.18 and a
+C compiler (clang or gcc)** to build the AWS-LC FIPS module
+(`aws-lc-fips-sys`); `gcc-aarch64-linux-gnu` for the aarch64 cross-check
+(`make check-linux` falls back to a TLS-off lint without it).
+`make check-notls` lints the `--no-default-features` build.
 
 <!-- --8<-- [start:quickstart] -->
 ## Quick start
@@ -63,8 +71,35 @@ Configuration changes to note when upgrading from an earlier build:
 - New keys: `translation.lowest_ipv6_mtu`, `icmp_errors_per_sec`, `copy_tos`,
   `wkp_non_global_icmp_errors`, `allow_non_global_destinations`;
   `nat64.max_subscribers`; `audit.file.max_files`, `audit.file.min_free_bytes`.
-- SIEM log schema is version 4; audit files written by schema 1 (chain v1) no
-  longer verify.
+- SIEM log schema is version 5 (FIPS status on `service_start`, `plat.reason`
+  on `audit_remote_loss`, new management and revocation records); audit
+  files written by schema 1 (chain v1) no longer verify.
+- **FIPS:** `tls.require_fips = true` is the default: `platd` refuses to
+  start unless the AWS-LC FIPS module is active, even with no TLS configured.
+  `check-config` and `/metrics` (`plat_fips_mode`) show the status.
+- **Breaking:** `management.tls.allowed_clients` entries must be typed:
+  `cn:<CN>`, `dns:<DNS SAN>`, `uri:<URI SAN>` or `sha256:<64 hex>`
+  (certificate fingerprint). Bare entries fail validation.
+- A non-loopback `management.listen` requires `[management.tls]` (mutual
+  TLS, client certificate required); with it there is no plaintext listener.
+  `management.tls.max_connections_per_ip` (default 2, 1..=64, capped at
+  `max_connections`) counts IPv4 per address and IPv6 per /64; a ClientHello
+  must arrive within 2 s.
+- `tls.pq_hybrid = true` (default) offers X25519MLKEM768 first. For an NIAP
+  NDcPP evaluated configuration set `pq_hybrid = false` (P-256/P-384 only).
+- Revocation checking (`tls.revocation.mode = "hard_fail"` by default)
+  rejects a peer whose status cannot be determined: make OCSP responders or
+  CRL distribution points reachable, or configure `crl.files`/`crl.urls`.
+  Prefer IP literals or a local resolver for them (DNS has no timeout,
+  POAM-025).
+- The unit now sets `StateDirectory=plat/revocation` (0700) for the optional
+  `tls.revocation.cache_dir = "/var/lib/plat/revocation"`, which holds
+  verified CRLs and `crl-numbers` (cRLNumber rollback marks).
+- `check-config` (both formats) loads every TLS file and exits 2 on a
+  missing file or bad key permissions; key files with setuid/setgid/sticky
+  bits, or that are not regular files, are rejected.
+- TLS syslog collectors must support TLS 1.3 (RFC 5425 TLS 1.2 is not
+  offered).
 
 <!-- --8<-- [end:quickstart] -->
 

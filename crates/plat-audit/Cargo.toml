@@ -7,8 +7,18 @@ license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[features]
+default = ["tls"]
+# RFC 5425 TLS syslog transport (AWS-LC FIPS via plat-tls). Off only for
+# lint builds on hosts without a C cross compiler; with it off, a
+# `transport = "tls"` destination fails `Logger::spawn`.
+tls = ["dep:plat-tls", "dep:rustls", "dep:rustls-pki-types"]
+
 [dependencies]
 plat-common.workspace = true
+plat-tls = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-pki-types = { workspace = true, optional = true }
 crossbeam-channel.workspace = true
 crossbeam-utils.workspace = true
 hex.workspace = true
@@ -22,6 +32,12 @@ rustix = { version = "1", default-features = false, features = ["fs", "std"] }
 
 [dev-dependencies]
 criterion.workspace = true
+proptest.workspace = true
+# TLS syslog integration tests (in-test collector and PKI; no committed keys).
+plat-tls.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
 
 [[bench]]
 name = "audit"

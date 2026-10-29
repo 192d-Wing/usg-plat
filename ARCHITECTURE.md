@@ -102,7 +102,7 @@ Lock order: `bib6 → subs` (released) `→ bib4`; sweeper `bib6 → bib4`
 
 See `docs/compliance/SIEM_LOGGING.md` for the schema.
 
-- Data plane builds a ≤ 48 byte `Copy` event and calls `try_send` on a
+- Data plane builds a ≤ 48 byte plain-data event and calls `try_send` on a
   bounded MPMC queue (default 1 Mi events). It never blocks.
 - The logger thread (`plat-audit`) drains up to `batch_max` events, formats
   JSON lines, writes the local file with one buffered write per batch and
@@ -124,6 +124,41 @@ See `docs/compliance/SIEM_LOGGING.md` for the schema.
   deletion first (`audit_retention_prune`).
 - Port-block logging keeps volume low: one record per block allocation and
   release covers all of a subscriber's flows on that block.
+
+## TLS, management and revocation
+
+Crate `plat-tls` holds all TLS and PKI code: FIPS provider set-up
+(`fips.rs`), the single TLS policy (`policy.rs`: TLS 1.3 only, FIPS suites,
+X25519MLKEM768/P-256/P-384), key and certificate loading (`load.rs`), peer
+identity and the typed allow-list (`identity.rs`), verifier wrappers that run
+webpki and then the full-chain revocation check (`verify.rs`), deadline-bound
+blocking TLS I/O (`stream.rs`) and the OCSP/CRL checker (`revocation/`).
+
+**Crypto boundary.** The data plane (packet parsing, translation, NAT64
+tables, cluster partitioning) remains pure Rust. Cryptography for TLS, OCSP
+and CRL signatures and the DRBG is delegated to the AWS-LC FIPS module (C and
+assembly, built by `aws-lc-fips-sys` through `aws-lc-rs`), installed as the
+process-default rustls provider. `tls.require_fips = true` (default) makes
+`platd` refuse to start unless the module reports FIPS mode. The audit hash
+chain still uses the pure-Rust `sha2` crate. Builds with the `tls` feature
+off contain no C crypto; they refuse TLS configs and, under the default
+`require_fips`, refuse to start.
+
+Additional threads (none touches the packet path):
+
+| Thread | Role |
+|--------|------|
+| `plat-syslog-<i>` (`transport = "tls"`) | existing per-destination sender; now also performs the TLS handshake and the collector's chain revocation check |
+| `plat-mgmt` | mTLS accept loop (non-blocking, 100 ms poll); enforces `max_connections` and `max_connections_per_ip` (IPv4 address / IPv6 /64) before any TLS work |
+| `plat-mgmt-conn` | one per accepted connection: ClientHello deadline (2 s), handshake under `handshake_timeout_ms`, revocation, allow-list, one read-only request |
+| `plat-revocation` | refresher: pre-fetches configured CRLs, refreshes watched CRLs/OCSP entries before nextUpdate, re-reads `crl.files`, emits `revocation_source_refresh` on transitions |
+
+Start-up order: FIPS gate, audit queue, TLS material and revocation checker
+(any failure exits before the logger starts), logger with TLS destinations,
+`service_start`, data plane, refresher, management listener. Shutdown joins
+the management threads before the logger stops so every connection record
+is queued. Without `[management.tls]` the old single-thread loopback metrics
+listener is used.
 
 ## Cluster scale-out
 
@@ -170,5 +205,6 @@ flowchart LR
 | PLAT → IPv4 Internet | never-translatable destinations always denied; RFC 6890 non-global destinations denied by default under every prefix (`translation.allow_non_global_destinations`; the cluster pool is exempt) |
 | IPv4 Internet → PLAT | pool ownership check, filtering, never-translatable and (by default) non-global data sources refused, unexpired source routes dropped |
 | Host forwarding | nftables `inet plat` forward chain, default drop, installed by `plat-tun-setup.sh` before forwarding is enabled (not tested on Linux; not restored after a ruleset flush, POAM-019) |
-| Management | loopback-only metrics and health; no write API |
-| Audit destinations | local 0640 file in a 0700 directory with an unkeyed hash chain (POAM-003); best-effort syslog to SIEM collectors, no TLS (POAM-005) |
+| Management | read-only metrics and health; plaintext only on loopback, otherwise mutual TLS 1.3 with client certificate, full-chain revocation and typed allow-list, per-IP and global connection caps; every mTLS connection audited |
+| Revocation sources (OCSP responders, CRL distribution points) | plaintext HTTP of signed objects; strict DER and HTTP parsing, size caps, per-chain time budget; `hard_fail` by default; DNS has no timeout (POAM-025) |
+| Audit destinations | local 0640 file in a 0700 directory with an unkeyed hash chain (POAM-003); best-effort syslog to SIEM collectors; TLS 1.3 (RFC 5425) with CA-pinned, revocation-checked collectors when `transport = "tls"` |

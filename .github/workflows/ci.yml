@@ -32,9 +32,17 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install AWS-LC FIPS build deps (CMake, Go, clang, aarch64 cross gcc)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake golang-go clang gcc-aarch64-linux-gnu
       - run: make fmt
       - run: make clippy
-      - run: make check-linux
+      - name: make check-linux (aarch64, TLS on)
+        env:
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+        run: make check-linux
+      - name: make check-notls (TLS feature off)
+        run: make check-notls
 
   test:
     name: test (native Linux)
@@ -49,6 +57,8 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install AWS-LC FIPS build deps (CMake, Go, clang)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake golang-go clang
       - run: make test
 
   security:

@@ -54,6 +54,12 @@ TasksMax=1024
 LogsDirectory=plat
 LogsDirectoryMode=0700
 ReadWritePaths=/var/log/plat
+# Optional CRL disk cache (tls.revocation.cache_dir =
+# "/var/lib/plat/revocation"): systemd creates it owned by plat:plat with
+# mode 0700, as check_cache_dir requires, and makes it writable under
+# ProtectSystem=strict (IA-5(2)(b)(2), SC-28). Harmless when unused.
+StateDirectory=plat/revocation
+StateDirectoryMode=0700
 DevicePolicy=closed
 DeviceAllow=/dev/net/tun rw
 LimitNOFILE=65536

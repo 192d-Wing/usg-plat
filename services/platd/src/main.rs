@@ -1,7 +1,13 @@
 //! `platd` — multithreaded 464XLAT PLAT (RFC 6877) / stateful NAT64 (RFC 6146).
 
 mod metrics;
+#[cfg(feature = "tls")]
+mod mgmt;
 mod run;
+#[cfg(all(test, feature = "tls"))]
+mod test_pki;
+#[cfg(feature = "tls")]
+mod tls;
 
 use std::io::BufReader;
 use std::net::Ipv4Addr;
@@ -61,11 +67,12 @@ enum OutputFormat {
 /// space-separated, for `deploy/systemd/plat-tun-setup.sh` (which parses
 /// them without `eval`). Refuses an interface name that is not a plain
 /// Linux name, so nothing shell-special ever reaches the script.
+/// `PLAT_FIPS` / `PLAT_MGMT_TLS` let nodes be compared (POAM-017 procedure).
 ///
 /// COMPLIANCE MAPPING:
 /// - NIST 800-53: CM-6 - host routing and the forward policy are derived
 ///   from the validated configuration, not edited by hand (SC-7).
-fn render_env(cfg: &Config, owned: &[u32]) -> Result<String, String> {
+fn render_env(cfg: &Config, owned: &[u32], fips: bool) -> Result<String, String> {
     use std::fmt::Write as _;
     let ifname = &cfg.dataplane.interface;
     if ifname.is_empty()
@@ -89,6 +96,38 @@ fn render_env(cfg: &Config, owned: &[u32]) -> Result<String, String> {
     );
     let _ =
         writeln!(o, "PLAT_OWNED_POOL={}", join(plat_cluster::cover(owned).iter().map(ToString::to_string).collect()));
+    let _ = writeln!(o, "PLAT_FIPS={}", u8::from(fips));
+    let _ = writeln!(o, "PLAT_MGMT_TLS={}", u8::from(cfg.management.tls.is_some()));
+    Ok(o)
+}
+
+/// Whether the FIPS module is active in this process (`PLAT_FIPS`).
+#[cfg(feature = "tls")]
+fn fips_active() -> bool {
+    plat_tls::init_fips();
+    plat_tls::require_fips().is_ok()
+}
+
+#[cfg(not(feature = "tls"))]
+fn fips_active() -> bool {
+    false
+}
+
+/// The `check-config` TLS section (fails closed on unusable TLS files).
+#[cfg(feature = "tls")]
+fn tls_summary(cfg: &Config) -> Result<String, String> {
+    tls::summary(cfg)
+}
+
+#[cfg(not(feature = "tls"))]
+fn tls_summary(cfg: &Config) -> Result<String, String> {
+    if cfg.uses_tls() {
+        return Err("TLS is configured but platd was built without TLS support (feature `tls`)".into());
+    }
+    let mut o = String::from("TLS:\n  not available in this build (feature `tls` off); FIPS: INACTIVE\n");
+    if cfg.tls.require_fips {
+        o.push_str("WARNING: tls.require_fips = true: platd run will refuse to start\n");
+    }
     Ok(o)
 }
 
@@ -105,17 +144,21 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
+        // QA-003 / NIST-002: both formats load and check the TLS files (key
+        // permissions included) and fail closed with exit 2.
         Cmd::CheckConfig { config, format: OutputFormat::Env } => match Config::load(&config) {
-            Ok(cfg) => match render_env(&cfg, &plat_cluster::owned(&cfg)) {
-                Ok(s) => {
-                    print!("{s}");
-                    ExitCode::SUCCESS
+            Ok(cfg) => {
+                match tls_summary(&cfg).and_then(|_| render_env(&cfg, &plat_cluster::owned(&cfg), fips_active())) {
+                    Ok(s) => {
+                        print!("{s}");
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("{e}");
+                        ExitCode::from(2)
+                    }
                 }
-                Err(e) => {
-                    eprintln!("{e}");
-                    ExitCode::from(2)
-                }
-            },
+            }
             Err(e) => {
                 eprintln!("{e}");
                 ExitCode::from(2)
@@ -132,7 +175,16 @@ fn main() -> ExitCode {
                 if let (Some(a), Some(b)) = (owned.first(), owned.last()) {
                     println!("  range {} - {}", Ipv4Addr::from(*a), Ipv4Addr::from(*b));
                 }
-                ExitCode::SUCCESS
+                match tls_summary(&cfg) {
+                    Ok(t) => {
+                        print!("{t}");
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("{e}");
+                        ExitCode::from(2)
+                    }
+                }
             }
             Err(e) => {
                 eprintln!("{e}");
@@ -214,20 +266,21 @@ mod tests {
     #[test]
     fn check_config_env_output() {
         let cfg = example(&[]);
-        let s = render_env(&cfg, &plat_cluster::owned(&cfg)).unwrap();
+        let s = render_env(&cfg, &plat_cluster::owned(&cfg), true).unwrap();
         assert_eq!(
             s,
             "PLAT_IF=plat0\nPLAT_NODE_ID=0\nPLAT_NAT64_PREFIX=64:ff9b:1::/96\n\
-             PLAT_CLIENT_PREFIXES=2001:db8:100::/40\nPLAT_OWNED_POOL=192.0.2.0/24\n"
+             PLAT_CLIENT_PREFIXES=2001:db8:100::/40\nPLAT_OWNED_POOL=192.0.2.0/24\nPLAT_FIPS=1\nPLAT_MGMT_TLS=0\n"
         );
         // Two nodes: node 1 gets only its half of the pool.
         let cfg = example(&[("id = 0", "id = 1"), ("node_count = 1", "node_count = 2")]);
-        let s = render_env(&cfg, &plat_cluster::owned(&cfg)).unwrap();
+        let s = render_env(&cfg, &plat_cluster::owned(&cfg), false).unwrap();
         assert!(s.contains("PLAT_OWNED_POOL=192.0.2.128/25\n"), "{s}");
+        assert!(s.ends_with("PLAT_FIPS=0\nPLAT_MGMT_TLS=0\n"), "{s}");
         // Nothing shell-special reaches the script.
         for bad in ["plat0;reboot", "plat 0", "plat$(x)", "averyveryverylongname"] {
             let cfg = example(&[("interface = \"plat0\"", &format!("interface = \"{bad}\""))]);
-            assert!(render_env(&cfg, &plat_cluster::owned(&cfg)).is_err(), "{bad}");
+            assert!(render_env(&cfg, &plat_cluster::owned(&cfg), true).is_err(), "{bad}");
         }
     }
 }

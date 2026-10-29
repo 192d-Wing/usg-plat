@@ -3,7 +3,12 @@
 //! COMPLIANCE MAPPING:
 //! - NIST 800-53: CM-6 (Configuration Settings) - secure defaults, every
 //!   value range-checked before the data plane starts.
-//! - NIST 800-53: CM-7 (Least Functionality) - management plane is loopback-only.
+//! - NIST 800-53: CM-7 (Least Functionality) - plaintext management only on
+//!   loopback; any other address requires `[management.tls]` (mutual TLS).
+//! - NIST 800-53: SC-8, SC-13, IA-5(2) - TLS settings (`[tls]`,
+//!   `[audit.syslog.tls]`, `[management.tls]`) are statically validated
+//!   here; certificate/key files are loaded and permission-checked by
+//!   `plat-tls` in `check-config` and at start.
 //! - NIST 800-53: SC-5 (Denial-of-Service Protection) - every table has a
 //!   limit: subscribers (`nat64.max_subscribers`), port blocks per subscriber,
 //!   sessions (global and per subscriber), pool size, audit queue. BIB
@@ -15,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::net::{Ipv4Cidr, Ipv6Cidr};
+use crate::net::{HttpUrl, Ipv4Cidr, Ipv6Cidr, is_dns_name};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -94,6 +99,9 @@ pub struct Config {
     pub audit: AuditConfig,
     #[serde(default)]
     pub management: ManagementConfig,
+    /// Process-wide TLS policy (FIPS, key exchange, revocation).
+    #[serde(default)]
+    pub tls: TlsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -324,6 +332,9 @@ pub enum LogFormat {
 pub enum SyslogTransport {
     Udp,
     Tcp,
+    /// RFC 5425 syslog over TLS 1.3 with octet-counted framing; requires
+    /// `[audit.syslog.tls]`.
+    Tls,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -411,6 +422,32 @@ pub struct SyslogConfig {
     pub format: LogFormat,
     #[serde(default = "d_app")]
     pub app_name: String,
+    /// Required when `transport = "tls"`, rejected otherwise.
+    #[serde(default)]
+    pub tls: Option<SyslogTlsConfig>,
+}
+
+/// TLS client settings for one syslog collector (RFC 5425).
+///
+/// COMPLIANCE MAPPING:
+/// - NIST 800-53: SC-8 (Transmission Confidentiality and Integrity), AU-9(2)
+/// - NIST 800-53: IA-3 (Device Identification and Authentication) - the
+///   collector certificate is verified against `ca_file` and `server_name`;
+///   the optional client certificate authenticates this node to it.
+/// - RFC 5425 §5.2 - subject name matching against `server_name`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyslogTlsConfig {
+    /// DNS name or IP address the collector certificate must carry (SAN).
+    pub server_name: String,
+    /// Trust anchors for the collector chain (PEM). System roots are never used.
+    pub ca_file: PathBuf,
+    /// Client certificate chain (PEM) for mutual TLS; both or neither with `key_file`.
+    pub cert_file: Option<PathBuf>,
+    pub key_file: Option<PathBuf>,
+    /// Replaces `[tls.revocation]` for this collector. Gets its own caches
+    /// and no background refresher (fetch on demand only).
+    pub revocation: Option<RevocationConfig>,
 }
 
 fn d_transport() -> SyslogTransport {
@@ -426,13 +463,404 @@ fn d_app() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagementConfig {
-    /// Read-only metrics/health listener. Must be a loopback address.
+    /// Read-only metrics/health listener. Without `tls` it must be a
+    /// loopback address (plaintext); with `tls` it may be any address and
+    /// is mutual TLS only (no plaintext listener alongside it).
     pub listen: Option<SocketAddr>,
+    #[serde(default)]
+    pub tls: Option<ManagementTlsConfig>,
 }
 
 impl Default for ManagementConfig {
     fn default() -> Self {
-        Self { listen: Some(SocketAddr::from(([127, 0, 0, 1], 9464))) }
+        Self { listen: Some(SocketAddr::from(([127, 0, 0, 1], 9464))), tls: None }
+    }
+}
+
+/// Mutual-TLS management listener.
+///
+/// COMPLIANCE MAPPING:
+/// - NIST 800-53: AC-17, AC-17(2) (Remote Access, protection by encryption)
+/// - NIST 800-53: IA-3, IA-5(2)(b)(1) - client certificate REQUIRED, chained to
+///   `client_ca_file`; AC-3 - identity must be in `allowed_clients`
+/// - NIST 800-53: SC-5 - `max_connections`, `max_connections_per_ip`,
+///   `handshake_timeout_ms`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagementTlsConfig {
+    pub cert_file: PathBuf,
+    pub key_file: PathBuf,
+    pub client_ca_file: PathBuf,
+    /// Exact, typed identities allowed to connect: `cn:<subject CN>`,
+    /// `dns:<DNS SAN>`, `uri:<URI SAN>` or `sha256:<hex DER fingerprint>`.
+    /// No wildcards; untyped entries are a configuration error.
+    pub allowed_clients: Vec<String>,
+    #[serde(default = "d_mgmt_conns")]
+    pub max_connections: u32,
+    /// Concurrent connections from one source IP (1..=64; the effective
+    /// limit is the smaller of this and `max_connections`).
+    #[serde(default = "d_mgmt_conns_per_ip")]
+    pub max_connections_per_ip: u32,
+    #[serde(default = "d_mgmt_handshake")]
+    pub handshake_timeout_ms: u64,
+}
+
+fn d_mgmt_conns() -> u32 {
+    4
+}
+fn d_mgmt_conns_per_ip() -> u32 {
+    2
+}
+fn d_mgmt_handshake() -> u64 {
+    5000
+}
+
+/// Largest accepted `management.tls.allowed_clients` list.
+pub const MAX_ALLOWED_CLIENTS: usize = 256;
+/// Longest accepted `allowed_clients` entry (bytes).
+pub const MAX_ALLOWED_CLIENT_LEN: usize = 255;
+
+/// Process-wide TLS policy.
+///
+/// COMPLIANCE MAPPING:
+/// - NIST 800-53: SC-13 (Cryptographic Protection) - `require_fips`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsConfig {
+    /// Offer X25519MLKEM768 first (then P-256, P-384). `false`: P-256/P-384 only.
+    #[serde(default = "d_true")]
+    pub pq_hybrid: bool,
+    /// Refuse to start unless the FIPS module is active (default `true`).
+    /// `false` is an explicit operator override, recorded in `service_start`.
+    #[serde(default = "d_true")]
+    pub require_fips: bool,
+    #[serde(default)]
+    pub revocation: RevocationConfig,
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self { pq_hybrid: true, require_fips: true, revocation: RevocationConfig::default() }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RevocationMode {
+    /// No conclusive status: reject the chain.
+    HardFail,
+    /// No status obtainable at all: accept and audit (`source = none`).
+    /// Stale data still rejects.
+    SoftFail,
+    /// Not checked (`status = not_checked`; `check-config` warns).
+    Off,
+}
+
+impl RevocationMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::HardFail => "hard_fail",
+            Self::SoftFail => "soft_fail",
+            Self::Off => "off",
+        }
+    }
+}
+
+/// Certificate revocation checking for every non-root certificate of
+/// management client chains and syslog collector chains.
+///
+/// COMPLIANCE MAPPING:
+/// - NIST 800-53: IA-5(2)(b)(1) (PKI-Based Authentication - path and
+///   status validation); IA-5(2)(b)(2) - `cache_dir`, cache sizes
+/// - RFC 6960 (OCSP), RFC 5280 §5, §6.3 (CRL)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RevocationConfig {
+    #[serde(default = "d_rev_mode")]
+    pub mode: RevocationMode,
+    #[serde(default = "d_skew")]
+    pub clock_skew_secs: u32,
+    /// Time budget for the whole chain, per handshake.
+    #[serde(default = "d_budget")]
+    pub budget_ms: u64,
+    /// Optional on-disk CRL cache (absolute, 0700, owned by the service user).
+    pub cache_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub ocsp: OcspConfig,
+    #[serde(default)]
+    pub crl: CrlConfig,
+}
+
+impl Default for RevocationConfig {
+    fn default() -> Self {
+        Self {
+            mode: d_rev_mode(),
+            clock_skew_secs: d_skew(),
+            budget_ms: d_budget(),
+            cache_dir: None,
+            ocsp: OcspConfig::default(),
+            crl: CrlConfig::default(),
+        }
+    }
+}
+
+fn d_rev_mode() -> RevocationMode {
+    RevocationMode::HardFail
+}
+fn d_skew() -> u32 {
+    300
+}
+fn d_budget() -> u64 {
+    4000
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OcspMethod {
+    Post,
+    Get,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OcspCertIdHash {
+    Sha256,
+    /// RFC 5019 lightweight responders.
+    Sha1,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OcspConfig {
+    #[serde(default = "d_true")]
+    pub enabled: bool,
+    /// Leaf only; overrides the leaf's AIA responder.
+    pub responder_url: Option<String>,
+    #[serde(default = "d_true")]
+    pub use_aia: bool,
+    #[serde(default = "d_ocsp_method")]
+    pub method: OcspMethod,
+    #[serde(default = "d_ocsp_hash")]
+    pub cert_id_hash: OcspCertIdHash,
+    #[serde(default = "d_true")]
+    pub nonce: bool,
+    #[serde(default)]
+    pub require_nonce: bool,
+    #[serde(default = "d_ocsp_timeout")]
+    pub timeout_ms: u64,
+    #[serde(default = "d_ocsp_max_age")]
+    pub max_age_secs: u32,
+    #[serde(default = "d_ocsp_entries")]
+    pub cache_entries: u32,
+}
+
+impl Default for OcspConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            responder_url: None,
+            use_aia: true,
+            method: d_ocsp_method(),
+            cert_id_hash: d_ocsp_hash(),
+            nonce: true,
+            require_nonce: false,
+            timeout_ms: d_ocsp_timeout(),
+            max_age_secs: d_ocsp_max_age(),
+            cache_entries: d_ocsp_entries(),
+        }
+    }
+}
+
+fn d_ocsp_method() -> OcspMethod {
+    OcspMethod::Post
+}
+fn d_ocsp_hash() -> OcspCertIdHash {
+    OcspCertIdHash::Sha256
+}
+fn d_ocsp_timeout() -> u64 {
+    2000
+}
+fn d_ocsp_max_age() -> u32 {
+    3600
+}
+fn d_ocsp_entries() -> u32 {
+    1024
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CrlConfig {
+    #[serde(default = "d_true")]
+    pub enabled: bool,
+    /// Use `http://` fullName URIs from CRL Distribution Points.
+    #[serde(default = "d_true")]
+    pub use_cdp: bool,
+    #[serde(default)]
+    pub urls: Vec<String>,
+    /// Absolute paths, DER or PEM.
+    #[serde(default)]
+    pub files: Vec<PathBuf>,
+    #[serde(default = "d_crl_timeout")]
+    pub timeout_ms: u64,
+    /// Per CRL.
+    #[serde(default = "d_crl_max_bytes")]
+    pub max_bytes: u64,
+    /// Estimated memory of all parsed CRLs.
+    #[serde(default = "d_crl_cache_bytes")]
+    pub cache_bytes: u64,
+    #[serde(default = "d_crl_max")]
+    pub max_crls: u32,
+    #[serde(default = "d_crl_margin")]
+    pub refresh_margin_secs: u32,
+}
+
+impl Default for CrlConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            use_cdp: true,
+            urls: Vec::new(),
+            files: Vec::new(),
+            timeout_ms: d_crl_timeout(),
+            max_bytes: d_crl_max_bytes(),
+            cache_bytes: d_crl_cache_bytes(),
+            max_crls: d_crl_max(),
+            refresh_margin_secs: d_crl_margin(),
+        }
+    }
+}
+
+fn d_crl_timeout() -> u64 {
+    5000
+}
+fn d_crl_max_bytes() -> u64 {
+    10 << 20
+}
+fn d_crl_cache_bytes() -> u64 {
+    64 << 20
+}
+fn d_crl_max() -> u32 {
+    64
+}
+fn d_crl_margin() -> u32 {
+    3600
+}
+
+/// Largest accepted `crl.max_bytes` (one CRL).
+pub const MAX_CRL_BYTES: u64 = 64 << 20;
+/// Largest accepted `crl.cache_bytes`.
+pub const MAX_CRL_CACHE_BYTES: u64 = 1 << 30;
+
+fn check_abs(what: &str, p: &Path) -> Result<(), ConfigError> {
+    if p.is_absolute() { Ok(()) } else { invalid(format!("{what} must be an absolute path")) }
+}
+
+fn check_url(what: &str, u: &str) -> Result<(), ConfigError> {
+    HttpUrl::parse(u).map(|_| ()).map_err(|e| ConfigError::Invalid(format!("{what} {u:?}: {e}")))
+}
+
+impl RevocationConfig {
+    /// Static checks; `cache_dir` ownership/mode and CRL files are checked
+    /// by `plat-tls` at start.
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: SC-5 - every cache and fetch is bounded
+    pub fn validate(&self, at: &str) -> Result<(), ConfigError> {
+        let (o, c) = (&self.ocsp, &self.crl);
+        if self.mode != RevocationMode::Off && !o.enabled && !c.enabled {
+            return invalid(format!(
+                "{at}: ocsp.enabled and crl.enabled are both false; set mode = \"off\" explicitly"
+            ));
+        }
+        if self.clock_skew_secs > 3600 {
+            return invalid(format!("{at}.clock_skew_secs must be 0..=3600"));
+        }
+        if !(500..=20_000).contains(&self.budget_ms) {
+            return invalid(format!("{at}.budget_ms must be 500..=20000"));
+        }
+        if let Some(d) = &self.cache_dir {
+            check_abs(&format!("{at}.cache_dir"), d)?;
+        }
+        if !(200..=10_000).contains(&o.timeout_ms) {
+            return invalid(format!("{at}.ocsp.timeout_ms must be 200..=10000"));
+        }
+        if o.enabled && self.budget_ms < o.timeout_ms {
+            return invalid(format!("{at}.budget_ms must be >= ocsp.timeout_ms"));
+        }
+        if !(60..=604_800).contains(&o.max_age_secs) {
+            return invalid(format!("{at}.ocsp.max_age_secs must be 60..=604800"));
+        }
+        if !(1..=65_536).contains(&o.cache_entries) {
+            return invalid(format!("{at}.ocsp.cache_entries must be 1..=65536"));
+        }
+        if let Some(u) = &o.responder_url {
+            check_url(&format!("{at}.ocsp.responder_url"), u)?;
+        }
+        if o.require_nonce && !o.nonce {
+            return invalid(format!("{at}.ocsp.require_nonce needs ocsp.nonce = true"));
+        }
+        if !(500..=30_000).contains(&c.timeout_ms) {
+            return invalid(format!("{at}.crl.timeout_ms must be 500..=30000"));
+        }
+        if !(1024..=MAX_CRL_BYTES).contains(&c.max_bytes) {
+            return invalid(format!("{at}.crl.max_bytes must be 1024..={MAX_CRL_BYTES}"));
+        }
+        if c.cache_bytes < c.max_bytes || c.cache_bytes > MAX_CRL_CACHE_BYTES {
+            return invalid(format!("{at}.crl.cache_bytes must be max_bytes..={MAX_CRL_CACHE_BYTES}"));
+        }
+        if !(1..=1024).contains(&c.max_crls) {
+            return invalid(format!("{at}.crl.max_crls must be 1..=1024"));
+        }
+        if c.refresh_margin_secs > 604_800 {
+            return invalid(format!("{at}.crl.refresh_margin_secs must be 0..=604800"));
+        }
+        // SC-5: configured sources must fit in the cache they feed.
+        if c.urls.len() + c.files.len() > c.max_crls as usize {
+            return invalid(format!("{at}.crl: urls + files must not exceed max_crls"));
+        }
+        for u in &c.urls {
+            check_url(&format!("{at}.crl.urls entry"), u)?;
+        }
+        for f in &c.files {
+            check_abs(&format!("{at}.crl.files entry"), f)?;
+        }
+        Ok(())
+    }
+}
+
+/// Allow-list entry: printable ASCII or UTF-8 without control characters,
+/// no wildcard (matching is exact).
+fn check_allowed_client(e: &str) -> Result<(), ConfigError> {
+    if e.is_empty() || e.len() > MAX_ALLOWED_CLIENT_LEN {
+        return invalid(format!("management.tls.allowed_clients entries must be 1..={MAX_ALLOWED_CLIENT_LEN} bytes"));
+    }
+    if e.chars().any(char::is_control) || e.trim() != e {
+        return invalid(format!(
+            "management.tls.allowed_clients entry {e:?} has control characters or surrounding spaces"
+        ));
+    }
+    if e.contains('*') {
+        return invalid(format!(
+            "management.tls.allowed_clients entry {e:?}: wildcards are not supported (exact match)"
+        ));
+    }
+    // Typed entries only: a bare value could match a CN where a SAN was
+    // meant (or the reverse).
+    let Some((kind, value)) = e.split_once(':') else {
+        return invalid(format!(
+            "management.tls.allowed_clients entry {e:?} must be typed: cn:, dns:, uri: or sha256:"
+        ));
+    };
+    if value.is_empty() {
+        return invalid(format!("management.tls.allowed_clients entry {e:?} has an empty value"));
+    }
+    match kind {
+        "cn" | "dns" | "uri" => Ok(()),
+        "sha256" if value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()) => Ok(()),
+        "sha256" => invalid(format!(
+            "management.tls.allowed_clients entry {e:?}: sha256: needs 64 hex digits (certificate DER fingerprint)"
+        )),
+        _ => invalid(format!("management.tls.allowed_clients entry {e:?} must be typed: cn:, dns:, uri: or sha256:")),
     }
 }
 
@@ -601,15 +1029,97 @@ impl Config {
             }
         }
 
-        // POAM: POAM-004 remote management requires mTLS (AC-17, SC-8); until it
-        // exists the listener is restricted to loopback.
-        if self.management.listen.is_some_and(|l| !l.ip().is_loopback()) {
-            return invalid("management.listen must be a loopback address");
+        for sl in &a.syslog {
+            match (sl.transport, &sl.tls) {
+                (SyslogTransport::Tls, None) => {
+                    return invalid(format!(
+                        "audit.syslog {}: transport = \"tls\" requires [audit.syslog.tls]",
+                        sl.address
+                    ));
+                }
+                (SyslogTransport::Udp | SyslogTransport::Tcp, Some(_)) => {
+                    return invalid(format!(
+                        "audit.syslog {}: [audit.syslog.tls] is only valid with transport = \"tls\"",
+                        sl.address
+                    ));
+                }
+                (SyslogTransport::Tls, Some(t)) => {
+                    // RFC 5425 §5.2: the collector is identified by name.
+                    if !is_dns_name(&t.server_name) && t.server_name.parse::<std::net::IpAddr>().is_err() {
+                        return invalid(format!(
+                            "audit.syslog.tls.server_name {:?} must be a DNS name or IP address",
+                            t.server_name
+                        ));
+                    }
+                    check_abs("audit.syslog.tls.ca_file", &t.ca_file)?;
+                    match (&t.cert_file, &t.key_file) {
+                        (Some(c), Some(k)) => {
+                            check_abs("audit.syslog.tls.cert_file", c)?;
+                            check_abs("audit.syslog.tls.key_file", k)?;
+                        }
+                        (None, None) => {}
+                        _ => return invalid("audit.syslog.tls.cert_file and key_file must be set together"),
+                    }
+                    if let Some(r) = &t.revocation {
+                        r.validate("audit.syslog.tls.revocation")?;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        self.tls.revocation.validate("tls.revocation")?;
+
+        // COMPLIANCE MAPPING:
+        // - NIST 800-53: AC-17, SC-8, CM-7 - plaintext management only on
+        //   loopback; any other address only with mutual TLS. With
+        //   [management.tls] the single listener is mTLS (no plaintext
+        //   listener alongside it).
+        let m = &self.management;
+        match (&m.listen, &m.tls) {
+            (Some(l), None) if !l.ip().is_loopback() => {
+                return invalid("management.listen must be a loopback address unless [management.tls] is configured");
+            }
+            (None, Some(_)) => return invalid("[management.tls] requires management.listen"),
+            (Some(_), Some(t)) => {
+                check_abs("management.tls.cert_file", &t.cert_file)?;
+                check_abs("management.tls.key_file", &t.key_file)?;
+                check_abs("management.tls.client_ca_file", &t.client_ca_file)?;
+                if t.allowed_clients.is_empty() || t.allowed_clients.len() > MAX_ALLOWED_CLIENTS {
+                    return invalid(format!(
+                        "management.tls.allowed_clients must list 1..={MAX_ALLOWED_CLIENTS} identities"
+                    ));
+                }
+                for e in &t.allowed_clients {
+                    check_allowed_client(e)?;
+                }
+                if !(1..=64).contains(&t.max_connections) {
+                    return invalid("management.tls.max_connections must be 1..=64");
+                }
+                if !(1..=64).contains(&t.max_connections_per_ip) {
+                    return invalid("management.tls.max_connections_per_ip must be 1..=64");
+                }
+                if !(500..=30_000).contains(&t.handshake_timeout_ms) {
+                    return invalid("management.tls.handshake_timeout_ms must be 500..=30000");
+                }
+                let r = &self.tls.revocation;
+                if r.mode != RevocationMode::Off && t.handshake_timeout_ms < r.budget_ms + 1000 {
+                    return invalid("management.tls.handshake_timeout_ms must be >= tls.revocation.budget_ms + 1000");
+                }
+            }
+            _ => {}
         }
         if self.dataplane.sweep_interval_ms == 0 || self.dataplane.sweep_interval_ms > MAX_SWEEP_INTERVAL_MS {
             return invalid(format!("dataplane.sweep_interval_ms must be 1..={MAX_SWEEP_INTERVAL_MS}"));
         }
         Ok(())
+    }
+
+    /// True if any TLS endpoint is configured (syslog `transport = "tls"`
+    /// or `[management.tls]`). Builds without the `tls` feature refuse such
+    /// a config.
+    pub fn uses_tls(&self) -> bool {
+        self.management.tls.is_some() || self.audit.syslog.iter().any(|s| s.transport == SyslogTransport::Tls)
     }
 }
 
@@ -648,5 +1158,294 @@ mod tests {
     fn rejects_bad_prefix_len() {
         let bad = EXAMPLE.replace("64:ff9b:1::/96", "64:ff9b:1::/80");
         assert!(matches!(Config::from_toml(&bad), Err(ConfigError::Invalid(_))));
+    }
+
+    const SYSLOG_UDP: &str = "transport = \"udp\"";
+    const SYSLOG_TAIL: &str = "app_name = \"platd\"\n";
+    const MGMT: &str = "listen = \"127.0.0.1:9464\"";
+
+    /// The example without its `[tls]` tables, so tests can append their own.
+    fn base() -> String {
+        EXAMPLE[..EXAMPLE.find("\n[tls]\n").unwrap() + 1].to_owned()
+    }
+
+    fn invalid_msg(text: &str) -> String {
+        match Config::from_toml(text) {
+            Err(ConfigError::Invalid(m)) => m,
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    fn syslog_tls(extra: &str) -> String {
+        EXAMPLE.replace(SYSLOG_UDP, "transport = \"tls\"").replace(
+            SYSLOG_TAIL,
+            &format!(
+                "{SYSLOG_TAIL}[audit.syslog.tls]\nserver_name = \"siem.example.net\"\n\
+                 ca_file = \"/etc/plat/tls/ca.pem\"\n{extra}\n"
+            ),
+        )
+    }
+
+    fn mgmt_tls(listen: &str, extra: &str) -> String {
+        EXAMPLE.replace(
+            MGMT,
+            &format!(
+                "listen = \"{listen}\"\n[management.tls]\ncert_file = \"/etc/plat/tls/m.pem\"\n\
+                 key_file = \"/etc/plat/tls/m.key\"\nclient_ca_file = \"/etc/plat/tls/ca.pem\"\n{extra}"
+            ),
+        )
+    }
+
+    fn base_mgmt_tls(listen: &str, extra: &str) -> String {
+        let m = mgmt_tls(listen, extra);
+        m[..m.find("\n[tls]\n").unwrap() + 1].to_owned()
+    }
+
+    #[test]
+    fn tls_defaults() {
+        let c = Config::from_toml(EXAMPLE).unwrap();
+        assert!(c.tls.require_fips && c.tls.pq_hybrid);
+        let r = &c.tls.revocation;
+        assert_eq!(r.mode, RevocationMode::HardFail);
+        assert!(r.ocsp.enabled && r.crl.enabled && r.ocsp.nonce && !r.ocsp.require_nonce);
+        assert_eq!((r.budget_ms, r.ocsp.timeout_ms, r.crl.max_crls), (4000, 2000, 64));
+        assert!(!c.uses_tls());
+        let c = Config::from_toml(&format!("{}\n[tls]\n", base())).unwrap();
+        assert!(c.tls.require_fips);
+    }
+
+    #[test]
+    fn syslog_tls_block_required_iff_tls() {
+        let c = Config::from_toml(&syslog_tls("")).unwrap();
+        assert_eq!(c.audit.syslog[0].transport, SyslogTransport::Tls);
+        assert!(c.uses_tls());
+        let m = invalid_msg(&EXAMPLE.replace(SYSLOG_UDP, "transport = \"tls\""));
+        assert!(m.contains("requires [audit.syslog.tls]"), "{m}");
+        let m = invalid_msg(&syslog_tls("").replace("transport = \"tls\"", "transport = \"tcp\""));
+        assert!(m.contains("only valid with transport"), "{m}");
+    }
+
+    #[test]
+    fn syslog_tls_fields() {
+        let ok = syslog_tls("cert_file = \"/etc/plat/c.pem\"\nkey_file = \"/etc/plat/c.key\"");
+        Config::from_toml(&ok).unwrap();
+        assert!(invalid_msg(&syslog_tls("cert_file = \"/etc/plat/c.pem\"")).contains("set together"));
+        assert!(invalid_msg(&syslog_tls("key_file = \"/etc/plat/c.key\"")).contains("set together"));
+        let rel = syslog_tls("").replace("/etc/plat/tls/ca.pem", "ca.pem");
+        assert!(invalid_msg(&rel).contains("absolute"));
+        for bad in ["", "siem example", "-x.example", "a..b"] {
+            let t = syslog_tls("").replace("siem.example.net", bad);
+            assert!(invalid_msg(&t).contains("server_name"), "{bad}");
+        }
+        Config::from_toml(&syslog_tls("").replace("siem.example.net", "2001:db8::10")).unwrap();
+        let unknown = syslog_tls("bogus = 1");
+        assert!(matches!(Config::from_toml(&unknown), Err(ConfigError::Parse(_))));
+        // Per-destination revocation override is validated with the same rules.
+        let ov = syslog_tls("[audit.syslog.tls.revocation]\nbudget_ms = 100");
+        assert!(invalid_msg(&ov).contains("audit.syslog.tls.revocation.budget_ms"));
+        let ov = syslog_tls("[audit.syslog.tls.revocation]\nmode = \"soft_fail\"");
+        let c = Config::from_toml(&ov).unwrap();
+        assert_eq!(c.audit.syslog[0].tls.as_ref().unwrap().revocation.as_ref().unwrap().mode, RevocationMode::SoftFail);
+    }
+
+    #[test]
+    fn management_tls_rules() {
+        let allow = "allowed_clients = [\"dns:prom-01.ops.example.net\", \"uri:spiffe://ops/prom\"]";
+        let c = Config::from_toml(&mgmt_tls("[2001:db8::10]:9464", allow)).unwrap();
+        let t = c.management.tls.as_ref().unwrap();
+        assert_eq!((t.max_connections, t.handshake_timeout_ms, t.allowed_clients.len()), (4, 5000, 2));
+        assert_eq!(t.max_connections_per_ip, 2);
+        assert!(c.uses_tls());
+        // mTLS on loopback is allowed too (single listener, mTLS only).
+        Config::from_toml(&mgmt_tls("127.0.0.1:9464", allow)).unwrap();
+        // Non-loopback without TLS is refused.
+        let m = invalid_msg(&EXAMPLE.replace("127.0.0.1:9464", "[2001:db8::10]:9464"));
+        assert!(m.contains("unless [management.tls]"), "{m}");
+        assert!(invalid_msg(&mgmt_tls("0.0.0.0:9464", "allowed_clients = []")).contains("allowed_clients"));
+        assert!(
+            invalid_msg(&mgmt_tls("0.0.0.0:9464", "allowed_clients = [\"dns:*.example.net\"]")).contains("wildcard")
+        );
+        assert!(invalid_msg(&mgmt_tls("0.0.0.0:9464", "allowed_clients = [\" a\"]")).contains("spaces"));
+        let long = format!("allowed_clients = [\"cn:{}\"]", "a".repeat(253));
+        assert!(invalid_msg(&mgmt_tls("0.0.0.0:9464", &long)).contains("bytes"));
+        let many = format!("allowed_clients = [{}]", vec!["\"cn:a\""; 257].join(","));
+        assert!(invalid_msg(&mgmt_tls("0.0.0.0:9464", &many)).contains("allowed_clients"));
+        for (extra, want) in [
+            ("max_connections = 0", "max_connections"),
+            ("max_connections = 65", "max_connections"),
+            ("max_connections_per_ip = 0", "max_connections_per_ip"),
+            ("max_connections_per_ip = 65", "max_connections_per_ip"),
+            ("handshake_timeout_ms = 499", "handshake_timeout_ms"),
+            ("handshake_timeout_ms = 30001", "handshake_timeout_ms"),
+            // budget 4000 + 1000
+            ("handshake_timeout_ms = 4999", "budget_ms + 1000"),
+        ] {
+            let m = invalid_msg(&mgmt_tls("0.0.0.0:9464", &format!("{allow}\n{extra}")));
+            assert!(m.contains(want), "{extra}: {m}");
+        }
+        // With revocation off the budget does not constrain the timeout.
+        let off = format!(
+            "{}\n[tls.revocation]\nmode = \"off\"\n",
+            base_mgmt_tls("0.0.0.0:9464", &format!("{allow}\nhandshake_timeout_ms = 500"))
+        );
+        Config::from_toml(&off).unwrap();
+        let unknown = mgmt_tls("0.0.0.0:9464", &format!("{allow}\nlisten_local = \"127.0.0.1:1\""));
+        assert!(matches!(Config::from_toml(&unknown), Err(ConfigError::Parse(_))));
+        // SEC-004: typed entries only.
+        for bad in ["prom", "host:prom", "cn:", "sha256:abc", &format!("sha256:{}", "g".repeat(64))] {
+            let m = invalid_msg(&mgmt_tls("0.0.0.0:9464", &format!("allowed_clients = [\"{bad}\"]")));
+            assert!(m.contains("allowed_clients"), "{bad}: {m}");
+        }
+        let fp = format!("allowed_clients = [\"sha256:{}\", \"cn:prom\"]", "aB".repeat(32));
+        Config::from_toml(&mgmt_tls("0.0.0.0:9464", &fp)).unwrap();
+        let nolisten = mgmt_tls("0.0.0.0:9464", allow).replace("listen = \"0.0.0.0:9464\"\n", "");
+        assert!(invalid_msg(&nolisten).contains("requires management.listen"));
+    }
+
+    #[test]
+    fn revocation_rules() {
+        let with = |body: &str| format!("{}\n[tls.revocation]\n{body}\n", base());
+        let c = Config::from_toml(&with(
+            "mode = \"soft_fail\"\ncache_dir = \"/var/lib/plat/revocation\"\n[tls.revocation.ocsp]\n\
+             responder_url = \"http://192.0.2.20/ocsp\"\nmethod = \"get\"\ncert_id_hash = \"sha1\"\n\
+             [tls.revocation.crl]\nurls = [\"http://crl.example.net/ca.crl\"]\nfiles = [\"/etc/plat/ca.crl\"]",
+        ))
+        .unwrap();
+        let r = &c.tls.revocation;
+        assert_eq!(
+            (r.mode, r.ocsp.method, r.ocsp.cert_id_hash),
+            (RevocationMode::SoftFail, OcspMethod::Get, OcspCertIdHash::Sha1)
+        );
+        for (body, want) in [
+            ("[tls.revocation.ocsp]\nenabled = false\n[tls.revocation.crl]\nenabled = false", "both false"),
+            ("clock_skew_secs = 3601", "clock_skew_secs"),
+            ("budget_ms = 499", "budget_ms"),
+            ("budget_ms = 1000", "budget_ms must be >= ocsp.timeout_ms"),
+            ("cache_dir = \"rel\"", "cache_dir"),
+            ("[tls.revocation.ocsp]\ntimeout_ms = 199", "ocsp.timeout_ms"),
+            ("[tls.revocation.ocsp]\nmax_age_secs = 59", "max_age_secs"),
+            ("[tls.revocation.ocsp]\ncache_entries = 0", "cache_entries"),
+            ("[tls.revocation.ocsp]\nresponder_url = \"https://x.example/\"", "responder_url"),
+            ("[tls.revocation.ocsp]\nresponder_url = \"http://u@x.example/\"", "responder_url"),
+            ("[tls.revocation.ocsp]\nnonce = false\nrequire_nonce = true", "require_nonce"),
+            ("[tls.revocation.crl]\ntimeout_ms = 30001", "crl.timeout_ms"),
+            ("[tls.revocation.crl]\nmax_bytes = 67108865", "crl.max_bytes"),
+            ("[tls.revocation.crl]\ncache_bytes = 1073741825", "cache_bytes"),
+            ("[tls.revocation.crl]\nmax_bytes = 2097152\ncache_bytes = 1048576", "cache_bytes"),
+            ("[tls.revocation.crl]\nmax_crls = 0", "max_crls"),
+            ("[tls.revocation.crl]\nmax_crls = 1\nfiles = [\"/a.crl\", \"/b.crl\"]", "exceed max_crls"),
+            ("[tls.revocation.crl]\nurls = [\"ldap://x.example/\"]", "crl.urls"),
+            ("[tls.revocation.crl]\nfiles = [\"a.crl\"]", "crl.files"),
+        ] {
+            let m = invalid_msg(&with(body));
+            assert!(m.contains(want), "{body}: {m}");
+        }
+        // Both sources off is fine once checking is explicitly off.
+        Config::from_toml(&with(
+            "mode = \"off\"\n[tls.revocation.ocsp]\nenabled = false\n[tls.revocation.crl]\nenabled = false",
+        ))
+        .unwrap();
+        assert!(matches!(Config::from_toml(&with("mode = \"maybe\"")), Err(ConfigError::Parse(_))));
+        assert!(matches!(Config::from_toml(&with("[tls.revocation.crl]\nbogus = 1")), Err(ConfigError::Parse(_))));
+        assert!(matches!(Config::from_toml(&format!("{}\n[tls]\nbogus = 1\n", base())), Err(ConfigError::Parse(_))));
+    }
+
+    /// QA: every new numeric key at both edges (accepted) and one past
+    /// (rejected), plus path/URL/unknown-key rules not covered above.
+    #[test]
+    fn qa_tls_key_boundaries() {
+        let with = |body: &str| format!("{}\n[tls.revocation]\n{body}\n", base());
+        let ok = |t: &str| {
+            if let Err(e) = Config::from_toml(t) {
+                panic!("expected ok: {e:?}\n{t}");
+            }
+        };
+        for (accept, reject) in [
+            ("clock_skew_secs = 0", "clock_skew_secs = 3601"),
+            ("clock_skew_secs = 3600", "clock_skew_secs = 3601"),
+            ("budget_ms = 20000", "budget_ms = 20001"),
+            ("budget_ms = 500\n[tls.revocation.ocsp]\ntimeout_ms = 500", "budget_ms = 499"),
+            ("[tls.revocation.ocsp]\ntimeout_ms = 200", "[tls.revocation.ocsp]\ntimeout_ms = 199"),
+            (
+                "budget_ms = 10000\n[tls.revocation.ocsp]\ntimeout_ms = 10000",
+                "budget_ms = 20000\n[tls.revocation.ocsp]\ntimeout_ms = 10001",
+            ),
+            ("[tls.revocation.ocsp]\nmax_age_secs = 60", "[tls.revocation.ocsp]\nmax_age_secs = 59"),
+            ("[tls.revocation.ocsp]\nmax_age_secs = 604800", "[tls.revocation.ocsp]\nmax_age_secs = 604801"),
+            ("[tls.revocation.ocsp]\ncache_entries = 1", "[tls.revocation.ocsp]\ncache_entries = 0"),
+            ("[tls.revocation.ocsp]\ncache_entries = 65536", "[tls.revocation.ocsp]\ncache_entries = 65537"),
+            ("[tls.revocation.crl]\ntimeout_ms = 500", "[tls.revocation.crl]\ntimeout_ms = 499"),
+            ("[tls.revocation.crl]\ntimeout_ms = 30000", "[tls.revocation.crl]\ntimeout_ms = 30001"),
+            ("[tls.revocation.crl]\nmax_bytes = 1024", "[tls.revocation.crl]\nmax_bytes = 1023"),
+            ("[tls.revocation.crl]\nmax_bytes = 67108864", "[tls.revocation.crl]\nmax_bytes = 67108865"),
+            ("[tls.revocation.crl]\ncache_bytes = 1073741824", "[tls.revocation.crl]\ncache_bytes = 1073741825"),
+            ("[tls.revocation.crl]\nmax_crls = 1024", "[tls.revocation.crl]\nmax_crls = 1025"),
+            (
+                "[tls.revocation.crl]\nrefresh_margin_secs = 604800",
+                "[tls.revocation.crl]\nrefresh_margin_secs = 604801",
+            ),
+            // budget >= ocsp.timeout only when OCSP is on.
+            ("budget_ms = 500\n[tls.revocation.ocsp]\nenabled = false\ntimeout_ms = 2000", "budget_ms = 500"),
+        ] {
+            ok(&with(accept));
+            assert!(matches!(Config::from_toml(&with(reject)), Err(ConfigError::Invalid(_))), "{reject}");
+        }
+        // Negative / wrong-typed values are parse errors, never wrap-around.
+        for bad in ["budget_ms = -1", "clock_skew_secs = \"300\"", "[tls.revocation.crl]\nmax_bytes = -1"] {
+            assert!(Config::from_toml(&with(bad)).is_err(), "{bad}");
+        }
+        // URLs: length cap, userinfo, fragment, port 0, IPv6 literal.
+        let long = format!("[tls.revocation.ocsp]\nresponder_url = \"http://x.example/{}\"", "a".repeat(2048));
+        assert!(invalid_msg(&with(&long)).contains("responder_url"));
+        for u in [
+            "http://u:p@x.example/c.crl",
+            "http://x.example/c.crl#f",
+            "http://x.example:0/",
+            "http://x.example/a b",
+            "file:///etc/x.crl",
+        ] {
+            let m = invalid_msg(&with(&format!("[tls.revocation.crl]\nurls = [\"{u}\"]")));
+            assert!(m.contains("crl.urls"), "{u}: {m}");
+        }
+        ok(&with("[tls.revocation.crl]\nurls = [\"http://[2001:db8::1]:8080/c.crl\"]"));
+        // Unknown keys in every new table.
+        for t in [
+            with("[tls.revocation.ocsp]\nbogus = 1"),
+            with("bogus = 1"),
+            syslog_tls("[audit.syslog.tls.revocation]\nbogus = 1"),
+            syslog_tls("[audit.syslog.tls.revocation.crl]\nbogus = 1"),
+            mgmt_tls("0.0.0.0:9464", "allowed_clients = [\"cn:a\"]\nbogus = 1"),
+        ] {
+            assert!(matches!(Config::from_toml(&t), Err(ConfigError::Parse(_))), "{t}");
+        }
+        // Management paths must be absolute.
+        let allow = "allowed_clients = [\"cn:a\"]";
+        for (from, what) in [
+            ("/etc/plat/tls/m.pem", "cert_file"),
+            ("/etc/plat/tls/m.key", "key_file"),
+            ("/etc/plat/tls/ca.pem", "client_ca_file"),
+        ] {
+            let t = mgmt_tls("0.0.0.0:9464", allow).replace(from, "rel.pem");
+            let m = invalid_msg(&t);
+            assert!(m.contains(what) && m.contains("absolute"), "{what}: {m}");
+        }
+        // Allow-list entries: control chars and 255-byte edge.
+        assert!(invalid_msg(&mgmt_tls("0.0.0.0:9464", "allowed_clients = [\"cn:a\\u0000b\"]")).contains("control"));
+        assert!(invalid_msg(&mgmt_tls("0.0.0.0:9464", "allowed_clients = [\"cn:a\\nb\"]")).contains("control"));
+        ok(&mgmt_tls("0.0.0.0:9464", &format!("allowed_clients = [\"cn:{}\"]", "a".repeat(252))));
+        ok(&mgmt_tls("0.0.0.0:9464", &format!("allowed_clients = [{}]", vec!["\"cn:a\""; 256].join(","))));
+        ok(&mgmt_tls("0.0.0.0:9464", &format!("{allow}\nmax_connections = 1\nhandshake_timeout_ms = 30000")));
+        ok(&mgmt_tls("0.0.0.0:9464", &format!("{allow}\nmax_connections = 64\nhandshake_timeout_ms = 5000")));
+        ok(&mgmt_tls("0.0.0.0:9464", &format!("{allow}\nmax_connections_per_ip = 1")));
+        ok(&mgmt_tls("0.0.0.0:9464", &format!("{allow}\nmax_connections_per_ip = 64")));
+        // Syslog TLS paths absolute; override validated under its own prefix.
+        let t = syslog_tls("cert_file = \"c.pem\"\nkey_file = \"/etc/plat/c.key\"");
+        assert!(invalid_msg(&t).contains("absolute"));
+        let ov = syslog_tls("[audit.syslog.tls.revocation.crl]\nfiles = [\"rel.crl\"]");
+        assert!(invalid_msg(&ov).contains("audit.syslog"), "override prefix");
+        // Global [tls] booleans.
+        let c = Config::from_toml(&format!("{}\n[tls]\npq_hybrid = false\nrequire_fips = false\n", base())).unwrap();
+        assert!(!c.tls.pq_hybrid && !c.tls.require_fips);
+        assert!(Config::from_toml(&format!("{}\n[tls]\npq_hybrid = \"no\"\n", base())).is_err());
     }
 }

@@ -1,16 +1,21 @@
 //! Record formatting: JSON lines (ECS-style dotted keys), ArcSight CEF, and
 //! the RFC 5424 syslog header.
 //!
-//! No field is attacker-controlled text: values are IP addresses, numbers,
-//! and static strings; the node name is restricted to `[A-Za-z0-9-_.]` at
-//! config load. That rules out log injection (CWE-117) without escaping on
-//! the hot formatting path.
+//! Data-plane records hold no attacker-controlled text: values are IP
+//! addresses, numbers, and static strings; the node name is restricted to
+//! `[A-Za-z0-9-_.]` at config load, so the hot formatting path needs no
+//! escaping. The TLS/management records (schema 5) carry certificate text
+//! as [`AuditText`] (control and bidi characters already replaced, length
+//! capped) and escape it here: JSON `"`/`\`, CEF `\`/`=` (CWE-117).
+//!
+//! COMPLIANCE MAPPING:
+//! - NIST 800-53: AU-3 (Content of Audit Records), SI-10 (log injection)
 
 use std::io::Write;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use crate::LOG_SCHEMA_VERSION;
-use crate::event::{Event, StorageState};
+use crate::event::{AuditText, Event, RefreshKind, StorageState, TlsRole};
 use crate::logger::NodeIdent;
 
 /// Writes `ts_us` as RFC 3339 UTC with microseconds: `2026-10-28T14:16:00.123456Z`.
@@ -44,6 +49,56 @@ fn proto_name(p: u8) -> &'static str {
 /// Subscriber prefix as an address (host bits already zero).
 fn sub_addr(sub: u128) -> Ipv6Addr {
     Ipv6Addr::from(sub)
+}
+
+/// Appends `s` as a JSON string body (no quotes). Control characters are
+/// escaped as well, although [`AuditText`] has already replaced them.
+fn json_str(out: &mut Vec<u8>, s: &str) {
+    for c in s.chars() {
+        match c {
+            '"' => out.extend_from_slice(b"\\\""),
+            '\\' => out.extend_from_slice(b"\\\\"),
+            c if c.is_control() => {
+                let _ = write!(out, "\\u{:04x}", u32::from(c));
+            }
+            c => {
+                let mut b = [0u8; 4];
+                out.extend_from_slice(c.encode_utf8(&mut b).as_bytes());
+            }
+        }
+    }
+}
+
+/// Appends `,"key":"<escaped text>"`.
+fn json_text(out: &mut Vec<u8>, key: &str, t: &AuditText) {
+    let _ = write!(out, ",\"{key}\":\"");
+    json_str(out, t.as_str());
+    out.push(b'"');
+}
+
+/// Appends a CEF extension value: `\` and `=` escaped, line breaks as
+/// `\n`/`\r` (CEF rev 25).
+fn cef_str(out: &mut Vec<u8>, s: &str) {
+    for c in s.chars() {
+        match c {
+            '\\' => out.extend_from_slice(b"\\\\"),
+            '=' => out.extend_from_slice(b"\\="),
+            '\n' => out.extend_from_slice(b"\\n"),
+            '\r' => out.extend_from_slice(b"\\r"),
+            c if c.is_control() => out.push(b'?'),
+            c => {
+                let mut b = [0u8; 4];
+                out.extend_from_slice(c.encode_utf8(&mut b).as_bytes());
+            }
+        }
+    }
+}
+
+/// Appends 32 bytes as lowercase hex.
+fn hex32(out: &mut Vec<u8>, h: &[u8; 32]) {
+    for b in h {
+        let _ = write!(out, "{b:02x}");
+    }
 }
 
 /// Appends one JSON object (no trailing newline).
@@ -114,8 +169,11 @@ pub fn json(out: &mut Vec<u8>, seq: u64, node: &NodeIdent, ev: &Event) {
                 sub_addr(sub)
             );
         }
-        Event::Lifecycle { .. } => {
+        Event::Lifecycle { fips, .. } => {
             let _ = write!(out, ",\"event.outcome\":\"success\",\"service.version\":\"{}\"", env!("CARGO_PKG_VERSION"));
+            if let Some(f) = fips {
+                let _ = write!(out, ",\"plat.fips\":{},\"plat.fips_provider\":\"{}\"", f.active, f.provider);
+            }
         }
         Event::Counter { name, value, .. } => {
             let _ = write!(out, ",\"plat.counter.name\":\"{name}\",\"plat.counter.value\":{value}");
@@ -131,12 +189,15 @@ pub fn json(out: &mut Vec<u8>, seq: u64, node: &NodeIdent, ev: &Event) {
                 if recovered { "recovered" } else { "degraded" }
             );
         }
-        Event::RemoteLoss { ip, port, lost, .. } => {
+        Event::RemoteLoss { ip, port, lost, reason, .. } => {
             let _ = write!(
                 out,
                 ",\"event.outcome\":\"failure\",\"plat.audit.destination\":\"syslog\",\"destination.ip\":\"{ip}\",\
                  \"destination.port\":{port},\"plat.audit.lost\":{lost}"
             );
+            if let Some(r) = reason {
+                let _ = write!(out, ",\"plat.reason\":\"{}\"", r.as_str());
+            }
         }
         Event::StorageThreshold { available, threshold, state, .. } => {
             let _ = write!(
@@ -160,8 +221,120 @@ pub fn json(out: &mut Vec<u8>, seq: u64, node: &NodeIdent, ev: &Event) {
                 state.as_str()
             );
         }
+        Event::ManagementConnection { ref conn, .. } => {
+            let _ = write!(
+                out,
+                ",\"event.outcome\":\"{}\",\"source.ip\":\"{}\",\"source.port\":{},\"plat.mgmt.reason\":\"{}\"",
+                ev.outcome().unwrap_or("unknown"),
+                conn.ip,
+                conn.port,
+                conn.reason.as_str()
+            );
+            if let Some(s) = &conn.subject {
+                json_text(out, "tls.client.subject", s);
+            }
+            if let Some(h) = &conn.cert_sha256 {
+                out.extend_from_slice(b",\"tls.client.hash.sha256\":\"");
+                hex32(out, h);
+                out.push(b'"');
+            }
+            if let Some(p) = conn.path {
+                let _ = write!(out, ",\"url.path\":\"{}\"", p.as_str());
+            }
+            if let Some(a) = &conn.allow_entry {
+                json_text(out, "plat.mgmt.allow_entry", a);
+            }
+            if !conn.sans.is_empty() {
+                out.extend_from_slice(b",\"tls.client.x509.alternative_names\":[");
+                for (i, n) in conn.sans.iter().take(crate::event::MgmtConnection::SANS_MAX).enumerate() {
+                    if i > 0 {
+                        out.push(b',');
+                    }
+                    out.push(b'"');
+                    json_str(out, n.as_str());
+                    out.push(b'"');
+                }
+                out.push(b']');
+            }
+        }
+        Event::ManagementSuppressed { suppressed, window_secs, .. } => {
+            let _ = write!(
+                out,
+                ",\"event.outcome\":\"failure\",\"plat.mgmt.suppressed\":{suppressed},\"plat.mgmt.window_secs\":{window_secs}"
+            );
+        }
+        Event::RevocationCheck { ref check, .. } => {
+            let c = &**check;
+            let side = match c.role {
+                TlsRole::MgmtClient => "client",
+                TlsRole::SyslogServer => "server",
+            };
+            let _ = write!(
+                out,
+                ",\"event.outcome\":\"{}\",\"plat.tls.role\":\"{}\",\"tls.{side}.hash.sha256\":\"",
+                ev.outcome().unwrap_or("unknown"),
+                c.role.as_str()
+            );
+            hex32(out, &c.cert_sha256);
+            out.push(b'"');
+            json_text(out, "x509.serial_number", &c.serial_hex);
+            json_text(out, "x509.issuer.distinguished_name", &c.issuer_dn);
+            let _ = write!(
+                out,
+                ",\"plat.revocation.chain_index\":{},\"plat.revocation.status\":\"{}\",\
+                 \"plat.revocation.source\":\"{}\",\"plat.revocation.policy\":\"{}\"",
+                c.chain_index,
+                c.status.as_str(),
+                c.source.as_str(),
+                c.policy
+            );
+            if let Some(r) = c.ocsp_reason {
+                let _ = write!(out, ",\"plat.ocsp.reason\":\"{r}\"");
+            }
+            if let Some(r) = c.crl_reason {
+                let _ = write!(out, ",\"plat.crl.reason\":\"{r}\"");
+            }
+            if let Some(r) = c.revocation_reason {
+                let _ = write!(out, ",\"plat.revocation.reason\":\"{r}\"");
+            }
+            if let Some(d) = c.revocation_date_us {
+                out.extend_from_slice(b",\"plat.revocation.date\":\"");
+                rfc3339(out, d);
+                out.push(b'"');
+            }
+            if let Some(r) = &c.ocsp_responder {
+                json_text(out, "plat.ocsp.responder", r);
+            }
+            if let Some(r) = &c.crl_source {
+                json_text(out, "plat.crl.source", r);
+            }
+        }
+        Event::RevocationRefresh { ref refresh, .. } => {
+            let _ = write!(
+                out,
+                ",\"event.outcome\":\"{}\",\"plat.revocation.transition\":\"{}\"",
+                ev.outcome().unwrap_or("unknown"),
+                refresh.transition.as_str()
+            );
+            let key = match refresh.kind {
+                RefreshKind::Crl => "plat.crl.source",
+                RefreshKind::Ocsp => "plat.ocsp.key",
+            };
+            json_text(out, key, &refresh.source);
+            if let Some(r) = refresh.reason {
+                let _ = write!(out, ",\"event.reason\":\"{r}\"");
+            }
+        }
     }
     out.push(b'}');
+}
+
+/// CEF address key: `src` for IPv4, `c6a2` for IPv6 (as data-plane records).
+fn cef_addr(out: &mut Vec<u8>, ip: std::net::IpAddr) {
+    let _ = match ip {
+        std::net::IpAddr::V4(a) => write!(out, " src={a}"),
+        std::net::IpAddr::V6(a) => write!(out, " c6a2={a}"),
+    };
 }
 
 /// Appends `v` in decimal.
@@ -253,12 +426,15 @@ pub fn cef(out: &mut Vec<u8>, seq: u64, node: &NodeIdent, ev: &Event) {
                 if recovered { "recovered" } else { "degraded" }
             );
         }
-        Event::RemoteLoss { ip, port, lost, .. } => {
+        Event::RemoteLoss { ip, port, lost, reason, .. } => {
             let _ = write!(
                 out,
                 " cs3=syslog cs3Label=destination cs5={} cs5Label=collector cn3={lost} cn3Label=lost",
                 std::net::SocketAddr::new(ip, port)
             );
+            if let Some(r) = reason {
+                let _ = write!(out, " reason={}", r.as_str());
+            }
         }
         Event::StorageThreshold { available, threshold, state, .. } => {
             let _ = write!(out, " cs3=file cs3Label=destination cs4={} cs4Label=state", state.as_str());
@@ -275,7 +451,83 @@ pub fn cef(out: &mut Vec<u8>, seq: u64, node: &NodeIdent, ev: &Event) {
                 state.as_str()
             );
         }
-        Event::Lifecycle { .. } => {}
+        Event::Lifecycle { fips, .. } => {
+            if let Some(f) = fips {
+                let _ =
+                    write!(out, " cs1={} cs1Label=fipsProvider cn2={} cn2Label=fips", f.provider, u8::from(f.active));
+            }
+        }
+        Event::ManagementConnection { ref conn, .. } => {
+            let accepted = conn.reason == crate::event::MgmtReason::Accepted;
+            let _ = write!(out, " act={}", if accepted { "accept" } else { "reject" });
+            cef_addr(out, conn.ip);
+            let _ = write!(out, " spt={} reason={}", conn.port, conn.reason.as_str());
+            if let Some(s) = &conn.subject {
+                out.extend_from_slice(b" suser=");
+                cef_str(out, s.as_str());
+            }
+            if let Some(h) = &conn.cert_sha256 {
+                out.extend_from_slice(b" cs1=");
+                hex32(out, h);
+                out.extend_from_slice(b" cs1Label=clientCertSha256");
+            }
+            if let Some(p) = conn.path {
+                let _ = write!(out, " request={}", p.as_str());
+            }
+            if let Some(a) = &conn.allow_entry {
+                out.extend_from_slice(b" cs2=");
+                cef_str(out, a.as_str());
+                out.extend_from_slice(b" cs2Label=allowEntry");
+            }
+            if !conn.sans.is_empty() {
+                out.extend_from_slice(b" cs3=");
+                for (i, n) in conn.sans.iter().take(crate::event::MgmtConnection::SANS_MAX).enumerate() {
+                    if i > 0 {
+                        out.push(b',');
+                    }
+                    cef_str(out, n.as_str());
+                }
+                out.extend_from_slice(b" cs3Label=subjectAltNames");
+            }
+        }
+        Event::ManagementSuppressed { suppressed, window_secs, .. } => {
+            let _ = write!(out, " cn3={suppressed} cn3Label=suppressed cn2={window_secs} cn2Label=windowSecs");
+        }
+        Event::RevocationCheck { ref check, .. } => {
+            let c = &**check;
+            let _ = write!(
+                out,
+                " act={} cs1={} cs1Label=tlsRole cs2={} cs2Label=revocationSource cn2={} cn2Label=chainIndex cs5=",
+                c.status.as_str(),
+                c.role.as_str(),
+                c.source.as_str(),
+                c.chain_index
+            );
+            hex32(out, &c.cert_sha256);
+            out.extend_from_slice(b" cs5Label=certSha256 cs3=");
+            cef_str(out, c.serial_hex.as_str());
+            out.extend_from_slice(b" cs3Label=serialNumber cs4=");
+            cef_str(out, c.issuer_dn.as_str());
+            let _ = write!(out, " cs4Label=issuer flexString1={} flexString1Label=policy", c.policy);
+            if let Some(r) = c.revocation_reason.or(c.ocsp_reason).or(c.crl_reason) {
+                let _ = write!(out, " reason={r}");
+            }
+            if c.ocsp_reason.is_some() || c.crl_reason.is_some() {
+                let _ = write!(out, " msg=ocsp:{} crl:{}", c.ocsp_reason.unwrap_or("-"), c.crl_reason.unwrap_or("-"));
+            }
+        }
+        Event::RevocationRefresh { ref refresh, .. } => {
+            let _ = write!(out, " act={} cs1=", refresh.transition.as_str());
+            cef_str(out, refresh.source.as_str());
+            let label = match refresh.kind {
+                RefreshKind::Crl => "crlSource",
+                RefreshKind::Ocsp => "ocspKey",
+            };
+            let _ = write!(out, " cs1Label={label}");
+            if let Some(r) = refresh.reason {
+                let _ = write!(out, " reason={r}");
+            }
+        }
     }
 }
 
@@ -389,7 +641,7 @@ mod tests {
         ] {
             assert!(s.contains(want), "{want} in {s}");
         }
-        let ev = Event::RemoteLoss { ts_us: 0, ip: "2001:db8::5".parse().unwrap(), port: 6514, lost: 3 };
+        let ev = Event::RemoteLoss { ts_us: 0, ip: "2001:db8::5".parse().unwrap(), port: 6514, lost: 3, reason: None };
         assert_eq!(ev.severity(), 4);
         let mut v = Vec::new();
         json(&mut v, 10, &node(), &ev);
@@ -482,5 +734,158 @@ mod tests {
         let mut v = Vec::new();
         cef(&mut v, 5, &node(), &low);
         assert!(String::from_utf8(v).unwrap().contains("cs4=below_threshold"));
+    }
+
+    fn json_of(ev: &Event) -> String {
+        let mut v = Vec::new();
+        json(&mut v, 1, &node(), ev);
+        String::from_utf8(v).unwrap()
+    }
+
+    fn cef_of(ev: &Event) -> String {
+        let mut v = Vec::new();
+        cef(&mut v, 1, &node(), ev);
+        String::from_utf8(v).unwrap()
+    }
+
+    /// Schema 5: FIPS state on service_start, reason on remote loss.
+    #[test]
+    fn fips_and_remote_loss_reason() {
+        use crate::event::{FipsMark, LifecycleKind, RemoteLossReason};
+        let ev = Event::Lifecycle {
+            ts_us: 0,
+            kind: LifecycleKind::Start,
+            fips: Some(FipsMark { active: true, provider: "aws-lc-rs-fips" }),
+        };
+        let s = json_of(&ev);
+        assert!(s.contains("\"plat.fips\":true,\"plat.fips_provider\":\"aws-lc-rs-fips\""), "{s}");
+        assert!(cef_of(&ev).contains(" cs1=aws-lc-rs-fips cs1Label=fipsProvider cn2=1 cn2Label=fips"));
+        let stop = Event::Lifecycle { ts_us: 0, kind: LifecycleKind::Stop, fips: None };
+        assert!(!json_of(&stop).contains("plat.fips"));
+        let loss = Event::RemoteLoss {
+            ts_us: 0,
+            ip: "192.0.2.10".parse().unwrap(),
+            port: 6514,
+            lost: 2,
+            reason: Some(RemoteLossReason::TlsVerify),
+        };
+        assert!(json_of(&loss).contains("\"plat.reason\":\"tls_verify\""));
+        assert!(cef_of(&loss).contains(" reason=tls_verify"));
+    }
+
+    /// Hostile certificate text cannot break out of JSON or CEF fields.
+    #[test]
+    fn management_connection_escaping() {
+        use crate::event::{AuditText, MgmtConnection, MgmtPath, MgmtReason};
+        use std::sync::Arc;
+        let subject = AuditText::new("evil\" ,\"x\":1 \\ cs1=pwn\nnext", AuditText::SUBJECT_MAX);
+        let ev = Event::ManagementConnection {
+            ts_us: 0,
+            conn: Arc::new(MgmtConnection {
+                ip: "2001:db8::7".parse().unwrap(),
+                port: 50_000,
+                subject: Some(subject),
+                cert_sha256: Some([0xab; 32]),
+                reason: MgmtReason::NotAllowlisted,
+                path: None,
+                allow_entry: None,
+                sans: vec![AuditText::new("dns:a\"b.example", AuditText::SUBJECT_MAX), AuditText::new("uri:x=y", 64)],
+            }),
+        };
+        let s = json_of(&ev);
+        assert!(s.contains("\"tls.client.subject\":\"evil\\\" ,\\\"x\\\":1 \\\\ cs1=pwn?next\""), "{s}");
+        assert!(s.contains("\"plat.mgmt.reason\":\"not_allowlisted\",") && s.contains("\"event.outcome\":\"failure\""));
+        assert!(s.contains(&format!("\"tls.client.hash.sha256\":\"{}\"", "ab".repeat(32))), "{s}");
+        assert!(!s.contains("url.path"));
+        assert!(!s.contains('\n'));
+        let c = cef_of(&ev);
+        assert!(c.contains(" act=reject c6a2=2001:db8::7 spt=50000 reason=not_allowlisted"), "{c}");
+        assert!(c.contains(" suser=evil\" ,\"x\":1 \\\\ cs1\\=pwn?next cs1="), "{c}");
+        let ok = Event::ManagementConnection {
+            ts_us: 0,
+            conn: Arc::new(MgmtConnection {
+                ip: "192.0.2.9".parse().unwrap(),
+                port: 1,
+                subject: None,
+                cert_sha256: None,
+                reason: MgmtReason::Accepted,
+                path: Some(MgmtPath::Metrics),
+                allow_entry: Some(AuditText::new("dns:prom.example", AuditText::SUBJECT_MAX)),
+                sans: Vec::new(),
+            }),
+        };
+        assert!(json_of(&ok).contains("\"plat.mgmt.allow_entry\":\"dns:prom.example\""));
+        assert!(cef_of(&ok).contains(" cs2=dns:prom.example cs2Label=allowEntry"));
+        assert!(s.contains("\"tls.client.x509.alternative_names\":[\"dns:a\\\"b.example\",\"uri:x=y\"]"), "{s}");
+        assert!(c.contains(" cs3=dns:a\"b.example,uri:x\\=y cs3Label=subjectAltNames"), "{c}");
+        assert!(json_of(&ok).contains("\"url.path\":\"/metrics\""));
+        assert!(cef_of(&ok).contains(" act=accept src=192.0.2.9 spt=1 reason=accepted request=/metrics"));
+        let sup = Event::ManagementSuppressed { ts_us: 0, suppressed: 41, window_secs: 60 };
+        assert!(json_of(&sup).contains("\"plat.mgmt.suppressed\":41,\"plat.mgmt.window_secs\":60"));
+        assert_eq!(sup.action(), "management_connection_suppressed");
+    }
+
+    #[test]
+    fn revocation_records() {
+        use crate::event::{
+            AuditText, RefreshKind, RefreshTransition, RevocationCheck, RevocationRefresh, RevocationSource,
+            RevocationStatus, TlsRole,
+        };
+        use std::sync::Arc;
+        let check = RevocationCheck {
+            role: TlsRole::SyslogServer,
+            cert_sha256: [1; 32],
+            serial_hex: AuditText::new("01ab", AuditText::SHORT_MAX),
+            issuer_dn: AuditText::new("CN=Intermediate,O=Example", AuditText::DN_MAX),
+            chain_index: 1,
+            status: RevocationStatus::Revoked,
+            source: RevocationSource::CrlFetch,
+            ocsp_reason: Some("connect"),
+            crl_reason: None,
+            revocation_reason: Some("key_compromise"),
+            revocation_date_us: Some(1_000_000),
+            ocsp_responder: Some(AuditText::new("ocsp.example.net:80", AuditText::SHORT_MAX)),
+            crl_source: Some(AuditText::new("crl.example.net:80", AuditText::SHORT_MAX)),
+            policy: "hard_fail",
+            allowed: false,
+        };
+        let ev = Event::RevocationCheck { ts_us: 0, check: Arc::new(check) };
+        assert_eq!((ev.action(), ev.outcome(), ev.severity()), ("tls_revocation_check", Some("failure"), 4));
+        let s = json_of(&ev);
+        for want in [
+            "\"plat.tls.role\":\"syslog_server\"",
+            &format!("\"tls.server.hash.sha256\":\"{}\"", "01".repeat(32)),
+            "\"x509.serial_number\":\"01ab\"",
+            "\"x509.issuer.distinguished_name\":\"CN=Intermediate,O=Example\"",
+            "\"plat.revocation.chain_index\":1",
+            "\"plat.revocation.status\":\"revoked\"",
+            "\"plat.revocation.source\":\"crl_fetch\"",
+            "\"plat.revocation.policy\":\"hard_fail\"",
+            "\"plat.ocsp.reason\":\"connect\"",
+            "\"plat.revocation.reason\":\"key_compromise\"",
+            "\"plat.revocation.date\":\"1970-01-01T00:00:01.000000Z\"",
+            "\"plat.ocsp.responder\":\"ocsp.example.net:80\"",
+            "\"plat.crl.source\":\"crl.example.net:80\"",
+        ] {
+            assert!(s.contains(want), "{want} in {s}");
+        }
+        assert!(!s.contains("plat.crl.reason"));
+        let c = cef_of(&ev);
+        assert!(c.contains(" act=revoked cs1=syslog_server cs1Label=tlsRole cs2=crl_fetch"), "{c}");
+        assert!(c.contains(" cs4=CN\\=Intermediate,O\\=Example cs4Label=issuer"), "{c}");
+        assert!(c.contains(" reason=key_compromise msg=ocsp:connect crl:-"), "{c}");
+        let r = Event::RevocationRefresh {
+            ts_us: 0,
+            refresh: Arc::new(RevocationRefresh {
+                kind: RefreshKind::Crl,
+                source: AuditText::new("crl.example.net:80", AuditText::SHORT_MAX),
+                transition: RefreshTransition::StaleDropped,
+                reason: Some("timeout"),
+            }),
+        };
+        let s = json_of(&r);
+        assert!(s.contains("\"event.outcome\":\"failure\",\"plat.revocation.transition\":\"stale_dropped\""), "{s}");
+        assert!(s.contains("\"plat.crl.source\":\"crl.example.net:80\",\"event.reason\":\"timeout\""), "{s}");
+        assert!(cef_of(&r).contains(" act=stale_dropped cs1=crl.example.net:80 cs1Label=crlSource reason=timeout"));
     }
 }

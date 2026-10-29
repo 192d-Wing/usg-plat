@@ -1,9 +1,11 @@
-//! Read-only Prometheus metrics and health endpoint on loopback.
+//! Read-only Prometheus metrics and health endpoint: rendering, routing,
+//! and the plaintext listener (loopback only). The mutual-TLS listener is
+//! in `mgmt`.
 //!
 //! COMPLIANCE MAPPING:
 //! - NIST 800-53: SI-4 (System Monitoring)
-//! - NIST 800-53: CM-7, AC-17 - loopback only (enforced at config load);
-//!   no secrets or subscriber identities are exposed.
+//! - NIST 800-53: CM-7, AC-17 - plaintext only on loopback (enforced at
+//!   config load); no secrets or subscriber identities are exposed.
 
 use std::fmt::Write as _;
 use std::io::{Read, Write};
@@ -13,14 +15,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use plat_audit::AuditSink;
+use plat_audit::{AuditSink, MgmtPath, RemoteLossReason};
 use plat_common::{Counter, Counters, DropReason};
 use plat_nat64::Nat64;
+
+/// Extra metric section (TLS, management, revocation), appended to
+/// `/metrics`.
+pub type Section = Box<dyn Fn(&mut String) + Send + Sync>;
 
 pub struct Sources {
     pub nat: Arc<Nat64>,
     pub workers: Vec<Arc<Counters>>,
     pub audit: AuditSink,
+    /// FIPS module active (`plat_fips_mode`, SC-13).
+    pub fips: bool,
+    pub extra: Vec<Section>,
 }
 
 pub fn render(s: &Sources) -> String {
@@ -70,7 +79,56 @@ pub fn render(s: &Sources) -> String {
         u8::from(a.degraded()),
         u8::from(a.storage_low()),
     );
+    let _ = writeln!(o, "# TYPE plat_fips_mode gauge\nplat_fips_mode {}", u8::from(s.fips));
+    let tls: Vec<_> = a.remotes().iter().filter(|r| r.transport == "tls").collect();
+    if !tls.is_empty() {
+        o.push_str("# TYPE plat_audit_remote_tls_handshakes_total counter\n");
+        for r in &tls {
+            let _ = writeln!(
+                o,
+                "plat_audit_remote_tls_handshakes_total{{dest=\"{}\"}} {}",
+                r.address,
+                r.tls_handshakes.load(Ordering::Relaxed)
+            );
+        }
+        o.push_str("# TYPE plat_audit_remote_tls_failures_total counter\n");
+        for r in &tls {
+            for reason in RemoteLossReason::ALL {
+                let _ = writeln!(
+                    o,
+                    "plat_audit_remote_tls_failures_total{{dest=\"{}\",reason=\"{}\"}} {}",
+                    r.address,
+                    reason.as_str(),
+                    r.failures(reason)
+                );
+            }
+        }
+    }
+    for section in &s.extra {
+        section(&mut o);
+    }
     o
+}
+
+/// Routes the request line of one read-only request: the audited path
+/// class, status line and body. Nothing from the request is echoed.
+pub fn route(line: &str, src: &Sources) -> (MgmtPath, &'static str, String) {
+    if line.starts_with("GET /metrics ") {
+        (MgmtPath::Metrics, "200 OK", render(src))
+    } else if line.starts_with("GET /healthz ") {
+        let (code, body) = health(&src.audit);
+        (MgmtPath::Healthz, code, body)
+    } else {
+        (MgmtPath::Other, "404 Not Found", String::new())
+    }
+}
+
+/// The full HTTP/1.1 response (`Connection: close`, one request).
+pub fn response(code: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {code}\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
 }
 
 /// `/healthz`: 503 while audit processing has failed or is about to
@@ -117,19 +175,9 @@ pub fn spawn(addr: SocketAddr, src: Sources, stop: Arc<AtomicBool>) -> std::io::
             let _ = s.set_write_timeout(Some(Duration::from_millis(500)));
             let mut req = [0u8; 1024];
             let n = s.read(&mut req).unwrap_or(0);
-            let line = std::str::from_utf8(&req[..n]).unwrap_or("").lines().next().unwrap_or("");
-            let (code, body) = if line.starts_with("GET /metrics ") {
-                ("200 OK", render(&src))
-            } else if line.starts_with("GET /healthz ") {
-                health(&src.audit)
-            } else {
-                ("404 Not Found", String::new())
-            };
-            let _ = write!(
-                s,
-                "HTTP/1.1 {code}\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
+            let line = std::str::from_utf8(req.get(..n).unwrap_or_default()).unwrap_or("").lines().next().unwrap_or("");
+            let (_, code, body) = route(line, &src);
+            let _ = s.write_all(response(code, &body).as_bytes());
         }
     })
 }
@@ -142,7 +190,7 @@ mod tests {
     use plat_audit::{Event, LifecycleKind};
 
     fn ev() -> Event {
-        Event::Lifecycle { ts_us: 0, kind: LifecycleKind::Start }
+        Event::Lifecycle { ts_us: 0, kind: LifecycleKind::Start, fips: None }
     }
 
     #[test]

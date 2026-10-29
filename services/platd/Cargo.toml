@@ -7,6 +7,14 @@ license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[features]
+default = ["tls"]
+# FIPS TLS (AWS-LC FIPS module): mTLS management listener, RFC 5425
+# syslog, revocation checking, and the SC-13 start gate. Without it the
+# daemon refuses TLS configs and, with the default `tls.require_fips`,
+# refuses to start: feature-off builds are lint/CI artefacts only.
+tls = ["dep:plat-tls", "dep:rustls", "plat-audit/tls"]
+
 [dependencies]
 plat-common.workspace = true
 plat-xlat.workspace = true
@@ -14,14 +22,22 @@ plat-nat64.workspace = true
 plat-audit.workspace = true
 plat-io.workspace = true
 plat-cluster.workspace = true
+plat-tls = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
 clap.workspace = true
 core_affinity.workspace = true
 signal-hook.workspace = true
+parking_lot.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
 plat-packet.workspace = true
+# mTLS management and FIPS start-policy tests (in-test PKI; no committed keys).
+plat-tls = { workspace = true, features = ["test-hooks"] }
+rcgen.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
 
 [lints]
 workspace = true

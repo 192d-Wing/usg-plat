@@ -8,16 +8,17 @@ use plat_audit::format;
 use plat_audit::{AuditSink, Event, Logger, NodeIdent};
 use plat_common::config::{AuditConfig, AuditFileConfig, AuditMode, OverflowPolicy};
 
+/// A data-plane record, built the way `plat-nat64` builds it (by value,
+/// per record). `Event` is no longer `Copy` (TLS variants hold an `Arc`),
+/// so enqueue benches build it inside the timed loop rather than timing a
+/// `clone` (PERF-002).
+fn bib(ts_us: u64) -> Event {
+    Event::BibCreate { ts_us, proto: 6, v6: 0x2001_0db8 << 96 | 1, v6_port: 40000, v4: 0xc000_020a, v4_port: 2048 }
+}
+
 fn bench(c: &mut Criterion) {
     let node = NodeIdent { name: "plat-01".into(), id: 0, pid: 1 };
-    let ev = Event::BibCreate {
-        ts_us: 1_793_196_960_000_000,
-        proto: 6,
-        v6: 0x2001_0db8 << 96 | 1,
-        v6_port: 40000,
-        v4: 0xc000_020a,
-        v4_port: 2048,
-    };
+    let ev = bib(1_793_196_960_000_000);
     let mut g = c.benchmark_group("audit");
     g.throughput(Throughput::Elements(1));
     let mut buf = Vec::with_capacity(512);
@@ -36,7 +37,7 @@ fn bench(c: &mut Criterion) {
     let (sink, rx) = AuditSink::bounded(1 << 17);
     g.bench_function("enqueue_try_send", |b| {
         b.iter(|| {
-            sink.emit(black_box(ev));
+            sink.emit(bib(black_box(1_793_196_960_000_000)));
             let _ = rx.try_recv();
         })
     });
@@ -70,8 +71,8 @@ fn bench(c: &mut Criterion) {
         b.iter(|| {
             let (sink, rx) = AuditSink::bounded(1 << 17);
             let h = Logger::new(cfg.clone(), node.clone(), rx, sink.stats().clone()).spawn().unwrap();
-            for _ in 0..N {
-                sink.emit(black_box(ev));
+            for i in 0..N {
+                sink.emit(bib(black_box(1_793_196_960_000_000 + i)));
             }
             drop(sink);
             h.join();

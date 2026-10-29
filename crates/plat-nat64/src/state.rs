@@ -283,6 +283,10 @@ impl State {
     }
 
     /// Emits a resource-limit record at most once per second per kind.
+    /// Cold and out of line so the session fast path stays compact
+    /// (PERF-001).
+    #[cold]
+    #[inline(never)]
     fn limit(&self, kind: LimitKind, sub: u128) {
         // Slots hold `now + 1`; 0 means "never emitted".
         let stamp = self.clock.now_ms() + 1;
@@ -293,6 +297,35 @@ impl State {
         {
             self.audit.emit(Event::Limit { ts_us: Clock::wall_us(), kind, sub, sub_len: self.sub_len });
         }
+    }
+
+    /// Queues a `port_block_alloc` record (once per block: cold, out of
+    /// line, PERF-001). `false` if the queue refused it.
+    #[cold]
+    #[inline(never)]
+    fn emit_port_block_alloc(&self, wall: u64, sub: u128, r: BlockRef, lo: u16, size: u16) -> bool {
+        self.audit.emit(Event::PortBlockAlloc {
+            ts_us: wall,
+            sub,
+            sub_len: self.sub_len,
+            v4: self.pool.addr(r.addr_idx),
+            port_lo: lo,
+            port_hi: lo + (size - 1),
+        })
+    }
+
+    /// Queues a `bib_create` record (session mode; new bindings only, out
+    /// of line so the existing-session path stays compact, PERF-001).
+    #[inline(never)]
+    fn emit_bib_create(&self, wall: u64, k6: Key6, k4: Key4) -> bool {
+        self.audit.emit(Event::BibCreate {
+            ts_us: wall,
+            proto: k6.proto,
+            v6: k6.addr,
+            v6_port: k6.port,
+            v4: k4.addr,
+            v4_port: k4.port,
+        })
     }
 
     fn alloc_port(&self, s: &mut Subscriber, sub: u128, p: u8) -> Result<Key4, DropReason> {
@@ -319,15 +352,7 @@ impl State {
         // - NIST 800-53: AU-12, AU-5 - attribution record precedes use; under
         //   refuse_new_bindings an unloggable block is never handed out.
         // - RFC 6888 REQ-12 / RFC 7422 §2 - port-block logging.
-        let ev = Event::PortBlockAlloc {
-            ts_us: wall,
-            sub,
-            sub_len: self.sub_len,
-            v4: self.pool.addr(r.addr_idx),
-            port_lo: lo,
-            port_hi: lo + (size - 1),
-        };
-        if !self.audit.emit(ev) && self.refuse_on_overflow {
+        if !self.emit_port_block_alloc(wall, sub, r, lo, size) && self.refuse_on_overflow {
             self.pool.release(r);
             return Err(DropReason::AuditUnavailable);
         }
@@ -409,19 +434,9 @@ impl State {
             }
         };
         let wall = Clock::wall_us();
-        if self.audit_mode == AuditMode::Session {
-            let ev = Event::BibCreate {
-                ts_us: wall,
-                proto: k6.proto,
-                v6: k6.addr,
-                v6_port: k6.port,
-                v4: k4.addr,
-                v4_port: k4.port,
-            };
-            if !self.audit.emit(ev) && self.refuse_on_overflow {
-                self.free_port(sub, k4);
-                return Err(DropReason::AuditUnavailable);
-            }
+        if self.audit_mode == AuditMode::Session && !self.emit_bib_create(wall, k6, k4) && self.refuse_on_overflow {
+            self.free_port(sub, k4);
+            return Err(DropReason::AuditUnavailable);
         }
         self.bib4.lock(&k4).insert(
             k4,

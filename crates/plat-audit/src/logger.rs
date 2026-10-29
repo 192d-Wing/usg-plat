@@ -6,7 +6,7 @@
 //! ```text
 //!  queue ─▶ plat-audit ─▶ local file (format, hash, checkpoint, rotate)
 //!              │  try_send (batch, never blocks)
-//!              ├────────▶ plat-syslog-0 ─▶ collector (UDP / TCP)
+//!              ├────────▶ plat-syslog-0 ─▶ collector (UDP / TCP / TLS)
 //!              └────────▶ plat-syslog-1 ─▶ ...
 //! ```
 //!
@@ -55,9 +55,9 @@ use plat_common::config::{AuditConfig, AuditFileConfig, LogFormat, SyslogConfig,
 use sha2::{Digest, Sha256};
 
 use crate::LOG_SCHEMA_VERSION;
-use crate::event::{Event, PruneState, StorageState};
+use crate::event::{Event, PruneState, RemoteLossReason, StorageState};
 use crate::format;
-use crate::sink::AuditStats;
+use crate::sink::{AuditStats, RemoteStats};
 
 /// Identity stamped on every record.
 #[derive(Debug, Clone)]
@@ -79,7 +79,7 @@ pub const CHAIN_GENESIS: &[u8] = b"usg-plat audit chain v2";
 const REMOTE_QUEUE_BATCHES: usize = 64;
 /// How often a failed local file is retried.
 const REOPEN_INTERVAL: Duration = Duration::from_secs(1);
-/// TCP reconnect back-off; records sent during it are counted as lost.
+/// TCP/TLS reconnect back-off; records sent during it are counted as lost.
 const TCP_BACKOFF: Duration = Duration::from_secs(5);
 /// Tail of an existing file read at start-up to find its last checkpoint.
 const RESUME_TAIL_BYTES: u64 = 8 << 20;
@@ -852,18 +852,112 @@ impl FileDest {
 enum SyslogConn {
     Udp(UdpSocket),
     Tcp(Option<BufWriter<TcpStream>>, Option<Instant>),
+    #[cfg(feature = "tls")]
+    Tls(Box<TlsDest>),
+}
+
+/// One RFC 5425 destination: TLS 1.3 over TCP, verified against the
+/// configured CA and `server_name`, full-chain revocation (stapled OCSP for
+/// the leaf), optional client certificate.
+///
+/// COMPLIANCE MAPPING:
+/// - NIST 800-53: SC-8, SC-8(1), AU-9(2) - audit records leave the box
+///   only inside TLS (no plaintext fallback)
+/// - NIST 800-53: IA-3, IA-5(2)(b)(1) - collector authenticated by certificate,
+///   revocation checked on this sender thread (never the logger thread)
+/// - RFC 5425 §4.2 (TLS), §4.3 (octet counting), §4.4 (close_notify),
+///   §5.2 (server name); TLS 1.3 only (documented deviation from the
+///   RFC 5425 TLS 1.2 mandatory suite)
+#[cfg(feature = "tls")]
+struct TlsDest {
+    config: Arc<rustls::ClientConfig>,
+    name: rustls_pki_types::ServerName<'static>,
+    conn: Option<(rustls::ClientConnection, TcpStream)>,
+    last_try: Option<Instant>,
+    /// Handshake deadline: `max(2 s, revocation budget + 1 s)`.
+    handshake: Duration,
+    /// Cause of the current outage (attributed to back-off losses too).
+    down: Option<RemoteLossReason>,
+}
+
+/// How long a connect waits after the handshake for the collector to
+/// reject our certificate (or our lack of one): in TLS 1.3 the server
+/// verifies the client only after the client's Finished. Connects are rare
+/// (start, after an outage), so this costs nothing in steady state.
+#[cfg(feature = "tls")]
+const CLIENT_CERT_VERDICT_WAIT: Duration = Duration::from_millis(300);
+
+/// Connect and write timeout of a stream destination.
+const STREAM_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[cfg(feature = "tls")]
+impl TlsDest {
+    fn new(cfg: &SyslogConfig, opts: Option<&crate::tls::TlsOptions>) -> std::io::Result<Self> {
+        use std::io::{Error, ErrorKind};
+        let invalid =
+            |e: plat_tls::TlsError| Error::new(ErrorKind::InvalidInput, format!("syslog {}: {e}", cfg.address));
+        let Some(t) = &cfg.tls else {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!("syslog {}: [audit.syslog.tls] missing", cfg.address),
+            ));
+        };
+        let Some(opts) = opts else {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!("syslog {}: TLS transport needs Logger::with_tls", cfg.address),
+            ));
+        };
+        let checker = opts.checker_for(t).map_err(invalid)?;
+        let rev = checker.settings();
+        let budget = if rev.mode == plat_common::config::RevocationMode::Off { Duration::ZERO } else { rev.budget };
+        let handshake = STREAM_TIMEOUT.max(budget + Duration::from_secs(1));
+        let settings = plat_tls::ClientSettings::from_config(t, opts.pq_hybrid, Some(checker));
+        let config = plat_tls::client_config(&settings).map_err(invalid)?;
+        let name = plat_tls::policy::server_name(&t.server_name).map_err(invalid)?;
+        Ok(Self { config, name, conn: None, last_try: None, handshake, down: None })
+    }
+
+    /// Connects and completes the handshake (certificate and revocation
+    /// checks run here, bounded by `handshake`).
+    fn connect(&mut self, addr: &SocketAddr) -> Result<(), RemoteLossReason> {
+        use plat_tls::stream::FailureClass;
+        let mut sock = TcpStream::connect_timeout(addr, STREAM_TIMEOUT).map_err(|e| {
+            tracing::warn!("syslog {addr}: {e}");
+            RemoteLossReason::Io
+        })?;
+        let _ = sock.set_nodelay(true);
+        let mut conn = rustls::ClientConnection::new(self.config.clone(), self.name.clone()).map_err(|e| {
+            tracing::warn!("syslog {addr}: TLS: {e}");
+            RemoteLossReason::TlsHandshake
+        })?;
+        let mut res = plat_tls::stream::handshake(&mut conn, &mut sock, Instant::now() + self.handshake);
+        if res.is_ok() {
+            res = plat_tls::stream::await_rejection(&mut conn, &mut sock, CLIENT_CERT_VERDICT_WAIT);
+        }
+        if let Err(e) = res {
+            tracing::warn!("syslog {addr}: {e}");
+            return Err(match e.class() {
+                FailureClass::Io => RemoteLossReason::Io,
+                FailureClass::Revoked | FailureClass::RevocationUnknown => RemoteLossReason::TlsRevocation,
+                FailureClass::BadCertificate | FailureClass::NoCertificate => RemoteLossReason::TlsVerify,
+                FailureClass::Timeout | FailureClass::Handshake => RemoteLossReason::TlsHandshake,
+            });
+        }
+        self.conn = Some((conn, sock));
+        Ok(())
+    }
 }
 
 /// One syslog destination, owned by its sender thread.
-// POAM: POAM-005 - syslog is UDP/TCP without TLS (RFC 5425); use a
-// protected management network until TLS transport is implemented.
 struct SyslogOut {
     cfg: SyslogConfig,
     conn: SyslogConn,
+    stats: Arc<RemoteStats>,
 }
 
 impl SyslogOut {
-    fn new(cfg: SyslogConfig) -> std::io::Result<Self> {
+    fn new(cfg: SyslogConfig, tls: Option<&TlsOptionsRef>) -> std::io::Result<Self> {
         let conn = match cfg.transport {
             SyslogTransport::Udp => {
                 let bind: SocketAddr = if cfg.address.is_ipv4() {
@@ -876,8 +970,25 @@ impl SyslogOut {
                 SyslogConn::Udp(s)
             }
             SyslogTransport::Tcp => SyslogConn::Tcp(None, None),
+            #[cfg(feature = "tls")]
+            SyslogTransport::Tls => SyslogConn::Tls(Box::new(TlsDest::new(&cfg, tls)?)),
+            // Built without TLS: refuse rather than send in the clear (SC-8).
+            #[cfg(not(feature = "tls"))]
+            SyslogTransport::Tls => {
+                let _: Option<&TlsOptionsRef> = tls;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "syslog transport \"tls\" is not available in this build (built without the `tls` feature)",
+                ));
+            }
         };
-        Ok(Self { cfg, conn })
+        let transport = match cfg.transport {
+            SyslogTransport::Udp => "udp",
+            SyslogTransport::Tcp => "tcp",
+            SyslogTransport::Tls => "tls",
+        };
+        let stats = Arc::new(RemoteStats::new(cfg.address, transport));
+        Ok(Self { cfg, conn, stats })
     }
 
     fn format(&self, seq: u64, node: &NodeIdent, ev: &Event, msg: &mut Vec<u8>) {
@@ -889,13 +1000,25 @@ impl SyslogOut {
         }
     }
 
-    /// Sends one batch. Returns the number of records not delivered.
+    /// RFC 6587 §3.4.1 / RFC 5425 §4.3 octet counting: `MSG-LEN SP MSG`.
+    fn frame(&self, batch: &[(u64, Event)], node: &NodeIdent, msg: &mut Vec<u8>, buf: &mut Vec<u8>) {
+        buf.clear();
+        for (seq, ev) in batch {
+            self.format(*seq, node, ev, msg);
+            let _ = write!(buf, "{} ", msg.len());
+            buf.extend_from_slice(msg);
+        }
+    }
+
+    /// Sends one batch. Returns the number of records not delivered and
+    /// the number of failed operations; the cause of a loss is noted in
+    /// `stats` for the next `audit_remote_loss` record.
     ///
     /// UDP is one datagram (one `send` syscall) per record: RFC 5426 allows
     /// one message per datagram, and batching with `sendmmsg` would need
     /// `unsafe` FFI outside `plat-io`. The cost stays on this thread, off the
-    /// file path. TCP (RFC 6587 §3.4.1 octet counting) is one write per batch;
-    /// on failure the whole batch is counted as lost (some frames may have
+    /// file path. TCP and TLS (octet counting) are one write per batch; on
+    /// failure the whole batch is counted as lost (some frames may have
     /// arrived), and records during the reconnect back-off are lost.
     fn send_batch(
         &mut self,
@@ -916,29 +1039,30 @@ impl SyslogOut {
                         lost += 1;
                     }
                 }
+                if lost > 0 {
+                    self.stats.note_loss(RemoteLossReason::Io);
+                }
                 (lost, u64::from(lost > 0))
             }
             SyslogConn::Tcp(..) => {
-                buf.clear();
-                for (seq, ev) in batch {
-                    self.format(*seq, node, ev, msg);
-                    let _ = write!(buf, "{} ", msg.len());
-                    buf.extend_from_slice(msg);
-                }
+                self.frame(batch, node, msg, buf);
                 let SyslogConn::Tcp(conn, last_try) = &mut self.conn else { return (0, 0) };
                 if conn.is_none() {
                     if last_try.is_some_and(|t| t.elapsed() < TCP_BACKOFF) {
+                        self.stats.note_loss(RemoteLossReason::Io);
                         return (n, 0);
                     }
                     *last_try = Some(Instant::now());
-                    match TcpStream::connect_timeout(&self.cfg.address, Duration::from_secs(2)).and_then(|s| {
+                    match TcpStream::connect_timeout(&self.cfg.address, STREAM_TIMEOUT).and_then(|s| {
                         s.set_nodelay(true)?;
-                        s.set_write_timeout(Some(Duration::from_secs(2)))?;
+                        s.set_write_timeout(Some(STREAM_TIMEOUT))?;
                         Ok(s)
                     }) {
                         Ok(s) => *conn = Some(BufWriter::with_capacity(1 << 20, s)),
                         Err(e) => {
                             tracing::warn!("syslog {}: {e}", self.cfg.address);
+                            self.stats.count_failure(RemoteLossReason::Io);
+                            self.stats.note_loss(RemoteLossReason::Io);
                             return (n, 1);
                         }
                     }
@@ -952,13 +1076,77 @@ impl SyslogOut {
                     Err(e) => {
                         tracing::warn!("syslog {}: {e}", self.cfg.address);
                         *conn = None;
+                        self.stats.count_failure(RemoteLossReason::Io);
+                        self.stats.note_loss(RemoteLossReason::Io);
+                        (n, 1)
+                    }
+                }
+            }
+            #[cfg(feature = "tls")]
+            SyslogConn::Tls(..) => {
+                self.frame(batch, node, msg, buf);
+                let SyslogConn::Tls(t) = &mut self.conn else { return (0, 0) };
+                if t.conn.is_none() {
+                    if t.last_try.is_some_and(|at| at.elapsed() < TCP_BACKOFF) {
+                        self.stats.note_loss(t.down.unwrap_or(RemoteLossReason::Io));
+                        return (n, 0);
+                    }
+                    t.last_try = Some(Instant::now());
+                    match t.connect(&self.cfg.address) {
+                        Ok(()) => {
+                            t.down = None;
+                            self.stats.tls_handshakes.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(r) => {
+                            t.down = Some(r);
+                            self.stats.count_failure(r);
+                            self.stats.note_loss(r);
+                            return (n, 1);
+                        }
+                    }
+                }
+                let Some((conn, sock)) = t.conn.as_mut() else { return (n, 0) };
+                match plat_tls::stream::write_all(conn, sock, buf, Instant::now() + STREAM_TIMEOUT) {
+                    Ok(()) => (0, 0),
+                    Err(e) => {
+                        tracing::warn!("syslog {}: {e}", self.cfg.address);
+                        t.conn = None;
+                        t.down = Some(RemoteLossReason::Io);
+                        self.stats.count_failure(RemoteLossReason::Io);
+                        self.stats.note_loss(RemoteLossReason::Io);
                         (n, 1)
                     }
                 }
             }
         }
     }
+
+    /// Orderly close at shutdown: TLS sends `close_notify` (RFC 5425 §4.4),
+    /// bounded by the write timeout.
+    fn close(&mut self) {
+        match &mut self.conn {
+            SyslogConn::Udp(_) => {}
+            SyslogConn::Tcp(conn, _) => {
+                if let Some(w) = conn.as_mut() {
+                    let _ = w.flush();
+                }
+            }
+            #[cfg(feature = "tls")]
+            SyslogConn::Tls(t) => {
+                if let Some((conn, sock)) = t.conn.as_mut() {
+                    plat_tls::stream::close(conn, sock, STREAM_TIMEOUT);
+                }
+                t.conn = None;
+            }
+        }
+    }
 }
+
+#[cfg(feature = "tls")]
+type TlsOptionsRef = crate::tls::TlsOptions;
+/// Placeholder so `SyslogOut::new` has one signature in both builds.
+#[cfg(not(feature = "tls"))]
+type TlsOptionsRef = ();
 
 type Batch = Arc<Vec<(u64, Event)>>;
 
@@ -966,6 +1154,7 @@ type Batch = Arc<Vec<(u64, Event)>>;
 struct Remote {
     tx: Option<Sender<Batch>>,
     addr: SocketAddr,
+    remote: Arc<RemoteStats>,
     /// Records not delivered (written by the sender thread and on hand-off).
     lost: Arc<AtomicU64>,
     reported: u64,
@@ -977,6 +1166,7 @@ impl Remote {
         let (tx, rx) = crossbeam_channel::bounded::<Batch>(REMOTE_QUEUE_BATCHES);
         let lost = Arc::new(AtomicU64::new(0));
         let addr = out.cfg.address;
+        let remote = out.stats.clone();
         let l = lost.clone();
         let thread = std::thread::Builder::new().name(format!("plat-syslog-{i}")).spawn(move || {
             let mut out = out;
@@ -990,8 +1180,9 @@ impl Remote {
                     stats.output_errors.fetch_add(errors, Ordering::Relaxed);
                 }
             }
+            out.close();
         })?;
-        Ok(Self { tx: Some(tx), addr, lost, reported: 0, thread: Some(thread) })
+        Ok(Self { tx: Some(tx), addr, remote, lost, reported: 0, thread: Some(thread) })
     }
 
     /// Hands a batch over without blocking; a full queue is remote loss.
@@ -1014,7 +1205,15 @@ impl Remote {
         let d = l - self.reported;
         self.reported = l;
         stats.remote_lost.fetch_add(d, Ordering::Relaxed);
-        Some(Event::RemoteLoss { ts_us: Clock::wall_us(), ip: self.addr.ip(), port: self.addr.port(), lost: d })
+        // `plat.reason`: the cause noted by the sender thread; absent when
+        // the only losses were a full hand-off queue.
+        Some(Event::RemoteLoss {
+            ts_us: Clock::wall_us(),
+            ip: self.addr.ip(),
+            port: self.addr.port(),
+            lost: d,
+            reason: self.remote.take_reason(),
+        })
     }
 
     /// Closes the hand-off and waits for queued batches to be sent.
@@ -1033,6 +1232,8 @@ pub struct Logger {
     rx: Receiver<Event>,
     stats: Arc<AuditStats>,
     counters: Option<CounterSource>,
+    #[cfg(feature = "tls")]
+    tls: Option<crate::tls::TlsOptions>,
 }
 
 impl std::fmt::Debug for Logger {
@@ -1064,7 +1265,23 @@ fn number(events: impl Iterator<Item = Event>, seq: &mut u64) -> Vec<(u64, Event
 
 impl Logger {
     pub fn new(cfg: AuditConfig, node: NodeIdent, rx: Receiver<Event>, stats: Arc<AuditStats>) -> Self {
-        Self { cfg, node, rx, stats, counters: None }
+        Self {
+            cfg,
+            node,
+            rx,
+            stats,
+            counters: None,
+            #[cfg(feature = "tls")]
+            tls: None,
+        }
+    }
+
+    /// TLS syslog policy and the shared revocation checker. Required when
+    /// any destination uses `transport = "tls"` (else `spawn` fails).
+    #[cfg(feature = "tls")]
+    pub fn with_tls(mut self, opts: crate::tls::TlsOptions) -> Self {
+        self.tls = Some(opts);
+        self
     }
 
     pub fn with_counters(mut self, src: CounterSource) -> Self {
@@ -1096,7 +1313,14 @@ impl Logger {
             }
             None => None,
         };
-        let outs = self.cfg.syslog.iter().cloned().map(SyslogOut::new).collect::<Result<Vec<_>, _>>()?;
+        #[cfg(feature = "tls")]
+        let tls = self.tls.as_ref();
+        #[cfg(not(feature = "tls"))]
+        let tls: Option<&TlsOptionsRef> = None;
+        // Fail closed: an unreadable CA, certificate or key, or a bad
+        // server name, stops the start (no plaintext fallback).
+        let outs = self.cfg.syslog.iter().cloned().map(|c| SyslogOut::new(c, tls)).collect::<Result<Vec<_>, _>>()?;
+        self.stats.set_remotes(outs.iter().map(|o| o.stats.clone()).collect());
         let remotes = outs
             .into_iter()
             .enumerate()

@@ -9,4 +9,4 @@ pub mod net;
 pub use clock::Clock;
 pub use config::{Config, ConfigError};
 pub use counters::{Counter, Counters, DropReason};
-pub use net::{Ipv4Cidr, Ipv6Cidr};
+pub use net::{HttpUrl, Ipv4Cidr, Ipv6Cidr};

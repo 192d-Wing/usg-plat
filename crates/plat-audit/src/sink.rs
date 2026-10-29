@@ -1,12 +1,69 @@
 //! The data plane's handle to the audit pipeline.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use crossbeam_utils::CachePadded;
 
-use crate::event::Event;
+use crate::event::{Event, RemoteLossReason};
+
+/// Counters of one syslog destination (`plat_audit_remote_*`).
+///
+/// COMPLIANCE MAPPING:
+/// - NIST 800-53: AU-5, AU-9(2), SI-4 - TLS handshake failures toward a
+///   collector are visible per destination and per cause.
+#[derive(Debug)]
+pub struct RemoteStats {
+    pub address: SocketAddr,
+    /// `udp` | `tcp` | `tls`.
+    pub transport: &'static str,
+    /// Completed TLS handshakes.
+    pub tls_handshakes: AtomicU64,
+    /// Failed connections or writes (TCP and TLS) by
+    /// [`RemoteLossReason::index`].
+    failures: [AtomicU64; 4],
+    /// Cause of the most recent undelivered batch (0 = none, else
+    /// `index + 1`); taken by the next `audit_remote_loss` record.
+    last_reason: AtomicU8,
+}
+
+impl RemoteStats {
+    pub fn new(address: SocketAddr, transport: &'static str) -> Self {
+        Self {
+            address,
+            transport,
+            tls_handshakes: AtomicU64::new(0),
+            failures: Default::default(),
+            last_reason: AtomicU8::new(0),
+        }
+    }
+
+    /// Failed connections (or TLS writes) with this cause.
+    pub fn failures(&self, r: RemoteLossReason) -> u64 {
+        self.failures.get(r.index()).map_or(0, |a| a.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn count_failure(&self, r: RemoteLossReason) {
+        if let Some(a) = self.failures.get(r.index()) {
+            a.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Records the cause of the batch just lost.
+    pub(crate) fn note_loss(&self, r: RemoteLossReason) {
+        self.last_reason.store(r.index() as u8 + 1, Ordering::Relaxed);
+    }
+
+    /// Takes the cause noted since the last call, if any.
+    pub(crate) fn take_reason(&self) -> Option<RemoteLossReason> {
+        match self.last_reason.swap(0, Ordering::Relaxed) {
+            0 => None,
+            n => RemoteLossReason::ALL.get(usize::from(n) - 1).copied(),
+        }
+    }
+}
 
 /// Audit pipeline counters and health.
 ///
@@ -33,6 +90,9 @@ pub struct AuditStats {
     /// The log volume is below `audit.file.min_free_bytes` (part of
     /// `degraded`, AU-5(1)).
     storage_low: AtomicBool,
+    /// Per syslog destination, in configuration order; set once by
+    /// `Logger::spawn`.
+    remotes: OnceLock<Vec<Arc<RemoteStats>>>,
 }
 
 impl AuditStats {
@@ -45,6 +105,15 @@ impl AuditStats {
     #[inline]
     pub fn degraded(&self) -> bool {
         self.degraded.load(Ordering::Relaxed)
+    }
+
+    /// Per-destination syslog counters (empty before `Logger::spawn`).
+    pub fn remotes(&self) -> &[Arc<RemoteStats>] {
+        self.remotes.get().map_or(&[], Vec::as_slice)
+    }
+
+    pub(crate) fn set_remotes(&self, r: Vec<Arc<RemoteStats>>) {
+        let _ = self.remotes.set(r);
     }
 
     /// True while the local audit file cannot be written.
@@ -168,7 +237,7 @@ mod tests {
     use crate::LifecycleKind;
 
     fn ev() -> Event {
-        Event::Lifecycle { ts_us: 0, kind: LifecycleKind::Start }
+        Event::Lifecycle { ts_us: 0, kind: LifecycleKind::Start, fips: None }
     }
 
     /// SEC-302 / NIST-401: `try_emit` never counts; a full queue is
