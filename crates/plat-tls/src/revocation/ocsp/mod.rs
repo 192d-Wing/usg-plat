@@ -100,6 +100,8 @@ pub struct OcspClient {
     flight: SingleFlight<Key>,
     watch: Mutex<HashMap<Key, Watch>>,
     hook: RefreshHook,
+    /// HTTP fetch latency (`plat_ocsp_fetch_seconds`).
+    hist: super::FetchHist,
 }
 
 impl std::fmt::Debug for OcspClient {
@@ -133,6 +135,7 @@ impl OcspClient {
             flight: SingleFlight::new(),
             watch: Mutex::new(HashMap::new()),
             hook,
+            hist: super::FetchHist::default(),
         })
     }
 
@@ -187,7 +190,7 @@ impl OcspClient {
             max_body: MAX_RESPONSE_BYTES,
             deadline,
         };
-        let body = http::fetch(target, &r).map_err(map_http)?.body;
+        let body = self.hist.time(|| http::fetch(target, &r)).map_err(map_http)?.body;
         let nonce = req.nonce.as_ref().map(|n| n.as_slice());
         let mut e = self.expect(&req.cert_id, nonce, now);
         e.require_nonce = self.cfg.require_nonce;
@@ -278,6 +281,10 @@ fn outcome(s: Status, src: Source) -> LookupOutcome {
 impl OcspSource for OcspClient {
     fn cache_entries(&self) -> usize {
         self.cache_len()
+    }
+
+    fn fetch_hist(&self) -> Option<&super::FetchHist> {
+        Some(&self.hist)
     }
 
     fn lookup(&self, ctx: &CertCtx<'_>) -> Lookup {

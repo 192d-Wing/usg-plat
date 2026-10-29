@@ -352,7 +352,7 @@ watched source (a CRL URL/file/CDP, or an OCSP watch entry):
 | `recovered` | a failing source refreshed successfully |
 | `stale_dropped` | cached data passed nextUpdate without a replacement and was dropped |
 | `rollback_rejected` | a fetched CRL had a lower (or missing) cRLNumber and was refused |
-| `state_rejected` | the persisted `cache_dir/crl-numbers` file was rejected at load (`plat.crl.source:"crl-numbers"`; `event.reason` `state_oversize`, `state_unreadable`, `state_not_utf8` or `state_bad_lines`); rollback marks from it are missing or partial |
+| `state_rejected` | the persisted `cache_dir/crl-numbers` file was rejected at load (`plat.crl.source:"crl-numbers"`; `event.reason` `state_oversize`, `state_unreadable`, `state_not_utf8` or `state_bad_lines`); rollback marks from it are missing or partial. The rejected file is kept on disk as `crl-numbers.rejected.<ts>` when it is a regular file (a non-regular entry stays in place); its path appears in the operational log |
 | `state_persist_failed` | writing `crl-numbers` failed (`event.reason` `state_write_failed`); retried at the next store, one record per failure streak |
 
 ```json
@@ -574,13 +574,32 @@ for `nat_port_block_release` (same address and range), `service_stop`,
   `plat.mgmt.reason` values); `plat_revocation_checks_total{role,status,source}`;
   `plat_revocation_refresh_failures_total{kind}` (`crl`, `ocsp`; every
   transition except `recovered` and the `state_*` ones); gauges `plat_ocsp_cache_entries`,
-  `plat_crl_cache_entries`, `plat_crl_cache_bytes`; `plat_crl_state_errors_total` (crl-numbers load/persist problems);
+  `plat_crl_cache_entries`, `plat_crl_cache_bytes`; `plat_crl_state_errors_total` (crl-numbers load/persist problems and failed move-aside);
   `plat_tls_cert_expiry_seconds{role,file}`; per TLS syslog destination
   `plat_audit_remote_tls_handshakes_total{dest}` and
   `plat_audit_remote_tls_failures_total{dest,reason}` (`io`, `tls_handshake`,
-  `tls_verify`, `tls_revocation`). Planned but not implemented:
-  `plat_ocsp_fetch_seconds`, `plat_crl_fetch_seconds`,
-  `plat_crl_next_update_seconds`.
+  `tls_verify`, `tls_revocation`).
+- Histograms `plat_ocsp_fetch_seconds{outcome}` and
+  `plat_crl_fetch_seconds{outcome}` (`outcome` = `ok` | `error`; buckets
+  0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 s, +Inf): latency of the HTTP
+  exchange only (connect/timeout/status/size/content-type failures are
+  `error`; signature and response validation are not included and are
+  counted by `plat_revocation_checks_total`). URL sources only.
+- Gauge `plat_crl_next_update_seconds{issuer}` (`issuer` = 16 hex chars, the
+  first 8 bytes of the SHA-256 issuer key hash): seconds until the earliest
+  nextUpdate over that issuer's verified CRLs; negative if stale. At most
+  `crl.max_crls` series.
+- Counter `plat_crl_state_dir_sync_failures_total`: directory fsyncs that
+  failed after a successful rename (counted and warned only; not in
+  `plat_crl_state_errors_total`, no audit record).
+- `crl-numbers` state: a rejected regular file is moved aside as
+  `crl-numbers.rejected.<unix_ts>` (exclusive name, mode 0600); the
+  just-moved file and the 2 newest other rejected files are kept, and only
+  regular files are pruned. A non-regular entry (directory, symlink) is left
+  in place and counted, warned and audited. A failed move-aside increments
+  `plat_crl_state_errors_total` and is warned (the `state_rejected` record
+  covers it). At start, only this daemon's own regular temp files older than
+  start − 60 s are removed.
 
 `GET /healthz`: `200 ok`, or `503` with `unhealthy:` and one or more of
 `audit file not writable`, `audit volume below min_free_bytes`,

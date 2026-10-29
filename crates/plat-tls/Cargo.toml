@@ -15,6 +15,13 @@ test-hooks = []
 [dependencies]
 plat-common.workspace = true
 aws-lc-rs.workspace = true
+# COMPLIANCE MAPPING:
+# - NIST 800-53: SC-13, CM-2 - pins the FIPS module line. aws-lc-fips-sys
+#   0.14.x bundles AWS-LC-FIPS 4.x (4.2.0), which is on the CMVP "Modules In
+#   Process" list: NOT validated (certificates #5298/#5314 cover AWS-LC-FIPS
+#   v3.1 only). Moving off this line is a deliberate, reviewed change.
+# POAM: POAM-026 AWS-LC-FIPS 4.x CMVP certificate pending; re-check and confirm OEs.
+aws-lc-fips-sys = "~0.14.4"
 der.workspace = true
 parking_lot.workspace = true
 rustls.workspace = true

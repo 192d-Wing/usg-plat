@@ -249,6 +249,20 @@ impl CrlCache {
         true
     }
 
+    /// Earliest `nextUpdate` per issuer key hash over the verified CRLs
+    /// (at most `max_crls` items).
+    pub fn next_updates(&self) -> Vec<([u8; 32], u64)> {
+        let mut out: Vec<([u8; 32], u64)> = Vec::with_capacity(self.verified.len());
+        for s in self.verified.values() {
+            let e = &s.entry;
+            match out.iter_mut().find(|(k, _)| *k == e.issuer_key_hash) {
+                Some((_, n)) => *n = (*n).min(e.next_update),
+                None => out.push((e.issuer_key_hash, e.next_update)),
+            }
+        }
+        out
+    }
+
     pub fn len(&self) -> usize {
         self.verified.len()
     }
@@ -327,5 +341,18 @@ mod tests {
         d.seed_hwm(([1; 32], Scope::default().key()), vec![9]);
         assert_eq!(d.put([1; 32], e(8, 100, 10), 0).unwrap_err(), CrlReason::Rollback);
         d.put([1; 32], e(10, 100, 10), 0).unwrap();
+    }
+
+    #[test]
+    fn next_updates_earliest_per_issuer() {
+        let mut c = CrlCache::new(4, 10_000);
+        c.put([1; 32], e(1, 500, 10), 0).unwrap();
+        let mut other = e(1, 300, 10);
+        other.scope.only_user = true;
+        c.put([2; 32], other, 0).unwrap();
+        c.put([3; 32], ei(7, 1, 900, 10), 0).unwrap();
+        let mut n = c.next_updates();
+        n.sort();
+        assert_eq!(n, vec![([1; 32], 300), ([7; 32], 900)]);
     }
 }

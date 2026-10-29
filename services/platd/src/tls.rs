@@ -22,7 +22,9 @@ use plat_audit::FipsMark;
 use plat_audit::tls::{TlsOptions, refresh_event, revocation_event};
 use plat_common::Config;
 use plat_common::config::{RevocationConfig, RevocationMode, SyslogTransport};
-use plat_tls::revocation::{RecordStatus, RefreshKind, RefreshTransition, Role, Source};
+use plat_tls::revocation::{
+    FETCH_BUCKETS, FETCH_OUTCOMES, FetchSnapshot, RecordStatus, RefreshKind, RefreshTransition, Role, Source,
+};
 use plat_tls::{
     AllowList, RefreshHook, RefreshRecord, RevocationChecker, RevocationHook, RevocationRecord, RevocationSettings,
 };
@@ -156,10 +158,39 @@ impl RevocationMetrics {
                 "# TYPE plat_ocsp_cache_entries gauge\nplat_ocsp_cache_entries {}\n\
                  # TYPE plat_crl_cache_entries gauge\nplat_crl_cache_entries {}\n\
                  # TYPE plat_crl_cache_bytes gauge\nplat_crl_cache_bytes {}\n\
-                 # TYPE plat_crl_state_errors_total counter\nplat_crl_state_errors_total {}\n",
-                st.ocsp_entries, st.crl_entries, st.crl_bytes, st.crl_state_errors,
+                 # TYPE plat_crl_state_errors_total counter\nplat_crl_state_errors_total {}\n\
+                 # TYPE plat_crl_state_dir_sync_failures_total counter\n\
+                 plat_crl_state_dir_sync_failures_total {}\n",
+                st.ocsp_entries, st.crl_entries, st.crl_bytes, st.crl_state_errors, st.crl_dir_sync_failures,
             );
+            let (ocsp, crl) = c.fetch_stats();
+            for (name, h) in [("plat_ocsp_fetch_seconds", ocsp), ("plat_crl_fetch_seconds", crl)] {
+                if let Some(h) = h {
+                    render_fetch_hist(o, name, &h);
+                }
+            }
+            // Bounded by `crl.max_crls` (one series per issuer).
+            o.push_str("# TYPE plat_crl_next_update_seconds gauge\n");
+            let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+            for (issuer, secs) in c.crl_next_update(now) {
+                let _ = writeln!(o, "plat_crl_next_update_seconds{{issuer=\"{issuer}\"}} {secs}");
+            }
         }
+    }
+}
+
+/// Renders one revocation fetch latency histogram (SI-4).
+fn render_fetch_hist(o: &mut String, name: &str, h: &FetchSnapshot) {
+    let _ = writeln!(o, "# TYPE {name} histogram");
+    for (oi, outcome) in FETCH_OUTCOMES.iter().enumerate() {
+        let (Some(b), Some(sum)) = (h.buckets.get(oi), h.sum_secs.get(oi)) else { continue };
+        for (le, v) in FETCH_BUCKETS.iter().zip(b.iter()) {
+            let _ = writeln!(o, "{name}_bucket{{outcome=\"{outcome}\",le=\"{le}\"}} {v}");
+        }
+        let count = b.last().copied().unwrap_or(0);
+        let _ = writeln!(o, "{name}_bucket{{outcome=\"{outcome}\",le=\"+Inf\"}} {count}");
+        let _ = writeln!(o, "{name}_sum{{outcome=\"{outcome}\"}} {sum}");
+        let _ = writeln!(o, "{name}_count{{outcome=\"{outcome}\"}} {count}");
     }
 }
 
@@ -513,6 +544,24 @@ mod tests {
         }
         let e = summary(&cfg).unwrap_err();
         assert!(e.contains("management.tls") && e.contains("permissions"), "{e}");
+    }
+
+    /// SI-4: fetch latency histograms render cumulative buckets per
+    /// outcome in Prometheus text format.
+    #[test]
+    fn fetch_histogram_rendering() {
+        let h = plat_tls::revocation::FetchHist::default();
+        h.observe(Duration::from_millis(30), true);
+        h.observe(Duration::from_secs(20), false);
+        let mut o = String::new();
+        render_fetch_hist(&mut o, "plat_crl_fetch_seconds", &h.snapshot());
+        assert!(o.starts_with("# TYPE plat_crl_fetch_seconds histogram\n"), "{o}");
+        assert!(o.contains("plat_crl_fetch_seconds_bucket{outcome=\"ok\",le=\"0.01\"} 0\n"), "{o}");
+        assert!(o.contains("plat_crl_fetch_seconds_bucket{outcome=\"ok\",le=\"0.05\"} 1\n"), "{o}");
+        assert!(o.contains("plat_crl_fetch_seconds_bucket{outcome=\"error\",le=\"10\"} 0\n"), "{o}");
+        assert!(o.contains("plat_crl_fetch_seconds_bucket{outcome=\"error\",le=\"+Inf\"} 1\n"), "{o}");
+        assert!(o.contains("plat_crl_fetch_seconds_sum{outcome=\"error\"} 20\n"), "{o}");
+        assert!(o.contains("plat_crl_fetch_seconds_count{outcome=\"ok\"} 1\n"), "{o}");
     }
 
     #[test]

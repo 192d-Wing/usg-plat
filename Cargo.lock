@@ -1061,6 +1061,7 @@ dependencies = [
 name = "plat-tls"
 version = "0.1.0"
 dependencies = [
+ "aws-lc-fips-sys",
  "aws-lc-rs",
  "der",
  "parking_lot",
