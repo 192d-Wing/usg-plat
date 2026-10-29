@@ -81,5 +81,12 @@ panic = "abort"
 debug = 1
 overflow-checks = false
 
+# Packaged binary (`make deb`, `make rpm`): the release build without debug
+# info. Symbols stay, so panic backtraces still name functions.
+[profile.dist]
+inherits = "release"
+debug = 0
+strip = "debuginfo"
+
 [profile.bench]
 inherits = "release"

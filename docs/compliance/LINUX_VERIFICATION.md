@@ -58,6 +58,7 @@ each item.
 | L15 | nftables reload or flush; forward-policy guard | SC-7, CM-7, SC-24 | POAM-019 | PASS with measured residual (runs 3 and 4) |
 | L16 | Crash and restart behaviour; start limit | CP-10, SC-24, AU-9 | POAM-009 | PASS (run 3) |
 | L17 | TUN back-pressure is counted, not a stall | SC-5, SI-4 | — | PARTIAL (run 2): kernel drops exported; `tx_queue_full` path unexercised |
+| L18 | `.deb` and `.rpm` install, upgrade and removal | CM-2, CM-6, AC-6, AU-9 | — | NOT RUN |
 
 
 ## Procedures, pass criteria and results
@@ -368,3 +369,18 @@ stall, `plat_io_errors_total` 0. `plat_tx_queue_full_total` stayed 0: a
 Linux TUN `write` did not return `EAGAIN` (default send buffer), so that
 path is still unexercised on Linux (covered only by
 `services/platd/src/run.rs::full_tx_queue_counts_back_pressure`).
+
+### L18 — package install, upgrade and removal
+
+- On Debian/Ubuntu (`apt install ./platd_*.deb`) and RHEL/Rocky
+  (`dnf install ./platd-*.rpm`), using the CI artifact for the host
+  architecture: the `plat` system user (no login shell) and `plat-log`
+  group exist; `/etc/plat` is `root:plat` 0750 and `/etc/plat/platd.toml`
+  `root:plat` 0640; `/var/log/plat` is `plat:plat-log` 2750; `platd` and
+  `plat-fwguard` are installed but neither enabled nor started;
+  `lintian` and `rpmlint` report no errors.
+- Edit the config, enable `plat-fwguard.timer` and `platd`, then install a
+  newer package: neither is restarted and an edited config is kept
+  (conffile / `%config(noreplace)`).
+- Remove the package: `platd` and the guard are stopped and disabled; the
+  config and `/var/log/plat` remain.
