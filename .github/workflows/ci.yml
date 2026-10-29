@@ -33,7 +33,7 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install AWS-LC FIPS build deps (CMake, Go, clang, aarch64 cross gcc)
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake golang-go clang gcc-aarch64-linux-gnu
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake golang-go clang gcc-aarch64-linux-gnu libc6-dev-arm64-cross linux-libc-dev-arm64-cross
       - run: make fmt
       - run: make clippy
       - name: make check-linux (aarch64, TLS on)
