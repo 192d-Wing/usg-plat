@@ -27,11 +27,24 @@ On a Linux host:
 cargo build --release -p platd
 sudo install -m 0755 target/release/platd /usr/bin/platd
 sudo install -D -m 0755 deploy/systemd/plat-tun-setup.sh /usr/libexec/plat/plat-tun-setup.sh
-sudo install -D -m 0640 config/platd.example.toml /etc/plat/platd.toml   # then edit
-sudo install -m 0644 deploy/systemd/platd.service /etc/systemd/system/
+sudo install -D -m 0755 deploy/systemd/plat-fwguard.sh /usr/libexec/plat/plat-fwguard.sh
+sudo install -m 0644 deploy/systemd/platd.service deploy/systemd/plat-fwguard.service \
+    deploy/systemd/plat-fwguard.timer /etc/systemd/system/
+sudo install -D -m 0644 deploy/systemd/plat.tmpfiles.conf /usr/lib/tmpfiles.d/plat.conf
+getent passwd plat >/dev/null || sudo useradd --system --user-group --no-create-home \
+    --home-dir /nonexistent --shell /usr/sbin/nologin plat
+getent group plat-log >/dev/null || sudo groupadd --system plat-log
+sudo install -D -m 0640 -o root -g plat config/platd.example.toml /etc/plat/platd.toml   # then edit
+sudo systemd-tmpfiles --create /usr/lib/tmpfiles.d/plat.conf   # /var/log/plat must exist before the first start
+sudo install -D -m 0644 deploy/systemd/nftables.service.d/plat-fwguard.conf \
+    /etc/systemd/system/nftables.service.d/plat-fwguard.conf
+sudo systemctl daemon-reload
+sudo systemctl enable chrony-wait.service    # chrony; with systemd-timesyncd:
+# sudo systemctl enable systemd-time-wait-sync.service
+sudo systemctl enable --now plat-fwguard.timer   # guards on its own, also while platd is stopped
 sudo systemctl enable --now platd
+curl -s --retry 10 --retry-connrefused --retry-delay 1 127.0.0.1:9464/healthz   # listener is up a few seconds after start
 curl -s 127.0.0.1:9464/metrics
-curl -s 127.0.0.1:9464/healthz
 ```
 
 Deployment notes:
@@ -42,20 +55,65 @@ Deployment notes:
   prefix, client prefixes and this node's pool slice from
   `platd check-config --format env`, creates the multiqueue TUN owned by
   `plat:plat`, installs the `table inet plat` forward policy (default drop),
-  routes only the NAT64 prefix and this node's slice to the TUN, and enables
-  forwarding last. Any mismatch aborts the start.
+  routes only the NAT64 prefix and this node's slice to the TUN (every other
+  route on the TUN, of any protocol, is removed), and enables forwarding
+  last. Any mismatch aborts the start. Keys of `check-config --format env`
+  it does not use are ignored; a line that is not `PLAT_*=` aborts.
+- The forward policy is written to `/etc/nftables.d/plat.nft` and the glob
+  line `include "/etc/nftables.d/*.nft"` is added once to
+  `/etc/nftables.conf` (an exact `include "/etc/nftables.d/plat.nft"` from an
+  earlier version is replaced by it), so `systemctl reload/restart nftables`
+  restores the policy, and a missing `plat.nft` cannot break the host
+  ruleset. A snapshot of the loaded table is kept in
+  `/etc/nftables.d/plat.nft.expected`.
+- `plat-fwguard` compares the live `table inet plat` with that snapshot
+  (counters ignored; without a snapshot it requires a default-drop forward
+  chain) and, if it is missing or different while forwarding is on, turns
+  IPv4/IPv6 forwarding off and logs an error to the journal (fail closed).
+  It runs every 2 s from `plat-fwguard.timer` (enable it on its own, as
+  above, so it also guards while platd is stopped) and at once after
+  `nftables.service` starts, reloads or stops (the drop-in above). Restore
+  with `systemctl restart platd`.
+- Uninstall the forward policy: stop platd; disable the guard first
+  (`systemctl disable --now plat-fwguard.timer`, remove
+  `/etc/systemd/system/nftables.service.d/plat-fwguard.conf`,
+  `systemctl daemon-reload`), otherwise it turns forwarding off when the
+  table goes; then `rm /etc/nftables.d/plat.nft
+  /etc/nftables.d/plat.nft.expected` and `nft delete table inet plat`.
+  The `include "/etc/nftables.d/*.nft"` line can stay.
+- Audit logs: `/var/log/plat` is `plat:plat-log` mode 2750, files 0640 group
+  `plat-log`. The directory comes from `/usr/lib/tmpfiles.d/plat.conf`
+  (not `LogsDirectory=`, which systemd re-applies as `plat:plat` 0750 after
+  the setup script); the setup script creates the group, applies that file
+  with `systemd-tmpfiles --create` (or sets owner, group and mode itself if
+  it is missing) and re-groups existing log files. Log shippers and
+  `verify-log` operators join `plat-log`; never add them to `plat`. When
+  upgrading from a unit with `LogsDirectory=plat`, install the new unit and
+  tmpfiles file, `systemctl daemon-reload`, then restart platd.
+  The directory must exist before platd starts: `ReadWritePaths=/var/log/plat`
+  is resolved when systemd builds the mount namespace, before `ExecStartPre=`,
+  so a missing directory fails the start with `226/NAMESPACE`. Run the
+  `systemd-tmpfiles --create` step above (after creating `plat` and
+  `plat-log`); at boot `systemd-tmpfiles-setup.service` recreates it.
+- Clock: the unit orders after `time-sync.target`. Enable the wait unit of
+  your time daemon (`chrony-wait.service` for chrony,
+  `systemd-time-wait-sync.service` for systemd-timesyncd);
+  `systemd-time-wait-sync` can wait forever under chrony.
+- The unit stops restarting after 5 failed starts in 60 s
+  (`systemctl reset-failed platd` after fixing the cause).
 - The daemon runs with no capabilities. Size `MemoryMax` in the unit for
   your `nat64.max_sessions` (formula in the unit file; the shipped 8G does not
   scale on its own, POAM-021).
-- None of the Linux-specific behaviour (unit sandbox, forward policy, TUN
-  attach) has been run yet; see `docs/compliance/LINUX_VERIFICATION.md`.
-- A flush or reload of the host nftables ruleset removes the forward policy
-  while forwarding stays on (POAM-019); do not flush the ruleset on a PLAT
-  host.
+- The Linux-specific behaviour (unit sandbox, forward policy and guard, TUN
+  attach, audit lifecycle) was verified on one Ubuntu 24.04 / systemd 255
+  host; results and open items are in
+  `docs/compliance/LINUX_VERIFICATION.md`.
 - Verify the audit log chain (live file and rotated files together):
   `platd verify-log /var/log/plat/nat64-audit.jsonl /var/log/plat/nat64-audit.jsonl.*`
-  (exit 0 = verified and linked, 1 = verification failure, unverified tail or
-  gap, 2 = I/O error; see `docs/compliance/SIEM_LOGGING.md`).
+  (exit 0 = verified and linked, including gaps announced with their exact
+  size; 1 = verification failure, unverified tail or unaccounted gap; 2 = I/O
+  error; 3 = recovery gap after a damaged start, check it against the remote
+  copy, `--allow-recovery` accepts it; see `docs/compliance/SIEM_LOGGING.md`).
 
 Configuration changes to note when upgrading from an earlier build:
 
@@ -102,6 +160,10 @@ Configuration changes to note when upgrading from an earlier build:
 - `check-config` (both formats) loads every TLS file and exits 2 on a
   missing file or bad key permissions; key files with setuid/setgid/sticky
   bits, or that are not regular files, are rejected.
+  Install key files owned by `plat` (mode 0600/0400/0640/0440) or by root
+  with group `plat` (mode 0640/0440), e.g.
+  `sudo install -D -m 0640 -o root -g plat server.key /etc/plat/tls/server.key`;
+  certificates may be 0644.
 - TLS syslog collectors must support TLS 1.3 (RFC 5425 TLS 1.2 is not
   offered).
 
@@ -147,5 +209,5 @@ https://192d-wing.github.io/usg-plat/ from `main`.
 - `ARCHITECTURE.md`: data path, concurrency, cluster design
 - `docs/compliance/SIEM_LOGGING.md`: log schema and SIEM correlation
 - `docs/compliance/NIST_800-53_MAPPING.md`, `RFC_COMPLIANCE.md`, `POAM.md`
-- `docs/compliance/LINUX_VERIFICATION.md`: Linux checks not yet run
+- `docs/compliance/LINUX_VERIFICATION.md`: Linux verification results
 - `CLAUDE.md` and `.claude/skills/plat-workflow/`: development workflow

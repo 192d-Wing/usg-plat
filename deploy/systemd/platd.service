@@ -1,13 +1,24 @@
 # NIST 800-53: AC-6 (Least Privilege), CM-7 (Least Functionality), SC-39 (Process Isolation)
-# NIST 800-53: AU-8 - start only after the clock is synchronised.
+# NIST 800-53: AU-8 - start only after the clock is synchronised: ordered
+# after time-sync.target, which is held back by the time daemon's wait unit.
+# Enable the one matching your daemon (see README):
+#   chrony:           systemctl enable chrony-wait.service
+#   systemd-timesyncd: systemctl enable systemd-time-wait-sync.service
+# (systemd-time-wait-sync can wait forever under chrony, so it is not pulled
+# in here.)
 [Unit]
 Description=usg-plat 464XLAT PLAT / NAT64 translator
-Wants=network-online.target time-sync.target systemd-time-wait-sync.service
-After=network-online.target time-sync.target systemd-time-wait-sync.service
+Wants=network-online.target time-sync.target plat-fwguard.timer
+After=network-online.target time-sync.target
+# CP-10, SC-24: stop restarting after 5 failed starts within 60 s instead of
+# looping forever (RestartSec=2s alone never hits the default limit).
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
 # Runs as root ('+' prefix) to create the persistent TUN owned by plat:plat.
+# It also creates /var/log/plat as plat:plat-log 2750 (tmpfiles.d).
 ExecStartPre=+/usr/libexec/plat/plat-tun-setup.sh /etc/plat/platd.toml
 ExecStart=/usr/bin/platd run --config /etc/plat/platd.toml
 Restart=on-failure
@@ -24,7 +35,9 @@ ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 PrivateIPC=yes
+RemoveIPC=yes
 ProtectProc=invisible
+ProcSubset=pid
 ProtectClock=yes
 ProtectHostname=yes
 ProtectKernelTunables=yes
@@ -46,13 +59,24 @@ SystemCallFilter=sched_setaffinity
 SystemCallErrorNumber=EPERM
 # SC-5 backstop against runaway memory or threads (tables and queues are
 # bounded by the config; size MemoryMax to about
-# nat64.max_sessions x 512 B + audit.queue_capacity x 64 B + 256 MiB).
+# nat64.max_sessions x 800 B + audit.queue_capacity x 64 B + 256 MiB headroom;
+# measured on aarch64: ~780 B/session, 3.05 GB at 3.91 M sessions with a
+# 1 Mi-record queue). 8G covers the default 4 M sessions; on a host with
+# 8 GiB of RAM or less it is no backstop, so lower it there.
 MemoryMax=8G
 TasksMax=1024
-# Audit logs readable by the service account only (AU-9); give a log
-# shipper access with an ACL rather than through the plat group.
-LogsDirectory=plat
-LogsDirectoryMode=0700
+# Audit logs (AU-9): writable by plat only; readable by group plat-log
+# (log shippers, verify-log operators), never through the plat group.
+# /var/log/plat is plat:plat-log 2750 from tmpfiles.d (plat.tmpfiles.conf,
+# applied by plat-tun-setup.sh), not LogsDirectory=: systemd re-applies
+# LogsDirectory= ownership and mode after ExecStartPre= and would drop the
+# plat-log group and setgid (L13).
+# No "-" prefix on purpose (fail loud): systemd sets up this mount before
+# ExecStartPre= runs, so the directory must already exist, or the start fails
+# with 226/NAMESPACE. Install creates it with
+#   systemd-tmpfiles --create /usr/lib/tmpfiles.d/plat.conf
+# (after the plat user and plat-log group exist, see README); at boot
+# systemd-tmpfiles-setup.service recreates it (L5).
 ReadWritePaths=/var/log/plat
 # Optional CRL disk cache (tls.revocation.cache_dir =
 # "/var/lib/plat/revocation"): systemd creates it owned by plat:plat with

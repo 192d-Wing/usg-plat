@@ -62,6 +62,7 @@ pub fn render(s: &Sources) -> String {
          # TYPE plat_audit_output_errors_total counter\nplat_audit_output_errors_total {}\n\
          # TYPE plat_audit_file_lost_total counter\nplat_audit_file_lost_total {}\n\
          # TYPE plat_audit_remote_lost_total counter\nplat_audit_remote_lost_total {}\n\
+         # TYPE plat_audit_seq_lease_failures_total counter\nplat_audit_seq_lease_failures_total {}\n\
          # TYPE plat_audit_degraded gauge\nplat_audit_degraded {}\n\
          # TYPE plat_audit_storage_low gauge\nplat_audit_storage_low {}\n",
         st.session_count(),
@@ -76,6 +77,7 @@ pub fn render(s: &Sources) -> String {
         a.output_errors.load(Ordering::Relaxed),
         a.file_lost.load(Ordering::Relaxed),
         a.remote_lost.load(Ordering::Relaxed),
+        a.seq_lease_failures.load(Ordering::Relaxed),
         u8::from(a.degraded()),
         u8::from(a.storage_low()),
     );
@@ -108,6 +110,51 @@ pub fn render(s: &Sources) -> String {
         section(&mut o);
     }
     o
+}
+
+/// Kernel drop counters of the TUN interface, read at scrape time from
+/// `/sys/class/net/<if>/statistics/{rx,tx}_dropped` (Linux only; elsewhere
+/// the section is empty). Drops caused by TUN back-pressure (a full queue
+/// toward the kernel) are counted only there, not in `plat_drops_total`;
+/// `plat_tx_queue_full_total` stays the user-space view.
+///
+/// COMPLIANCE MAPPING:
+/// - NIST 800-53: SI-4, SC-5 - kernel-side drops are monitored (L17)
+pub fn tun_section(ifname: String) -> Section {
+    Box::new(move |o: &mut String| render_tun(o, std::path::Path::new("/sys/class/net"), &ifname))
+}
+
+fn render_tun(o: &mut String, sysfs: &std::path::Path, ifname: &str) {
+    if !cfg!(target_os = "linux") && sysfs == std::path::Path::new("/sys/class/net") {
+        return;
+    }
+    // The name comes from validated config; still refuse anything that is
+    // not a single path component.
+    if ifname.is_empty() || ifname == "." || ifname == ".." || ifname.contains(['/', '\0']) {
+        return;
+    }
+    let dir = sysfs.join(ifname).join("statistics");
+    for (metric, file) in [("plat_tun_rx_dropped_total", "rx_dropped"), ("plat_tun_tx_dropped_total", "tx_dropped")] {
+        let Some(v) = std::fs::read_to_string(dir.join(file)).ok().and_then(|t| t.trim().parse::<u64>().ok()) else {
+            continue;
+        };
+        let _ = write!(o, "# TYPE {metric} counter\n{metric}{{interface=\"");
+        push_label_value(o, ifname);
+        let _ = writeln!(o, "\"}} {v}");
+    }
+}
+
+/// Appends `v` as a Prometheus label value: `\\`, `"` and newline escaped
+/// (exposition format), so no name can break out of the label (SEC-9).
+fn push_label_value(o: &mut String, v: &str) {
+    for c in v.chars() {
+        match c {
+            '\\' => o.push_str("\\\\"),
+            '"' => o.push_str("\\\""),
+            '\n' => o.push_str("\\n"),
+            c => o.push(c),
+        }
+    }
 }
 
 /// Routes the request line of one read-only request: the audited path
@@ -191,6 +238,33 @@ mod tests {
 
     fn ev() -> Event {
         Event::Lifecycle { ts_us: 0, kind: LifecycleKind::Start, fips: None }
+    }
+
+    #[test]
+    fn tun_kernel_drops_are_exported() {
+        let base = std::env::temp_dir().join(format!("platd-sysfs-{}", std::process::id()));
+        let stats = base.join("plat0").join("statistics");
+        std::fs::create_dir_all(&stats).unwrap();
+        std::fs::write(stats.join("rx_dropped"), "3\n").unwrap();
+        std::fs::write(stats.join("tx_dropped"), "1745\n").unwrap();
+        let mut o = String::new();
+        render_tun(&mut o, &base, "plat0");
+        assert!(
+            o.contains("# TYPE plat_tun_rx_dropped_total counter\nplat_tun_rx_dropped_total{interface=\"plat0\"} 3\n"),
+            "{o}"
+        );
+        assert!(o.contains("plat_tun_tx_dropped_total{interface=\"plat0\"} 1745\n"), "{o}");
+        let mut o = String::new();
+        render_tun(&mut o, &base, "../plat0");
+        render_tun(&mut o, &base, "missing0");
+        assert!(o.is_empty(), "{o}");
+        // SEC-9: quote and backslash cannot break out of the label.
+        let odd = base.join("a\"b\\c").join("statistics");
+        std::fs::create_dir_all(&odd).unwrap();
+        std::fs::write(odd.join("rx_dropped"), "7\n").unwrap();
+        render_tun(&mut o, &base, "a\"b\\c");
+        assert!(o.contains("plat_tun_rx_dropped_total{interface=\"a\\\"b\\\\c\"} 7\n"), "{o}");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

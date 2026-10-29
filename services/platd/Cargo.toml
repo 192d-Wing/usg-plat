@@ -38,6 +38,9 @@ plat-tls = { workspace = true, features = ["test-hooks"] }
 rcgen.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
+# verify-log accounted-gap test builds a checkpointed file by hand.
+hex.workspace = true
+sha2.workspace = true
 
 [lints]
 workspace = true

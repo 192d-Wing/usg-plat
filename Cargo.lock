@@ -1093,6 +1093,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "core_affinity",
+ "hex",
  "parking_lot",
  "plat-audit",
  "plat-cluster",
@@ -1105,6 +1106,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "rustls-pki-types",
+ "sha2",
  "signal-hook",
  "tracing",
  "tracing-subscriber",

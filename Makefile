@@ -2,7 +2,7 @@
 LINUX_TARGET ?= aarch64-unknown-linux-gnu
 ZENSICAL ?= uvx zensical@0.0.73
 
-.PHONY: all check fmt clippy check-linux check-notls test bench security compliance-annotations release docs docs-serve
+.PHONY: all check fmt clippy check-linux check-notls test test-deploy bench security compliance-annotations release docs docs-serve
 
 all: check test
 
@@ -34,6 +34,16 @@ check: fmt clippy check-linux check-notls
 
 test:
 	cargo test --workspace
+
+# Deploy scripts: POSIX syntax, shellcheck (required when CI=true) and a stubbed run
+# against the real `platd check-config --format env` output.
+DEPLOY_SH := deploy/systemd/plat-tun-setup.sh deploy/systemd/plat-fwguard.sh deploy/tests/deploy-scripts-test.sh
+test-deploy:
+	for f in $(DEPLOY_SH); do sh -n $$f || exit 1; done
+	@if command -v shellcheck >/dev/null 2>&1; then shellcheck $(DEPLOY_SH); \
+	elif [ "$$CI" = true ]; then echo "ERROR: shellcheck is required in CI" >&2; exit 1; \
+	else echo "WARNING: shellcheck not installed; skipped" >&2; fi
+	sh deploy/tests/deploy-scripts-test.sh
 
 bench:
 	cargo bench -p plat-xlat -p plat-nat64 -p plat-audit --bench xlat --bench nat64 --bench audit

@@ -1,6 +1,6 @@
 # SIEM Logging and NAT Attribution
 
-Schema version: **5** (`plat.schema`, `plat_audit::LOG_SCHEMA_VERSION`).
+Schema version: **6** (`plat.schema`, `plat_audit::LOG_SCHEMA_VERSION`).
 Source: `crates/plat-audit`.
 
 ## Purpose
@@ -19,11 +19,12 @@ never limits forwarding.
 | 2 | Chain v2: `audit_chain_continue` file header, header-seeded chain, checkpoint `seq_first`/`seq_last` hashed. New records `audit_output_failure`, `audit_remote_loss`. Checkpoints gain `plat.schema` and `plat.node_id`. New `event.reason` `subscriber_table_limit`. Every CEF record gains `cn4` (node id), `cs6` (schema) and `outcome`. |
 | 3 | New records `audit_storage_threshold` (AU-5(1)) and `audit_retention_prune` (AU-9, AU-11). |
 | 5 | TLS (branch `feat/fips-tls`). `service_start` gains `plat.fips` / `plat.fips_provider` (CEF `cn2`/`cs1`). `audit_remote_loss` gains optional `plat.reason` (`io`, `tls_handshake`, `tls_verify`, `tls_revocation`; CEF `reason`); TCP losses now carry `io`. New records `management_connection`, `management_connection_suppressed`, `tls_revocation_check`, `revocation_source_refresh`. First records that carry peer-supplied text (certificate subject, SANs, issuer DN, serial, URLs), sanitised and capped (see Injection safety). |
+| 6 | Branch `fix/linux-validation` (unreleased). New record `audit_recovery` (`plat.reason` `empty_file`/`missing_header`/`truncated_tail`, `plat.audit.last_checkpoint_seq`, `plat.audit.max_seq`, `plat.audit.lease_state` `ok`/`absent`/`corrupt`/`inflated`/`high`; CEF `reason`, `cn3` `lastCheckpointSeq`, `cn2` `maxSeq`, `cs4` `leaseState`). `audit_output_failure` may carry `plat.reason` (`truncate_failed`, `seq_lease_failed`, `seq_exhausted`; CEF `reason`). New lease file `.<name>.seq`. `verify-log` exit 3 and `--allow-recovery`. |
 | 4 | `audit_retention_prune` gains `plat.audit.state` (`scheduled` with outcome `unknown`, then `deleted` / `failed`; CEF `act=`). `audit_storage_threshold` gains state `unknown` (free space undeterminable; no `plat.audit.available_bytes`). |
 
 Files written by the v1 chain (schema 1) **no longer verify** with
 `platd verify-log`: the first line must be an `audit_chain_continue` header.
-Files written under schemas 2–5 use the same chain v2 and verify.
+Files written under schemas 2–6 use the same chain v2 and verify.
 
 ## Controls
 
@@ -36,7 +37,7 @@ Files written under schemas 2–5 use the same chain v2 and verify.
 | AU-5(1) | `min_free_bytes` threshold (default 0 = off; the example sets 2 GiB); `audit_storage_threshold` records; fail closed when free space cannot be determined. | `logger.rs::tests::free_space_threshold_degrades_and_recovers`, `undeterminable_free_space_fails_closed_once` |
 | AU-6(3), AU-6(4) | ECS-style field names, CEF, RFC 5424 syslog to central collectors. | `format.rs`; `pipeline.rs::file_and_syslog_records_with_valid_chain` |
 | AU-8 | JSON and syslog header: RFC 3339 UTC with microseconds from the system clock. CEF `rt`: milliseconds. The platform must run NTP/PTP. | `format.rs::timestamps` |
-| AU-9 (Partial) | File mode 0640 in a 0700 directory; SHA-256 chain v2 across batches and files; sequence numbers continue across restarts and files; atomic rotation; `platd verify-log`. The chain is unkeyed (POAM-003). | `health.rs::restart_continues_chain_and_sequence`, `header_and_checkpoint_metadata_are_bound_into_the_chain`, `missing_live_file_resumes_from_newest_rotated_file`; `pipeline.rs::tampering_is_detected` |
+| AU-9 (Partial) | File mode 0640 in a `plat:plat-log` 2750 directory; SHA-256 chain v2 across batches and files; per-checkpoint `fdatasync`; a failed batch is cut back to the last checkpoint; sequence numbers continue across restarts and files and are never reused (durable lease `.<name>.seq`, `audit_recovery` after a damaged start); atomic rotation; `platd verify-log` (exit 3 for a recovery gap). The chain is unkeyed (POAM-003); a deleted tail plus restart looks like a crash (POAM-027). Linux: L12, L13, L16 PASS (LINUX_VERIFICATION.md). | `health.rs::restart_continues_chain_and_sequence`, `header_and_checkpoint_metadata_are_bound_into_the_chain`, `missing_live_file_resumes_from_newest_rotated_file`; `pipeline.rs::tampering_is_detected` |
 | AU-9(2) (Partial) | Best-effort copy on the collectors; every undelivered record is counted and recorded locally (`audit_remote_loss`, with `plat.reason`). `transport = "tls"` (RFC 5425, TLS 1.3, FIPS provider) protects the copy in transit; UDP/TCP remain selectable without TLS. | `health.rs::stalled_collector_never_stalls_the_local_file`; `outputs.rs::tcp_syslog_unreachable_counts_output_errors_without_blocking`; `plat-audit/tests/tls_syslog.rs` (6 tests) |
 | AC-17, AU-2 (management) | One `management_connection` record per management connection (mTLS mode): accepted always; rejections through a token bucket (10/s, burst 20) with a `management_connection_suppressed` summary. | `services/platd/src/mgmt/tests.rs::rejected_clients_are_refused_and_audited_once`, `rejection_flood_is_rate_limited_and_summarised` |
 | IA-5(2), AU-2 (revocation) | One `tls_revocation_check` per checked certificate (every non-root certificate of the chain); `revocation_source_refresh` on refresher state transitions only. | `plat-tls/tests/revocation_fallback.rs`; `format.rs::revocation_records` |
@@ -53,7 +54,12 @@ Files written under schemas 2–5 use the same chain v2 and verify.
   syslog-sender threads, never on a worker.)
 - Logger thread (`plat-audit`): drains up to `batch_max` events per wake-up
   (or every `flush_interval_ms`), formats JSON lines, writes the local file
-  once per batch and appends one checkpoint per batch.
+  once per batch and appends one checkpoint per batch. Each checkpoint is
+  made durable with `fdatasync` (Linux; `fsync` elsewhere) before the batch
+  counts as written, so the sync rate is one per batch: size `batch_max`
+  (example 4096) so that the record rate divided by `batch_max` stays well
+  within the volume's sync rate. Rotation splits a batch so that no file
+  exceeds `max_bytes`, except the single recovery batch after an outage.
 - Each syslog destination has its own sender thread (`plat-syslog-<i>`)
   behind a bounded hand-off of 64 batches. The logger only offers the batch
   (`try_send` of a shared `Arc`); a slow or unreachable collector never
@@ -68,7 +74,7 @@ Common fields on every sequenced record:
 | Field | Type | Meaning |
 |-------|------|---------|
 | `@timestamp` | RFC 3339 UTC, µs | Event time |
-| `plat.schema` | int | Schema version (5) |
+| `plat.schema` | int | Schema version (6) |
 | `event.sequence` | int | Monotonically increasing. With `[audit.file]` configured it continues across restarts and across files, and is never reused while any audit file is present; numbers of records after the last checkpoint of a crashed file are skipped, not reused. Without a file (syslog only) it restarts at 1 with each process. A gap means records were lost (see AU-5 records). |
 | `event.kind`, `event.category` | `event`, `network` | ECS categorisation |
 | `event.action` | string | Record type, below; also the syslog MSGID |
@@ -92,7 +98,8 @@ local file, are never sent to syslog, and carry no `event.sequence`,
 | `service_start`, `service_stop` | 5 | `success` | `service.version`; `service_start` also `plat.fips` (bool), `plat.fips_provider` |
 | `dataplane_counter` | 6 | (none) | `plat.counter.name`, `plat.counter.value` |
 | `audit_queue_overflow` | 4 | `failure` | `plat.audit.lost` |
-| `audit_output_failure` | 3 (`degraded`), 4 (`recovered`) | `failure` | `plat.audit.destination` (`file`), `plat.audit.state` (`degraded` / `recovered`), `plat.audit.lost` |
+| `audit_output_failure` | 3 (`degraded`), 4 (`recovered`) | `failure` | `plat.audit.destination` (`file`), `plat.audit.state` (`degraded` / `recovered`), `plat.audit.lost`, `plat.reason` (optional: `truncate_failed`, `seq_lease_failed`, `seq_exhausted`) |
+| `audit_recovery` | 4 | `failure` | `plat.audit.destination` (`file`), `plat.reason` (`empty_file` / `missing_header` / `truncated_tail`), `plat.audit.last_checkpoint_seq`, `plat.audit.max_seq`, `plat.audit.lease_state` |
 | `audit_remote_loss` | 4 | `failure` | `plat.audit.destination` (`syslog`), `destination.ip`, `destination.port`, `plat.audit.lost`, `plat.reason` (optional) |
 | `management_connection` | 5 (`accepted`), 4 (rejected) | `success` (`accepted`), `failure` | `source.ip`, `source.port`, `plat.mgmt.reason`, optional `tls.client.subject`, `tls.client.hash.sha256`, `url.path`, `plat.mgmt.allow_entry`, `tls.client.x509.alternative_names` |
 | `management_connection_suppressed` | 4 | `failure` | `plat.mgmt.suppressed`, `plat.mgmt.window_secs` |
@@ -104,7 +111,7 @@ local file, are never sent to syslog, and carry no `event.sequence`,
 ### `nat_port_block_allocate` / `nat_port_block_release`
 
 ```json
-{"@timestamp":"2026-10-28T14:16:00.000001Z","plat.schema":5,"event.sequence":7,"event.kind":"event","event.category":"network","event.action":"nat_port_block_allocate","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"success","source.ip":"2001:db8:100:1::","plat.subscriber.prefix":"2001:db8:100:1::/64","source.nat.ip":"192.0.2.10","plat.nat.port_start":1024,"plat.nat.port_end":1535}
+{"@timestamp":"2026-10-28T14:16:00.000001Z","plat.schema":6,"event.sequence":7,"event.kind":"event","event.category":"network","event.action":"nat_port_block_allocate","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"success","source.ip":"2001:db8:100:1::","plat.subscriber.prefix":"2001:db8:100:1::/64","source.nat.ip":"192.0.2.10","plat.nat.port_start":1024,"plat.nat.port_end":1535}
 ```
 
 A block is released after it has been empty for 60 s, and only once its
@@ -115,7 +122,7 @@ record at shutdown or on a crash (POAM-009).
 ### `nat_binding_create` / `nat_binding_delete` (`audit.mode = "session"`)
 
 ```json
-{"@timestamp":"2026-10-28T14:16:00.120000Z","plat.schema":5,"event.sequence":8,"event.kind":"event","event.category":"network","event.action":"nat_binding_create","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"success","network.transport":"udp","source.ip":"2001:db8:100:1::5","source.port":40000,"source.nat.ip":"192.0.2.10","source.nat.port":1100}
+{"@timestamp":"2026-10-28T14:16:00.120000Z","plat.schema":6,"event.sequence":8,"event.kind":"event","event.category":"network","event.action":"nat_binding_create","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"success","network.transport":"udp","source.ip":"2001:db8:100:1::5","source.port":40000,"source.nat.ip":"192.0.2.10","source.nat.port":1100}
 ```
 
 Destinations are deliberately **not** logged (privacy; not needed for
@@ -128,7 +135,7 @@ attribution).
 `subscriber_table_limit`. Rate-limited to one record per second per reason.
 
 ```json
-{"@timestamp":"2026-10-28T14:16:01.000000Z","plat.schema":5,"event.sequence":9,"event.kind":"event","event.category":"network","event.action":"nat_resource_limit","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","event.reason":"subscriber_block_limit","source.ip":"2001:db8:100:1::","plat.subscriber.prefix":"2001:db8:100:1::/64"}
+{"@timestamp":"2026-10-28T14:16:01.000000Z","plat.schema":6,"event.sequence":9,"event.kind":"event","event.category":"network","event.action":"nat_resource_limit","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","event.reason":"subscriber_block_limit","source.ip":"2001:db8:100:1::","plat.subscriber.prefix":"2001:db8:100:1::/64"}
 ```
 
 ### `service_start` / `service_stop`
@@ -147,7 +154,7 @@ exists, so a `service_start` with `plat.fips:false` means the operator set
 `require_fips = false` and no TLS configured).
 
 ```json
-{"@timestamp":"2026-10-28T14:00:00.000000Z","plat.schema":5,"event.sequence":1,"event.kind":"event","event.category":"network","event.action":"service_start","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"success","service.version":"0.1.0","plat.fips":true,"plat.fips_provider":"aws-lc-rs-fips"}
+{"@timestamp":"2026-10-28T14:00:00.000000Z","plat.schema":6,"event.sequence":1,"event.kind":"event","event.category":"network","event.action":"service_start","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"success","service.version":"0.1.0","plat.fips":true,"plat.fips_provider":"aws-lc-rs-fips"}
 ```
 
 ### `dataplane_counter`
@@ -159,7 +166,7 @@ non-drop counters such as `tx_queue_full`, `icmp_errors_generated` or
 `fragmented_v4_to_v6` are only in `/metrics`.
 
 ```json
-{"@timestamp":"2026-10-28T14:17:00.000000Z","plat.schema":5,"event.sequence":40,"event.kind":"event","event.category":"network","event.action":"dataplane_counter","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"plat.counter.name":"filtered","plat.counter.value":12}
+{"@timestamp":"2026-10-28T14:17:00.000000Z","plat.schema":6,"event.sequence":40,"event.kind":"event","event.category":"network","event.action":"dataplane_counter","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"plat.counter.name":"filtered","plat.counter.value":12}
 ```
 
 ### `audit_queue_overflow`
@@ -184,12 +191,51 @@ opened or rotated.
   because records were lost.
 
 ```json
-{"@timestamp":"2026-10-28T14:20:00.000000Z","plat.schema":5,"event.sequence":512,"event.kind":"event","event.category":"network","event.action":"audit_output_failure","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","plat.audit.destination":"file","plat.audit.state":"degraded","plat.audit.lost":12}
+{"@timestamp":"2026-10-28T14:20:00.000000Z","plat.schema":6,"event.sequence":512,"event.kind":"event","event.category":"network","event.action":"audit_output_failure","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","plat.audit.destination":"file","plat.audit.state":"degraded","plat.audit.lost":12}
 ```
 
 `plat_audit_file_lost_total` also counts records that reached the failed file
 after its last checkpoint (its unverified tail), so the sequence gap that
 `verify-log` reports equals `file_lost` minus that tail.
+
+The failed file is cut back to its last durable checkpoint, so it ends in a
+complete line and verifies. Optional `plat.reason` (schema 6; `degraded`,
+`lost` 0 unless stated):
+
+- `truncate_failed`: the cut-back (`set_len` / sync) failed; the file may end
+  in a partial batch (unverified tail).
+- `seq_lease_failed`: the sequence lease `.<name>.seq` could not be written;
+  emitted once per failure streak, retried every flush interval, each failure
+  counted in `plat_audit_seq_lease_failures_total`.
+- `seq_exhausted`: the u64 sequence space is used up; further events are
+  dropped (`lost` = their count), the file is synced and closed, and the
+  logger stays degraded (fail closed).
+
+### `audit_recovery` (schema 6)
+
+First record of the new live file after a start-up that found the newest
+audit file damaged: `plat.reason` `empty_file` (0 bytes), `missing_header`
+(no complete `audit_chain_continue` line) or `truncated_tail` (last line
+without `\n`, e.g. a power cut). Severity 4, `event.outcome` `failure`.
+
+- `plat.audit.last_checkpoint_seq`: last durable checkpoint found on disk;
+  records after it may be lost.
+- `plat.audit.max_seq`: highest sequence number that may have been used
+  (the larger of the files' maximum and the `.<name>.seq` lease). Numbering
+  resumes at `max_seq + 1`, so no number is reused; the skipped range is a
+  *recovery gap* in `verify-log` (exit 3).
+- `plat.audit.lease_state`: `ok` (lease used), `absent` (no lease file),
+  `corrupt` (not a regular file, or unreadable / not a number), `inflated`
+  (above the wrap guard `u64::MAX - 2^21`; ignored), `high` (used, but more
+  than one lease block above the files' maximum: a large skip, or a planted
+  lease).
+
+```json
+{"@timestamp":"2026-10-29T06:01:00.000000Z","plat.schema":6,"event.sequence":2099522,"event.kind":"event","event.category":"network","event.action":"audit_recovery","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","plat.audit.destination":"file","plat.reason":"truncated_tail","plat.audit.last_checkpoint_seq":1699072,"plat.audit.max_seq":2099521,"plat.audit.lease_state":"ok"}
+```
+
+A clean start (intact newest file) writes no `audit_recovery`, even if the
+lease is corrupt or inflated (only warned in the journal).
 
 ### `audit_remote_loss`
 
@@ -217,7 +263,7 @@ counted as delivered. Every lost batch is counted once; the sum of
 `plat_audit_remote_lost_total` for that destination.
 
 ```json
-{"@timestamp":"2026-10-28T14:21:00.000000Z","plat.schema":5,"event.sequence":700,"event.kind":"event","event.category":"network","event.action":"audit_remote_loss","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","plat.audit.destination":"syslog","destination.ip":"198.51.100.10","destination.port":6514,"plat.audit.lost":3,"plat.reason":"tls_verify"}
+{"@timestamp":"2026-10-28T14:21:00.000000Z","plat.schema":6,"event.sequence":700,"event.kind":"event","event.category":"network","event.action":"audit_remote_loss","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","plat.audit.destination":"syslog","destination.ip":"198.51.100.10","destination.port":6514,"plat.audit.lost":3,"plat.reason":"tls_verify"}
 ```
 
 ### `audit_storage_threshold`
@@ -233,7 +279,7 @@ Free space on the log volume, checked at most once per second when
   `plat.audit.available_bytes`; it clears with a `recovered` record.
 
 ```json
-{"@timestamp":"2026-10-28T14:22:00.000000Z","plat.schema":5,"event.sequence":800,"event.kind":"event","event.category":"network","event.action":"audit_storage_threshold","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","plat.audit.destination":"file","plat.audit.state":"below_threshold","plat.audit.available_bytes":1073741824,"plat.audit.min_free_bytes":2147483648}
+{"@timestamp":"2026-10-28T14:22:00.000000Z","plat.schema":6,"event.sequence":800,"event.kind":"event","event.category":"network","event.action":"audit_storage_threshold","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","plat.audit.destination":"file","plat.audit.state":"below_threshold","plat.audit.available_bytes":1073741824,"plat.audit.min_free_bytes":2147483648}
 ```
 
 ### `audit_retention_prune`
@@ -251,7 +297,7 @@ file's header carries the full value). Two phases:
    at the next rotation with a new `scheduled` record.
 
 ```json
-{"@timestamp":"2026-10-28T15:00:00.000000Z","plat.schema":5,"event.sequence":90001,"event.kind":"event","event.category":"network","event.action":"audit_retention_prune","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"unknown","plat.audit.state":"scheduled","plat.audit.pruned_rotated_us":1793196960000000,"plat.audit.pruned_seq_first":1,"plat.audit.pruned_seq_last":45000,"plat.audit.pruned_chain_prefix":"9f2c4e01b7a6d3c8"}
+{"@timestamp":"2026-10-28T15:00:00.000000Z","plat.schema":6,"event.sequence":90001,"event.kind":"event","event.category":"network","event.action":"audit_retention_prune","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"unknown","plat.audit.state":"scheduled","plat.audit.pruned_rotated_us":1793196960000000,"plat.audit.pruned_seq_first":1,"plat.audit.pruned_seq_last":45000,"plat.audit.pruned_chain_prefix":"9f2c4e01b7a6d3c8"}
 ```
 
 ### `management_connection` (mTLS management only)
@@ -291,7 +337,7 @@ One record per TCP connection accepted by the mTLS listener
   `source.ip` still records the full address.
 
 ```json
-{"@timestamp":"2026-10-28T14:30:00.000000Z","plat.schema":5,"event.sequence":901,"event.kind":"event","event.category":"network","event.action":"management_connection","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"success","source.ip":"2001:db8:ff::10","source.port":50412,"plat.mgmt.reason":"accepted","tls.client.subject":"prometheus-01","tls.client.hash.sha256":"<64 hex>","url.path":"/metrics","plat.mgmt.allow_entry":"dns:prometheus-01.ops.example.net","tls.client.x509.alternative_names":["dns:prometheus-01.ops.example.net"]}
+{"@timestamp":"2026-10-28T14:30:00.000000Z","plat.schema":6,"event.sequence":901,"event.kind":"event","event.category":"network","event.action":"management_connection","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"success","source.ip":"2001:db8:ff::10","source.port":50412,"plat.mgmt.reason":"accepted","tls.client.subject":"prometheus-01","tls.client.hash.sha256":"<64 hex>","url.path":"/metrics","plat.mgmt.allow_entry":"dns:prometheus-01.ops.example.net","tls.client.x509.alternative_names":["dns:prometheus-01.ops.example.net"]}
 ```
 
 ### `management_connection_suppressed`
@@ -300,7 +346,7 @@ One record per TCP connection accepted by the mTLS listener
 by the token bucket during the last `plat.mgmt.window_secs` seconds.
 
 ```json
-{"@timestamp":"2026-10-28T14:31:00.000000Z","plat.schema":5,"event.sequence":950,"event.kind":"event","event.category":"network","event.action":"management_connection_suppressed","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","plat.mgmt.suppressed":41,"plat.mgmt.window_secs":60}
+{"@timestamp":"2026-10-28T14:31:00.000000Z","plat.schema":6,"event.sequence":950,"event.kind":"event","event.category":"network","event.action":"management_connection_suppressed","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","plat.mgmt.suppressed":41,"plat.mgmt.window_secs":60}
 ```
 
 ### `tls_revocation_check`
@@ -338,7 +384,7 @@ syslog collectors (`"syslog_server"`, `tls.server.hash.sha256`). With
 - `plat.ocsp.responder` / `plat.crl.source`: `host:port` of the source used.
 
 ```json
-{"@timestamp":"2026-10-28T14:32:00.000000Z","plat.schema":5,"event.sequence":960,"event.kind":"event","event.category":"network","event.action":"tls_revocation_check","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","plat.tls.role":"syslog_server","tls.server.hash.sha256":"<64 hex>","x509.serial_number":"01ab","x509.issuer.distinguished_name":"CN=Intermediate,O=Example","plat.revocation.chain_index":1,"plat.revocation.status":"revoked","plat.revocation.source":"crl_fetch","plat.revocation.policy":"hard_fail","plat.ocsp.reason":"connect","plat.revocation.reason":"key_compromise","plat.revocation.date":"2026-10-20T00:00:00.000000Z","plat.ocsp.responder":"ocsp.example.net:80","plat.crl.source":"crl.example.net:80"}
+{"@timestamp":"2026-10-28T14:32:00.000000Z","plat.schema":6,"event.sequence":960,"event.kind":"event","event.category":"network","event.action":"tls_revocation_check","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","plat.tls.role":"syslog_server","tls.server.hash.sha256":"<64 hex>","x509.serial_number":"01ab","x509.issuer.distinguished_name":"CN=Intermediate,O=Example","plat.revocation.chain_index":1,"plat.revocation.status":"revoked","plat.revocation.source":"crl_fetch","plat.revocation.policy":"hard_fail","plat.ocsp.reason":"connect","plat.revocation.reason":"key_compromise","plat.revocation.date":"2026-10-20T00:00:00.000000Z","plat.ocsp.responder":"ocsp.example.net:80","plat.crl.source":"crl.example.net:80"}
 ```
 
 ### `revocation_source_refresh`
@@ -356,13 +402,13 @@ watched source (a CRL URL/file/CDP, or an OCSP watch entry):
 | `state_persist_failed` | writing `crl-numbers` failed (`event.reason` `state_write_failed`); retried at the next store, one record per failure streak |
 
 ```json
-{"@timestamp":"2026-10-28T14:33:00.000000Z","plat.schema":5,"event.sequence":970,"event.kind":"event","event.category":"network","event.action":"revocation_source_refresh","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","plat.revocation.transition":"failing","plat.crl.source":"crl.example.net:80","event.reason":"timeout"}
+{"@timestamp":"2026-10-28T14:33:00.000000Z","plat.schema":6,"event.sequence":970,"event.kind":"event","event.category":"network","event.action":"revocation_source_refresh","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","plat.revocation.transition":"failing","plat.crl.source":"crl.example.net:80","event.reason":"timeout"}
 ```
 
 ### `audit_chain_continue` (local file only, first line of every file)
 
 ```json
-{"@timestamp":"2026-10-28T14:00:00.000000Z","plat.schema":5,"event.action":"audit_chain_continue","observer.name":"plat-01","plat.node_id":0,"plat.audit.prev_chain":"<64 hex digits; all zero if no predecessor is known>","plat.audit.prev_seq":45000,"plat.audit.next_seq":45001}
+{"@timestamp":"2026-10-28T14:00:00.000000Z","plat.schema":6,"event.action":"audit_chain_continue","observer.name":"plat-01","plat.node_id":0,"plat.audit.prev_chain":"<64 hex digits; all zero if no predecessor is known>","plat.audit.prev_seq":45000,"plat.audit.next_seq":45001}
 ```
 
 `prev_chain` / `prev_seq`: the previous file's final checkpoint chain and its
@@ -371,7 +417,7 @@ watched source (a CRL URL/file/CDP, or an OCSP watch entry):
 ### `audit_checkpoint` (local file only, after every batch)
 
 ```json
-{"@timestamp":"2026-10-28T14:00:00.100000Z","plat.schema":5,"event.action":"audit_checkpoint","observer.name":"plat-01","plat.node_id":0,"plat.audit.seq_first":45001,"plat.audit.seq_last":45012,"plat.audit.batch_sha256":"<64 hex>","plat.audit.chain_sha256":"<64 hex>"}
+{"@timestamp":"2026-10-28T14:00:00.100000Z","plat.schema":6,"event.action":"audit_checkpoint","observer.name":"plat-01","plat.node_id":0,"plat.audit.seq_first":45001,"plat.audit.seq_last":45012,"plat.audit.batch_sha256":"<64 hex>","plat.audit.chain_sha256":"<64 hex>"}
 ```
 
 Chain v2:
@@ -391,7 +437,7 @@ for that case (best-effort; use `transport = "tls"` to protect it in transit).
 ## `platd verify-log`
 
 ```text
-platd verify-log [--allow-tail] [--allow-gap] FILE...
+platd verify-log [--allow-tail] [--allow-gap] [--allow-recovery] FILE...
 ```
 
 Pass the live file and any rotated files (`<path>.<µs>`), in any order. Each
@@ -407,9 +453,28 @@ sequence.
 | 0 | Every file verifies and the files form one chain. |
 | 1 | A file fails verification; or a file has records after its last checkpoint (unverified tail, e.g. the live file or a crash) without `--allow-tail`; or records are missing between files (gap) without `--allow-gap`; or a link is broken (file removed, replaced or reordered, or a sequence number reused). |
 | 2 | A file cannot be opened or read. |
+| 3 | Everything else verifies, but a range is skipped after a damaged start (an `audit_recovery` recovery gap, printed `RECOVERY GAP N..=M (restart after damaged log; verify against the remote copy): audit_recovery at record X`) and `--allow-recovery` was not given. `--allow-gap` does not cover it; with `--allow-recovery` the line is prefixed `WARNING:` and the exit is 0. Exit 1 takes precedence over 3. |
 
 A gap means records were not written locally (see `audit_output_failure` and
-the syslog copy). Removal of the oldest retained file is not detectable from
+the syslog copy). A gap is *accounted* (printed as `OK: accounted gap:
+N..=M`, exit 0 without `--allow-gap`) only when the file after it opens with
+a checkpointed record that announces exactly that range: an
+`audit_output_failure` for the file (`plat.audit.state` `recovered`) whose
+`plat.audit.lost` equals `M - N + 1` (the batches dropped during an ENOSPC
+or I/O outage). A range skipped by a valid `audit_recovery` whose
+`plat.audit.max_seq` is `M` (start-up after a damaged newest file) is a
+*recovery gap* (exit 3, see above). A partial final line on a file other
+than the newest is accepted only when the next file opens with an
+`audit_recovery` naming that file's last checkpoint (`truncated_tail`, or
+`empty_file` / `missing_header` when the file that held that record was
+itself emptied); the partial line still needs `--allow-tail`. An
+`audit_recovery` after an intact file is a broken link. Every other gap, or
+a different count, fails (exit 1).
+
+Limitation (POAM-027): deleting the newest records and restarting is
+indistinguishable, locally, from a power cut; it shows only as a recovery
+gap. The remote copy is the reference for that range, and the chain is
+unkeyed (POAM-003). Removal of the oldest retained file is not detectable from
 the files alone: compare its header `prev_seq` / `prev_chain` with the newest
 `audit_retention_prune` record that names it. Truncation exactly at the
 newest checkpoint is also not detectable locally.
@@ -423,9 +488,16 @@ newest checkpoint is also not detectable locally.
   and removed if it holds only a header.
 - Restarts with no traffic do not create rotated files: a live file that holds
   only a header is replaced in place.
-- The unit sets `LogsDirectoryMode=0700`; files are created 0640. Grant a log
-  shipper or `verify-log` operator access with an ACL, not through the `plat`
-  group.
+- The directory is `plat:plat-log` mode 2750 (from
+  `/usr/lib/tmpfiles.d/plat.conf`, not `LogsDirectory=`); files are created
+  0640 and inherit group `plat-log`. Add log shippers and `verify-log`
+  operators to `plat-log`, never to `plat`.
+- `.<name>.seq` holds the durable sequence high-water mark (numbers
+  reserved in blocks of 2^20; after an emptied or cut-off newest file,
+  numbering resumes above it so no sequence number is reused). It holds
+  decimal text, `-rw-r----- plat:plat-log`, written (tmp, fsync,
+  rename, directory fsync) about once per 2^20 records. Log shippers must
+  ignore it, like `.*.new`; `nat64-audit.jsonl*` globs do not match it.
 
 ## Syslog
 
@@ -459,7 +531,7 @@ newest checkpoint is also not detectable locally.
 ### CEF
 
 ```text
-<134>1 2026-10-28T14:16:00.000001Z plat-01 platd 4242 nat_port_block_allocate - CEF:0|USG|usg-plat|0.1.0|nat_port_block_allocate|nat_port_block_allocate|3|rt=1793196960000 dvchost=plat-01 cn1=7 cn1Label=sequence cn4=0 cn4Label=nodeId cs6=5 cs6Label=schema outcome=success c6a2=2001:db8:100:1:: cn2=64 cn2Label=subscriberPrefixLen sourceTranslatedAddress=192.0.2.10 cs1=1024-1535 cs1Label=portRange
+<134>1 2026-10-28T14:16:00.000001Z plat-01 platd 4242 nat_port_block_allocate - CEF:0|USG|usg-plat|0.1.0|nat_port_block_allocate|nat_port_block_allocate|3|rt=1793196960000 dvchost=plat-01 cn1=7 cn1Label=sequence cn4=0 cn4Label=nodeId cs6=6 cs6Label=schema outcome=success c6a2=2001:db8:100:1:: cn2=64 cn2Label=subscriberPrefixLen sourceTranslatedAddress=192.0.2.10 cs1=1024-1535 cs1Label=portRange
 ```
 
 Header: `CEF:0|USG|usg-plat|<version>|<event.action>|<event.action>|<severity>`.
@@ -477,7 +549,8 @@ keeps microseconds), `dvchost` (node name), `cn1` (`sequence`), `cn4`
 | `service_start`, `service_stop` | none; `service_start` adds `cs1` (`fipsProvider`), `cn2` (`fips`, 1/0) |
 | `dataplane_counter` | `cs2` (`counter`), `cn3` (`value`) |
 | `audit_queue_overflow` | `cn3` (`lost`) |
-| `audit_output_failure` | `cs3=file` (`destination`), `cs4` (`state`), `cn3` (`lost`) |
+| `audit_output_failure` | `cs3=file` (`destination`), `cs4` (`state`), `cn3` (`lost`), `reason` (optional) |
+| `audit_recovery` | `cs3=file` (`destination`), `reason`, `cn3` (`lastCheckpointSeq`), `cn2` (`maxSeq`), `cs4` (`leaseState`) |
 | `audit_remote_loss` | `cs3=syslog` (`destination`), `cs5` (`collector`, `ip:port`), `cn3` (`lost`), `reason` (optional) |
 | `audit_storage_threshold` | `cs3=file` (`destination`), `cs4` (`state`), `cn3` (`availableBytes`, omitted for `unknown`), `cn2` (`minFreeBytes`) |
 | `management_connection` | `act` (`accept`/`reject`), `src` (IPv4) or `c6a2` (IPv6), `spt`, `reason` (`plat.mgmt.reason`), `suser` (subject), `cs1` (`clientCertSha256`), `request` (path), `cs2` (`allowEntry`), `cs3` (`subjectAltNames`, comma-separated, ≤ 8) |
@@ -516,6 +589,21 @@ Given `(ipv4, port, time)` from an external report:
    software (POAM-017): verify node configuration as part of the evidence.
 6. If the record falls in a pruned file, the newest `audit_retention_prune`
    records name what retention removed (`deleted`) and when.
+
+Audit-integrity alerts (AU-5, AU-9, SI-4):
+
+- Alert on **every** `audit_recovery`: the node restarted after a damaged
+  newest file (power cut, or deletion/emptying of records). Reconcile the
+  range `last_checkpoint_seq + 1 ..= max_seq` against the collector copy; the
+  local files cannot prove what was there. Treat `lease_state` `corrupt`,
+  `inflated` or `high` as a possible tampering indicator.
+- Alert on every `audit_output_failure` with `plat.audit.destination`
+  `file` (any `plat.reason`); for `degraded` records use the remote copy to
+  reconcile what the local file lost.
+- `plat-fwguard` trips (forward policy missing or modified, IP forwarding
+  disabled) are **journal-only**, not audit records (NIST-502): ship the
+  systemd journal (`journalctl -u plat-fwguard -u nftables -p err`) to the
+  SIEM and alert on `plat-fwguard:` messages.
 
 Management access review (AC-17, AU-6): group `management_connection` by
 `tls.client.hash.sha256` / `plat.mgmt.allow_entry`; alert on any
@@ -568,7 +656,13 @@ for `nat_port_block_release` (same address and range), `service_stop`,
   retried and not counted), `plat_audit_written_total` (records
   whose checkpoint was flushed; without a file, records handed to the syslog
   senders), `plat_audit_output_errors_total`, `plat_audit_file_lost_total`,
-  `plat_audit_remote_lost_total`.
+  `plat_audit_remote_lost_total`, `plat_audit_seq_lease_failures_total`
+  (failed writes of the sequence lease `.<name>.seq`).
+- Linux only: `plat_tun_rx_dropped_total{interface}` and
+  `plat_tun_tx_dropped_total{interface}`, the kernel's drop counters for the
+  TUN (`/sys/class/net/<if>/statistics/{rx,tx}_dropped`, read at scrape).
+  Congestion drops on a Linux TUN appear here, not in `tx_queue_full`
+  (which counts `EAGAIN` and stayed 0 in Linux testing).
 - TLS: `plat_fips_mode` (1/0); `plat_mgmt_connections_total{outcome}`
   (`accepted`, `rejected`); `plat_mgmt_rejections_total{reason}` (the
   `plat.mgmt.reason` values); `plat_revocation_checks_total{role,status,source}`;

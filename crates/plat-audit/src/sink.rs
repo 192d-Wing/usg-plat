@@ -84,6 +84,9 @@ pub struct AuditStats {
     pub file_lost: AtomicU64,
     /// Records not delivered to a syslog collector (AU-5, AU-9(2)).
     pub remote_lost: AtomicU64,
+    /// Failed writes of the sequence high-water mark `.<name>.seq`
+    /// (SEC-303; each also counts in `output_errors`).
+    pub seq_lease_failures: AtomicU64,
     degraded: CachePadded<AtomicBool>,
     /// The local file cannot be written (part of `degraded`).
     file_down: AtomicBool,

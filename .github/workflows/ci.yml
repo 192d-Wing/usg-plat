@@ -58,8 +58,10 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install AWS-LC FIPS build deps (CMake, Go, clang)
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake golang-go clang
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake golang-go clang shellcheck
       - run: make test
+      - name: Deploy script test (stubbed, real check-config output)
+        run: make test-deploy
 
   security:
     name: supply chain (cargo-audit, cargo-deny)

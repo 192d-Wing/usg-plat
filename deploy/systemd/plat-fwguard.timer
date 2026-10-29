@@ -1,0 +1,16 @@
+# NIST 800-53: SC-7, SC-24 - check the forward policy every 2 seconds.
+# Enable it on its own (systemctl enable --now plat-fwguard.timer) so it
+# guards from boot and while platd is stopped; platd.service also pulls it
+# in (Wants=). Changes made through the nftables service are checked at once
+# by the nftables.service drop-in; this timer bounds the window for direct
+# nft(8) changes (POAM-019 residual).
+[Unit]
+Description=usg-plat forward policy guard timer
+
+[Timer]
+OnActiveSec=2s
+OnUnitActiveSec=2s
+AccuracySec=100ms
+
+[Install]
+WantedBy=timers.target

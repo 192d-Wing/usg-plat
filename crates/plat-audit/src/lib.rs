@@ -34,9 +34,9 @@ pub mod tls;
 pub mod verify;
 
 pub use event::{
-    AuditText, Event, FipsMark, LifecycleKind, LimitKind, MgmtConnection, MgmtPath, MgmtReason, PruneState,
-    RefreshKind, RefreshTransition, RemoteLossReason, RevocationCheck, RevocationRefresh, RevocationSource,
-    RevocationStatus, StorageState, TlsRole,
+    AuditText, Event, FipsMark, LeaseState, LifecycleKind, LimitKind, MgmtConnection, MgmtPath, MgmtReason,
+    OutputFailureReason, PruneState, RecoveryReason, RefreshKind, RefreshTransition, RemoteLossReason, RevocationCheck,
+    RevocationRefresh, RevocationSource, RevocationStatus, StorageState, TlsRole,
 };
 pub use logger::{Logger, LoggerHandle, NodeIdent};
 pub use sink::{AuditSink, AuditStats, RemoteStats, TryEmit};
@@ -64,4 +64,13 @@ pub use sink::{AuditSink, AuditStats, RemoteStats, TryEmit};
 /// `management_connection`, `management_connection_suppressed`,
 /// `tls_revocation_check` and `revocation_source_refresh` (AC-17, IA-3,
 /// IA-5(2)). Certificate text in these is sanitized, capped and escaped.
-pub const LOG_SCHEMA_VERSION: u32 = 5;
+///
+/// 6: new record `audit_recovery` (AU-5, AU-9): first record after a
+/// start-up that found the newest audit file empty, without a header or
+/// ending in a partial line; `plat.reason`
+/// (`empty_file`|`missing_header`|`truncated_tail`),
+/// `plat.audit.last_checkpoint_seq`, `plat.audit.max_seq`
+/// (CEF `reason`, `cn3`/`lastCheckpointSeq`, `cn2`/`maxSeq`).
+/// `audit_output_failure` may carry `plat.reason` (`truncate_failed`: a
+/// failed batch could not be cut back to the last checkpoint; CEF `reason`).
+pub const LOG_SCHEMA_VERSION: u32 = 6;

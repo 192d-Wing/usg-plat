@@ -181,13 +181,16 @@ pub fn json(out: &mut Vec<u8>, seq: u64, node: &NodeIdent, ev: &Event) {
         Event::QueueOverflow { lost, .. } => {
             let _ = write!(out, ",\"event.outcome\":\"failure\",\"plat.audit.lost\":{lost}");
         }
-        Event::OutputFailure { lost, recovered, .. } => {
+        Event::OutputFailure { lost, recovered, reason, .. } => {
             let _ = write!(
                 out,
                 ",\"event.outcome\":\"failure\",\"plat.audit.destination\":\"file\",\"plat.audit.state\":\"{}\",\
                  \"plat.audit.lost\":{lost}",
                 if recovered { "recovered" } else { "degraded" }
             );
+            if let Some(r) = reason {
+                let _ = write!(out, ",\"plat.reason\":\"{}\"", r.as_str());
+            }
         }
         Event::RemoteLoss { ip, port, lost, reason, .. } => {
             let _ = write!(
@@ -219,6 +222,16 @@ pub fn json(out: &mut Vec<u8>, seq: u64, node: &NodeIdent, ev: &Event) {
                  \"plat.audit.pruned_chain_prefix\":\"{chain_prefix:016x}\"",
                 ev.outcome().unwrap_or("unknown"),
                 state.as_str()
+            );
+        }
+        Event::AuditRecovery { reason, last_checkpoint_seq, max_seq, lease_state, .. } => {
+            let _ = write!(
+                out,
+                ",\"event.outcome\":\"failure\",\"plat.audit.destination\":\"file\",\"plat.reason\":\"{}\",\
+                 \"plat.audit.last_checkpoint_seq\":{last_checkpoint_seq},\"plat.audit.max_seq\":{max_seq},\
+                 \"plat.audit.lease_state\":\"{}\"",
+                reason.as_str(),
+                lease_state.as_str()
             );
         }
         Event::ManagementConnection { ref conn, .. } => {
@@ -419,12 +432,15 @@ pub fn cef(out: &mut Vec<u8>, seq: u64, node: &NodeIdent, ev: &Event) {
         Event::QueueOverflow { lost, .. } => {
             let _ = write!(out, " cn3={lost} cn3Label=lost");
         }
-        Event::OutputFailure { lost, recovered, .. } => {
+        Event::OutputFailure { lost, recovered, reason, .. } => {
             let _ = write!(
                 out,
                 " cs3=file cs3Label=destination cs4={} cs4Label=state cn3={lost} cn3Label=lost",
                 if recovered { "recovered" } else { "degraded" }
             );
+            if let Some(r) = reason {
+                let _ = write!(out, " reason={}", r.as_str());
+            }
         }
         Event::RemoteLoss { ip, port, lost, reason, .. } => {
             let _ = write!(
@@ -449,6 +465,15 @@ pub fn cef(out: &mut Vec<u8>, seq: u64, node: &NodeIdent, ev: &Event) {
                 " act={} cs3=file cs3Label=destination cn3={rotated_us} cn3Label=prunedRotatedUs \
                  cs5={seq_first}-{seq_last} cs5Label=prunedSeqRange cs4={chain_prefix:016x} cs4Label=prunedChainPrefix",
                 state.as_str()
+            );
+        }
+        Event::AuditRecovery { reason, last_checkpoint_seq, max_seq, lease_state, .. } => {
+            let _ = write!(
+                out,
+                " cs3=file cs3Label=destination reason={} cn3={last_checkpoint_seq} cn3Label=lastCheckpointSeq \
+                 cn2={max_seq} cn2Label=maxSeq cs4={} cs4Label=leaseState",
+                reason.as_str(),
+                lease_state.as_str()
             );
         }
         Event::Lifecycle { fips, .. } => {
@@ -630,7 +655,7 @@ mod tests {
     #[test]
     fn output_health_records() {
         let mut v = Vec::new();
-        json(&mut v, 9, &node(), &Event::OutputFailure { ts_us: 0, lost: 12, recovered: false });
+        json(&mut v, 9, &node(), &Event::OutputFailure { ts_us: 0, lost: 12, recovered: false, reason: None });
         let s = String::from_utf8(v).unwrap();
         for want in [
             "\"event.action\":\"audit_output_failure\"",
@@ -660,8 +685,21 @@ mod tests {
         assert!(s.contains("|audit_remote_loss|audit_remote_loss|7|"), "{s}");
         assert!(s.contains(" cs5=[2001:db8::5]:6514 cs5Label=collector cn3=3 cn3Label=lost"), "{s}");
         let mut v = Vec::new();
-        cef(&mut v, 11, &node(), &Event::OutputFailure { ts_us: 0, lost: 1, recovered: false });
+        cef(&mut v, 11, &node(), &Event::OutputFailure { ts_us: 0, lost: 1, recovered: false, reason: None });
         assert!(String::from_utf8(v).unwrap().contains("|audit_output_failure|audit_output_failure|9|"));
+        // SEC-7: a failed cut-back carries its own reason.
+        let ev = Event::OutputFailure {
+            ts_us: 0,
+            lost: 0,
+            recovered: false,
+            reason: Some(crate::OutputFailureReason::TruncateFailed),
+        };
+        let mut v = Vec::new();
+        json(&mut v, 12, &node(), &ev);
+        assert!(String::from_utf8(v).unwrap().contains(",\"plat.reason\":\"truncate_failed\""));
+        let mut v = Vec::new();
+        cef(&mut v, 12, &node(), &ev);
+        assert!(String::from_utf8(v).unwrap().contains(" reason=truncate_failed"));
     }
 
     /// AU-5(1) storage threshold and AU-9/AU-11 retention records (schema 3).

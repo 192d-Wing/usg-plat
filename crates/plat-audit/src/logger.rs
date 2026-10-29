@@ -55,7 +55,9 @@ use plat_common::config::{AuditConfig, AuditFileConfig, LogFormat, SyslogConfig,
 use sha2::{Digest, Sha256};
 
 use crate::LOG_SCHEMA_VERSION;
-use crate::event::{Event, PruneState, RemoteLossReason, StorageState};
+use crate::event::{
+    Event, LeaseState, OutputFailureReason, PruneState, RecoveryReason, RemoteLossReason, StorageState,
+};
 use crate::format;
 use crate::sink::{AuditStats, RemoteStats};
 
@@ -89,6 +91,12 @@ const CLASSIFY_TAIL_BYTES: u64 = 64 << 10;
 const DISPOSABLE_MAX_BYTES: u64 = 4096;
 /// How often free space on the log volume is checked (AU-5(1)).
 const SPACE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+/// Upper bound of a checkpoint line without the node name (~420 B with
+/// 20-digit sequence numbers).
+const CHECKPOINT_RESERVE: u64 = 512;
+/// Sequence numbers reserved per write of the high-water file
+/// (`.<name>.seq`): at most one small synced write per this many records.
+const SEQ_LEASE: u64 = 1 << 20;
 
 /// Chain value a file starts from: `SHA-256(GENESIS || header line)`. The
 /// header line carries the previous file's final chain and sequence
@@ -164,7 +172,13 @@ fn inspect(path: &Path, tail: u64) -> Option<FileInfo> {
     f.seek(SeekFrom::Start(start)).ok()?;
     let mut buf = Vec::new();
     f.take(tail).read_to_end(&mut buf).ok()?;
-    let text = String::from_utf8_lossy(&buf);
+    // A final line without its newline was cut off (short write, power
+    // cut): it is never a usable checkpoint.
+    let complete = match buf.iter().rposition(|b| *b == b'\n') {
+        Some(i) => buf.get(..=i).unwrap_or_default(),
+        None => &[],
+    };
+    let text = String::from_utf8_lossy(complete);
     let mut lines = text.lines();
     if start > 0 {
         lines.next(); // partial line
@@ -198,6 +212,10 @@ fn inspect(path: &Path, tail: u64) -> Option<FileInfo> {
                 r.max_seq = r.max_seq.max(n.saturating_sub(1));
             }
         }
+    }
+    // The header bounds the numbers in use even when the tail shows none.
+    if let Some(n) = info.header_next {
+        r.max_seq = r.max_seq.max(n.saturating_sub(1));
     }
     Some(info)
 }
@@ -256,6 +274,76 @@ fn temp_path(path: &Path) -> PathBuf {
     n.push(path.file_name().unwrap_or_default());
     n.push(".new");
     dir_of(path).join(n)
+}
+
+/// Durable sequence high-water mark `.<name>.seq` next to the live file
+/// (not matched by the rotated-file pattern).
+fn lease_path(path: &Path) -> PathBuf {
+    let mut n = OsString::from(".");
+    n.push(path.file_name().unwrap_or_default());
+    n.push(".seq");
+    dir_of(path).join(n)
+}
+
+/// The reserved sequence high-water mark and the state it was found in;
+/// 0 unless [`LeaseState::Ok`]. Absent: an installation from before it
+/// existed. Corrupt: a torn write, or not a regular file; the files decide.
+///
+/// COMPLIANCE MAPPING:
+/// - NIST 800-53: AU-9, SC-5 - opened without following a symlink and
+///   without blocking (a FIFO planted in the log directory cannot hang
+///   start-up), and used only if `fstat` on the open descriptor shows a
+///   regular file (SEC-304).
+fn read_lease(path: &Path) -> (u64, LeaseState) {
+    let f = match open_lease(&lease_path(path)) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (0, LeaseState::Absent),
+        Err(_) => return (0, LeaseState::Corrupt),
+    };
+    let mut b = Vec::new();
+    if f.take(64).read_to_end(&mut b).is_err() {
+        return (0, LeaseState::Corrupt);
+    }
+    match std::str::from_utf8(&b).ok().and_then(|t| t.strip_suffix('\n')).and_then(|t| t.parse().ok()) {
+        Some(v) => (v, LeaseState::Ok),
+        None => (0, LeaseState::Corrupt),
+    }
+}
+
+#[cfg(unix)]
+fn open_lease(p: &Path) -> std::io::Result<File> {
+    use rustix::fs::{FileType, Mode, OFlags};
+    let fd =
+        rustix::fs::open(p, OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC, Mode::empty())?;
+    if FileType::from_raw_mode(rustix::fs::fstat(&fd)?.st_mode) != FileType::RegularFile {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "not a regular file"));
+    }
+    Ok(File::from(fd))
+}
+
+#[cfg(not(unix))]
+fn open_lease(p: &Path) -> std::io::Result<File> {
+    let f = File::open(p)?;
+    if !f.metadata()?.is_file() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "not a regular file"));
+    }
+    Ok(f)
+}
+
+/// Durably records that sequence numbers up to `reserved` may be in use:
+/// written to a temporary file, synced, renamed over the old one.
+fn write_lease(path: &Path, reserved: u64) -> std::io::Result<()> {
+    let to = lease_path(path);
+    let mut tmp = to.clone().into_os_string();
+    tmp.push(".new");
+    let tmp = PathBuf::from(tmp);
+    {
+        let mut f = create_new(&tmp)?;
+        f.write_all(format!("{reserved}\n").as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, &to)?;
+    sync_dir(&to)
 }
 
 /// Rotated files `<path>.<µs>`, oldest first.
@@ -321,6 +409,24 @@ fn sync_dir(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Makes the file's data (and size) durable at a checkpoint: `fdatasync` on
+/// Linux; plain `fsync` on other Unix (on macOS `sync_data` would be a
+/// device-wide `F_FULLFSYNC` per batch).
+fn sync_data(f: &File) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        rustix::fs::fdatasync(f).map_err(std::io::Error::from)
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        rustix::fs::fsync(f).map_err(std::io::Error::from)
+    }
+    #[cfg(not(unix))]
+    {
+        f.sync_data()
+    }
+}
+
 /// Bytes available to an unprivileged writer on the volume holding `dir`.
 fn available_bytes(dir: &Path) -> std::io::Result<u64> {
     #[cfg(test)]
@@ -359,6 +465,19 @@ pub(crate) mod fault {
         v
     }
 
+    static NO_TRUNCATE: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    /// Makes every cut-back (`set_len`) of a file under `dir` fail.
+    pub(crate) fn fail_truncate(dir: &Path) {
+        if let Ok(mut g) = NO_TRUNCATE.lock() {
+            g.push(dir.to_path_buf());
+        }
+    }
+
+    pub(crate) fn truncate_fails(path: &Path) -> bool {
+        NO_TRUNCATE.lock().is_ok_and(|g| g.iter().any(|d| path.starts_with(d)))
+    }
+
     pub(crate) fn volume_of(path: &Path) -> Option<Arc<AtomicI64>> {
         let g = VOLUMES.lock().ok()?;
         g.iter().find(|(d, _)| path.starts_with(d)).map(|(_, v)| v.clone())
@@ -373,6 +492,8 @@ struct AuditFile {
     vol: Option<Arc<std::sync::atomic::AtomicI64>>,
     #[cfg(test)]
     written: u64,
+    #[cfg(test)]
+    no_truncate: bool,
 }
 
 impl AuditFile {
@@ -383,7 +504,27 @@ impl AuditFile {
             vol: fault::volume_of(_path),
             #[cfg(test)]
             written: 0,
+            #[cfg(test)]
+            no_truncate: fault::truncate_fails(_path),
         }
+    }
+
+    /// Cuts the file back to `len` bytes (the end of its last checkpoint)
+    /// and syncs it; a simulated volume gets the cut bytes back.
+    fn truncate(&mut self, len: u64) -> std::io::Result<()> {
+        #[cfg(test)]
+        if self.no_truncate {
+            return Err(std::io::Error::other("simulated set_len failure"));
+        }
+        self.f.set_len(len)?;
+        self.f.seek(SeekFrom::Start(len))?;
+        self.f.sync_all()?;
+        #[cfg(test)]
+        if let Some(v) = &self.vol {
+            v.fetch_add(i64::try_from(self.written.saturating_sub(len)).unwrap_or(0), Ordering::SeqCst);
+            self.written = self.written.min(len);
+        }
+        Ok(())
     }
 
     /// The file is being deleted: a simulated volume gets its bytes back.
@@ -435,6 +576,15 @@ impl Write for AuditFile {
 struct FileOut {
     w: BufWriter<AuditFile>,
     bytes: u64,
+    /// File length at the end of the last flushed and synced checkpoint
+    /// (the header for a new file): the point a failed batch is cut back to.
+    durable: u64,
+    /// At least one record is in this file.
+    has_records: bool,
+    /// Length of the last record line written (eager rotation estimate).
+    last_line: u64,
+    /// Room kept for the checkpoint line when deciding whether a record fits.
+    reserve: u64,
     max_bytes: u64,
     batch: Sha256,
     batch_first: Option<u64>,
@@ -494,6 +644,10 @@ impl FileOut {
         let mut out = Self {
             w: BufWriter::with_capacity(1 << 20, AuditFile::new(f, &tmp)),
             bytes: scratch.len() as u64,
+            durable: scratch.len() as u64,
+            has_records: false,
+            last_line: 0,
+            reserve: CHECKPOINT_RESERVE + node.name.len() as u64,
             max_bytes: cfg.max_bytes,
             batch: Sha256::new(),
             batch_first: None,
@@ -509,8 +663,8 @@ impl FileOut {
         }
     }
 
-    /// Makes the prepared file the live file: flush (and `sync_all` when
-    /// `durable`, i.e. it already holds a checkpoint that must survive), move
+    /// Makes the prepared file the live file: flush and `sync_all` (so the
+    /// header, and any checkpoint, is on disk before the name is), move
     /// a live file that holds records aside (`<path>.<µs>`), rename this file
     /// into place (atomically replacing a live file without records), sync
     /// the directory. A header-only file lost in a crash is harmless: start-up
@@ -519,12 +673,12 @@ impl FileOut {
     /// COMPLIANCE MAPPING:
     /// - NIST 800-53: AU-9 - the old file is only renamed, never deleted;
     ///   a crash leaves either the old live file or its rotated copy (start-up
-    ///   then resumes from the newest file, see `resume_for`).
-    fn install(&mut self, path: &Path, durable: bool) -> std::io::Result<()> {
+    ///   then resumes from the newest file, see `resume_for`). The file is
+    ///   synced before the rename and the directory after it, so a power cut
+    ///   cannot leave an empty live file (L12).
+    fn install(&mut self, path: &Path) -> std::io::Result<()> {
         self.w.flush()?;
-        if durable {
-            self.sync()?;
-        }
+        self.sync()?;
         let Some(tmp) = self.tmp.clone() else { return Ok(()) };
         if path.exists() && !disposable(path) {
             rotate_aside(path, path)?;
@@ -538,11 +692,18 @@ impl FileOut {
         self.batch_first.get_or_insert(seq);
         self.batch.update(line);
         self.bytes += line.len() as u64;
+        self.has_records = true;
+        self.last_line = line.len() as u64;
         self.w.write_all(line)
     }
 
-    /// Writes the checkpoint for the current batch and flushes. The chain
-    /// advances only once the checkpoint is flushed.
+    /// Writes the checkpoint for the current batch, flushes and syncs the
+    /// file data. The chain (and the cut-back point) advances only once the
+    /// checkpoint is durable.
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: AU-9, AU-5 - a checkpoint is write + fsync; records
+    ///   counted as written survive a power cut (L12).
     // POAM: POAM-003 - checkpoints are an unkeyed SHA-256 chain (integrity
     // against non-privileged edits only); keyed/signed checkpoints pending.
     fn checkpoint(&mut self, last_seq: u64, node: &NodeIdent, scratch: &mut Vec<u8>) -> std::io::Result<()> {
@@ -567,8 +728,41 @@ impl FileOut {
         self.bytes += scratch.len() as u64;
         self.w.write_all(scratch)?;
         self.w.flush()?;
+        sync_data(&self.w.get_ref().f)?;
         self.chain = chain;
+        self.durable = self.bytes;
         Ok(())
+    }
+
+    /// Writes the leading records of `batch` that fit under `max_bytes`
+    /// (with room for the checkpoint) and checkpoints them; returns how many
+    /// were written. A file without records always takes the first record,
+    /// so a file exceeds `max_bytes` only by a single oversized record.
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: AU-4 - rotation size is a bound, not a trigger checked
+    ///   after the batch (L12: 1 MiB files grew to ~1.6 MB).
+    fn write_fitting(
+        &mut self,
+        batch: &[(u64, Event)],
+        node: &NodeIdent,
+        line: &mut Vec<u8>,
+    ) -> std::io::Result<usize> {
+        let mut n = 0usize;
+        for (seq, ev) in batch {
+            line.clear();
+            format::json(line, *seq, node, ev);
+            line.push(b'\n');
+            if self.has_records && self.bytes + line.len() as u64 + self.reserve > self.max_bytes {
+                break;
+            }
+            self.record(*seq, line)?;
+            n += 1;
+        }
+        if let Some(&(last, _)) = n.checked_sub(1).and_then(|i| batch.get(i)) {
+            self.checkpoint(last, node, line)?;
+        }
+        Ok(n)
     }
 
     /// Writes every record of `batch` and its checkpoint.
@@ -585,6 +779,25 @@ impl FileOut {
 
     fn sync(&self) -> std::io::Result<()> {
         self.w.get_ref().f.sync_all()
+    }
+
+    /// A write failed: drops the buffered bytes and cuts the file back to
+    /// the end of its last durable checkpoint, so no record of the failed
+    /// batch (e.g. a binding that was then refused) and no partial
+    /// checkpoint stays on disk outside the chain. A file still under its
+    /// temporary name is deleted instead.
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: AU-9, AU-10 - the failed file ends at a checkpoint and
+    ///   verifies; the cut records are counted lost (`audit_output_failure`).
+    fn abandon(self) -> std::io::Result<()> {
+        if self.tmp.is_some() {
+            self.discard();
+            return Ok(());
+        }
+        let durable = self.durable;
+        let (mut f, _) = self.w.into_parts();
+        f.truncate(durable)
     }
 
     /// Drops the writer without flushing buffered bytes (the file failed or
@@ -630,6 +843,26 @@ fn resume_for(path: &Path) -> Resume {
     r
 }
 
+/// How the live file left by the previous run is damaged, if it is: empty,
+/// without a complete header line, or ending in a partial line (a power
+/// cut or short write). Read before the file is replaced or rotated.
+fn startup_damage(path: &Path) -> Option<RecoveryReason> {
+    let mut f = File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    if len == 0 {
+        return Some(RecoveryReason::EmptyFile);
+    }
+    let mut head = Vec::new();
+    Read::by_ref(&mut f).take(4096).read_to_end(&mut head).ok()?;
+    if !head.contains(&b'\n') || header_next_seq(&mut f).is_none() {
+        return Some(RecoveryReason::MissingHeader);
+    }
+    let mut last = [0u8; 1];
+    f.seek(SeekFrom::End(-1)).ok()?;
+    f.read_exact(&mut last).ok()?;
+    (last[0] != b'\n').then_some(RecoveryReason::TruncatedTail)
+}
+
 /// A temporary file left by a crash: removed if it holds no record,
 /// otherwise kept as a rotated file so its records stay in the chain.
 fn rescue_temp(path: &Path) {
@@ -646,6 +879,9 @@ fn rescue_temp(path: &Path) {
 
 /// A rotated file scheduled for deletion by retention.
 struct PruneDue {
+    /// Its `scheduled` record is in the batch being written (set when the
+    /// batch starts); only armed entries are deleted after a checkpoint.
+    armed: bool,
     path: PathBuf,
     rotated_us: u64,
     seq_first: u64,
@@ -683,6 +919,17 @@ struct FileDest {
     prune_due: Vec<PruneDue>,
     /// Retention classification cache, by rotation time.
     classified: BTreeMap<u64, Classified>,
+    /// Highest sequence number durably reserved in `.<name>.seq`.
+    lease: u64,
+    /// Highest sequence number handed out; the lease must cover it.
+    lease_want: u64,
+    /// The last lease write failed (one record per failure streak).
+    lease_failing: bool,
+    /// Next lease write attempt while failing (every flush interval).
+    lease_retry: Instant,
+    lease_retry_every: Duration,
+    /// The sequence space is used up: nothing more is written (SEC-302).
+    exhausted: bool,
 }
 
 impl FileDest {
@@ -698,11 +945,62 @@ impl FileDest {
             next_space_check: now,
             prune_due: Vec::new(),
             classified: BTreeMap::new(),
+            lease: 0,
+            lease_want: 0,
+            lease_failing: false,
+            lease_retry: now,
+            lease_retry_every: REOPEN_INTERVAL,
+            exhausted: false,
+        }
+    }
+
+    /// Reserves sequence numbers up to at least `seq` before any record
+    /// numbered above the current reservation reaches a destination, so a
+    /// start-up after the newest file was emptied or cut off never reuses
+    /// a number (AU-9, AU-10). Also called on every flush tick with `seq`
+    /// 0 so a failed write is retried each flush interval, not only at the
+    /// next lease boundary; no synced write per batch while it fails.
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: AU-5 - a failed lease write is counted
+    ///   (`seq_lease_failures`, `output_errors`) and announced once per
+    ///   failure streak as `audit_output_failure` (`seq_lease_failed`).
+    fn reserve(&mut self, seq: u64, stats: &AuditStats) -> Option<Event> {
+        self.lease_want = self.lease_want.max(seq);
+        let now = Instant::now();
+        if self.lease_want <= self.lease || (self.lease_failing && now < self.lease_retry) {
+            return None;
+        }
+        let to = self.lease_want.saturating_add(SEQ_LEASE);
+        match write_lease(&self.cfg.path, to) {
+            Ok(()) => {
+                self.lease = to;
+                if std::mem::take(&mut self.lease_failing) {
+                    tracing::warn!("audit file {}: sequence high-water mark written again", self.cfg.path.display());
+                }
+                None
+            }
+            Err(e) => {
+                stats.seq_lease_failures.fetch_add(1, Ordering::Relaxed);
+                stats.output_errors.fetch_add(1, Ordering::Relaxed);
+                self.lease_retry = now + self.lease_retry_every;
+                if std::mem::replace(&mut self.lease_failing, true) {
+                    tracing::debug!("audit file {}: sequence high-water mark: {e}", self.cfg.path.display());
+                    return None;
+                }
+                tracing::error!("audit file {}: sequence high-water mark: {e}", self.cfg.path.display());
+                Some(Event::OutputFailure {
+                    ts_us: Clock::wall_us(),
+                    lost: 0,
+                    recovered: false,
+                    reason: Some(OutputFailureReason::SeqLeaseFailed),
+                })
+            }
         }
     }
 
     fn publish(&self, stats: &AuditStats) {
-        stats.set_file_state(self.out.is_none(), self.low);
+        stats.set_file_state(self.out.is_none() || self.exhausted, self.low);
     }
 
     /// The file failed: abandon it (buffered bytes are not written), retry
@@ -792,6 +1090,10 @@ impl FileDest {
         self.classified.retain(|ts, _| present.contains(ts));
         let mut real = Vec::new();
         for (ts, p) in files {
+            // Already scheduled by an earlier rotation in the same batch.
+            if self.prune_due.iter().any(|d| d.rotated_us == ts) {
+                continue;
+            }
             if let Some(c) = *self.classified.entry(ts).or_insert_with(|| classify(&p)) {
                 real.push((ts, p, c));
             }
@@ -803,7 +1105,14 @@ impl FileDest {
         for (ts, path, (seq_first, seq_last, chain)) in real.into_iter().take(excess) {
             let mut head = [0u8; 8];
             head.copy_from_slice(&chain[..8]);
-            let due = PruneDue { path, rotated_us: ts, seq_first, seq_last, chain_prefix: u64::from_be_bytes(head) };
+            let due = PruneDue {
+                armed: false,
+                path,
+                rotated_us: ts,
+                seq_first,
+                seq_last,
+                chain_prefix: u64::from_be_bytes(head),
+            };
             carry.push(due.record(PruneState::Scheduled));
             self.classified.remove(&ts);
             self.prune_due.push(due);
@@ -819,16 +1128,18 @@ impl FileDest {
     ///   actually removed (NIST-202); a failed prune is retried, with a new
     ///   `scheduled` record, at the next rotation.
     fn run_prune(&mut self, f: &FileOut, stats: &AuditStats, carry: &mut Vec<Event>) {
-        if self.prune_due.is_empty() {
+        if !self.prune_due.iter().any(|d| d.armed) {
             return;
         }
+        let (due, later): (Vec<PruneDue>, Vec<PruneDue>) = self.prune_due.drain(..).partition(|d| d.armed);
+        self.prune_due = later;
         if let Err(e) = f.sync() {
             stats.output_errors.fetch_add(1, Ordering::Relaxed);
             tracing::warn!("audit retention postponed: {e}");
-            carry.extend(self.prune_due.drain(..).map(|d| d.record(PruneState::Failed)));
+            carry.extend(due.into_iter().map(|d| d.record(PruneState::Failed)));
             return;
         }
-        for d in self.prune_due.drain(..) {
+        for d in due {
             let state = match std::fs::remove_file(&d.path) {
                 Ok(()) => {
                     tracing::info!("audit retention: removed {}", d.path.display());
@@ -1253,14 +1564,46 @@ impl LoggerHandle {
     }
 }
 
-/// Numbers events with consecutive sequence numbers after `seq`.
-fn number(events: impl Iterator<Item = Event>, seq: &mut u64) -> Vec<(u64, Event)> {
-    events
-        .map(|ev| {
-            *seq += 1;
-            (*seq, ev)
-        })
-        .collect()
+/// Numbers `events` (drained) with consecutive sequence numbers after
+/// `seq`; returns the numbered batch and how many events were dropped.
+/// Every batch leaves one number free: when the 64-bit space cannot hold
+/// the events plus that one, they are dropped and the last number goes to
+/// an `audit_output_failure` (`seq_exhausted`); afterwards everything is
+/// dropped (`exhausted`). Never wraps (release builds do not check overflow).
+///
+/// COMPLIANCE MAPPING:
+/// - NIST 800-53: AU-5, AU-10 - sequence exhaustion fails closed and is
+///   announced; no number is ever reused (SEC-302).
+fn number(events: &mut Vec<Event>, seq: &mut u64, exhausted: &mut bool) -> (Vec<(u64, Event)>, u64) {
+    let n = events.len() as u64;
+    if !*exhausted && seq.checked_add(n.saturating_add(1)).is_some() {
+        let first = *seq;
+        let batch = (first + 1..).zip(events.drain(..)).collect();
+        *seq = first + n;
+        return (batch, 0);
+    }
+    events.clear();
+    if std::mem::replace(exhausted, true) {
+        return (Vec::new(), n);
+    }
+    match seq.checked_add(1) {
+        Some(s) => {
+            *seq = s;
+            let ev = Event::OutputFailure {
+                ts_us: Clock::wall_us(),
+                lost: n,
+                recovered: false,
+                reason: Some(OutputFailureReason::SeqExhausted),
+            };
+            (vec![(s, ev)], n)
+        }
+        None => (Vec::new(), n),
+    }
+}
+
+/// Start-up found no sequence number left to continue with.
+fn exhausted_error() -> std::io::Error {
+    std::io::Error::other("audit sequence space exhausted (SEC-302); archive the audit files and reset the chain")
 }
 
 impl Logger {
@@ -1297,17 +1640,90 @@ impl Logger {
     pub fn spawn(self) -> std::io::Result<LoggerHandle> {
         let mut scratch = Vec::with_capacity(512);
         let mut seq = 0u64;
+        let mut carry = Vec::new();
         let file = match &self.cfg.file {
             Some(f) => {
+                let damage = startup_damage(&f.path);
                 rescue_temp(&f.path);
                 let resume = resume_for(&f.path);
+                let (mut lease, mut lease_state) = read_lease(&f.path);
+                // COMPLIANCE MAPPING:
+                // - NIST 800-53: AU-9, AU-10, SC-5 - the lease is used whenever
+                //   it is below the wrap guard, so no sequence number is ever
+                //   reused even when the files holding the top numbers are
+                //   gone (`high` when it is more than one lease above the
+                //   files). Only a value near u64::MAX, which would burn the
+                //   sequence space, is ignored as `inflated` (SEC-302).
+                if lease_state == LeaseState::Ok {
+                    if lease > u64::MAX - 2 * SEQ_LEASE {
+                        lease_state = LeaseState::Inflated;
+                    } else if lease > resume.max_seq.saturating_add(SEQ_LEASE) {
+                        lease_state = LeaseState::High;
+                    }
+                }
+                if !matches!(lease_state, LeaseState::Ok | LeaseState::High) {
+                    lease = 0;
+                }
+                if lease_state == LeaseState::High {
+                    tracing::warn!(
+                        "audit file {}: sequence high-water mark {} is more than one lease above the files; used",
+                        f.path.display(),
+                        lease_path(&f.path).display()
+                    );
+                }
+                if matches!(lease_state, LeaseState::Inflated | LeaseState::Corrupt) {
+                    tracing::warn!(
+                        "audit file {}: sequence high-water mark {} is {}; ignored",
+                        f.path.display(),
+                        lease_path(&f.path).display(),
+                        lease_state.as_str()
+                    );
+                }
+                // Fail closed: an inflated lease next to files that are
+                // themselves above the wrap guard leaves nothing safe to
+                // number from (SEC-302).
+                if lease_state == LeaseState::Inflated && resume.max_seq > u64::MAX - 2 * SEQ_LEASE {
+                    return Err(exhausted_error());
+                }
                 seq = resume.max_seq;
-                let mut out = FileOut::prepare(f, &resume, seq + 1, &self.node, &mut scratch)?;
-                if let Err(e) = out.install(&f.path, false) {
+                // COMPLIANCE MAPPING:
+                // - NIST 800-53: AU-9, AU-10 - after damage the files no
+                //   longer show every number used (an emptied file held
+                //   records); resume above the durable high-water mark so
+                //   no sequence number is reused. The skipped range is
+                //   announced by `audit_recovery` (`max_seq`).
+                if damage.is_some() {
+                    seq = seq.max(lease);
+                }
+                // COMPLIANCE MAPPING:
+                // - NIST 800-53: AU-5, AU-9 - a damaged newest file (power
+                //   cut) is announced by an `audit_recovery` record so the
+                //   SIEM sees a possible gap after the last durable checkpoint.
+                if let Some(reason) = damage {
+                    tracing::warn!(
+                        "audit file {}: {}; records after sequence {} may be lost",
+                        f.path.display(),
+                        reason.as_str(),
+                        resume.seq
+                    );
+                    carry.push(Event::AuditRecovery {
+                        ts_us: Clock::wall_us(),
+                        reason,
+                        last_checkpoint_seq: resume.seq,
+                        max_seq: seq,
+                        lease_state,
+                    });
+                }
+                // Fail closed: no sequence number left to continue with.
+                let next = seq.checked_add(2).map(|_| seq + 1).ok_or_else(exhausted_error)?;
+                let mut out = FileOut::prepare(f, &resume, next, &self.node, &mut scratch)?;
+                if let Err(e) = out.install(&f.path) {
                     out.discard();
                     return Err(e);
                 }
-                let fd = FileDest::new(f.clone(), out, resume);
+                let mut fd = FileDest::new(f.clone(), out, resume);
+                fd.lease = lease;
+                fd.lease_retry_every = Duration::from_millis(self.cfg.flush_interval_ms).max(Duration::from_millis(1));
                 fd.publish(&self.stats);
                 Some(fd)
             }
@@ -1328,17 +1744,24 @@ impl Logger {
             .collect::<Result<Vec<_>, _>>()?;
         let h = std::thread::Builder::new()
             .name("plat-audit".into())
-            .spawn(move || self.run(file, remotes, seq, scratch))?;
+            .spawn(move || self.run(file, remotes, seq, scratch, carry))?;
         Ok(LoggerHandle(h))
     }
 
-    fn run(self, mut file: Option<FileDest>, mut remotes: Vec<Remote>, mut seq: u64, mut line: Vec<u8>) {
+    fn run(
+        self,
+        mut file: Option<FileDest>,
+        mut remotes: Vec<Remote>,
+        mut seq: u64,
+        mut line: Vec<u8>,
+        mut carry: Vec<Event>,
+    ) {
         let flush_every = Duration::from_millis(self.cfg.flush_interval_ms);
         let summary_every = Duration::from_secs(self.cfg.summary_interval_secs);
         let mut last_summary = Instant::now();
         let mut lost_reported = 0u64;
         let mut pending: Vec<Event> = Vec::with_capacity(self.cfg.batch_max);
-        let mut carry: Vec<Event> = Vec::new();
+        let mut exhausted = false;
 
         loop {
             let first = self.rx.recv_timeout(flush_every);
@@ -1367,19 +1790,30 @@ impl Logger {
             let mut recover = false;
             if let Some(fd) = file.as_mut() {
                 pending.extend(fd.check_space(&self.stats));
+                // SEC-303: a failed lease write is retried every tick.
+                pending.extend(fd.reserve(0, &self.stats));
                 // A due retry of a failed file leads with the `recovered`
                 // record; it is rewritten to `degraded` if the retry fails.
-                if fd.out.is_none() && !disconnected && Instant::now() >= fd.next_retry {
+                if fd.out.is_none() && !fd.exhausted && !disconnected && Instant::now() >= fd.next_retry {
                     recover = true;
-                    pending.insert(0, Event::OutputFailure { ts_us: Clock::wall_us(), lost: fd.lost, recovered: true });
+                    pending.insert(
+                        0,
+                        Event::OutputFailure { ts_us: Clock::wall_us(), lost: fd.lost, recovered: true, reason: None },
+                    );
                 }
             }
             if !pending.is_empty() {
-                let mut batch = number(pending.drain(..), &mut seq);
-                self.write_file(file.as_mut(), &mut batch, recover, &mut line, &mut carry);
-                let batch: Batch = Arc::new(batch);
-                for r in &remotes {
-                    r.offer(&batch);
+                let (mut batch, dropped) = number(&mut pending, &mut seq, &mut exhausted);
+                if !batch.is_empty() {
+                    self.write_file(file.as_mut(), &mut batch, recover, &mut line, &mut carry);
+                    let batch: Batch = Arc::new(batch);
+                    for r in &remotes {
+                        r.offer(&batch);
+                    }
+                }
+                self.count_dropped(dropped);
+                if exhausted {
+                    self.stop_exhausted(file.as_mut());
                 }
             }
 
@@ -1395,8 +1829,11 @@ impl Logger {
                     if tail.is_empty() {
                         break;
                     }
-                    let mut batch = number(tail.drain(..), &mut seq);
-                    self.write_file(file.as_mut(), &mut batch, false, &mut line, &mut carry);
+                    let (mut batch, dropped) = number(&mut tail, &mut seq, &mut exhausted);
+                    if !batch.is_empty() {
+                        self.write_file(file.as_mut(), &mut batch, false, &mut line, &mut carry);
+                    }
+                    self.count_dropped(dropped);
                 }
                 if let Some(f) = file.as_ref().and_then(|fd| fd.out.as_ref())
                     && f.sync().is_err()
@@ -1426,7 +1863,7 @@ impl Logger {
             return false;
         }
         let res = FileOut::prepare(&fd.cfg, &fd.resume, first, &self.node, line).and_then(|mut nf| {
-            match nf.write_batch(batch, &self.node, line).and_then(|()| nf.install(&fd.cfg.path, true)) {
+            match nf.write_batch(batch, &self.node, line).and_then(|()| nf.install(&fd.cfg.path)) {
                 Ok(()) => Ok(nf),
                 Err(e) => {
                     nf.discard();
@@ -1467,6 +1904,9 @@ impl Logger {
             self.stats.written.fetch_add(n, Ordering::Relaxed);
             return;
         };
+        if let Some(&(last, _)) = batch.last() {
+            carry.extend(fd.reserve(last, &self.stats));
+        }
         let Some(mut f) = fd.out.take() else {
             if !(recover && self.recover(fd, batch, line)) {
                 // Still down: the other destinations must not be told otherwise.
@@ -1478,49 +1918,122 @@ impl Logger {
             }
             return;
         };
-        match f.write_batch(batch, &self.node, line) {
-            Ok(()) => {
-                let last = batch.last().map_or(0, |(s, _)| *s);
-                self.stats.written.fetch_add(n, Ordering::Relaxed);
+        // The `scheduled` prune records carried from the last rotation are
+        // in this batch.
+        for d in &mut fd.prune_due {
+            d.armed = true;
+        }
+        let mut rest: &[(u64, Event)] = batch;
+        loop {
+            let k = match f.write_fitting(rest, &self.node, line) {
+                Ok(k) => k,
+                Err(e) => {
+                    // L12: cut the file back to its last checkpoint; the
+                    // records of this chunk are lost, never half on disk.
+                    // COMPLIANCE MAPPING:
+                    // - NIST 800-53: AU-5, AU-9 - a failed cut-back leaves
+                    //   records outside the chain; it is announced with its
+                    //   own reason, not only counted (SEC-7).
+                    if let Err(te) = f.abandon() {
+                        self.stats.output_errors.fetch_add(1, Ordering::Relaxed);
+                        tracing::error!("audit file {}: cutting back a failed batch: {te}", fd.cfg.path.display());
+                        carry.push(Event::OutputFailure {
+                            ts_us: Clock::wall_us(),
+                            lost: 0,
+                            recovered: false,
+                            reason: Some(OutputFailureReason::TruncateFailed),
+                        });
+                    }
+                    self.file_failed(fd, &e, rest.len() as u64, carry);
+                    return;
+                }
+            };
+            let (done, left) = rest.split_at(k.min(rest.len()));
+            rest = left;
+            if let Some(&(last, _)) = done.last() {
+                self.stats.written.fetch_add(done.len() as u64, Ordering::Relaxed);
                 fd.resume = Resume { chain: f.chain, seq: last, max_seq: last };
                 // Retention records from the previous rotation are in this
                 // batch: delete their files now that it is checkpointed.
                 fd.run_prune(&f, &self.stats, carry);
-                if f.bytes < f.max_bytes {
-                    fd.out = Some(f);
+            }
+            // Rotate once a record like the last one would no longer fit,
+            // so an idle file is not left one record short of full.
+            if rest.is_empty() && f.bytes + f.reserve + f.last_line <= f.max_bytes {
+                fd.out = Some(f);
+                return;
+            }
+            // Full (the next record does not fit, or one like the last
+            // would not): rotate, then write the rest into the new file.
+            let rotated = f.sync().and_then(|()| {
+                let next = fd.resume.max_seq.checked_add(1).ok_or_else(exhausted_error)?;
+                let mut nf = FileOut::prepare(&fd.cfg, &fd.resume, next, &self.node, line)?;
+                match nf.install(&fd.cfg.path) {
+                    Ok(()) => Ok(nf),
+                    Err(e) => {
+                        nf.discard();
+                        Err(e)
+                    }
+                }
+            });
+            f.discard();
+            match rotated {
+                Ok(nf) => {
+                    f = nf;
+                    fd.schedule_prune(carry);
+                }
+                Err(e) => {
+                    self.file_failed(fd, &e, rest.len() as u64, carry);
                     return;
                 }
-                let rotated = f.sync().and_then(|()| {
-                    let mut nf = FileOut::prepare(&fd.cfg, &fd.resume, last + 1, &self.node, line)?;
-                    match nf.install(&fd.cfg.path, false) {
-                        Ok(()) => Ok(nf),
-                        Err(e) => {
-                            nf.discard();
-                            Err(e)
-                        }
-                    }
-                });
-                f.discard();
-                match rotated {
-                    Ok(nf) => {
-                        fd.out = Some(nf);
-                        fd.schedule_prune(carry);
-                    }
-                    Err(e) => {
-                        fd.fail(&self.stats, &e, carry);
-                        carry.push(Event::OutputFailure { ts_us: Clock::wall_us(), lost: 0, recovered: false });
-                    }
-                }
             }
-            Err(e) => {
-                f.discard();
-                fd.fail(&self.stats, &e, carry);
-                fd.lost += n;
-                self.stats.file_lost.fetch_add(n, Ordering::Relaxed);
-                // Tell the remaining destinations now (AU-5).
-                carry.push(Event::OutputFailure { ts_us: Clock::wall_us(), lost: n, recovered: false });
+            if rest.is_empty() {
+                fd.out = Some(f);
+                return;
             }
         }
+    }
+
+    /// Events dropped because the sequence space is used up: counted as
+    /// not written to the file (AU-5).
+    fn count_dropped(&self, dropped: u64) {
+        if dropped > 0 {
+            self.stats.file_lost.fetch_add(dropped, Ordering::Relaxed);
+            self.stats.output_errors.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// SEC-302: the sequence space is used up. The file (holding the
+    /// `seq_exhausted` record, checkpointed) is synced and closed for good;
+    /// the logger stays degraded so new bindings are refused (fail closed).
+    fn stop_exhausted(&self, file: Option<&mut FileDest>) {
+        let Some(fd) = file else {
+            self.stats.set_file_state(true, false);
+            return;
+        };
+        if std::mem::replace(&mut fd.exhausted, true) {
+            return;
+        }
+        if let Some(f) = fd.out.take() {
+            if f.sync().is_err() {
+                self.stats.output_errors.fetch_add(1, Ordering::Relaxed);
+            }
+            f.discard();
+        }
+        fd.publish(&self.stats);
+        tracing::error!(
+            "audit file {}: sequence space exhausted; audit output stopped, new bindings refused",
+            fd.cfg.path.display()
+        );
+    }
+
+    /// The live file failed with `lost` records of the batch not written:
+    /// degraded, counted, and announced to the remaining destinations (AU-5).
+    fn file_failed(&self, fd: &mut FileDest, e: &std::io::Error, lost: u64, carry: &mut Vec<Event>) {
+        fd.fail(&self.stats, e, carry);
+        fd.lost += lost;
+        self.stats.file_lost.fetch_add(lost, Ordering::Relaxed);
+        carry.push(Event::OutputFailure { ts_us: Clock::wall_us(), lost, recovered: false, reason: None });
     }
 }
 
@@ -1532,7 +2045,7 @@ mod tests {
 
     use super::*;
     use crate::sink::AuditSink;
-    use crate::verify::{LinkIssue, VerifyReport, link, verify};
+    use crate::verify::{GapAccount, LinkIssue, VerifyReport, link, verify};
 
     fn cfg(path: &Path, max_bytes: u64, max_files: u32, min_free_bytes: u64) -> AuditConfig {
         AuditConfig {
@@ -1635,9 +2148,11 @@ mod tests {
         for i in 0..300 {
             assert!(sink.emit(ev(i)));
         }
-        wait("records", || written(&stats) >= 300);
-        // The last rotation's prune records go out with the next batch and
+        wait("records", || written(&stats) >= 300 && sink.queued() == 0);
+        // The last batch may still be in flight (each checkpoint is synced);
+        // the last rotation's prune records go out with the next batch and
         // its files are deleted after that checkpoint.
+        std::thread::sleep(Duration::from_millis(300));
         wait("retention settled", || rotated_names(&path).len() == 2);
         std::thread::sleep(Duration::from_millis(100));
         let before = rotated_names(&path);
@@ -1667,9 +2182,9 @@ mod tests {
         // Space freed: recovers, and the failed live file is kept.
         vol.store(i64::MAX / 2, Ordering::SeqCst);
         wait("recovered", || !stats.degraded());
-        for i in 0..5 {
-            assert!(sink.emit(ev(2000 + i)));
-        }
+        // One record: more could fill the 4 KiB file, rotate it and let
+        // retention prune `before` legitimately.
+        assert!(sink.emit(ev(2000)));
         drop(sink);
         h.join();
         for p in &before {
@@ -1686,7 +2201,9 @@ mod tests {
         let is = issues(&files);
         assert_eq!(is.len(), 1, "{is:?}");
         match &is[0] {
-            LinkIssue::Gap { first, last, .. } => assert_eq!(last - first + 1, lost),
+            LinkIssue::Gap { first, last, accounted, .. } => {
+                assert!(last - first + 1 == lost && *accounted == Some(GapAccount::OutputFailure), "{is:?}")
+            }
             other => panic!("{other:?}"),
         }
     }
@@ -1762,7 +2279,7 @@ mod tests {
         let fcfg = AuditFileConfig { path: dir.join("audit.jsonl"), max_bytes: 1 << 30, max_files: 2, min_free_bytes };
         let mut scratch = Vec::new();
         let mut out = FileOut::prepare(&fcfg, &Resume::default(), 1, &node(), &mut scratch).unwrap();
-        out.install(&fcfg.path, false).unwrap();
+        out.install(&fcfg.path).unwrap();
         FileDest::new(fcfg, out, Resume::default())
     }
 
@@ -1801,7 +2318,14 @@ mod tests {
         let dir = tmpdir("pruneresult");
         let stats = AuditSink::bounded(1).0.stats().clone();
         let mut fd = file_dest(&dir, 0);
-        let due = |path: PathBuf, rotated_us| PruneDue { path, rotated_us, seq_first: 1, seq_last: 2, chain_prefix: 7 };
+        let due = |path: PathBuf, rotated_us| PruneDue {
+            armed: true,
+            path,
+            rotated_us,
+            seq_first: 1,
+            seq_last: 2,
+            chain_prefix: 7,
+        };
         let present = dir.join("audit.jsonl.1");
         std::fs::write(&present, b"x").unwrap();
         fd.prune_due.push(due(present.clone(), 1));
@@ -1843,5 +2367,364 @@ mod tests {
         h.join();
         assert!(!temp_path(&path).exists());
         assert_eq!(verified(&dir).len(), 1);
+    }
+
+    fn run_once(path: &Path, c: AuditConfig, events: impl Iterator<Item = Event>) {
+        let (sink, rx) = AuditSink::bounded(4096);
+        let h = Logger::new(c, node(), rx, sink.stats().clone()).spawn().unwrap();
+        for e in events {
+            assert!(sink.emit(e));
+        }
+        drop(sink);
+        h.join();
+        assert!(path.exists());
+    }
+
+    /// L12 regression: the volume accepts part of a batch (a short write)
+    /// and then fails with ENOSPC. The failed file is cut back to its last
+    /// checkpoint: it verifies with no tail, no record of the failed batch
+    /// (bindings then refused) stays on disk, and the failed batch shows up
+    /// as exactly the counted gap.
+    #[test]
+    fn short_write_then_enospc_cuts_back_to_the_last_checkpoint() {
+        let dir = tmpdir("shortwrite");
+        let vol = fault::volume(&dir, i64::MAX / 2);
+        let path = dir.join("audit.jsonl");
+        let (sink, rx) = AuditSink::bounded(4096);
+        let stats = sink.stats().clone();
+        let h = Logger::new(cfg(&path, 1 << 30, 0, 0), node(), rx, stats.clone()).spawn().unwrap();
+        for i in 0..10 {
+            assert!(sink.emit(ev(i)));
+        }
+        wait("records", || written(&stats) >= 10);
+        let good = std::fs::metadata(&path).unwrap().len();
+
+        // Room for one record and half a checkpoint, as seen on ext4/xfs.
+        let mut one = Vec::new();
+        format::json(&mut one, 11, &node(), &ev(5000));
+        vol.store(i64::try_from(one.len() + 200).unwrap(), Ordering::SeqCst);
+        for i in 0..8 {
+            sink.emit(ev(5000 + i));
+        }
+        wait("degraded", || stats.degraded());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.len() as u64, good, "cut back to the last checkpoint");
+        assert!(text.lines().last().unwrap().contains("\"event.action\":\"audit_checkpoint\""));
+        assert!(!text.contains("\"source.port\":5000") && !text.contains(":5000,"), "{text}");
+        let r = verify(text.as_bytes()).unwrap();
+        assert!(r.ok() && !r.has_unverified_tail(), "{r:?}");
+
+        vol.store(i64::MAX / 2, Ordering::SeqCst);
+        wait("recovered", || !stats.degraded());
+        drop(sink);
+        h.join();
+        let lost = stats.file_lost.load(Ordering::Relaxed);
+        assert!(lost >= 8, "the failed batch is counted lost: {lost}");
+        let files = verified(&dir);
+        assert!(files.iter().all(|(_, r)| !r.has_unverified_tail()), "{files:?}");
+        let is = issues(&files);
+        assert!(
+            matches!(is[..], [LinkIssue::Gap { first, last, accounted: Some(GapAccount::OutputFailure), .. }] if last - first + 1 == lost),
+            "{is:?}"
+        );
+    }
+
+    /// L12 regression: a power cut left a partial final line (the newest
+    /// file did not end at a checkpoint). `verify` reports a truncated tail,
+    /// not a chain mismatch; start-up continues from the last complete
+    /// checkpoint (the next header links), and writes `audit_recovery`.
+    #[test]
+    fn truncated_tail_is_unverified_and_the_next_file_links() {
+        let dir = tmpdir("trunctail");
+        let path = dir.join("audit.jsonl");
+        run_once(&path, cfg(&path, 1 << 30, 0, 0), (0..20).map(ev));
+        let text = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &text[..text.len() - 40]).unwrap(); // mid-checkpoint
+        let r = verify(&text[..text.len() - 40]).unwrap();
+        assert!(r.ok(), "{r:?}");
+        assert!(r.truncated_tail_bytes > 0 && r.has_unverified_tail(), "{r:?}");
+
+        let (lease, _) = read_lease(&path);
+        assert!(lease > r.last_seq, "high-water mark {lease} covers {}", r.last_seq);
+        run_once(&path, cfg(&path, 1 << 30, 0, 0), (100..103).map(ev));
+        let files = verified(&dir);
+        assert_eq!(files.len(), 2);
+        // The partial record's number is never reused: numbering resumes
+        // above the high-water mark, and the skipped range is announced.
+        assert_eq!(files[1].1.next_seq, lease + 1);
+        let is = issues(&files);
+        assert!(
+            matches!(is[..], [LinkIssue::Gap { last, accounted: Some(GapAccount::Recovery), .. }] if last == lease),
+            "{is:?}"
+        );
+        let newest = std::fs::read_to_string(&path).unwrap();
+        let first = newest.lines().nth(1).unwrap();
+        assert!(first.contains("\"event.action\":\"audit_recovery\""), "{first}");
+        assert!(first.contains("\"plat.reason\":\"truncated_tail\""), "{first}");
+        let lcs = files[0].1.last_checkpoint_seq;
+        assert!(first.contains(&format!("\"plat.audit.last_checkpoint_seq\":{lcs},")), "{first} {lcs}");
+    }
+
+    /// L12 regression: power cut left a 0-byte live file. Start-up replaces
+    /// it and the first record is `audit_recovery` naming the last durable
+    /// sequence, a visible gap signal for the SIEM.
+    #[test]
+    fn startup_with_an_empty_newest_file_records_audit_recovery() {
+        let dir = tmpdir("emptylive");
+        let path = dir.join("audit.jsonl");
+        run_once(&path, cfg(&path, 1 << 30, 0, 0), (0..5).map(ev));
+        std::fs::rename(&path, dir.join("audit.jsonl.1")).unwrap();
+        File::create(&path).unwrap();
+        let (lease, _) = read_lease(&path);
+        assert!(lease >= 5, "{lease}");
+        run_once(&path, cfg(&path, 1 << 30, 0, 0), (10..12).map(ev));
+        let newest = std::fs::read_to_string(&path).unwrap();
+        let first = newest.lines().nth(1).unwrap();
+        assert!(first.contains("\"event.action\":\"audit_recovery\""), "{first}");
+        assert!(first.contains("\"plat.reason\":\"empty_file\""), "{first}");
+        assert!(
+            first.contains(&format!("\"plat.audit.last_checkpoint_seq\":5,\"plat.audit.max_seq\":{lease}")),
+            "{first}"
+        );
+        let files = verified(&dir);
+        let is = issues(&files);
+        assert!(
+            matches!(is[..], [LinkIssue::Gap { first: 6, last, accounted: Some(GapAccount::Recovery), .. }] if last == lease),
+            "{is:?}"
+        );
+
+        // results-run2 L12 emulation: the file holding the recovery record
+        // is moved aside and the live file emptied; the next recovery record
+        // must not reuse its number (nor any other number used before).
+        let used = files.iter().map(|(_, r)| r.last_seq).max().unwrap();
+        std::fs::rename(&path, dir.join("audit.jsonl.2")).unwrap();
+        File::create(&path).unwrap();
+        run_once(&path, cfg(&path, 1 << 30, 0, 0), (30..32).map(ev));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let r = verify(text.as_bytes()).unwrap();
+        assert!(r.ok() && r.next_seq > used, "resumed at {} after {used} was used", r.next_seq);
+        assert!(text.contains("\"plat.audit.lease_state\":\"ok\""), "{text}");
+        // Lose the evidence: that file is deleted too, so the lease is more
+        // than one lease above every file; it is still used (`high`) and no
+        // number is reused (SEC-302).
+        let used = used.max(r.last_seq);
+        std::fs::remove_file(dir.join("audit.jsonl.2")).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        run_once(&path, cfg(&path, 1 << 30, 0, 0), std::iter::once(ev(40)));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"plat.audit.lease_state\":\"high\""), "{text}");
+        let r = verify(text.as_bytes()).unwrap();
+        assert!(r.ok() && r.next_seq > used, "resumed at {} after {used} was used", r.next_seq);
+        // A clean restart writes no recovery record.
+        run_once(&path, cfg(&path, 1 << 30, 0, 0), std::iter::once(ev(20)));
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("audit_recovery"));
+    }
+
+    /// SEC-7: when the cut-back after a failed batch itself fails, the
+    /// failure is counted and announced as `audit_output_failure` with
+    /// `plat.reason:"truncate_failed"` (to the remaining destinations).
+    #[test]
+    fn failed_cut_back_is_announced_with_its_own_reason() {
+        let dir = tmpdir("notruncate");
+        let vol = fault::volume(&dir, i64::MAX / 2);
+        fault::fail_truncate(&dir);
+        let path = dir.join("audit.jsonl");
+        let collector = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        collector.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        let mut c = cfg(&path, 1 << 30, 0, 0);
+        c.syslog = vec![SyslogConfig {
+            address: collector.local_addr().unwrap(),
+            transport: SyslogTransport::Udp,
+            format: LogFormat::Json,
+            app_name: "platd".into(),
+            tls: None,
+        }];
+        let (sink, rx) = AuditSink::bounded(4096);
+        let stats = sink.stats().clone();
+        let h = Logger::new(c, node(), rx, stats.clone()).spawn().unwrap();
+        for i in 0..4 {
+            assert!(sink.emit(ev(i)));
+        }
+        wait("records", || written(&stats) >= 4);
+        let errors = stats.output_errors.load(Ordering::Relaxed);
+        vol.store(200, Ordering::SeqCst);
+        for i in 0..8 {
+            sink.emit(ev(5000 + i));
+        }
+        wait("degraded", || stats.degraded());
+        assert!(stats.output_errors.load(Ordering::Relaxed) > errors, "the failed cut-back is counted");
+        let mut got = false;
+        let mut b = [0u8; 4096];
+        let t = Instant::now();
+        while !got && t.elapsed() < Duration::from_secs(5) {
+            if let Ok(n) = collector.recv(&mut b) {
+                let s = String::from_utf8_lossy(&b[..n]);
+                got = s.contains("\"event.action\":\"audit_output_failure\"")
+                    && s.contains("\"plat.reason\":\"truncate_failed\"");
+            }
+        }
+        assert!(got, "audit_output_failure (truncate_failed) sent to syslog");
+        drop(sink);
+        h.join();
+    }
+
+    /// L12 regression: with large batches, rotated files used to exceed
+    /// `max_bytes` by most of a batch. Now a file exceeds it only when a
+    /// single record does not fit into an empty file.
+    #[test]
+    fn rotation_never_exceeds_max_bytes() {
+        let dir = tmpdir("rotbound");
+        let path = dir.join("audit.jsonl");
+        let mut c = cfg(&path, 8192, 0, 0);
+        c.batch_max = 256;
+        c.flush_interval_ms = 200;
+        run_once(&path, c, (0..1000).map(ev));
+        let files = verified(&dir);
+        assert!(files.len() > 10, "{}", files.len());
+        for (p, _) in &files {
+            let len = std::fs::metadata(p).unwrap().len();
+            assert!(len <= 8192, "{}: {len} bytes", p.display());
+        }
+        assert!(issues(&files).is_empty(), "{:?}", issues(&files));
+        assert_eq!(files.iter().map(|(_, r)| r.records).sum::<u64>(), 1000);
+    }
+
+    /// A rotated file holding only a header that starts at `next_seq`, so
+    /// start-up resumes near the end of the sequence space.
+    fn header_only(dir: &Path, next_seq: u64) {
+        let mut h = Vec::new();
+        header_line(&mut h, &node(), &Resume::default(), next_seq);
+        std::fs::write(dir.join("audit.jsonl.1"), h).unwrap();
+    }
+
+    /// SEC-302: a lease above the wrap guard (near u64::MAX) is ignored and
+    /// recorded as `inflated`; numbering resumes from the files and nothing
+    /// wraps. One just below the guard is used (`high`).
+    #[test]
+    fn inflated_lease_is_ignored_and_recorded() {
+        let dir = tmpdir("inflated");
+        let path = dir.join("audit.jsonl");
+        run_once(&path, cfg(&path, 1 << 30, 0, 0), (0..5).map(ev));
+        for planted in [u64::MAX, u64::MAX - 2 * SEQ_LEASE + 1] {
+            std::fs::write(lease_path(&path), format!("{planted}\n")).unwrap();
+            assert_eq!(read_lease(&path), (planted, LeaseState::Ok));
+            std::fs::write(&path, b"").unwrap(); // damaged: the lease would be used
+            run_once(&path, cfg(&path, 1 << 30, 0, 0), std::iter::once(ev(9)));
+            let text = std::fs::read_to_string(&path).unwrap();
+            let first = text.lines().nth(1).unwrap();
+            assert!(first.contains("\"plat.audit.lease_state\":\"inflated\""), "{first}");
+            let r = verify(text.as_bytes()).unwrap();
+            assert!(r.ok() && r.next_seq < 100, "{r:?}");
+            let (lease, state) = read_lease(&path);
+            assert_eq!(state, LeaseState::Ok);
+            assert!(lease > r.last_seq && lease <= r.last_seq + SEQ_LEASE, "rewritten: {lease}");
+        }
+        let planted = u64::MAX - 2 * SEQ_LEASE;
+        std::fs::write(lease_path(&path), format!("{planted}\n")).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        run_once(&path, cfg(&path, 1 << 30, 0, 0), std::iter::once(ev(9)));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"plat.audit.lease_state\":\"high\""), "{text}");
+        let r = verify(text.as_bytes()).unwrap();
+        assert!(r.ok() && r.next_seq > planted, "{r:?}");
+    }
+
+    /// SEC-302: a lease of u64::MAX that is within bounds of the files (they
+    /// end near u64::MAX) does not wrap: start-up fails closed.
+    #[test]
+    fn lease_at_u64_max_fails_closed_without_wrapping() {
+        let dir = tmpdir("leasemax");
+        let path = dir.join("audit.jsonl");
+        header_only(&dir, u64::MAX - 1);
+        std::fs::write(lease_path(&path), format!("{}\n", u64::MAX)).unwrap();
+        File::create(&path).unwrap(); // empty live file: damaged, lease used
+        let (_sink, rx) = AuditSink::bounded(16);
+        let e = Logger::new(cfg(&path, 1 << 30, 0, 0), node(), rx, Arc::default()).spawn().unwrap_err();
+        assert!(e.to_string().contains("exhausted"), "{e}");
+    }
+
+    /// SEC-302: running out of sequence numbers stops the file after a
+    /// checkpointed `seq_exhausted` record and stays degraded (fail closed);
+    /// later events are counted, never numbered from 0 again.
+    #[test]
+    fn sequence_exhaustion_fails_closed() {
+        let dir = tmpdir("exhaust");
+        let path = dir.join("audit.jsonl");
+        header_only(&dir, u64::MAX - 3);
+        let (sink, rx) = AuditSink::bounded(64);
+        let stats = sink.stats().clone();
+        let h = Logger::new(cfg(&path, 1 << 30, 0, 0), node(), rx, stats.clone()).spawn().unwrap();
+        assert!(sink.emit(ev(0)));
+        wait("first record", || written(&stats) >= 1);
+        for i in 1..6 {
+            sink.emit(ev(i));
+        }
+        wait("degraded", || stats.degraded());
+        assert!(!sink.has_room());
+        drop(sink);
+        h.join();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"plat.reason\":\"seq_exhausted\""), "{text}");
+        let r = verify(text.as_bytes()).unwrap();
+        assert!(r.ok() && !r.has_unverified_tail(), "{r:?}");
+        assert!(r.next_seq == u64::MAX - 3 && r.records >= 2 && r.last_seq < u64::MAX, "{r:?}");
+        assert!(stats.file_lost.load(Ordering::Relaxed) > 0);
+    }
+
+    /// SEC-304: a symlink, FIFO or directory at the lease path is
+    /// `corrupt`, and a FIFO does not hang start-up.
+    #[cfg(unix)]
+    #[test]
+    fn lease_must_be_a_regular_file() {
+        let dir = tmpdir("leasekind");
+        let path = dir.join("audit.jsonl");
+        let lp = lease_path(&path);
+        assert_eq!(read_lease(&path), (0, LeaseState::Absent));
+        let target = dir.join("target");
+        std::fs::write(&target, b"7\n").unwrap();
+        std::os::unix::fs::symlink(&target, &lp).unwrap();
+        assert_eq!(read_lease(&path), (0, LeaseState::Corrupt), "symlink");
+        std::fs::remove_file(&lp).unwrap();
+        std::fs::write(&lp, b"garbage\n").unwrap();
+        assert_eq!(read_lease(&path), (0, LeaseState::Corrupt), "unparsable");
+        std::fs::remove_file(&lp).unwrap();
+        std::fs::create_dir(&lp).unwrap();
+        assert_eq!(read_lease(&path), (0, LeaseState::Corrupt), "directory");
+        std::fs::remove_dir(&lp).unwrap();
+        assert!(std::process::Command::new("mkfifo").arg(&lp).status().unwrap().success());
+        let t = Instant::now();
+        assert_eq!(read_lease(&path), (0, LeaseState::Corrupt), "fifo");
+        // A damaged start with the FIFO in place completes too.
+        File::create(&path).unwrap();
+        run_once(&path, cfg(&path, 1 << 30, 0, 0), std::iter::once(ev(1)));
+        assert!(t.elapsed() < Duration::from_secs(5));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"plat.audit.lease_state\":\"corrupt\""), "{text}");
+    }
+
+    /// SEC-303: a failed lease write is counted every time, announced once
+    /// per failure streak, and retried every flush interval without new
+    /// records.
+    #[test]
+    fn lease_write_failure_is_audited_once_and_retried() {
+        let dir = tmpdir("leasefail");
+        let path = dir.join("audit.jsonl");
+        let lp = lease_path(&path);
+        std::fs::create_dir(&lp).unwrap(); // rename onto it fails
+        let (sink, rx) = AuditSink::bounded(64);
+        let stats = sink.stats().clone();
+        let h = Logger::new(cfg(&path, 1 << 30, 0, 0), node(), rx, stats.clone()).spawn().unwrap();
+        assert!(sink.emit(ev(1)));
+        wait("retries", || stats.seq_lease_failures.load(Ordering::Relaxed) >= 3);
+        assert!(sink.emit(ev(2)));
+        wait("records", || written(&stats) >= 3);
+        std::fs::remove_dir(&lp).unwrap();
+        // No new record: the flush tick alone retries.
+        wait("lease written", || read_lease(&path).1 == LeaseState::Ok);
+        drop(sink);
+        h.join();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("\"plat.reason\":\"seq_lease_failed\"").count(), 1, "{text}");
+        assert!(read_lease(&path).0 > verify(text.as_bytes()).unwrap().last_seq);
     }
 }
