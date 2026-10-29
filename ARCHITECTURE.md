@@ -71,6 +71,17 @@ flowchart TD
 - **Counters** are per-worker, cache-line padded, relaxed atomics; metrics
   sum them.
 
+### Performance profile on Linux
+
+A TUN measurement in a Lima VM (Apple M2 Max, virtio; indicative only, see
+README "Measured performance") showed TUN I/O dominating: about 86% of a
+saturated worker's CPU is in the kernel (read and write syscalls, and the
+forwarding of the translated packet, which runs synchronously inside
+`write()`). The engine and translation take about 10%; shard-lock operations
+about 0.7%, with no futex or slow-path samples, so locks are negligible at TUN
+rates (about 0.45–0.62 Mpps per worker). Further throughput needs a different
+I/O backend (POAM-016), not lock changes (POAM-015).
+
 ## State
 
 | Table | Key | Value | Lock |

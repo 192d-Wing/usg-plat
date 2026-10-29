@@ -4,6 +4,17 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 
 ## [Unreleased]
 
+### Documentation: Linux TUN throughput (branch `perf/linux-throughput`)
+
+- README "Measured performance" and ARCHITECTURE.md: indicative Linux TUN
+  numbers (Lima VM on Apple M2 Max, virtio, main @a080417): about
+  0.45–0.62 Mpps per worker, 1→2 workers about 1.75×, 4 workers
+  generator-bound at 1.05–1.60 Mpps, v4→v6 return path, CPU split kernel 86% /
+  engine+xlat about 10% / locks about 0.7%. Validate on bare metal before sizing.
+- POA&M: POAM-015 downgraded to "Risk accepted pending AF_XDP" with
+  re-check trigger; POAM-016 evidence and options added (still Open).
+  NIST SC-5(2) row cites the measurement. No code changes.
+
 ### Linux validation (branch `fix/linux-validation`)
 
 Found by running `docs/compliance/LINUX_VERIFICATION.md` on Ubuntu 24.04.5
