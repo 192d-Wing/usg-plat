@@ -44,3 +44,52 @@ sha2.workspace = true
 
 [lints]
 workspace = true
+
+# Linux packages: `make deb`, `make rpm` (README "Packages").
+# NIST 800-53: CM-2, CM-6 - the package installs the baseline unit, setup
+# script, forward-policy guard and example config; AC-6 - the service account
+# and plat-log group come from sysusers.d; AU-9 - /var/log/plat from
+# tmpfiles.d. No unit is enabled or restarted by the package: an operator
+# edits /etc/plat/platd.toml and enables plat-fwguard.timer and platd.
+[package.metadata.deb]
+maintainer = "usg-plat Contributors"
+copyright = "usg-plat Contributors"
+extended-description = "Multithreaded 464XLAT PLAT / stateful NAT64 translator (RFC 6877, RFC 6146, RFC 7915) with SIEM attribution logging."
+section = "net"
+priority = "optional"
+depends = "$auto, nftables, systemd"
+conf-files = ["/etc/plat/platd.toml"]
+maintainer-scripts = "../../deploy/debian/"
+systemd-units = [
+    { unit-name = "platd", unit-scripts = "../../deploy/systemd/", enable = false, start = false, restart-after-upgrade = false, stop-on-upgrade = false },
+    { unit-name = "plat-fwguard", unit-scripts = "../../deploy/systemd/", enable = false, start = false, restart-after-upgrade = false, stop-on-upgrade = false },
+]
+assets = [
+    ["target/release/platd", "usr/bin/", "755"],
+    ["../../deploy/systemd/plat-tun-setup.sh", "usr/libexec/plat/", "755"],
+    ["../../deploy/systemd/plat-fwguard.sh", "usr/libexec/plat/", "755"],
+    ["../../deploy/systemd/nftables.service.d/plat-fwguard.conf", "usr/lib/systemd/system/nftables.service.d/", "644"],
+    ["../../deploy/systemd/plat.tmpfiles.conf", "usr/lib/tmpfiles.d/plat.conf", "644"],
+    ["../../config/platd.example.toml", "etc/plat/platd.toml", "640"],
+    ["../../deploy/sysusers.d/plat.conf", "usr/lib/sysusers.d/", "644"],
+]
+
+[package.metadata.generate-rpm]
+summary = "usg-plat 464XLAT PLAT / stateful NAT64 translator"
+release = "1"
+requires = { nftables = "*", systemd = "*" }
+post_install_script = "../../deploy/rpm/post_install.sh"
+pre_uninstall_script = "../../deploy/rpm/pre_uninstall.sh"
+post_uninstall_script = "../../deploy/rpm/post_uninstall.sh"
+assets = [
+    { source = "target/release/platd", dest = "/usr/bin/platd", mode = "755" },
+    { source = "../../deploy/systemd/plat-tun-setup.sh", dest = "/usr/libexec/plat/plat-tun-setup.sh", mode = "755" },
+    { source = "../../deploy/systemd/plat-fwguard.sh", dest = "/usr/libexec/plat/plat-fwguard.sh", mode = "755" },
+    { source = "../../deploy/systemd/platd.service", dest = "/usr/lib/systemd/system/platd.service", mode = "644" },
+    { source = "../../deploy/systemd/plat-fwguard.service", dest = "/usr/lib/systemd/system/plat-fwguard.service", mode = "644" },
+    { source = "../../deploy/systemd/plat-fwguard.timer", dest = "/usr/lib/systemd/system/plat-fwguard.timer", mode = "644" },
+    { source = "../../deploy/systemd/nftables.service.d/plat-fwguard.conf", dest = "/usr/lib/systemd/system/nftables.service.d/plat-fwguard.conf", mode = "644" },
+    { source = "../../deploy/systemd/plat.tmpfiles.conf", dest = "/usr/lib/tmpfiles.d/plat.conf", mode = "644" },
+    { source = "../../config/platd.example.toml", dest = "/etc/plat/platd.toml", mode = "640", config = "noreplace" },
+    { source = "../../deploy/sysusers.d/plat.conf", dest = "/usr/lib/sysusers.d/plat.conf", mode = "644" },
+]

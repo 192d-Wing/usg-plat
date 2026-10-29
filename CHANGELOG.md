@@ -165,6 +165,14 @@ aarch64 / systemd 255 (2026-10-29); results recorded there.
 - `platd check-config --format text|env`.
 - `deploy/systemd/plat-tun-setup.sh`: TUN, routing and nftables setup run
   before the unprivileged daemon.
+- Linux packages: `make deb`, `make rpm`, `make packages` (cargo-deb and
+  cargo-generate-rpm metadata in `services/platd/Cargo.toml`, `dist`
+  profile without debug info), built natively for x86_64 and aarch64 by
+  `.github/workflows/packages.yml`. The packages install the binary, setup
+  and guard scripts, systemd units, nftables drop-in, `plat` user and
+  `plat-log` group (`deploy/sysusers.d/plat.conf`), `/var/log/plat` and the
+  example config as a conffile; they never enable or restart a unit. Not
+  signed.
 - Zensical documentation site (`zensical.toml`, `make docs`, `make docs-serve`)
   with a GitHub Pages workflow (`.github/workflows/docs.yml`).
 
