@@ -58,6 +58,101 @@ tracked in [`POAM.md`](POAM.md).
 | 6877 | PLAT role | Implemented (stateful NAT64; no CLAT-specific behaviour) | — |
 | 1624 | Incremental checksum update | Implemented | `plat-packet/src/checksum.rs::incremental_matches_full`; `translate.rs::roundtrip_preserves_payload_and_checksums` |
 | 5424, 6587, 5426 | Syslog format; TCP octet counting; UDP one message per datagram | Implemented | `plat-audit/src/format.rs::cef_and_syslog`; `plat-audit/tests/outputs.rs::tcp_syslog_uses_octet_counting_framing` |
+| 5425 | Syslog over TLS | See "TLS and certificate revocation" below. | — |
+
+## TLS and certificate revocation (RFC 8446, RFC 5425, RFC 5280, RFC 6960, RFC 9110/9112)
+
+Code in `crates/plat-tls` (policy, verification, revocation),
+`crates/plat-audit` (TLS syslog) and `services/platd/src/mgmt.rs` (mTLS
+management). Tests ran on the macOS development host (`make test` after the
+`feat/fips-tls` fix round 2: 38 suites, 0 failed, 0 ignored).
+
+### TLS profile (RFC 8446, RFC 9325)
+
+| RFC | Requirement | Status | Location / test |
+|-----|-------------|--------|-----------------|
+| 8446 | TLS 1.3 | Implemented, TLS 1.3 **only** everywhere (the rustls `tls12` feature is not built). Cipher suites: the provider's TLS 1.3 suites that report FIPS (2). Key exchange: X25519MLKEM768 (hybrid, offered first by default), secp256r1, secp384r1; `tls.pq_hybrid = false` removes the hybrid. Every built config is asserted FIPS. No 0-RTT. Server: no tickets, no session cache; client: resumption disabled, so every connection re-validates the peer chain and its revocation status. NDcPP note: an evaluated configuration must set `pq_hybrid = false` (NIST_800-53_MAPPING.md). | `plat-tls/src/policy.rs`; `policy.rs::suites_and_groups`; `plat-tls/tests/handshake.rs::mutual_tls13_with_hybrid_kx`, `classic_groups_when_pq_off`; `plat-tls/tests/qa_load.rs::tls12_only_server_is_refused` |
+| 9325 §4.1–4.3 | No version below 1.2; AEAD only; no static RSA/DH | Implemented (TLS 1.3 only). | as above |
+| 6125 / 9525 | Server identity check | Implemented through webpki: the collector certificate must carry `server_name` in its SAN and chain to the configured `ca_file` only (no system roots). | `handshake.rs::server_verification_failures` |
+| 8446 §4.4.2.4, mTLS | Client authentication on the management listener | Implemented: client certificate required (no anonymous mode); chain to `client_ca_file`; full-chain revocation; exact, typed allow-list (`cn:`, `dns:`, `uri:`, `sha256:`). Resource bounds before and during the handshake: `max_connections`, `max_connections_per_ip` (default 2; IPv4 per address, IPv6 per /64, IPv4-mapped counted as IPv4), ClientHello within 2 s, hard `handshake_timeout_ms` deadline. | `services/platd/src/mgmt.rs`; `mgmt/tests.rs::allow_listed_client_gets_metrics_and_healthz`, `rejected_clients_are_refused_and_audited_once`, `per_ip_cap_and_client_hello_deadline`; `handshake.rs::client_certificate_required_and_chained` |
+| 6066 §8, 8446 §4.4.2.1 | OCSP stapling (syslog client) | Implemented for the collector leaf: a stapled response is validated by the same pipeline as a fetched one; intermediates are always checked from the cache, a fetch or a CRL. Stapled responses are ignored when `require_nonce = true` (they cannot carry our nonce). | `plat-tls/tests/ocsp.rs::stapled_response`; `revocation_fallback.rs::syslog_handshake_uses_staple_for_leaf` |
+
+### Syslog over TLS (RFC 5425)
+
+| RFC | Requirement | Status | Location / test |
+|-----|-------------|--------|-----------------|
+| 5425 §4.2 | TLS MUST be used; implementations MUST support TLS 1.2 and `TLS_RSA_WITH_AES_128_CBC_SHA` | **Deviation (RFC-007, user decision Q5): TLS 1.3 only.** The mandatory suite is static-RSA CBC, which RFC 9325 §4.1/§4.2 rule out, and the FIPS build without `tls12` does not offer it. Collectors must support TLS 1.3; a TLS 1.2-only collector is refused. | `qa_load.rs::tls12_only_server_is_refused` |
+| 5425 §4.3, 6587 | Octet-counting framing | Implemented (shared with TCP). | `plat-audit/tests/tls_syslog.rs::records_arrive_octet_counted_over_tls` |
+| 5425 §4.4 | Close with `close_notify` | Implemented (bounded by 2 s). | `tls_syslog.rs::records_arrive_octet_counted_over_tls` (collector sees a clean close) |
+| 5425 §5.1, §5.2 | Certificate-based authentication of the collector; subject name matching | Implemented: CA-pinned path validation, name = `server_name`, full-chain revocation; optional client certificate for mutual authentication. Fingerprint-only authentication (§5.2 alternative) is not offered. | `tls_syslog.rs::wrong_ca_or_name_rejects_collector_and_accounts_loss`, `revoked_collector_chain_is_refused`, `mutual_tls_to_collector` |
+| 5425 §4.2.1 (loss) | — | Reconnect with 5 s back-off; every undelivered record counted and recorded as `audit_remote_loss` with `plat.reason`. | `tls_syslog.rs::reconnects_after_outage_and_accounts_every_missing_record` |
+
+### Certificate path and CRL processing (RFC 5280)
+
+| RFC | Requirement | Status | Location / test |
+|-----|-------------|--------|-----------------|
+| 5280 §6.1 | Path validation | Implemented by webpki (rustls). For revocation, plat-tls rebuilds the path (subject/issuer DER equality plus FIPS signature check, depth ≤ 8, ≤ 16 intermediates, ≤ 64 signature checks) and checks every non-root certificate; the trust anchor is not checked. Residual (SEC-007, info): the rebuilt path checks names and signatures only, not basicConstraints/validity, so with cross-certificates it could differ from the path webpki accepted. | `plat-tls/src/revocation/chain.rs`; `plat-tls/tests/chain.rs::rebuild_zero_one_two_intermediates`, `candidate_with_wrong_key_is_skipped`, `missing_issuer_and_depth_cap` |
+| 5280 §6.3.3 | CRL validity: issuer, signature, cRLSign | Implemented: CRL issuer DER must equal the certificate issuer's subject (`wrong_issuer`, fatal); issuer keyUsage must include cRLSign when present (`no_crl_sign`); signature verified in the FIPS module (`bad_signature`, fatal; SHA-1 rejected). | `crl/parse.rs` `verify`; `tests/crl.rs::forged_crls_are_fatal`, `issuer_without_crl_sign` |
+| 4055 §2.1, §3.1, 5280 §4.1.1.2 | RSASSA-PSS signatures (CRL, OCSP, path rebuild) | Implemented: parameters decoded structurally (RFC 4055 §3.1); hash SHA-256/384/512 with parameters absent or NULL (§2.1); MGF1 with the same hash; saltLength = hash length; an explicit trailerField (even 1) is rejected (X.690 §11.5 DER); SHA-1 defaults (absent hash/MGF) rejected. Keys must be rsaEncryption; id-RSASSA-PSS SPKIs are refused. | `revocation/sig.rs` `pss_algorithm`; unit tests `pss_*` |
+| 5280 §5.1.2.4–5, §6.3.3(a) | thisUpdate / nextUpdate | Implemented: nextUpdate required (`no_next_update`); past nextUpdate beyond `clock_skew_secs` → `stale`; thisUpdate in the future beyond the skew → `not_yet_valid` (RFC-003). Stale data is never used, even under `soft_fail`. | `tests/crl.rs::stale_rejected_even_in_soft_fail`, `missing_next_update_is_unusable`, `unsupported_features_are_unusable` |
+| 5280 §5.2.4, §6.3.3(b)(1) | Full and delta CRLs | Full CRLs only. A delta CRL (deltaCRLIndicator) is unusable (`delta`) (POAM-025). | `tests/crl.rs::unsupported_features_are_unusable` |
+| 5280 §5.2.5, §6.3.3(b)(2) | IssuingDistributionPoint scope | Implemented: indirect CRLs (IDP indirectCRL or an entry certificateIssuer) rejected (`indirect`, POAM-025); onlySomeReasons rejected (partial CRL); onlyContainsAttributeCerts, or onlyUser together with onlyCA, → `scope_mismatch`; onlyContainsUserCerts / onlyContainsCACerts applied per certificate. **Named IDP (RFC-001):** if the IDP names a distribution point, the CRL is used only when (a) fetched from a CDP URI that is one of the IDP names, or an IDP directoryName equals a directoryName in the certificate's CDP (RFC-101, fixed), (b) from a configured `crl.urls`/`crl.files` source and an IDP name equals a fullName of the certificate's CDP (DPs carrying cRLIssuer excluded), or (c) the certificate has no CDP and an IDP directoryName equals the certificate's issuer; otherwise `scope_mismatch`, so a partitioned CRL never answers for another partition. A nameRelativeToCRLIssuer IDP, or an IDP with more than 64 names, fails closed. | `crl/parse.rs` `CrlEntry::covers`, `idp_scope`; `tests/crl.rs::partitioned_crl_never_answers_for_another_partition`, `directory_name_idp_scope`, `unsupported_features_are_unusable` |
+| 5280 §5.2.3 | cRLNumber monotonic | Implemented: the highest cRLNumber per (issuer key, IDP scope) is kept from every source; a lower number, or a CRL without a number after a numbered one, is refused (`rollback`) and audited (`revocation_source_refresh` `rollback_rejected`). With `cache_dir` set the marks are persisted in `cache_dir/crl-numbers` (0600, atomic write) and reloaded at start. Writers are serialised and the snapshot is taken under the same lock, so the file only moves forward; temp files are unique per write; a failed write re-arms the mark and is retried at the next store. A rejected file (oversize, unreadable, not UTF-8, bad lines) or a failed write is reported (`revocation_source_refresh` `state_rejected` / `state_persist_failed`, `plat_crl_state_errors_total`, operational warning). Residual: marks lost before a successful write still depend on `cache_dir` being writable. | `crl/cache.rs` `check_hwm`; `crl/disk.rs` `load_hwm`, `store_hwm`; `cache.rs::high_water_mark_across_sources`; `tests/crl.rs::crl_number_high_water_mark_persists`, `crl_number_state_problems_are_surfaced`; `revocation_fallback.rs::refresher_drops_stale_and_refuses_rollback` |
+| 5280 §4.2, §5.2 | Extension handling | Implemented: unknown critical CRL or entry extensions → `critical_ext`; a duplicate extension in crlExtensions or crlEntryExtensions → `malformed` (RFC-005); extensions in a v1 CRL → `malformed`; removeFromCRL → `malformed`. v1 CRLs without a version field do not decode and are `malformed` (CAs conforming to RFC 5280 issue v2). | `tests/crl.rs::unsupported_features_are_unusable` |
+| 5280 §4.2.1.13 | CRL distribution points | `http://` fullName URIs only, at most 4 per certificate; LDAP and other schemes and nameRelativeToCRLIssuer are ignored (POAM-025). Configured sources are tried before CDPs. | `crl/mod.rs`; `tests/crl.rs::cdp_unavailable`, `configured_files_der_and_pem` |
+
+### OCSP (RFC 6960, RFC 5019, RFC 8954)
+
+| RFC | Requirement | Status | Location / test |
+|-----|-------------|--------|-----------------|
+| 6960 §4.1 | Request syntax | Implemented: one CertID per request, SHA-256 by default; `cert_id_hash = "sha1"` for RFC 5019 responders. | `ocsp/request.rs`; `tests/ocsp.rs::get_method_and_sha1_cert_id` |
+| 6960 App. A | HTTP GET/POST, media types | Implemented: POST by default (`application/ocsp-request`), GET optional (base64, percent-encoded); response must be `application/ocsp-response`; body ≤ 16 KiB. | `tests/ocsp.rs::get_method_and_sha1_cert_id`, `transport_failures_are_unavailable` |
+| 6960 §3.2 | Client checks: CertID match, signature, authorized signer, thisUpdate recent, nextUpdate > now | Implemented: strict DER; CertID (hash OID, both hashes, serial) must match (`cert_id_mismatch`, fatal); signature verified in the FIPS module (fatal on failure; SHA-1 rejected); future thisUpdate or past nextUpdate → `stale`; without nextUpdate stale after `max_age_secs`. Unknown critical extensions → `malformed`. | `ocsp/response.rs`; `tests/ocsp.rs::bad_signature_is_fatal`, `cert_id_mismatch_is_fatal`, `stale_or_future_never_soft_accepted` |
+| 6960 §4.2.2.2 | Authorized responders | Implemented: the issuer itself, or a delegate issued directly by the issuer with id-kp-OCSPSigning, valid now ± skew, matching responderID (`unauthorized_responder`, fatal). The delegate's own revocation status is not checked (id-pkix-ocsp-nocheck assumed; POAM-025). | `tests/ocsp.rs::delegated_responders` |
+| 6960 §2.3 | Non-successful responseStatus | Treated as `malformed` (non-fatal; unsigned, so not an attack indicator). | `tests/ocsp.rs::transport_failures_are_unavailable` |
+| 8954 | Nonce | Implemented: 32-byte nonce from the FIPS DRBG, on by default; an echoed nonce must match (fatal); a missing nonce is accepted unless `require_nonce = true`. | `tests/ocsp.rs::nonce_rules` |
+| 5019 | Lightweight profile interop | SHA-1 CertID option; responses still need a non-SHA-1 signature, so SHA-1-signing responders fail closed. | `tests/ocsp.rs::get_method_and_sha1_cert_id` |
+| — | Caching | Positive entries until `min(nextUpdate, thisUpdate + max_age)`; failures and `unknown` negatively cached for 10 s; fatal results not cached; single-flight per (issuer key, serial); bounded by `cache_entries`. | `tests/ocsp.rs::good_then_cached`, `negative_cache`, `cache_bound_evicts`, `single_flight` |
+
+Decision order (both roles, every non-root certificate): OCSP (stapled,
+cache, fetch), then CRL; `revoked` is final; attack-class failures (bad
+signature, unauthorized responder, nonce or CertID mismatch, wrong CRL
+issuer) reject in every mode with no fallback; `hard_fail` (default) rejects
+when nothing is conclusive; `soft_fail` accepts only when no data at all
+could be obtained (an accepted-risk setting: an on-path attacker who blocks
+the plaintext responders makes the check pass, SEC-009); one shared
+`budget_ms` per chain. Tests: `plat-tls/tests/chain.rs`,
+`revocation_fallback.rs` (14 tests).
+
+### HTTP fetcher for OCSP and CRL (RFC 9110, RFC 9112)
+
+| RFC | Requirement | Status | Location / test |
+|-----|-------------|--------|-----------------|
+| 9112 §2.3 | Status line | HTTP/1.0 requests (`Connection: close`); responses `HTTP/1.0` or `HTTP/1.1` only; any status other than 200 is an error, so redirects are not followed. | `revocation/http.rs`; `tests/http.rs::faults` |
+| 9110 §5.1, §5.6.2; 9112 §5.1 | Field names are tokens; no whitespace between name and colon | Implemented: a field name must be 1*tchar; empty names, whitespace before the colon and non-tchar names → `malformed` (RFC-002). | `http.rs` `is_token`; `tests/qa_parsers.rs::header_name_whitespace_rejected` |
+| 9112 §5.2 | obs-fold: a user agent receiving it in a response MUST replace each obs-fold with SP | **Deviation (RFC-105): a header line that starts with whitespace (obs-fold) is rejected as `malformed`.** Deliberate anti-smuggling choice; for a revocation fetcher it fails closed (the source is unavailable, `hard_fail` rejects). | `http.rs` `rejects_hostile_shapes`; `tests/qa_parsers.rs::header_name_whitespace_rejected` |
+| 9112 §6.1, §6.3 | Transfer-Encoding / Content-Length | `Transfer-Encoding` of any kind rejected; duplicate, signed, hex, empty or otherwise non-decimal `Content-Length` rejected; a short body is an error; without `Content-Length` the body is read to close within the cap. | `tests/qa_parsers.rs::chunked_and_te_variants_refused`, `content_length_shapes`, `no_length_exactly_max_then_close_ok` |
+| — | Bounds | Header block ≤ 8 KiB; body ≤ 16 KiB (OCSP) or `crl.max_bytes` (default 10 MiB), checked against `Content-Length` before reading and while reading; connect/read/write under the caller's deadline. DNS resolution has no timeout (POAM-025). | `tests/qa_parsers.rs::slowloris_header_trickle_bounded_by_deadline`, `slowloris_body_trickle_bounded_by_deadline`; `tests/crl.rs::size_caps` |
+| — | Content type | OCSP: `application/ocsp-response`; CRL: `application/pkix-crl` or `application/octet-stream` (parameters ignored, case-insensitive); PEM only from files. | `tests/ocsp.rs::transport_failures_are_unavailable`; `http.rs` tests |
+
+### Known deviations and limits (TLS and PKI)
+
+- **RFC-007**: TLS 1.3 only, against RFC 5425 §4.2 (TLS 1.2 and
+  `TLS_RSA_WITH_AES_128_CBC_SHA` mandatory). NDcPP also expects TLS 1.2.
+- **RFC-105**: obs-fold header lines rejected instead of replaced by SP
+  (RFC 9112 §5.2). Fails closed.
+- **RFC-102**: directoryNames (IDP, CDP, issuer) are compared as DER bytes,
+  not with the RFC 5280 §7.1 name-comparison rules; names that differ only
+  in case or string type do not match. Fails closed.
+- **RFC-103**: an IDP with more than 64 names (`MAX_IDP_NAMES`) makes the
+  CRL unusable (`scope_mismatch`); only the first 16 names of a
+  certificate's CDP (`MAX_CDP_NAMES`) are compared. Both fail closed.
+- Delta and indirect CRLs, LDAP distribution points and the delegated OCSP
+  responder's own status are not supported (POAM-025).
+- v1 CRLs and OCSP non-successful responses are `malformed`; SHA-1
+  signatures on OCSP responses and CRLs are `bad_signature` (fatal).
+- `soft_fail` with plaintext HTTP responders is an accepted-risk setting
+  (SEC-009); `hard_fail` is the default.
 
 ## Drop reasons relevant to conformance
 

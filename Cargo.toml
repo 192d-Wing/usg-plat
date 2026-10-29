@@ -8,6 +8,7 @@ members = [
     "crates/plat-audit",
     "crates/plat-io",
     "crates/plat-cluster",
+    "crates/plat-tls",
     "services/platd",
 ]
 
@@ -25,9 +26,12 @@ plat-common = { path = "crates/plat-common", version = "0.1.0" }
 plat-packet = { path = "crates/plat-packet", version = "0.1.0" }
 plat-xlat = { path = "crates/plat-xlat", version = "0.1.0" }
 plat-nat64 = { path = "crates/plat-nat64", version = "0.1.0" }
-plat-audit = { path = "crates/plat-audit", version = "0.1.0" }
+# Default features off here: data-plane crates get plat-audit without TLS;
+# platd enables `plat-audit/tls` through its own `tls` feature.
+plat-audit = { path = "crates/plat-audit", version = "0.1.0", default-features = false }
 plat-io = { path = "crates/plat-io", version = "0.1.0" }
 plat-cluster = { path = "crates/plat-cluster", version = "0.1.0" }
+plat-tls = { path = "crates/plat-tls", version = "0.1.0" }
 
 ahash = "0.8"
 clap = { version = "4", features = ["derive"] }
@@ -46,6 +50,19 @@ thiserror = "2"
 toml = "1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# TLS / FIPS boundary (plat-tls only; never a data-plane dependency).
+# NIST 800-53: SC-13 - AWS-LC FIPS module via aws-lc-rs; TLS 1.3 only (no
+# `tls12` feature). Exact rustls pin: the FIPS policy is checked against it.
+rustls = { version = "=0.23.46", default-features = false, features = ["fips", "std", "logging"] }
+rustls-pki-types = { version = "1.15", features = ["std"] }
+aws-lc-rs = { version = "1.19", default-features = false, features = ["fips", "alloc"] }
+zeroize = "1.9"
+x509-cert = "0.2.5"
+der = { version = "0.7", features = ["alloc", "oid"] }
+# RFC 6960 OCSP DER types (no builder: requests and checks use aws-lc-rs).
+x509-ocsp = { version = "0.2.1", default-features = false }
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

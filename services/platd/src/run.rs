@@ -1,10 +1,14 @@
-//! Daemon lifecycle: audit → state → workers → sweeper → metrics → signals.
+//! Daemon lifecycle: FIPS gate → TLS material → audit → state → workers →
+//! sweeper → management → signals.
 
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use parking_lot::RwLock;
+#[cfg(not(feature = "tls"))]
+use plat_audit::FipsMark;
 use plat_audit::{AuditSink, Event, LifecycleKind, Logger, LoggerHandle, NodeIdent};
 use plat_common::{Clock, Config, Counter, Counters, DropReason};
 use plat_io::PacketQueue;
@@ -77,11 +81,60 @@ fn worker_count(cfg: &Config) -> usize {
 /// Emits the stop record and waits for the logger to drain (NIST 800-53
 /// AU-12: every exit after start is recorded). Callers drop every other
 /// `AuditSink` clone (including the engine's) first.
-fn stop_audit(sink: AuditSink, logger: LoggerHandle) {
-    sink.emit(Event::Lifecycle { ts_us: Clock::wall_us(), kind: LifecycleKind::Stop });
+fn stop_audit(sink: AuditSink, hooks: &HookSink, logger: LoggerHandle) {
+    sink.emit(Event::Lifecycle { ts_us: Clock::wall_us(), kind: LifecycleKind::Stop, fips: None });
     drop(sink);
+    // The revocation checker (held by the syslog senders' TLS configs)
+    // reaches the queue only through this slot; empty it so the logger
+    // sees the queue disconnect and drains.
+    hooks.detach();
     logger.join();
 }
+
+/// An `AuditSink` slot for hooks owned by long-lived TLS objects (the
+/// revocation checker inside the syslog senders' and the management
+/// listener's TLS configs). Those objects outlive the logger's input, so
+/// they must not hold a sink directly: `detach` at shutdown releases it.
+#[derive(Debug, Clone, Default)]
+pub struct HookSink(Arc<RwLock<Option<AuditSink>>>);
+
+impl HookSink {
+    pub fn new(sink: AuditSink) -> Self {
+        Self(Arc::new(RwLock::new(Some(sink))))
+    }
+
+    /// Queues `ev` without blocking (lost and counted if the queue is
+    /// full; dropped after `detach`).
+    #[cfg(feature = "tls")]
+    pub fn emit(&self, ev: Event) {
+        if let Some(s) = self.0.read().as_ref() {
+            s.emit(ev);
+        }
+    }
+
+    pub fn detach(&self) {
+        self.0.write().take();
+    }
+}
+
+/// SC-13 start gate for a build without the `tls` feature: there is no
+/// FIPS module, so the default `tls.require_fips` refuses to start, and a
+/// TLS configuration is refused outright.
+#[cfg(not(feature = "tls"))]
+fn fips_gate(cfg: &Config) -> Result<FipsMark, String> {
+    if cfg.uses_tls() {
+        return Err("TLS is configured but platd was built without TLS support (feature `tls`)".into());
+    }
+    if cfg.tls.require_fips {
+        return Err("platd was built without the FIPS module (feature `tls`); refusing to start \
+                    (tls.require_fips = true)"
+            .into());
+    }
+    Ok(FipsMark { active: false, provider: "none" })
+}
+
+#[cfg(feature = "tls")]
+use crate::tls::fips_gate;
 
 #[cfg(target_os = "linux")]
 fn open_queues(cfg: &Config, n: usize) -> std::io::Result<Vec<plat_io::tun::TunQueue>> {
@@ -106,8 +159,31 @@ pub fn run(cfg: Config) -> ExitCode {
     let n = worker_count(&cfg);
     let counters: Vec<Arc<Counters>> = (0..n).map(|_| Arc::new(Counters::default())).collect();
 
-    // Audit first: nothing may be translated before attribution logging is up (AU-12).
+    // SC-13: the FIPS module is installed and checked before anything else
+    // (no `service_start` is written when the start is refused).
+    let fips = match fips_gate(&cfg) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::error!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    tracing::info!(fips = fips.active, provider = fips.provider, "FIPS status");
+
+    // The queue exists before the TLS material is loaded, so revocation
+    // records produced from here on wait in it until the logger is up.
     let (sink, rx) = AuditSink::bounded(cfg.audit.queue_capacity);
+    let hooks = HookSink::new(sink.clone());
+    #[cfg(feature = "tls")]
+    let tls = match crate::tls::prepare(&cfg, &hooks) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Audit first: nothing may be translated before attribution logging is up (AU-12).
     let node = NodeIdent { name: cfg.node.name.clone(), id: cfg.node.id, pid: std::process::id() };
     let summary_src = counters.clone();
     let logger = Logger::new(cfg.audit.clone(), node, rx, sink.stats().clone()).with_counters(Box::new(move || {
@@ -117,6 +193,8 @@ pub fn run(cfg: Config) -> ExitCode {
             .filter(|(_, v)| *v > 0)
             .collect()
     }));
+    #[cfg(feature = "tls")]
+    let logger = logger.with_tls(tls.logger_options(&cfg));
     let logger = match logger.spawn() {
         Ok(h) => h,
         Err(e) => {
@@ -124,14 +202,14 @@ pub fn run(cfg: Config) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    sink.emit(Event::Lifecycle { ts_us: Clock::wall_us(), kind: LifecycleKind::Start });
+    sink.emit(Event::Lifecycle { ts_us: Clock::wall_us(), kind: LifecycleKind::Start, fips: Some(fips) });
 
     let clock = Clock::new();
     let nat = match Nat64::new(&cfg, owned.clone(), sink.clone(), clock.clone()) {
         Ok(n) => Arc::new(n),
         Err(e) => {
             tracing::error!("{e}");
-            stop_audit(sink, logger);
+            stop_audit(sink, &hooks, logger);
             return ExitCode::FAILURE;
         }
     };
@@ -142,7 +220,7 @@ pub fn run(cfg: Config) -> ExitCode {
             tracing::error!("opening {} ({n} queues): {e}", cfg.dataplane.interface);
             stop.store(true, Ordering::Relaxed);
             drop(nat);
-            stop_audit(sink, logger);
+            stop_audit(sink, &hooks, logger);
             return ExitCode::FAILURE;
         }
     };
@@ -179,12 +257,34 @@ pub fn run(cfg: Config) -> ExitCode {
             worker(q, nat, c, i as u16, stop);
         }));
     }
+    // IA-5(2): background revocation refresher (joined before the logger
+    // stops).
+    #[cfg(feature = "tls")]
+    if let Some(c) = tls.checker.as_ref().filter(|c| c.settings().mode != plat_common::config::RevocationMode::Off) {
+        threads.push(plat_tls::spawn_refresher(c.clone(), stop.clone()));
+    }
+    #[cfg(feature = "tls")]
+    let extra = tls.sections();
+    #[cfg(not(feature = "tls"))]
+    let extra = Vec::new();
+    let src =
+        metrics::Sources { nat: nat.clone(), workers: counters.clone(), audit: sink.clone(), fips: fips.active, extra };
+    #[cfg(feature = "tls")]
+    let mut tls = tls;
     let metrics = cfg.management.listen.map(|addr| {
-        metrics::spawn(
-            addr,
-            metrics::Sources { nat: nat.clone(), workers: counters.clone(), audit: sink.clone() },
-            stop.clone(),
-        )
+        #[cfg(feature = "tls")]
+        if let Some(m) = tls.mgmt.take() {
+            return crate::mgmt::spawn(
+                addr,
+                m,
+                src,
+                sink.clone(),
+                tls.mgmt_stats.clone(),
+                tls.limiter.clone(),
+                stop.clone(),
+            );
+        }
+        metrics::spawn(addr, src, stop.clone())
     });
 
     // Any thread or listener that failed to start is a failed start: stop
@@ -220,12 +320,16 @@ pub fn run(cfg: Config) -> ExitCode {
     if let Some(Ok(m)) = metrics {
         let _ = m.join();
     }
+    #[cfg(feature = "tls")]
+    if let Some(c) = &tls.checker {
+        c.notify();
+    }
     // Drop every AuditSink clone so the logger drains and exits.
     // POAM: POAM-009 - live port blocks are not released (no `nat_port_block_release`
     // records) at shutdown; the release needs a plat-nat64 drain API. SIEM
     // correlation closes them at `service_stop`.
     drop(nat);
-    stop_audit(sink, logger);
+    stop_audit(sink, &hooks, logger);
     if failed { ExitCode::FAILURE } else { ExitCode::SUCCESS }
 }
 
@@ -317,6 +421,75 @@ mod tests {
         assert_eq!(counters.get(Counter::TxPackets), 3, "one IPv4 packet + two fragments");
         assert_eq!(counters.get(Counter::TxBytes), (v4.len() + f1.len() + f2.len()) as u64);
         assert_eq!(counters.get(Counter::IoErrors), 0);
+    }
+
+    /// The example config with the audit file in `dir`, a small queue, and
+    /// an interface name no kernel accepts (IFNAMSIZ), so `run` always
+    /// stops after the audit start-up, even as root on Linux.
+    #[cfg(feature = "tls")]
+    fn start_cfg(dir: &std::path::Path, extra: &str) -> Config {
+        let text = include_str!("../../../config/platd.example.toml")
+            .replace("/var/log/plat/nat64-audit.jsonl", &dir.join("audit.jsonl").display().to_string())
+            .replace("queue_capacity = 1048576", "queue_capacity = 4096")
+            .replace("min_free_bytes = 2147483648", "min_free_bytes = 0")
+            .replace("interface = \"plat0\"", "interface = \"plat0-name-longer-than-ifnamsiz\"")
+            .replace("[[audit.syslog]]\naddress = \"198.51.100.10:514\"\ntransport = \"udp\"\nformat = \"json\"\napp_name = \"platd\"\n", "")
+            .replace("# [management.tls]", extra);
+        Config::from_toml(&text).unwrap()
+    }
+
+    /// SC-13 (Q1): with `tls.require_fips` (default) and the FIPS module
+    /// inactive, `run` refuses to start before the logger exists: exit
+    /// non-zero, no audit file, no `service_start`; with or without TLS
+    /// configured. `require_fips = false` starts and records
+    /// `plat.fips=false`. One test, because the hook is process-global.
+    #[cfg(feature = "tls")]
+    #[test]
+    fn require_fips_refuses_start_when_module_inactive() {
+        let mgmt_tls = "[management.tls]\ncert_file = \"/nonexistent/mgmt.pem\"\nkey_file = \"/nonexistent/mgmt.key\"\n\
+                        client_ca_file = \"/nonexistent/ca.pem\"\nallowed_clients = [\"dns:prom.test\"]\n# [x]";
+        let plain_dir = crate::test_pki::TempDir::new("fips-plain");
+        let tls_dir = crate::test_pki::TempDir::new("fips-tls");
+        let plain = start_cfg(plain_dir.path(), "# [management.tls]");
+        let with_tls = start_cfg(tls_dir.path(), mgmt_tls);
+        assert!(with_tls.uses_tls() && !plain.uses_tls());
+
+        let _serial = crate::test_pki::FIPS_HOOK.lock();
+        plat_tls::fips::force_inactive_for_tests(true);
+        let refused_plain = run(plain.clone());
+        let refused_tls = run(with_tls.clone());
+        let gate = fips_gate(&with_tls);
+        let mut lax = plain.clone();
+        lax.tls.require_fips = false;
+        let lax_mark = fips_gate(&lax);
+        plat_tls::fips::force_inactive_for_tests(false);
+
+        assert_eq!(refused_plain, ExitCode::FAILURE);
+        assert_eq!(refused_tls, ExitCode::FAILURE);
+        for d in [&plain_dir, &tls_dir] {
+            assert!(!d.path().join("audit.jsonl").exists(), "refused before the logger: no service_start");
+        }
+        let e = gate.unwrap_err();
+        assert!(e.contains("refusing to start") && e.contains("require_fips"), "{e}");
+        assert_eq!(lax_mark.unwrap(), plat_audit::FipsMark { active: false, provider: "aws-lc-rs-fips" });
+        assert_eq!(fips_gate(&plain).unwrap(), plat_audit::FipsMark { active: true, provider: "aws-lc-rs-fips" });
+    }
+
+    /// SC-13 / AU-3: a start records the FIPS state on `service_start`
+    /// (the data plane then fails to open the bogus interface and the
+    /// daemon stops cleanly with `service_stop`).
+    #[cfg(feature = "tls")]
+    #[test]
+    fn service_start_records_fips_state() {
+        let dir = crate::test_pki::TempDir::new("fips-start");
+        let cfg = start_cfg(dir.path(), "# [management.tls]");
+        let serial = crate::test_pki::FIPS_HOOK.lock();
+        assert_eq!(run(cfg), ExitCode::FAILURE, "no TUN device in tests");
+        drop(serial);
+        let text = std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap();
+        let start = text.lines().find(|l| l.contains("\"event.action\":\"service_start\"")).expect("service_start");
+        assert!(start.contains("\"plat.fips\":true,\"plat.fips_provider\":\"aws-lc-rs-fips\""), "{start}");
+        assert!(text.contains("\"event.action\":\"service_stop\""));
     }
 
     /// PERF-107: a full device queue is counted as back-pressure, not as

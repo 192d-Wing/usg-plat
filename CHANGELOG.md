@@ -6,6 +6,50 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 
 ### Added
 
+- FIPS TLS (POAM-004, POAM-005): rustls with the aws-lc-rs FIPS crypto provider
+  (TLS 1.3 only; FIPS cipher suites; kx X25519MLKEM768/P-256/P-384, hybrid off via
+  `tls.pq_hybrid = false`). New `audit.syslog[].transport = "tls"` (RFC 5425
+  octet-counted framing, CA-pinned server verification, optional client cert)
+  and mTLS remote management (non-loopback `management.listen` requires a TLS
+  block; client cert required; subject/SAN allow-list; every connection audited).
+  Full-chain revocation checking (OCSP first, CRL fallback, `hard_fail` default).
+  Key-file permission checks and zeroized key buffers. `check-config` prints a TLS summary.
+- `make check-notls` CI step keeps the TLS-off (`--no-default-features`) build compiling.
+- New crate `plat-tls` (FIPS init, TLS policy, key/cert loading, identity,
+  verifiers, deadline-bound TLS I/O, OCSP/CRL revocation checker and the
+  `plat-revocation` refresher thread).
+- OCSP client (RFC 6960): stapling for the syslog collector leaf, SHA-256
+  CertID (`cert_id_hash = "sha1"` option for RFC 5019), RFC 8954 nonce,
+  delegated-responder checks, bounded cache with single-flight fetches.
+- CRL support (RFC 5280): `crl.files`, `crl.urls` and HTTP CDPs; named
+  IssuingDistributionPoint enforced (URI and directoryName); delta/indirect
+  CRLs unusable; duplicate extensions rejected; reason `not_yet_valid` for a
+  future thisUpdate; cRLNumber high-water mark per issuer and scope,
+  persisted to `cache_dir/crl-numbers` (serialised atomic writes, retried on
+  failure).
+- Management mTLS listener (`plat-mgmt`, `plat-mgmt-conn` threads):
+  `max_connections` (default 4), `management.tls.max_connections_per_ip`
+  (default 2; IPv4 per address, IPv6 per /64, IPv4-mapped = IPv4), 2 s
+  ClientHello deadline, `handshake_timeout_ms` (default 5000).
+- Log schema v5 records: `management_connection` (incl.
+  `plat.mgmt.allow_entry`, `tls.client.x509.alternative_names`; CEF
+  `cs2`/`cs3`), `management_connection_suppressed`, `tls_revocation_check`,
+  `revocation_source_refresh` (transitions `failing`, `recovered`,
+  `stale_dropped`, `rollback_rejected`, `state_rejected`,
+  `state_persist_failed`); `service_start` `plat.fips`/`plat.fips_provider`;
+  `audit_remote_loss` `plat.reason` (`io`, `tls_handshake`, `tls_verify`,
+  `tls_revocation`; TCP losses now report `io`).
+- Metrics: `plat_fips_mode`, `plat_mgmt_connections_total`,
+  `plat_mgmt_rejections_total`, `plat_revocation_checks_total`,
+  `plat_revocation_refresh_failures_total`, `plat_ocsp_cache_entries`,
+  `plat_crl_cache_entries`, `plat_crl_cache_bytes`,
+  `plat_crl_state_errors_total`, `plat_tls_cert_expiry_seconds`,
+  `plat_audit_remote_tls_handshakes_total`,
+  `plat_audit_remote_tls_failures_total`.
+- `check-config --format env` adds `PLAT_FIPS` and `PLAT_MGMT_TLS`.
+- systemd unit: `StateDirectory=plat/revocation` (mode 0700) for the
+  optional CRL cache.
+
 - Stateful NAT64 / 464XLAT PLAT engine: RFC 6052 mapping, RFC 7915 in-place
   translation, ICMP error translation, RFC 6146 BIB/session tables with
   endpoint-independent mapping, address-dependent filtering, TCP state
@@ -42,6 +86,35 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 
 ### Changed
 
+- **Breaking (log schema v5):** `LOG_SCHEMA_VERSION` 4 -> 5; `service_start` gains
+  FIPS status, new management-connection and revocation records. SIEM parser
+  owners must update.
+- **Breaking (config):** new `tls`/revocation/management TLS settings; `require_fips`
+  defaults to `true` - `platd` refuses to start if the FIPS module is not active.
+- **Breaking (build):** the crypto boundary is no longer pure Rust. Building now
+  requires CMake, Go (>= 1.18) and a C compiler (plus `gcc-aarch64-linux-gnu`
+  for aarch64 cross-checks; `make check-linux` falls back to TLS-off without it).
+- `deny.toml`: allow `ISC`; `OpenSSL` permitted only for `aws-lc-fips-sys`.
+- Version: minor bump at release (pre-1.0, config + log schema breaking).
+- **Breaking (config):** `management.tls.allowed_clients` entries must be typed
+  (`cn:`, `dns:`, `uri:`, `sha256:<hex>`); bare entries are a validation error.
+- **Breaking (config):** a non-loopback `management.listen` requires
+  `[management.tls]`; with it the single listener is mTLS only.
+- `tls.pq_hybrid` defaults to `true`; NIAP NDcPP evaluated configurations must
+  set it to `false`.
+- `check-config` (text and env) loads all TLS files and checks key permissions;
+  exit 2 on failure.
+- Key files with setuid/setgid/sticky bits are rejected; FIFOs and devices at
+  any configured TLS/CRL path are rejected instead of blocking.
+- Revocation HTTP fetcher rejects non-token header names, whitespace before
+  the colon and obs-fold lines (documented deviation from RFC 9112 §5.2).
+- `Event` is no longer `Copy` (TLS records carry text behind `Arc`);
+  data-plane events are unchanged.
+- Workspace builds `plat-audit` without TLS by default for data-plane crates;
+  `platd`'s `tls` feature enables it.
+- Docs: NIST mapping (AC-17, SC-8, IA-3, IA-5(2), SC-12, SC-13; CM-3 and SA-11
+  now Implemented), POA&M (POAM-004/005 closed, POAM-025 added), SIEM schema
+  v5, RFC compliance TLS/revocation section, architecture and README.
 - **Breaking (config behaviour):** `translation.allow_non_global_destinations`
   defaults to `false`; RFC 6890 non-global IPv4 space (RFC 1918, 100.64/10,
   documentation ranges, ...) is refused as a destination and as an inbound

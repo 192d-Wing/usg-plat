@@ -152,6 +152,7 @@ fn tcp_syslog_uses_octet_counting_framing() {
         transport: SyslogTransport::Tcp,
         format: LogFormat::Json,
         app_name: "platd".into(),
+        tls: None,
     };
     let (sink, rx) = AuditSink::bounded(1024);
     let h = Logger::new(cfg(None, vec![syslog], 16), node(), rx, sink.stats().clone()).spawn().unwrap();
@@ -195,6 +196,7 @@ fn tcp_syslog_unreachable_counts_output_errors_without_blocking() {
         transport: SyslogTransport::Tcp,
         format: LogFormat::Cef,
         app_name: "platd".into(),
+        tls: None,
     };
     let dir = tmpdir("remote-loss");
     let path = dir.join("audit.jsonl");
@@ -223,8 +225,10 @@ fn tcp_syslog_unreachable_counts_output_errors_without_blocking() {
                 l.contains(&format!("\"destination.ip\":\"127.0.0.1\",\"destination.port\":{}", addr.port())),
                 "{l}"
             );
+            // Schema 5: the connection failures carry their cause.
+            assert!(l.contains("\"plat.reason\":\"io\"") || !l.contains("plat.reason"), "{l}");
             let i = l.find("\"plat.audit.lost\":").unwrap() + 18;
-            l[i..].trim_end_matches('}').parse::<u64>().unwrap()
+            l[i..].chars().take_while(char::is_ascii_digit).collect::<String>().parse::<u64>().unwrap()
         })
         .sum();
     let remote_lost = stats.remote_lost.load(Ordering::Relaxed);

@@ -7,7 +7,15 @@ yanked = "deny"
 version = 2
 # Only licenses present in the dependency graph (CM-10). Add one here only
 # after review when a new dependency needs it.
-allow = ["Apache-2.0", "MIT", "BSD-3-Clause", "Unicode-3.0"]
+# ISC (FIPS TLS, POAM-004/005): aws-lc-rs, aws-lc-fips-sys, untrusted, rustls-webpki.
+allow = ["Apache-2.0", "MIT", "BSD-3-Clause", "Unicode-3.0", "ISC"]
+# OpenSSL licence is NOT allowed globally. Only the AWS-LC FIPS module carries it
+# (crates.io: aws-lc-fips-sys "ISC AND (Apache-2.0 OR ISC) AND OpenSSL").
+# aws-lc-sys >= 0.47 no longer declares OpenSSL, so it needs no exception;
+# add one here only after review if a resolved version does.
+exceptions = [
+    { crate = "aws-lc-fips-sys", allow = ["OpenSSL"] },
+]
 
 [bans]
 multiple-versions = "warn"

@@ -95,6 +95,7 @@ fn file_failure_degrades_fails_closed_and_recovers() {
         transport: SyslogTransport::Udp,
         format: LogFormat::Json,
         app_name: "platd".into(),
+        tls: None,
     };
     let (sink, rx) = AuditSink::bounded(4096);
     let stats = sink.stats().clone();
@@ -492,6 +493,7 @@ fn stalled_collector_never_stalls_the_local_file() {
         transport: SyslogTransport::Tcp,
         format: LogFormat::Json,
         app_name: "platd".into(),
+        tls: None,
     };
     let dir = tmpdir("stalled");
     let path = dir.join("audit.jsonl");

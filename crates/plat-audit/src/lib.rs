@@ -6,10 +6,10 @@
 //!  worker N ─┤   bounded MPMC queue       │ batch, fmt   │
 //!  sweeper  ─┘                            └──────┬───────┘
 //!                       bounded hand-off, try_send│ (never waits on a collector)
-//!                                    plat-syslog-i ─▶ syslog UDP/TCP JSON|CEF (AU-6(4))
+//!                                    plat-syslog-i ─▶ syslog UDP/TCP/TLS JSON|CEF (AU-6(4), RFC 5425)
 //! ```
 //!
-//! The data plane only builds a small `Copy` [`Event`] and hands it off with
+//! The data plane only builds a small plain-data [`Event`] and hands it off with
 //! a non-blocking `try_send`; formatting, hashing and I/O happen on the
 //! logger threads in batches (one write per batch to the file and to each
 //! TCP collector; UDP syslog is one datagram per record on its own thread).
@@ -29,11 +29,17 @@ pub mod event;
 pub mod format;
 pub mod logger;
 pub mod sink;
+#[cfg(feature = "tls")]
+pub mod tls;
 pub mod verify;
 
-pub use event::{Event, LifecycleKind, LimitKind, PruneState, StorageState};
+pub use event::{
+    AuditText, Event, FipsMark, LifecycleKind, LimitKind, MgmtConnection, MgmtPath, MgmtReason, PruneState,
+    RefreshKind, RefreshTransition, RemoteLossReason, RevocationCheck, RevocationRefresh, RevocationSource,
+    RevocationStatus, StorageState, TlsRole,
+};
 pub use logger::{Logger, LoggerHandle, NodeIdent};
-pub use sink::{AuditSink, AuditStats, TryEmit};
+pub use sink::{AuditSink, AuditStats, RemoteStats, TryEmit};
 
 /// Version of the SIEM record schema (`plat.schema`). Bump on any field
 /// or record-type change; downstream parsers key on it.
@@ -51,4 +57,11 @@ pub use sink::{AuditSink, AuditStats, TryEmit};
 /// `success`/`failure`; CEF `act`); `audit_storage_threshold` state
 /// `unknown` (free space undeterminable, fail closed; no
 /// `plat.audit.available_bytes`).
-pub const LOG_SCHEMA_VERSION: u32 = 4;
+///
+/// 5: `service_start` carries `plat.fips` / `plat.fips_provider` (SC-13);
+/// `audit_remote_loss` may carry `plat.reason`
+/// (`io`|`tls_handshake`|`tls_verify`|`tls_revocation`); new records
+/// `management_connection`, `management_connection_suppressed`,
+/// `tls_revocation_check` and `revocation_source_refresh` (AC-17, IA-3,
+/// IA-5(2)). Certificate text in these is sanitized, capped and escaped.
+pub const LOG_SCHEMA_VERSION: u32 = 5;

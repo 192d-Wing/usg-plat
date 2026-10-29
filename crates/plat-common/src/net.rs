@@ -171,6 +171,105 @@ macro_rules! serde_via_str {
 serde_via_str!(Ipv4Cidr);
 serde_via_str!(Ipv6Cidr);
 
+/// Longest accepted `http://` URL (OCSP responder, CRL location).
+pub const MAX_URL_LEN: usize = 2048;
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum UrlError {
+    #[error("URL longer than {MAX_URL_LEN} bytes")]
+    TooLong,
+    #[error("only http:// URLs are supported")]
+    Scheme,
+    #[error("URL must not contain user information, a fragment, spaces or control characters")]
+    Forbidden,
+    #[error("invalid host")]
+    Host,
+    #[error("invalid port")]
+    Port,
+}
+
+/// A plain `http://host[:port][/path]` URL, as used for OCSP responders
+/// (RFC 6960 Appendix A) and CRL distribution points (RFC 5280 §4.2.1.13).
+///
+/// Deliberately narrow: no userinfo, no fragment, no percent-decoding, no
+/// IDNA. `host` is a DNS name, a dotted IPv4 address or a bracketed IPv6
+/// literal (stored without brackets); `path` always starts with `/` and
+/// keeps any query string verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpUrl {
+    pub host: String,
+    pub port: u16,
+    pub path: String,
+}
+
+impl HttpUrl {
+    pub fn parse(s: &str) -> Result<Self, UrlError> {
+        if s.len() > MAX_URL_LEN {
+            return Err(UrlError::TooLong);
+        }
+        let rest = match s.get(..7) {
+            Some(p) if p.eq_ignore_ascii_case("http://") => &s[7..],
+            _ => return Err(UrlError::Scheme),
+        };
+        if rest.bytes().any(|b| !(b'!'..=b'~').contains(&b) || b == b'#') {
+            return Err(UrlError::Forbidden);
+        }
+        let (authority, path) = match rest.find(['/', '?']) {
+            Some(i) if rest.as_bytes()[i] == b'/' => (&rest[..i], rest[i..].to_owned()),
+            Some(i) => (&rest[..i], format!("/{}", &rest[i..])),
+            None => (rest, "/".to_owned()),
+        };
+        if authority.contains('@') {
+            return Err(UrlError::Forbidden);
+        }
+        let (host, port) = if let Some(v6) = authority.strip_prefix('[') {
+            let end = v6.find(']').ok_or(UrlError::Host)?;
+            let host = &v6[..end];
+            host.parse::<Ipv6Addr>().map_err(|_| UrlError::Host)?;
+            (host, &v6[end + 1..])
+        } else {
+            match authority.find(':') {
+                Some(i) => (&authority[..i], &authority[i..]),
+                None => (authority, ""),
+            }
+        };
+        let port = match port {
+            "" => 80,
+            p => match p.strip_prefix(':').map(str::parse::<u16>) {
+                Some(Ok(n)) if n != 0 => n,
+                _ => return Err(UrlError::Port),
+            },
+        };
+        if !authority.starts_with('[') && !is_dns_name(host) && host.parse::<Ipv4Addr>().is_err() {
+            return Err(UrlError::Host);
+        }
+        Ok(Self { host: host.to_ascii_lowercase(), port, path })
+    }
+
+    /// `host:port` for logs and the HTTP `Host` header (IPv6 bracketed).
+    pub fn authority(&self) -> String {
+        if self.host.contains(':') {
+            format!("[{}]:{}", self.host, self.port)
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
+    }
+}
+
+/// RFC 1123 host name: 1..=253 bytes, labels 1..=63 of `[A-Za-z0-9-]`, no
+/// leading/trailing hyphen. A trailing dot is not accepted.
+pub fn is_dns_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 253
+        && s.split('.').all(|l| {
+            !l.is_empty()
+                && l.len() <= 63
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+                && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,5 +290,26 @@ mod tests {
         assert_eq!("192.0.2.0/33".parse::<Ipv4Cidr>(), Err(CidrError::BadLen));
         assert_eq!("2001:db8::1/64".parse::<Ipv6Cidr>(), Err(CidrError::HostBits));
         assert_eq!("2001:db8::".parse::<Ipv6Cidr>(), Err(CidrError::MissingLen));
+    }
+
+    #[test]
+    fn http_urls() {
+        let u = HttpUrl::parse("http://ocsp.example.net/a/b?x=1").unwrap();
+        assert_eq!((u.host.as_str(), u.port, u.path.as_str()), ("ocsp.example.net", 80, "/a/b?x=1"));
+        let u = HttpUrl::parse("HTTP://[2001:db8::1]:8080").unwrap();
+        assert_eq!((u.host.as_str(), u.port, u.path.as_str()), ("2001:db8::1", 8080, "/"));
+        assert_eq!(u.authority(), "[2001:db8::1]:8080");
+        assert_eq!(HttpUrl::parse("http://192.0.2.20?q").unwrap().path, "/?q");
+        assert_eq!(HttpUrl::parse("https://x.example/"), Err(UrlError::Scheme));
+        assert_eq!(HttpUrl::parse("http://u:p@x.example/"), Err(UrlError::Forbidden));
+        assert_eq!(HttpUrl::parse("http://x.example/a b"), Err(UrlError::Forbidden));
+        assert_eq!(HttpUrl::parse("http://x.example/#f"), Err(UrlError::Forbidden));
+        assert_eq!(HttpUrl::parse("http://x.example:0/"), Err(UrlError::Port));
+        assert_eq!(HttpUrl::parse("http://x.example:99999/"), Err(UrlError::Port));
+        assert_eq!(HttpUrl::parse("http://-bad.example/"), Err(UrlError::Host));
+        assert_eq!(HttpUrl::parse("http:///path"), Err(UrlError::Host));
+        assert_eq!(HttpUrl::parse("http://[::1/"), Err(UrlError::Host));
+        let long = format!("http://x.example/{}", "a".repeat(MAX_URL_LEN));
+        assert_eq!(HttpUrl::parse(&long), Err(UrlError::TooLong));
     }
 }

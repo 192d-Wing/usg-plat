@@ -53,6 +53,7 @@ fn file_and_syslog_records_with_valid_chain() {
         transport: SyslogTransport::Udp,
         format: LogFormat::Cef,
         app_name: "platd".into(),
+        tls: None,
     };
     let path = tmp("chain");
     let (sink, rx) = AuditSink::bounded(1024);

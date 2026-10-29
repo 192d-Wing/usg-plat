@@ -99,5 +99,86 @@ transport = "udp"
 format = "json"
 app_name = "platd"
 
+# RFC 5425 syslog over TLS 1.3 (SC-8, AU-9(2)); octet-counted framing.
+# The collector certificate must chain to ca_file (system roots are never
+# used) and carry server_name in its SAN. cert_file/key_file (both or
+# neither) authenticate this node to the collector. Key files must be owned
+# by the service user (mode 0600/0400/0640/0440) or by root with the service
+# group (0640/0440).
+# [[audit.syslog]]
+# address = "192.0.2.10:6514"
+# transport = "tls"
+# format = "json"
+# [audit.syslog.tls]
+# server_name = "siem.example.net"
+# ca_file = "/etc/plat/tls/siem-ca.pem"
+# cert_file = "/etc/plat/tls/platd-client.pem"
+# key_file = "/etc/plat/tls/platd-client.key"
+
 [management]
+# Without [management.tls] the listener is plaintext and must be loopback.
 listen = "127.0.0.1:9464"
+# With [management.tls] the (single) listener is mutual TLS only and may use
+# any address (AC-17, IA-3). Clients must present a certificate chaining to
+# client_ca_file that exactly matches a typed allowed_clients entry (no
+# wildcards): "cn:<subject CN>", "dns:<DNS SAN>", "uri:<URI SAN>" or
+# "sha256:<64 hex digits, SHA-256 of the certificate DER>". Untyped entries
+# are a configuration error.
+# max_connections_per_ip (1..=64, capped at max_connections) limits
+# concurrent connections from one source address; a client must also send its ClientHello within
+# 2 s of connecting (SC-5).
+# [management.tls]
+# cert_file = "/etc/plat/tls/mgmt.pem"
+# key_file = "/etc/plat/tls/mgmt.key"
+# client_ca_file = "/etc/plat/tls/mgmt-clients-ca.pem"
+# allowed_clients = ["dns:prometheus-01.ops.example.net", "uri:spiffe://ops/prom"]
+# max_connections = 4
+# max_connections_per_ip = 2
+# handshake_timeout_ms = 5000
+
+[tls]
+# SC-13: refuse to start unless the AWS-LC FIPS module is active. Setting
+# false is an operator override recorded in service_start (plat.fips=false).
+require_fips = true
+# Offer hybrid X25519MLKEM768 first, then P-256 and P-384.
+pq_hybrid = true
+
+[tls.revocation]
+# Every non-root certificate of management client chains and syslog
+# collector chains: OCSP first, CRL fallback (IA-5(2)). hard_fail rejects
+# when no conclusive status is available; soft_fail accepts only when no
+# status could be obtained at all (stale data always rejects); off disables.
+mode = "hard_fail"
+clock_skew_secs = 300
+# Whole-chain time budget per handshake; management.tls.handshake_timeout_ms
+# must be at least budget_ms + 1000.
+budget_ms = 4000
+# Optional on-disk CRL cache (0700, owned by the service user); CRLs are
+# re-verified when loaded. The shipped systemd unit creates this path
+# (StateDirectory=plat/revocation). With it, the highest cRLNumber seen per
+# issuer is also persisted (rollback protection across restarts).
+# cache_dir = "/var/lib/plat/revocation"
+
+[tls.revocation.ocsp]
+enabled = true
+# Leaf only; intermediates always use their AIA responder.
+# responder_url = "http://192.0.2.20/ocsp"
+use_aia = true
+method = "post"
+cert_id_hash = "sha256"
+nonce = true
+require_nonce = false
+timeout_ms = 2000
+max_age_secs = 3600
+cache_entries = 1024
+
+[tls.revocation.crl]
+enabled = true
+use_cdp = true
+urls = []
+files = []
+timeout_ms = 5000
+max_bytes = 10485760
+cache_bytes = 67108864
+max_crls = 64
+refresh_margin_secs = 3600
