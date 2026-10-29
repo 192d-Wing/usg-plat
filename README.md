@@ -77,6 +77,10 @@ Configuration changes to note when upgrading from an earlier build:
 - **FIPS:** `tls.require_fips = true` is the default: `platd` refuses to
   start unless the AWS-LC FIPS module is active, even with no TLS configured.
   `check-config` and `/metrics` (`plat_fips_mode`) show the status.
+  The module is AWS-LC-FIPS 4.2.0 (`aws-lc-fips-sys` ~0.14.4) — submitted to
+  NIST (Modules In Process), not yet validated. The `aws-lc-fips-sys` README's
+  "3.0.x" statement is out of date. Certificates #5298/#5314 (v3.1) do not
+  cover this build (POAM-026).
 - **Breaking:** `management.tls.allowed_clients` entries must be typed:
   `cn:<CN>`, `dns:<DNS SAN>`, `uri:<URI SAN>` or `sha256:<64 hex>`
   (certificate fingerprint). Bare entries fail validation.

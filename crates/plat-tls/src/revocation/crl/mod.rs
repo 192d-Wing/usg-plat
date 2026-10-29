@@ -215,6 +215,11 @@ pub struct CrlClient {
     persist: Mutex<bool>,
     /// cRLNumber state load problems + write failures (SEC-103, NIST-102).
     state_errors: AtomicU64,
+    /// `crl-numbers` directory fsync failures (SEC-308), kept apart from
+    /// `state_errors` (the write itself succeeded).
+    dir_sync_failures: AtomicU64,
+    /// HTTP fetch latency (`plat_crl_fetch_seconds`).
+    hist: super::FetchHist,
 }
 
 impl std::fmt::Debug for CrlClient {
@@ -264,12 +269,22 @@ impl CrlClient {
         }
         let disk = s.cache_dir.as_deref().map(DiskCache::new);
         let mut hwm_problem = None;
+        let mut hwm_not_moved = false;
         if let Some(d) = &disk {
+            // SEC-202: leftovers of a crashed writer (never this process).
+            let gone = d.remove_stale_tmp(std::time::SystemTime::now());
+            if gone > 0 {
+                tracing::warn!("revocation: removed {gone} stale temporary file(s) from cache_dir");
+            }
             let l = d.load_hwm((cfg.max_crls as usize).saturating_mul(4));
             for (k, n) in l.marks {
                 state.seed_hwm(k, n);
             }
             hwm_problem = l.problem;
+            if let Some(p) = &l.moved_to {
+                tracing::warn!("revocation: rejected {HWM_SOURCE} kept as {}", p.display());
+            }
+            hwm_not_moved = l.move_failed;
             for (k, der) in d.load(cfg.max_crls as usize, cfg.max_bytes, now, skew) {
                 state.put_pending(k, Pending { der: Arc::new(der), kind: PendingKind::Disk, at: now }, now);
             }
@@ -302,6 +317,8 @@ impl CrlClient {
             hook,
             persist: Mutex::new(false),
             state_errors: AtomicU64::new(0),
+            dir_sync_failures: AtomicU64::new(0),
+            hist: super::FetchHist::default(),
         };
         if let Some(p) = hwm_problem {
             // SEC-103 / NIST-102: rollback marks were (partly) lost; the
@@ -315,6 +332,12 @@ impl CrlClient {
                 _ => tracing::warn!("revocation: {HWM_SOURCE} ignored: {}", p.as_str()),
             }
             me.state_error(RefreshTransition::StateRejected, p.as_str());
+        }
+        if hwm_not_moved {
+            // SEC-303: the rejected file stays in place (and may be
+            // overwritten by the next write); the audit record above covers it.
+            tracing::warn!("revocation: rejected {HWM_SOURCE} could not be moved aside");
+            me.state_errors.fetch_add(1, Ordering::Relaxed);
         }
         Ok(me)
     }
@@ -410,7 +433,19 @@ impl CrlClient {
         let snap = self.state.lock().take_hwm_if_dirty();
         let Some(m) = snap else { return };
         match d.store_hwm(&m) {
-            Ok(()) => *failing = false,
+            Ok(st) => {
+                *failing = false;
+                // SEC-201 / SEC-308: the marks are in place but may not
+                // survive power loss; counted separately (not audited: the
+                // write itself succeeded).
+                // COMPLIANCE MAPPING:
+                // - NIST 800-53: IA-5(2)(b)(2) - durability of the revocation
+                //   rollback state; SC-24, CP-10
+                if !st.dir_synced {
+                    tracing::warn!("revocation: cRLNumber state directory fsync failed");
+                    self.dir_sync_failures.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             Err(err) => {
                 self.state.lock().mark_hwm_dirty();
                 tracing::warn!("revocation: cRLNumber state write failed: {err}");
@@ -527,7 +562,7 @@ impl CrlClient {
                     max_body,
                     deadline,
                 };
-                http::fetch(url, &req).map(|r| r.body).map_err(map_http)
+                self.hist.time(|| http::fetch(url, &req)).map(|r| r.body).map_err(map_http)
             }
             SrcRef::File(p) => match disk::read_capped(p, self.cfg.max_bytes) {
                 Ok(Some(b)) => file_der(b),
@@ -546,6 +581,18 @@ impl CrlSource for CrlClient {
 
     fn state_errors(&self) -> u64 {
         self.state_errors.load(Ordering::Relaxed)
+    }
+
+    fn dir_sync_failures(&self) -> u64 {
+        self.dir_sync_failures.load(Ordering::Relaxed)
+    }
+
+    fn fetch_hist(&self) -> Option<&super::FetchHist> {
+        Some(&self.hist)
+    }
+
+    fn next_updates(&self) -> Vec<([u8; 32], u64)> {
+        self.state.lock().next_updates()
     }
 
     fn lookup(&self, ctx: &CertCtx<'_>) -> Lookup {

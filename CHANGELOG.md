@@ -6,6 +6,10 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 
 ### Added
 
+- Revocation metrics (SI-4): `plat_ocsp_fetch_seconds` and
+  `plat_crl_fetch_seconds` histograms (`outcome` = `ok`/`error`, HTTP exchange
+  only), `plat_crl_next_update_seconds{issuer}` gauge and
+  `plat_crl_state_dir_sync_failures_total` counter.
 - FIPS TLS (POAM-004, POAM-005): rustls with the aws-lc-rs FIPS crypto provider
   (TLS 1.3 only; FIPS cipher suites; kx X25519MLKEM768/P-256/P-384, hybrid off via
   `tls.pq_hybrid = false`). New `audit.syslog[].transport = "tls"` (RFC 5425
@@ -86,6 +90,10 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 
 ### Changed
 
+- `aws-lc-fips-sys` pinned to `~0.14.4` (AWS-LC-FIPS 4.2.0) in `plat-tls`.
+- SC-13 status corrected to Partial: AWS-LC-FIPS 4.x is CMVP Modules In
+  Process, not validated; certificates #5298/#5314 (v3.1) do not cover this
+  build (POAM-026).
 - **Breaking (log schema v5):** `LOG_SCHEMA_VERSION` 4 -> 5; `service_start` gains
   FIPS status, new management-connection and revocation records. SIEM parser
   owners must update.
@@ -138,6 +146,13 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 
 ### Security
 
+- SEC-201: the CRL disk cache fsyncs the directory after the atomic rename;
+  failures are counted in the new `plat_crl_state_dir_sync_failures_total`.
+- SEC-202: a rejected regular `crl-numbers` file is moved aside as
+  `crl-numbers.rejected.<ts>` (exclusive name, fchmod 0600 via O_NOFOLLOW;
+  just-moved plus 2 newest others kept); non-regular entries are left in
+  place; a failed move-aside counts in `plat_crl_state_errors_total`. Own
+  stale temporary files older than start − 60 s are removed at start.
 - Per-subscriber and subscriber-table limits (`nat64.max_subscribers`).
 - Expired sessions no longer match on the data path.
 - SEC-301: wire IPv4 packets sourced from this node's own pool slice are

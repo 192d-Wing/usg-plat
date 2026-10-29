@@ -442,8 +442,20 @@ fn crl_number_high_water_mark_persists() {
     let mut s = crl_only(RevocationMode::HardFail);
     s.cache_dir = Some(dir.path().to_path_buf());
     let a = revoc::anchors(&[&fx.root]);
-    assert_eq!(Rig::new(s.clone()).check(&fx.leaf, &[], &a).outcome, ChainOutcome::Accepted);
+    let rig = Rig::new(s.clone());
+    assert_eq!(rig.check(&fx.leaf, &[], &a).outcome, ChainOutcome::Accepted);
     assert!(dir.path().join("crl-numbers").exists());
+    // SI-4: one successful CRL fetch, one issuer with a future nextUpdate.
+    let (ocsp, crl) = rig.c.fetch_stats();
+    assert_eq!(ocsp.map(|h| h.buckets[0][9]), Some(0));
+    let crl = crl.unwrap();
+    assert_eq!((crl.buckets[0][9], crl.buckets[1][9]), (1, 0));
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let nu = rig.c.crl_next_update(now);
+    assert_eq!(nu.len(), 1);
+    assert_eq!(nu[0].0.len(), 16);
+    assert!(nu[0].1 > 0, "{nu:?}");
+    drop(rig);
     // Restart without the cached CRL itself: only the mark remains.
     for f in cache_files(&dir) {
         std::fs::remove_file(f).unwrap();
@@ -473,6 +485,15 @@ fn crl_number_state_problems_are_surfaced() {
     s.cache_dir = Some(dir.path().to_path_buf());
     let a = revoc::anchors(&[&fx.root]);
     let rig = Rig::new(s.clone());
+    // SEC-304: a non-regular path is not moved aside; it stays in place
+    // and so blocks the first write.
+    assert!(
+        std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .all(|e| !e.file_name().to_string_lossy().starts_with("crl-numbers.rejected."))
+    );
+    assert!(blocker.join("x").is_file());
     assert_eq!(rig.check(&fx.leaf, &[], &a).outcome, ChainOutcome::Accepted);
     let tr: Vec<_> = rig.refresh.lock().unwrap().iter().map(|r| (r.transition, r.source.clone(), r.reason)).collect();
     assert!(tr.contains(&(RefreshTransition::StateRejected, "crl-numbers".into(), Some("state_unreadable"))), "{tr:?}");

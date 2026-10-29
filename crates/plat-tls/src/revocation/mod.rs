@@ -46,6 +46,7 @@ pub mod sig;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
@@ -306,6 +307,11 @@ pub trait OcspSource: Send + Sync + fmt::Debug {
         0
     }
 
+    /// HTTP fetch latency (`plat_ocsp_fetch_seconds`).
+    fn fetch_hist(&self) -> Option<&FetchHist> {
+        None
+    }
+
     /// Background refresh of watched items; called by the refresher at
     /// least every 500 ms. Must only do work that is due. Returns how long
     /// until it next has work, if it knows.
@@ -327,6 +333,23 @@ pub trait CrlSource: Send + Sync + fmt::Debug {
     /// cRLNumber state problems so far (`plat_crl_state_errors_total`).
     fn state_errors(&self) -> u64 {
         0
+    }
+
+    /// `cache_dir` fsync failures after a completed replace
+    /// (`plat_crl_state_dir_sync_failures_total`, SEC-308).
+    fn dir_sync_failures(&self) -> u64 {
+        0
+    }
+
+    /// HTTP fetch latency (`plat_crl_fetch_seconds`).
+    fn fetch_hist(&self) -> Option<&FetchHist> {
+        None
+    }
+
+    /// `(issuer key hash, earliest nextUpdate)` per issuer of the verified
+    /// CRLs, at most `crl.max_crls` items (`plat_crl_next_update_seconds`).
+    fn next_updates(&self) -> Vec<([u8; 32], u64)> {
+        Vec::new()
     }
 
     /// See [`OcspSource::refresh`].
@@ -533,6 +556,73 @@ pub(crate) fn next_backoff(prev: u64) -> u64 {
     if prev == 0 { 30 } else { prev.saturating_mul(2).min(600) }
 }
 
+/// Upper bounds (seconds) of the [`FetchHist`] buckets; `+Inf` is implied.
+pub const FETCH_BUCKETS: [f64; 9] = [0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
+
+/// Outcome label of a [`FetchHist`] series.
+pub const FETCH_OUTCOMES: [&str; 2] = ["ok", "error"];
+
+/// Lock-free latency histogram of revocation HTTP fetches, split by
+/// outcome (`ok`: HTTP exchange completed with an accepted body; `error`:
+/// connect/timeout/status/size/content-type failure). Fetches only run on
+/// handshake or refresher threads; recording is a few relaxed atomic adds.
+///
+/// COMPLIANCE MAPPING:
+/// - NIST 800-53: SI-4 - revocation responder/distribution point latency
+#[derive(Debug, Default)]
+pub struct FetchHist {
+    /// Non-cumulative counts per outcome; the last slot is `+Inf`.
+    buckets: [[AtomicU64; FETCH_BUCKETS.len() + 1]; 2],
+    sum_us: [AtomicU64; 2],
+}
+
+/// Point-in-time copy of a [`FetchHist`] (cumulative bucket counts).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct FetchSnapshot {
+    /// Cumulative counts per outcome for each [`FETCH_BUCKETS`] bound,
+    /// then `+Inf` (= count).
+    pub buckets: [[u64; FETCH_BUCKETS.len() + 1]; 2],
+    pub sum_secs: [f64; 2],
+}
+
+impl FetchHist {
+    /// Records one fetch that took `d`.
+    pub fn observe(&self, d: Duration, ok: bool) {
+        let o = usize::from(!ok);
+        let secs = d.as_secs_f64();
+        let i = FETCH_BUCKETS.iter().position(|b| secs <= *b).unwrap_or(FETCH_BUCKETS.len());
+        if let Some(c) = self.buckets.get(o).and_then(|b| b.get(i)) {
+            c.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(s) = self.sum_us.get(o) {
+            s.fetch_add(u64::try_from(d.as_micros()).unwrap_or(u64::MAX), Ordering::Relaxed);
+        }
+    }
+
+    /// Times `f` and records it; `ok` classifies the result.
+    pub fn time<T, E>(&self, f: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
+        let t = Instant::now();
+        let r = f();
+        self.observe(t.elapsed(), r.is_ok());
+        r
+    }
+
+    pub fn snapshot(&self) -> FetchSnapshot {
+        let mut s = FetchSnapshot::default();
+        for (o, (out, b)) in s.buckets.iter_mut().zip(&self.buckets).enumerate() {
+            let mut acc = 0u64;
+            for (dst, c) in out.iter_mut().zip(b) {
+                acc = acc.saturating_add(c.load(Ordering::Relaxed));
+                *dst = acc;
+            }
+            if let (Some(dst), Some(sum)) = (s.sum_secs.get_mut(o), self.sum_us.get(o)) {
+                *dst = sum.load(Ordering::Relaxed) as f64 / 1e6;
+            }
+        }
+        s
+    }
+}
+
 /// Cache occupancy of one checker, for the metrics endpoint.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CacheStats {
@@ -542,6 +632,8 @@ pub struct CacheStats {
     /// cRLNumber state load problems and write failures
     /// (`plat_crl_state_errors_total`).
     pub crl_state_errors: u64,
+    /// `cache_dir` fsync failures (`plat_crl_state_dir_sync_failures_total`).
+    pub crl_dir_sync_failures: u64,
 }
 
 /// Shared revocation checker: one per process (plus one per syslog
@@ -618,7 +710,30 @@ impl RevocationChecker {
             crl_entries,
             crl_bytes,
             crl_state_errors: self.crl.state_errors(),
+            crl_dir_sync_failures: self.crl.dir_sync_failures(),
         }
+    }
+
+    /// OCSP and CRL fetch latency (`plat_ocsp_fetch_seconds`,
+    /// `plat_crl_fetch_seconds`); `None` for a source without fetches.
+    pub fn fetch_stats(&self) -> (Option<FetchSnapshot>, Option<FetchSnapshot>) {
+        (self.ocsp.fetch_hist().map(FetchHist::snapshot), self.crl.fetch_hist().map(FetchHist::snapshot))
+    }
+
+    /// Seconds until the earliest `nextUpdate` of the verified CRLs of
+    /// each issuer (negative when stale), keyed by the first 8 bytes of
+    /// the issuer key hash in hex (`plat_crl_next_update_seconds`). At
+    /// most `crl.max_crls` items; metrics scrape only.
+    pub fn crl_next_update(&self, now_secs: u64) -> Vec<(String, i64)> {
+        let now = i64::try_from(now_secs).unwrap_or(i64::MAX);
+        self.crl
+            .next_updates()
+            .into_iter()
+            .map(|(ikh, next)| {
+                let short = ikh.get(..8).map(hex).unwrap_or_default();
+                (short, i64::try_from(next).unwrap_or(i64::MAX).saturating_sub(now))
+            })
+            .collect()
     }
 
     /// Wakes the refresher early (new watch item).
@@ -861,6 +976,22 @@ mod tests {
         assert!(!SourceError::Crl(CrlReason::Rollback).is_fatal());
         assert!(SourceError::Crl(CrlReason::Stale).is_stale());
         assert!(SourceError::Crl(CrlReason::NotYetValid).is_stale());
+    }
+
+    #[test]
+    fn fetch_hist_buckets() {
+        let h = FetchHist::default();
+        h.observe(Duration::from_millis(5), true);
+        h.observe(Duration::from_millis(300), true);
+        h.observe(Duration::from_secs(30), false);
+        let s = h.snapshot();
+        assert_eq!(s.buckets[0], [1, 1, 1, 1, 2, 2, 2, 2, 2, 2]);
+        assert_eq!(s.buckets[1], [0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        assert!((s.sum_secs[0] - 0.305).abs() < 1e-9);
+        assert!((s.sum_secs[1] - 30.0).abs() < 1e-9);
+        let r: Result<(), ()> = h.time(|| Err(()));
+        assert!(r.is_err());
+        assert_eq!(h.snapshot().buckets[1][FETCH_BUCKETS.len()], 2);
     }
 
     #[test]
