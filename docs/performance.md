@@ -40,7 +40,7 @@ Trade-offs of smaller blocks:
   x `audit.file.max_bytes` + `audit.file.min_free_bytes`) by that factor for
   the share of heavy subscribers; otherwise bursts reach `min_free_bytes` or
   fill the queue sooner, and the node goes degraded and refuses new bindings
-  (fail-closed). Block attribution (RFC 6888 REQ-12, RFC 7422) and the SIEM
+  (fail-closed). Block attribution (RFC 6888 §4, RFC 7422) and the SIEM
   schema are unchanged; SIEM rules that assume 512-port ranges need updating.
 - **New-flow cost.** Only the BIB-miss path changes: a new block (pool locks,
   audit record, replication slot with HA) every 128 ports instead of 512,

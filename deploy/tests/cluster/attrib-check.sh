@@ -30,7 +30,7 @@
 #
 # COMPLIANCE MAPPING:
 # - NIST 800-53: AU-3 (Content of Audit Records), AU-10 (Non-repudiation)
-# - RFC 6888 REQ-12 - attribution of the translated address and port
+# - RFC 6888 §4, RFC 7422 - attribution of the translated address and port
 set -eu
 
 PKTS=

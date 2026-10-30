@@ -4,6 +4,18 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 
 ## [Unreleased]
 
+### RFC 6888 citation fixes (branch `fix/rfc6888-req12-citations`)
+
+Documentation and comments only; no behaviour or schema change.
+
+- RFC 6888 REQ-12 is "SHOULD NOT log destination addresses or ports", not
+  port-block logging. The released-block cool-down now cites REQ-8 (120 s
+  hold before reallocation); port-block logging cites §4 and REQ-14 with
+  RFC 7422. `RFC_COMPLIANCE.md` gains REQ-8 (Partial) and REQ-12 rows; REQ-12
+  is met by construction (no translation record carries a destination).
+- New POAM-036: REQ-8's configurable maximum number of ports in cool-down
+  is not implemented.
+
 ### Pool sizing guidance
 
 - When the pool cannot give every subscriber one block, `platd check-config`

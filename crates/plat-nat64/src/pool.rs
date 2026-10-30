@@ -107,7 +107,7 @@ struct Run {
 /// - NIST 800-53: SC-5 - bounded, constant work per allocation even when the
 ///   pool is exhausted (no per-packet scan of every address).
 /// - RFC 4787 REQ-2 - paired pooling via `prefer`.
-/// - RFC 6888 REQ-12 / RFC 7422 §2 - released blocks cool down before reuse
+/// - RFC 6888 REQ-8 - released blocks cool down before reuse
 ///   (POAM-010 closed).
 #[derive(Debug)]
 pub struct Pool {
@@ -739,9 +739,12 @@ impl Pool {
     /// cool-down (moved by [`Pool::promote`], which the sweeper runs).
     ///
     /// COMPLIANCE MAPPING:
-    /// - RFC 6888 REQ-12, RFC 7422 §2 - a released block is not handed to
+    /// - RFC 6888 REQ-8 - a released block is not handed to
     ///   another subscriber for `nat64.block_cooldown_secs`, so attribution
     ///   windows never abut (POAM-010)
+    ///
+    /// POAM-036: REQ-8 also asks for a configurable maximum number of ports in
+    /// cool-down; the count is bounded only by the pool.
     pub fn release(&self, b: BlockRef, now_ms: u64) {
         let ready = now_ms + self.cooldown_ms;
         if let Some(s) = &self.sliced {

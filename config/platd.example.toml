@@ -145,7 +145,7 @@ max_subscribers_per_aggregate = 256
 # the sweeper walks each shard in short lock holds.
 table_shards = 1024
 # Released port blocks are held back this long before reuse (RFC 6888
-# REQ-12; 120..=3600).
+# REQ-8; 120..=3600).
 block_cooldown_secs = 120
 
 [timeouts]
