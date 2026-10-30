@@ -18,6 +18,7 @@ nav = [
   { "Getting started" = "getting-started.md" },
   { "Architecture" = "architecture.md" },
   { "Performance" = "performance.md" },
+  { "Jool comparison" = "jool-comparison.md" },
   { "Compliance" = [
     "compliance/index.md",
     { "NIST 800-53 mapping" = "compliance/NIST_800-53_MAPPING.md" },
