@@ -209,3 +209,61 @@ fn concurrent_creates_are_never_lost() {
     assert_eq!(st.aggregate_count(sub(10, 1)), 0);
     assert_eq!(st.pool.free_blocks() + st.pool.cooling_blocks(), st.pool.total_blocks());
 }
+
+/// PERF-2, SEC-002: while another thread keeps removing and re-inserting
+/// entries in every `bib4` shard (each churn step breaks a chunked
+/// sweeper's key snapshot), every session still expires: each pass
+/// resumes a due shard where the interrupted walk stopped instead of
+/// re-walking its first hold, so no shard tail is starved. With chunk 1 a
+/// pass makes progress of at least one BIB per due shard, so the bound is
+/// the largest shard's length in full cycles.
+#[test]
+fn churn_cannot_starve_a_shard_tail() {
+    let fx = fixture(&[("table_shards = 1024", "table_shards = 1")]);
+    let nat = Arc::new(fx.nat);
+    let st = nat.state();
+    st.set_sweep_chunk(1);
+    for s in 1..=4 {
+        flows(st, s, 250, 1);
+    }
+    assert_eq!(st.session_count(), 1000);
+    let largest = (0..st.bib4.shard_count()).map(|i| st.bib4.lock_index(i).len()).max().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let churn: Vec<_> = (0..3u64)
+        .map(|t| {
+            let (nat, stop) = (nat.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let st = nat.state();
+                let mut x = 0x9e37_79b9_u64 + t;
+                let mut steps = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                    let i = (x >> 33) as usize % st.bib4.shard_count();
+                    let mut g = st.bib4.lock_index(i);
+                    let n = g.len();
+                    if n == 0 {
+                        continue;
+                    }
+                    let Some(k) = g.keys().nth((x >> 40) as usize % n).copied() else { continue };
+                    if let Some(v) = g.remove(&k) {
+                        st.bib4.note_removal_index(i);
+                        g.insert(k, v);
+                    }
+                    steps += 1;
+                }
+                steps
+            })
+        })
+        .collect();
+    fx.clock.advance(Duration::from_secs(UDP_S + 1));
+    let mut cycles = 0;
+    while st.session_count() > 0 && cycles <= largest {
+        st.sweep();
+        cycles += 1;
+    }
+    stop.store(true, Ordering::Relaxed);
+    let steps: u64 = churn.into_iter().map(|c| c.join().unwrap()).sum();
+    assert!(steps > 0);
+    assert_eq!(st.session_count(), 0, "{cycles} cycles, largest shard {largest}");
+    assert!(cycles <= largest, "{cycles} cycles > largest shard {largest}");
+}

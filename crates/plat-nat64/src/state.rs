@@ -254,10 +254,14 @@ impl SweepStats {
 pub const BIB4_SHARD_FACTOR: u32 = 16;
 /// Upper bound of the `bib4` shard count (8 MiB of padded shard headers).
 pub const BIB4_MAX_SHARDS: u32 = 1 << 16;
-/// Longest a sweeper lock hold runs before it releases the shard (checked
-/// about every 32 work units, POAM-012). A single BIB is never split, so one BIB
-/// with many sessions (at most `nat64.max_sessions_per_subscriber`) can
-/// take longer.
+/// Target length of a sweeper lock hold (POAM-012). It is a soft bound:
+/// the clock is read only once at least [`HOLD_CHECK_UNITS`] (32) more work
+/// units have been done, and an entry is never split, so a hold ends at
+/// the first entry boundary after the check that sees the time passed. It
+/// can therefore run past this by up to the 32 units since the previous
+/// check plus one whole entry; a BIB with many sessions (at most
+/// `nat64.max_sessions_per_subscriber`) or preemption makes it longer
+/// (`SweepStats::long_holds`, `max_hold_ns`).
 pub const SWEEP_HOLD: Duration = Duration::from_micros(15);
 /// Default work-unit cap per sweeper lock hold ([`SWEEP_ENTRY_COST`] per
 /// BIB or subscriber plus one per session or block), on top of
@@ -280,6 +284,10 @@ struct SweepCursor {
     subs: Vec<u128>,
     gone: Vec<u128>,
     dead: Vec<(Key4, Key6)>,
+    /// Per-shard table position the next walk starts at (`bib4` shards,
+    /// then `subs` shards; sized on first use): where an interrupted walk
+    /// stopped, so churn cannot starve a shard's tail (PERF-2).
+    start: Vec<usize>,
 }
 
 /// Cluster (sliced pool) settings of the engine.
@@ -459,25 +467,51 @@ impl Hold {
     }
 }
 
-/// Where a shard walk stopped: the next table position and the table's
-/// (length, capacity) at the end of the hold that visited the positions
-/// before it.
+/// Where a shard walk stopped. The walk visits table positions `start..`
+/// to the end, then wraps to `0..start` (`start` from the per-shard
+/// cursor, PERF-2). `pos` is the next position, `wrapped` whether the walk
+/// is in its second part, and `len`, `cap`, `gen` the table's length,
+/// capacity and removal generation at the end of the hold that visited the
+/// positions before `pos`.
 #[derive(Debug, Clone, Copy)]
 struct Resume {
     pos: usize,
+    start: usize,
+    wrapped: bool,
     len: usize,
     cap: usize,
+    removals: u64,
 }
 
-/// Copies the keys of shard `i` of `t` from position `from.pos` on into
-/// `out`, one bounded hold at a time (POAM-012).
+impl Resume {
+    /// After an in-place hold that started at `start` and visited `n`
+    /// entries, with the shard still locked.
+    fn after<K, V>(g: &Map<K, V>, removals: u64, start: usize, n: usize) -> Self {
+        Self { pos: start + n, start, wrapped: false, len: g.len(), cap: g.capacity(), removals }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: between two snapshot holds, remove and re-insert one key
+    /// of the shard, as worst-case churn (every snapshot breaks).
+    static CHURN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Copies the keys of shard `i` of `t` not yet visited by the walk
+/// described by `from` into `out`, one bounded hold at a time (POAM-012).
+/// Returns `None` when the copy covers the whole walk, or the table
+/// position it stopped at (the next pass starts there).
 ///
 /// Between holds the copy resumes by position. An insert before the
-/// position only repeats a key (processing is idempotent) and every insert
-/// lowers the due hint; a removal, or a rehash (capacity change), could move
-/// an unread key behind the position, so then the copy stops with the keys
-/// read so far and lowers the hint to `now`: the shard is walked again next
-/// pass.
+/// position only shifts keys up, so it repeats a key (processing is
+/// idempotent); in the wrapped part the copy reads as many positions past
+/// `start` as the table grew, so a shifted key is not lost either, and
+/// every insert lowers the due hint. A removal (removal generation
+/// changed, SEC-002) or a rehash (capacity change) could move an unread
+/// key behind the position, so then the copy stops with the keys read so
+/// far and lowers the hint to `now`: the shard is walked again next pass,
+/// from where this copy stopped.
 fn snapshot_keys<K: std::hash::Hash + Eq + Copy, V>(
     t: &Sharded<K, V>,
     i: usize,
@@ -486,22 +520,23 @@ fn snapshot_keys<K: std::hash::Hash + Eq + Copy, V>(
     from: Resume,
     out: &mut Vec<K>,
     st: &mut SweepStats,
-) {
+) -> Option<usize> {
     out.clear();
-    let Some(due) = t.due_index(i) else { return };
-    let Resume { mut pos, len, cap } = from;
-    let mut shape = (len, cap);
+    let due = t.due_index(i)?;
+    let Resume { mut pos, start, mut wrapped, len, cap, removals } = from;
     let piece = chunk.saturating_mul(SWEEP_KEYS_PER_UNIT);
     loop {
         let g = t.lock_index(i);
         let mut h = Hold::start(piece);
-        if g.len() < shape.0 || g.capacity() != shape.1 {
+        if t.removals_index(i) != Some(removals) || g.capacity() != cap {
             lower_due(due, now);
             st.note_hold(h.t);
-            return;
+            return Some(pos);
         }
+        // No removal since `len`: the growth is the number of inserts.
+        let end = if wrapped { (start + g.len().saturating_sub(len)).min(g.len()) } else { g.len() };
         let mut more = false;
-        for k in g.keys().skip(pos) {
+        for k in g.keys().skip(pos).take(end.saturating_sub(pos)) {
             if h.full() {
                 more = true;
                 break;
@@ -510,10 +545,24 @@ fn snapshot_keys<K: std::hash::Hash + Eq + Copy, V>(
             out.push(*k);
         }
         pos += h.entries;
-        shape = (g.len(), g.capacity());
         st.note_hold(h.t);
         if !more {
-            return;
+            if wrapped || start == 0 {
+                return None;
+            }
+            wrapped = true;
+            pos = 0;
+        }
+        drop(g);
+        #[cfg(test)]
+        if CHURN.get() {
+            let mut g = t.lock_index(i);
+            if let Some(k) = g.keys().next().copied()
+                && let Some(v) = g.remove(&k)
+            {
+                t.note_removal_index(i);
+                g.insert(k, v);
+            }
         }
     }
 }
@@ -912,6 +961,7 @@ impl State {
                     // Never leave an empty subscriber entry behind (SC-5).
                     if is_new {
                         gs.remove(&sub);
+                        self.subs.note_removal(&sub);
                         self.sub_count.fetch_sub(1, Ordering::Relaxed);
                         self.agg_release(sub);
                     }
@@ -1337,31 +1387,38 @@ impl State {
             return;
         }
         st.shards_visited += 1;
-        let SweepCursor { keys4, dead, .. } = cur;
+        let n4 = self.bib4.shard_count();
+        let SweepCursor { keys4, dead, start: starts, .. } = cur;
+        starts.resize(n4 + self.subs.shard_count(), 0);
         keys4.clear();
         let rest = {
             let mut g = self.bib4.lock_index(i);
             let mut h = Hold::start(chunk);
             due.store(u64::MAX, Ordering::Relaxed);
+            let start = starts.get(i).copied().filter(|&p| p < g.len()).unwrap_or(0);
             let mut next = u64::MAX;
-            let mut pos = 0;
+            let mut n = 0;
             let mut more = false;
-            for (k4, bib) in g.iter_mut() {
+            for (k4, bib) in g.iter_mut().skip(start) {
                 if h.full() {
                     more = true;
                     break;
                 }
-                pos += 1;
+                n += 1;
                 h.add(SWEEP_ENTRY_COST + bib.sessions.len());
                 next = next.min(self.sweep_bib(*k4, bib, now, st, dead));
             }
             lower_due(due, next);
-            let rest = more.then_some(Resume { pos, len: g.len(), cap: g.capacity() });
+            let removals = self.bib4.removals_index(i).unwrap_or(0);
+            let rest = (more || start > 0).then(|| Resume::after(&g, removals, start, n));
             st.note_hold(h.t);
             rest
         };
         if let Some(from) = rest {
-            snapshot_keys(&self.bib4, i, chunk, now, from, keys4, st);
+            let stop = snapshot_keys(&self.bib4, i, chunk, now, from, keys4, st);
+            if let Some(slot) = starts.get_mut(i) {
+                *slot = stop.unwrap_or(from.start);
+            }
             let mut pos = 0;
             while pos < keys4.len() {
                 let mut g = self.bib4.lock_index(i);
@@ -1431,6 +1488,7 @@ impl State {
                 let still_dead = g4.get(&k4).is_some_and(|b| b.sessions.is_empty() && b.empty_since.is_some());
                 if still_dead {
                     g6.remove(&k6);
+                    self.bib4.note_removal(&k4);
                     g4.remove(&k4)
                 } else {
                     None
@@ -1481,22 +1539,25 @@ impl State {
             return;
         }
         st.shards_visited += 1;
-        let SweepCursor { subs: keys, gone, .. } = cur;
+        let slot = self.bib4.shard_count() + i;
+        let SweepCursor { subs: keys, gone, start: starts, .. } = cur;
+        starts.resize(slot - i + self.subs.shard_count(), 0);
         keys.clear();
         let rest = {
             let mut g = self.subs.lock_index(i);
             let mut h = Hold::start(chunk);
             due.store(u64::MAX, Ordering::Relaxed);
+            let start = starts.get(slot).copied().filter(|&p| p < g.len()).unwrap_or(0);
             let mut next = u64::MAX;
-            let mut pos = 0;
+            let mut n = 0;
             let mut more = false;
             gone.clear();
-            for (sub, s) in g.iter_mut() {
+            for (sub, s) in g.iter_mut().skip(start) {
                 if h.full() {
                     more = true;
                     break;
                 }
-                pos += 1;
+                n += 1;
                 h.add(SWEEP_ENTRY_COST + s.blocks.len());
                 let (keep, d) = self.sweep_sub(*sub, s, now, st, repl);
                 if keep {
@@ -1505,20 +1566,25 @@ impl State {
                     gone.push(*sub);
                 }
             }
-            // Removing visited entries only moves the unvisited ones down
-            // by as many positions.
-            pos -= gone.len();
+            // Removing visited entries (all at or after `start`) only moves
+            // the unvisited ones down by as many positions.
+            n -= gone.len();
             for sub in gone.drain(..) {
                 g.remove(&sub);
+                self.subs.note_removal_index(i);
                 self.sub_gone(sub, repl);
             }
             lower_due(due, next);
-            let rest = more.then_some(Resume { pos, len: g.len(), cap: g.capacity() });
+            let removals = self.subs.removals_index(i).unwrap_or(0);
+            let rest = (more || start > 0).then(|| Resume::after(&g, removals, start, n));
             st.note_hold(h.t);
             rest
         };
         let Some(from) = rest else { return };
-        snapshot_keys(&self.subs, i, chunk, now, from, keys, st);
+        let stop = snapshot_keys(&self.subs, i, chunk, now, from, keys, st);
+        if let Some(s) = starts.get_mut(slot) {
+            *s = stop.unwrap_or(from.start);
+        }
         let mut pos = 0;
         while pos < keys.len() {
             let mut g = self.subs.lock_index(i);
@@ -1535,6 +1601,7 @@ impl State {
                     next = next.min(d);
                 } else {
                     g.remove(&sub);
+                    self.subs.note_removal_index(i);
                     self.sub_gone(sub, repl);
                 }
             }
@@ -1876,6 +1943,7 @@ impl State {
                 if g6.get(&k6).is_some_and(|m| m.k4 == k4) {
                     g6.remove(&k6);
                 }
+                self.bib4.note_removal(&k4);
                 g4.remove(&k4)
             };
             let Some(bib) = removed else { continue };
@@ -1899,6 +1967,7 @@ impl State {
         }
         for i in 0..self.subs.shard_count() {
             let mut g = self.subs.lock_index(i);
+            let before = g.len();
             g.retain(|sub, sx| {
                 sx.blocks.retain(|b| {
                     if self.pool.slice_of_idx(b.r.addr_idx) != Some(s) {
@@ -1927,6 +1996,9 @@ impl State {
                 }
                 keep
             });
+            if g.len() != before {
+                self.subs.note_removal_index(i);
+            }
         }
         self.pool.reset_slice(s, &[], &[], &[]);
         st
@@ -2240,8 +2312,9 @@ mod tests {
     use super::*;
 
     /// POAM-012: a key snapshot resumes by position across holds and stops
-    /// (shard due again now) when the table shrank or was rebuilt between
-    /// holds, since an unread key may then sit behind the position.
+    /// (shard due again now, stop position returned) when an entry was
+    /// removed or the table rebuilt between holds, since an unread key may
+    /// then sit behind the position.
     #[test]
     fn snapshot_keys_resume_and_shape_change() {
         let t: Sharded<u32, ()> = Sharded::new(1);
@@ -2249,14 +2322,14 @@ mod tests {
         for k in 0..100 {
             g.insert(k, ());
         }
-        let (len, cap) = (g.len(), g.capacity());
+        let from = Resume::after(&g, t.removals_index(0).unwrap(), 0, 10);
         drop(g);
         let mut st = SweepStats::default();
         let mut out = Vec::new();
         let due = t.due_index(0).unwrap();
         due.store(u64::MAX, Ordering::Relaxed);
         // Pieces of 8 keys, from position 10: the other 90 keys.
-        snapshot_keys(&t, 0, 1, 5, Resume { pos: 10, len, cap }, &mut out, &mut st);
+        assert_eq!(snapshot_keys(&t, 0, 1, 5, from, &mut out, &mut st), None);
         assert_eq!(out.len(), 90);
         assert!(st.holds >= 90 / 8);
         assert_eq!(due.load(Ordering::Relaxed), u64::MAX);
@@ -2265,10 +2338,100 @@ mod tests {
         all.sort_unstable();
         assert_eq!(all, (0..100).collect::<Vec<_>>());
         // An entry removed since the caller's hold: stop, due now.
-        t.lock_index(0).remove(&0);
-        snapshot_keys(&t, 0, 1, 5, Resume { pos: 10, len, cap }, &mut out, &mut st);
+        let mut g = t.lock_index(0);
+        g.remove(&0);
+        t.note_removal_index(0);
+        drop(g);
+        assert_eq!(snapshot_keys(&t, 0, 1, 5, from, &mut out, &mut st), Some(10));
         assert!(out.is_empty());
         assert_eq!(due.load(Ordering::Relaxed), 5);
+    }
+
+    /// SEC-002: a removal followed by an insert leaves the length and
+    /// capacity unchanged but may still move an unread key behind the
+    /// position; the removal generation catches it.
+    #[test]
+    fn snapshot_keys_detects_remove_then_insert() {
+        let t: Sharded<u32, ()> = Sharded::new(1);
+        let mut g = t.lock_index(0);
+        for k in 0..100 {
+            g.insert(k, ());
+        }
+        let from = Resume::after(&g, t.removals_index(0).unwrap(), 0, 10);
+        let first = *g.keys().next().unwrap();
+        g.remove(&first);
+        t.note_removal_index(0);
+        g.insert(1000, ());
+        assert_eq!(g.len(), from.len);
+        // Same shape as far as length and capacity can tell.
+        let from = Resume { cap: g.capacity(), ..from };
+        drop(g);
+        let (mut st, mut out) = (SweepStats::default(), Vec::new());
+        t.due_index(0).unwrap().store(u64::MAX, Ordering::Relaxed);
+        assert_eq!(snapshot_keys(&t, 0, 1, 5, from, &mut out, &mut st), Some(10));
+        assert_eq!(t.due_index(0).unwrap().load(Ordering::Relaxed), 5);
+    }
+
+    /// PERF-2: a walk starting mid-table wraps around and copies every key
+    /// not visited in place, including keys shifted by concurrent inserts.
+    #[test]
+    fn snapshot_keys_wraps_from_start() {
+        let t: Sharded<u32, ()> = Sharded::new(1);
+        let mut g = t.lock_index(0);
+        for k in 0..100 {
+            g.insert(k, ());
+        }
+        // In place: positions 40..50.
+        let visited: Vec<u32> = g.keys().skip(40).take(10).copied().collect();
+        let from = Resume::after(&g, t.removals_index(0).unwrap(), 40, 10);
+        drop(g);
+        let (mut st, mut out) = (SweepStats::default(), Vec::new());
+        assert_eq!(snapshot_keys(&t, 0, 1, 5, from, &mut out, &mut st), None);
+        out.extend(&visited);
+        out.sort_unstable();
+        out.dedup();
+        assert_eq!(out, (0..100).collect::<Vec<_>>());
+    }
+
+    /// PERF-2: with every key snapshot broken by churn, the in-place first
+    /// hold resumes where the interrupted walk stopped, so every BIB of a
+    /// shard is reached within as many cycles as the shard has BIBs (chunk
+    /// 1: at least one BIB per cycle); without the cursor the tail of a
+    /// shard is never reached.
+    #[test]
+    fn churn_cannot_starve_a_shard_tail() {
+        let t = include_str!("../../../config/platd.example.toml")
+            .replace("192.0.2.0/24", "192.0.2.0/30")
+            .replace("table_shards = 1024", "table_shards = 1")
+            .replace("allow_non_global_destinations = false", "allow_non_global_destinations = true");
+        let cfg = Config::from_toml(&t).unwrap();
+        let clock = Clock::new();
+        let (sink, _rx) = AuditSink::bounded(1 << 16);
+        let st = State::new(&cfg, vec![0xc000_0200, 0xc000_0201], sink, clock.clone());
+        st.set_sweep_chunk(1);
+        let c = Counters::default();
+        for s in 0..4u128 {
+            for p in 0..250u16 {
+                let k6 = Key6 {
+                    proto: proto::UDP,
+                    addr: 0x2001_0db8_0100_0000_0000_0000_0000_0001 | (s << 64),
+                    port: 1000 + p,
+                };
+                let m = st.bib_for(k6, true, &c, &None).unwrap();
+                st.outbound(m.k4, (0xc633_6407, 53), 0, &c).unwrap();
+            }
+        }
+        let largest = (0..st.bib4.shard_count()).map(|i| st.bib4.lock_index(i).len()).max().unwrap();
+        clock.advance(Duration::from_secs(301));
+        CHURN.set(true);
+        let mut cycles = 0;
+        while st.session_count() > 0 && cycles <= largest {
+            st.sweep();
+            cycles += 1;
+        }
+        CHURN.set(false);
+        assert_eq!(st.session_count(), 0, "{cycles} cycles, largest shard {largest}");
+        assert!(cycles > 2, "churn broke the snapshots");
     }
 
     fn cluster_state() -> (State, crossbeam_channel::Receiver<Event>) {

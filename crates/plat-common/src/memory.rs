@@ -28,6 +28,14 @@ pub const AUDIT_SLOT_BYTES: u64 = 64;
 pub const REPL_SLOT_BYTES: u64 = 64;
 /// Fixed headroom: binary, thread stacks, TLS, logger buffers, allocator slack.
 pub const HEADROOM_BYTES: u64 = 256 << 20;
+/// Bytes per table shard header (a cache-line-padded mutex, map header and
+/// due hint; 128 B on aarch64/x86_64 with `CachePadded`).
+pub const SHARD_HEADER_BYTES: u64 = 128;
+/// `bib4` shard multiplier and cap (`plat_nat64::state::BIB4_SHARD_FACTOR`,
+/// `BIB4_MAX_SHARDS`): at the 65536 cap the `bib4` headers alone take 8 MiB.
+pub const BIB4_SHARD_FACTOR: u64 = 16;
+/// See [`BIB4_SHARD_FACTOR`].
+pub const BIB4_MAX_SHARDS: u64 = 1 << 16;
 /// Share of physical RAM the requirement may use, in percent.
 pub const RAM_PERCENT: u64 = 90;
 
@@ -44,7 +52,12 @@ pub fn worker_count(cfg: &Config) -> usize {
 ///
 /// `max_sessions × 800 + queue_capacity × 64
 ///  + workers × fragment memory per worker
-///  + (workers + 1) × repl_ring_entries × 64 (HA only) + 256 MiB`.
+///  + (workers + 1) × repl_ring_entries × 64 (HA only)
+///  + shard headers + 256 MiB`,
+///
+/// where the shard headers are 128 B × (4 × `table_shards` for `bib6`,
+/// `subs`, `aggs` and the cluster directory, + min(16 × `table_shards`, 65536) for
+/// `bib4`), each count rounded up to a power of two (PERF-1, POAM-012).
 ///
 /// Every term is an upper bound on preallocated or table memory; the sum
 /// saturates instead of overflowing.
@@ -59,7 +72,15 @@ pub fn required_bytes(cfg: &Config, workers: usize) -> u64 {
         .saturating_add((cfg.audit.queue_capacity as u64).saturating_mul(AUDIT_SLOT_BYTES))
         .saturating_add(w.saturating_mul(cfg.translation.fragments.memory_per_worker()))
         .saturating_add(ring)
+        .saturating_add(shard_header_bytes(cfg.nat64.table_shards))
         .saturating_add(HEADROOM_BYTES)
+}
+
+/// Shard header memory of the NAT64 tables for `table_shards`.
+pub fn shard_header_bytes(table_shards: u32) -> u64 {
+    let base = u64::from(table_shards.max(1)).next_power_of_two();
+    let bib4 = base.saturating_mul(BIB4_SHARD_FACTOR).min(BIB4_MAX_SHARDS);
+    base.saturating_mul(4).saturating_add(bib4).saturating_mul(SHARD_HEADER_BYTES)
 }
 
 /// The cgroup v2 path from `/proc/self/cgroup` (the `0::<path>` line), or
@@ -135,17 +156,27 @@ impl HostLimits {
         if let Some(path) =
             std::fs::read_to_string(proc_root.join("self/cgroup")).ok().as_deref().and_then(parse_proc_cgroup)
         {
-            // Walk from this cgroup up to (excluding) the root, which has no
-            // memory.max; a level without the file has no memory controller.
-            let mut rel = path.trim_matches('/').to_string();
-            while !rel.is_empty() {
-                let file = cgroup_root.join(&rel).join("memory.max");
+            // SEC-003: the path comes from the kernel, but a ".." would walk
+            // out of the cgroup root; fail closed instead.
+            let mut parts: Vec<&str> = path.split('/').filter(|c| !c.is_empty() && *c != ".").collect();
+            if parts.contains(&"..") {
+                return Err(format!("/proc/self/cgroup path {path:?} contains \"..\": refusing to start"));
+            }
+            // Walk from this cgroup up to and including the root. On the host
+            // root has no memory.max; inside a cgroup namespace ("0::/") the
+            // namespace root is the container's own cgroup and carries its
+            // limit (SEC-001). A level without the file has no memory
+            // controller.
+            loop {
+                let file = cgroup_root.join(parts.join("/")).join("memory.max");
                 if let Ok(t) = std::fs::read_to_string(&file)
                     && let Some(v) = parse_memory_max(&t).map_err(|e| format!("{}: {e}", file.display()))?
                 {
                     cgroup_max = Some(cgroup_max.map_or(v, |c: u64| c.min(v)));
                 }
-                rel = rel.rsplit_once('/').map_or(String::new(), |(p, _)| p.to_string());
+                if parts.pop().is_none() {
+                    break;
+                }
             }
         }
         let ram = std::fs::read_to_string(proc_root.join("meminfo")).ok().as_deref().and_then(parse_mem_total).or_else(
@@ -216,7 +247,10 @@ mod tests {
         let mut c = Config::from_toml(EXAMPLE).unwrap();
         c.cluster.ha = None;
         let frag = c.translation.fragments.memory_per_worker();
-        let base = 4_000_000 * 800 + 1_048_576 * 64 + (256 << 20);
+        let hdr = shard_header_bytes(c.nat64.table_shards);
+        assert_eq!(shard_header_bytes(1024), (4 * 1024 + 16 * 1024) * 128);
+        assert_eq!(shard_header_bytes(65536), (4 * 65536 + 65536) * 128);
+        let base = 4_000_000 * 800 + 1_048_576 * 64 + hdr + (256 << 20);
         assert_eq!(required_bytes(&c, 4), base + 4 * frag);
         assert_eq!(required_bytes(&c, 1), base + frag);
         c.nat64.max_sessions = u64::MAX;
@@ -297,6 +331,12 @@ mod tests {
         // /proc/meminfo hidden: RAM from sysfs.
         let l = tree(None, &[], None, Some("Node 0 MemTotal: 2097152 kB\n"));
         assert_eq!(l, HostLimits { cgroup_max: None, ram: Some(2 * gib) });
+        // Cgroup namespace: the path is "/" and the limit is on the
+        // namespace root (SEC-001); a root limit also caps a leaf.
+        let l = tree(Some("0::/\n"), &[("", "1073741824\n")], Some("MemTotal: 16777216 kB\n"), None);
+        assert_eq!(l.cgroup_max, Some(gib));
+        let l = tree(Some("0::/a\n"), &[("", "1073741824\n"), ("a", "max\n")], Some("MemTotal: 1 kB\n"), None);
+        assert_eq!(l.cgroup_max, Some(gib));
         let l = tree(Some("0::/x\n"), &[], None, None);
         assert_eq!(l, HostLimits { cgroup_max: None, ram: None });
     }
@@ -309,6 +349,17 @@ mod tests {
         std::fs::create_dir_all(d.join("cg/x")).unwrap();
         std::fs::write(d.join("cg/x/memory.max"), "garbage\n").unwrap();
         assert!(HostLimits::read(&d.join("proc"), &d.join("cg"), &d).is_err());
+    }
+
+    #[test]
+    fn dotdot_in_cgroup_path_fails_closed() {
+        for p in ["0::/a/../b\n", "0::/..\n", "0::/a/..\n"] {
+            let d = scratch();
+            std::fs::create_dir_all(d.join("proc/self")).unwrap();
+            std::fs::write(d.join("proc/self/cgroup"), p).unwrap();
+            let e = HostLimits::read(&d.join("proc"), &d.join("cg"), &d).unwrap_err();
+            assert!(e.contains(".."), "{e}");
+        }
     }
 
     #[test]

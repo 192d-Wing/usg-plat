@@ -93,6 +93,7 @@ fn main() {
         t.elapsed().as_secs_f64()
     );
     let keys = Arc::new(keys);
+    let filled = st.session_count();
 
     for (label, advance) in [("nothing due", 0u64), ("all due", 301)] {
         if advance > 0 {
@@ -119,6 +120,16 @@ fn main() {
         passes.sort();
         if let Some(s) = last {
             println!("  last pass: {s:?}");
+            // "all due": the refreshing worker starts 100 ms before the pass
+            // and runs over its (at most 2^20) sessions: one it reaches before the
+            // sweeper is re-armed and stays, one it reaches after is
+            // re-created on its BIB. Every other session expires.
+            if advance > 0 {
+                let left = st.session_count();
+                assert!(s.sessions_expired + left >= filled, "every session expired or was refreshed");
+                assert!(left <= keys.len() as u64, "only worker-refreshed sessions remain");
+                println!("  expired {} of {filled}; {left} refreshed or re-created by the worker", s.sessions_expired);
+            }
         }
         println!(
             "{label}: pass median {:.3} ms max {:.3} ms; worker refresh max {:.1} us p99.99 {:.1} us",

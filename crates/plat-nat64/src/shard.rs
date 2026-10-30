@@ -10,13 +10,17 @@ use parking_lot::{Mutex, MutexGuard};
 
 pub type Map<K, V> = HashMap<K, V, RandomState>;
 
-/// One shard: the map and its earliest-due hint (POAM-012). The hint
-/// shares the padded line with the mutex that every user writes anyway,
-/// so maintaining it costs no extra cache line.
+/// One shard: the map, its earliest-due hint and its removal generation
+/// (POAM-012). Both share the padded line with the mutex that every user
+/// writes anyway, so maintaining them costs no extra cache line.
 #[derive(Debug)]
 struct Shard<K, V> {
     map: Mutex<Map<K, V>>,
     due: AtomicU64,
+    /// Bumped, with the shard lock held, by every removal from the map
+    /// ([`Sharded::note_removal`]); the sweeper's key snapshot compares it
+    /// across lock releases (SEC-002).
+    removals: AtomicU64,
 }
 
 /// A hash map split into `2^n` independently locked shards.
@@ -40,6 +44,7 @@ impl<K: Hash + Eq, V> Sharded<K, V> {
                     CachePadded::new(Shard {
                         map: Mutex::new(Map::with_hasher(RandomState::new())),
                         due: AtomicU64::new(u64::MAX),
+                        removals: AtomicU64::new(0),
                     })
                 })
                 .collect(),
@@ -74,6 +79,31 @@ impl<K: Hash + Eq, V> Sharded<K, V> {
     #[inline]
     pub fn due_index(&self, i: usize) -> Option<&AtomicU64> {
         self.shards.get(i).map(|s| &s.due)
+    }
+
+    /// Removal generation of shard `i`; `None` out of range. Read it with
+    /// the shard lock held.
+    #[inline]
+    pub fn removals_index(&self, i: usize) -> Option<u64> {
+        self.shards.get(i).map(|s| s.removals.load(Ordering::Relaxed))
+    }
+
+    /// Records a removal from shard `i`. Call with the shard lock held,
+    /// for every removal from a table the sweeper snapshots (`bib4`,
+    /// `subs`): a removal can move an unread key behind a snapshot's
+    /// resume position (SEC-002). Relaxed is enough: the lock orders it
+    /// before the sweeper's next read under the same lock.
+    #[inline]
+    pub fn note_removal_index(&self, i: usize) {
+        if let Some(s) = self.shards.get(i) {
+            s.removals.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// [`Sharded::note_removal_index`] for the shard of `k`.
+    #[inline]
+    pub fn note_removal(&self, k: &K) {
+        self.note_removal_index(self.index_of(k));
     }
 
     pub fn shard_count(&self) -> usize {

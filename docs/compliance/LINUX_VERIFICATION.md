@@ -49,7 +49,7 @@ each item.
 | L6 | Forward policy behaviour, including spoofed client sources | SC-7, SC-7(5), AC-4 | POAM-014 | PASS (run 2); spoofed source accepted as expected (POAM-014) |
 | L7 | platd survives the system-call filter, with CPU pinning | SC-39, AC-6 | — | PASS (run 2) |
 | L8 | Device policy and sandbox options leave `/dev/net/tun` usable | SC-39 | — | PASS (run 2) |
-| L9 | `MemoryMax` / `TasksMax` adequate for the production config | SC-5, SC-39, CP-10 | POAM-021 | PASS (run 2); formula ~14 % conservative |
+| L9 | `MemoryMax` / `TasksMax` adequate for the production config | SC-5, SC-39, CP-10 | POAM-021 | PASS (run 2); formula ~14 % conservative; start gate PASS (run 3, incl. cgroup namespace) |
 | L10 | Two-node cluster: each node routes only its own slice | SC-7, SC-5(2) | POAM-017 | PASS (emulated: two netns on one host, not a real two-node cluster; run 2). Legacy `contiguous` mode only; the real multi-VM cluster test is L19–L23 (not yet run) |
 | L11 | No other forward drop policy overrides ours; no conntrack from our ruleset | SC-7, CM-7 | — | PASS with note (run 2) |
 | L12 | Audit lifecycle on ext4/xfs, `statvfs` under the sandbox, power cut, damaged start | AU-5, AU-5(1), AU-9, AU-11 | POAM-020, POAM-027 | PASS (run 4); by-design residual POAM-027 |
@@ -189,11 +189,53 @@ Result: PASS (run 2). 4 M sessions configured, 5 workers, queue 1 048 576:
 count, about 14 % above the measurement. `MemoryMax=8G` equalled the VM's
 RAM, so it was not a backstop on this host (POAM-021).
 
-Since `fix/poam-021` (not yet re-run on Linux): `platd run` reads its cgroup
-v2 `memory.max` and RAM and refuses to start when the configured requirement
-(formula above plus fragment and HA ring memory) exceeds `memory.max` or 90 %
-of RAM. Re-run check: with `MemoryMax=1G` and the example config the start
-fails with a `memory.max` error; with 8G it starts and logs `memory sizing OK`.
+Since `fix/poams-021-018-012`: `platd run` reads its cgroup v2 `memory.max`
+(this cgroup and every ancestor, including the root of a cgroup namespace)
+and RAM, and refuses to start when the configured requirement (formula above
+plus fragment memory, HA ring memory and table shard headers) exceeds
+`memory.max` or 90 % of RAM.
+
+Re-check (run 3, 2026-10-30, Lima `plat-linux`, Ubuntu 24.04 aarch64,
+systemd 255, 6 vCPU, 8 GiB): PASS. Release `platd` built in the VM from this
+branch's tree (`cargo build --release -p platd`; FIPS module active), run
+under transient units next to the installed `platd.service` (left running).
+Config: `config/platd.example.toml` with `interface = "plat9"`,
+`workers = 2`, the audit file under `/var/tmp/l9` and management on
+`127.0.0.1:9474`. `platd check-config --format env` printed
+`PLAT_MEMORY_REQUIRED_BYTES=3540198392`. Copies (tree, binary, config,
+audit file) were deleted afterwards.
+
+```text
+$ sudo systemd-run --unit=plat-l9-low --collect --wait -p MemoryMax=1G \
+    /var/tmp/l9/platd run --config /var/tmp/l9/platd.toml
+Finished with result: exit-code   (status=1, runtime 8 ms)
+INFO FIPS status fips=true provider="aws-lc-rs-fips"
+ERROR the configuration needs 3540198392 B of memory but the cgroup memory.max is 1073741824 B: lower nat64.max_sessions / audit.queue_capacity / [translation.fragments] / dataplane.workers, or raise MemoryMax (POAM-021)
+
+$ sudo systemd-run --unit=plat-l9-high --collect -p MemoryMax=4G \
+    /var/tmp/l9/platd run --config /var/tmp/l9/platd.toml
+active; MemoryMax=4294967296; GET /healthz -> ok
+INFO memory sizing OK required=3540198392 cgroup_max=Some(4294967296) ram=Some(8307843072)
+INFO platd running node=plat-01 workers=2 pool_addrs=256 prefix=64:ff9b:1::/96
+```
+
+Cgroup namespace (SEC-001), as a container sees it: the unit runs
+`unshare -C -m --propagation private sh -c "umount -l /sys/fs/cgroup &&
+mount -t cgroup2 cgroup2 /sys/fs/cgroup && exec platd run ..."`, so
+`/proc/self/cgroup` is `0::/` and the limit sits on the namespace root:
+
+```text
+MemoryMax=1G: proc-self-cgroup: 0::/   ns-root memory.max: 1073741824
+  ERROR the configuration needs 3540198392 B of memory but the cgroup memory.max is 1073741824 B: ... (POAM-021)
+  status=1
+MemoryMax=4G: proc-self-cgroup: 0::/   ns-root memory.max: 4294967296
+  INFO memory sizing OK required=3540198392 cgroup_max=Some(4294967296) ram=Some(8307843072)
+  INFO platd running node=plat-01 workers=2 ...
+```
+
+Not covered: the shipped unit file itself (`MemoryMax=8G`) was not
+restarted with a lower value; the transient units exercise the same
+`memory.max` path.
 
 ### L10 — two-node cluster
 

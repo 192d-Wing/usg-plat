@@ -1003,25 +1003,53 @@ mod tests {
     fn buffer_flood_from_one_source_does_not_block_another() {
         let c = Counters::default();
         let mut t = FragTable::new(&cfg(16, 0));
+        // Five sources with distinct load buckets: the buckets are keyed
+        // randomly, and two colliding sources would share one budget.
+        let mut srcs: Vec<u128> = Vec::new();
+        for src in 1u128.. {
+            let b = t.bucket(&key_from(src, 0));
+            if srcs.iter().all(|&o| t.bucket(&key_from(o, 0)) != b) {
+                srcs.push(src);
+            }
+            if srcs.len() == 5 {
+                break;
+            }
+        }
         // Heavy source: at most a quarter of the buffer.
         let mut held = 0;
         for id in 0..64u32 {
-            let i = t.get_or_insert(&key_from(8, id), 0, &c).unwrap();
+            let i = t.get_or_insert(&key_from(srcs[0], id), 0, &c).unwrap();
             if t.buffer(i, &[0; 8], &c).is_ok() {
                 held += 1;
             }
         }
         assert_eq!(held, 4);
         // Three more sources fill the rest.
-        for src in 1..4u128 {
-            for id in 0..4u32 {
+        // The table is set-associative with random keys: use ids whose set
+        // has a free way, so no entry of another source is evicted by a
+        // full set (that would free a buffer slot by chance).
+        let free_way = |t: &FragTable, k: &FragKey| {
+            let s = t.set_of(k);
+            t.entries[s..s + WAYS].iter().any(|e| e.st.is_none())
+        };
+        for &src in &srcs[1..4] {
+            let mut n = 0;
+            for id in 0u32.. {
+                if n == 4 {
+                    break;
+                }
+                if !free_way(&t, &key_from(src, id)) {
+                    continue;
+                }
                 let i = t.get_or_insert(&key_from(src, id), 0, &c).unwrap();
                 t.buffer(i, &[0; 8], &c).unwrap();
+                n += 1;
             }
         }
         assert!(!t.can_buffer());
         // A new source still gets a slot: a heavier source's datagram goes.
-        let i = t.get_or_insert(&key_from(99, 0), 0, &c).unwrap();
+        let id = (0u32..).find(|&id| free_way(&t, &key_from(srcs[4], id))).unwrap();
+        let i = t.get_or_insert(&key_from(srcs[4], id), 0, &c).unwrap();
         t.buffer(i, &[0; 8], &c).unwrap();
         assert_eq!(c.drops(DropReason::FragmentBufferFull), 1);
     }

@@ -4,20 +4,20 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 
 ## [Unreleased]
 
-### Memory sizing checked against the config (branch `fix/poam-021`)
+### Memory sizing checked against the config (branch `fix/poams-021-018-012`)
 
 Closes POAM-021. SIEM schema unchanged.
 
 - `platd check-config` prints the memory the configuration needs
   (sessions × 800 B + audit queue × 64 B + fragment memory per worker +
-  HA replication rings + 256 MiB); `--format env` adds
+  HA replication rings + table shard headers + 256 MiB); `--format env` adds
   `PLAT_MEMORY_REQUIRED_BYTES`. The text format warns when the installed
   unit's (or `--unit <file>`'s) `MemoryMax` is lower.
 - **Behaviour change:** `platd run` on Linux refuses to start when that
   requirement exceeds its cgroup v2 `memory.max` or 90 % of RAM, or when RAM
   cannot be determined. Raise `MemoryMax` or lower the limits.
 
-### UDP syslog batching (POAM-018, branch `fix/poam-018`)
+### UDP syslog batching (POAM-018, branch `fix/poams-021-018-012`)
 
 - On Linux, UDP syslog sends each sender-thread batch with `sendmmsg`
   (up to 64 datagrams per call) instead of one `send` per record. Still one
@@ -26,18 +26,31 @@ Closes POAM-021. SIEM schema unchanged.
   about 580 k records/s per destination, from about 310–360 k. New bench
   `audit_logger/udp_e2e_100k`. POAM-018 closed.
 
-### Incremental sweeper (branch `fix/poam-012`)
+### Incremental sweeper (branch `fix/poams-021-018-012`)
 
 Closes POAM-012. SIEM schema unchanged.
 
 - The sweeper skips shards with nothing due (per-shard expiry hints, no lock
-  taken), holds a shard lock for at most about 15 µs per chunk (resuming from
-  a key snapshot), and each pass is budgeted to half of
+  taken), holds a shard lock for a target of about 15 µs per chunk (resuming
+  from a key snapshot; a soft bound, see `SWEEP_HOLD`), and each pass is budgeted to half of
   `dataplane.sweep_interval_ms`, resuming where it stopped. At 4 M sessions
   an idle pass drops from 44–90 ms to about 0.02 ms and the worker refresh
   p99.99 during passes from 58–469 µs to 6–17 µs (Lima VM). A pass with
   everything due is up to 1.3× slower.
 - `bib4` uses 16 × `nat64.table_shards` shards (at most 65 536).
+
+### Review fixes for POAM-021/018/012 (branch `fix/poams-021-018-012`)
+
+- Memory gate: inside a cgroup namespace (`/proc/self/cgroup` is `0::/`)
+  the namespace root's `memory.max` is now read (the container limit was
+  missed); a `..` component in the cgroup path refuses the start. The
+  requirement now includes the table shard headers (128 B each; `bib4` has
+  16 × `table_shards`, up to 8 MiB).
+- Sweeper: a removal between two key-snapshot holds is detected by a
+  per-shard removal counter (a remove plus an insert left length and
+  capacity unchanged and could skip a key); an interrupted shard walk
+  resumes next pass where it stopped instead of re-walking its first hold,
+  so churn cannot starve a shard's tail.
 - New counter `plat_sweep_resumed_total`. `SweepStats` gains
   `shards_skipped`, `shards_visited`, `holds`, `long_holds`, `max_hold_ns`
   and `complete`; new `State::sweep_budget`, `State::set_sweep_chunk`.
