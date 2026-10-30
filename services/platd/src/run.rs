@@ -352,10 +352,14 @@ pub fn run(cfg: Config) -> ExitCode {
     {
         let (nat, stop) = (nat.clone(), stop.clone());
         let every = Duration::from_millis(cfg.dataplane.sweep_interval_ms);
+        // COMPLIANCE MAPPING:
+        // - NIST 800-53: SC-5, SC-10 - each pass is budgeted to half the
+        //   interval and resumes where the last one stopped (POAM-012)
+        let budget = (every / 2).max(Duration::from_millis(1));
         threads.push(std::thread::Builder::new().name("plat-sweep".into()).spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(every);
-                let s = nat.state().sweep_with(sweep_repl.as_ref());
+                let s = nat.state().sweep_budget(sweep_repl.as_ref(), budget);
                 tracing::debug!(?s, "sweep");
             }
         }));

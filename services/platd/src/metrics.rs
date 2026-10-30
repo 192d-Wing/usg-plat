@@ -67,6 +67,7 @@ pub fn render(s: &Sources) -> String {
          # TYPE plat_pool_blocks_free gauge\nplat_pool_blocks_free {}\n\
          # TYPE plat_pool_blocks_total gauge\nplat_pool_blocks_total {}\n\
          # TYPE plat_pool_releases_deferred_total counter\nplat_pool_releases_deferred_total {}\n\
+         # TYPE plat_sweep_resumed_total counter\nplat_sweep_resumed_total {}\n\
          # TYPE plat_audit_queue_depth gauge\nplat_audit_queue_depth {}\n\
          # TYPE plat_audit_enqueued_total counter\nplat_audit_enqueued_total {}\n\
          # TYPE plat_audit_lost_total counter\nplat_audit_lost_total {}\n\
@@ -82,6 +83,7 @@ pub fn render(s: &Sources) -> String {
         st.pool.free_blocks(),
         st.pool.total_blocks(),
         st.releases_deferred_total(),
+        st.sweep_resumed_total(),
         s.audit.queued(),
         a.enqueued.load(Ordering::Relaxed),
         a.lost.load(Ordering::Relaxed),

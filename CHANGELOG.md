@@ -26,6 +26,22 @@ Closes POAM-021. SIEM schema unchanged.
   about 580 k records/s per destination, from about 310–360 k. New bench
   `audit_logger/udp_e2e_100k`. POAM-018 closed.
 
+### Incremental sweeper (branch `fix/poam-012`)
+
+Closes POAM-012. SIEM schema unchanged.
+
+- The sweeper skips shards with nothing due (per-shard expiry hints, no lock
+  taken), holds a shard lock for at most about 15 µs per chunk (resuming from
+  a key snapshot), and each pass is budgeted to half of
+  `dataplane.sweep_interval_ms`, resuming where it stopped. At 4 M sessions
+  an idle pass drops from 44–90 ms to about 0.02 ms and the worker refresh
+  p99.99 during passes from 58–469 µs to 6–17 µs (Lima VM). A pass with
+  everything due is up to 1.3× slower.
+- `bib4` uses 16 × `nat64.table_shards` shards (at most 65 536).
+- New counter `plat_sweep_resumed_total`. `SweepStats` gains
+  `shards_skipped`, `shards_visited`, `holds`, `long_holds`, `max_hold_ns`
+  and `complete`; new `State::sweep_budget`, `State::set_sweep_chunk`.
+
 ### Review fixes for POAM-020/024/013 (branch `fix/poams-020-024-013`)
 
 - The cluster configuration digest now also covers

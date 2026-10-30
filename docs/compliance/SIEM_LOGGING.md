@@ -850,6 +850,10 @@ for `nat_port_block_release` (same address and range), `service_stop`,
 - Counter `plat_pool_releases_deferred_total`: port-block releases the
   sweeper deferred because the `nat_port_block_release` record could not
   yet be queued (the block stays out of the pool until it is).
+- Counter `plat_sweep_resumed_total`: sweeper passes that reached their
+  budget (half of `dataplane.sweep_interval_ms`) before the end of their
+  cycle; the next pass resumes there (POAM-012). A steadily rising value
+  means reclamation lags expiry by more than one interval.
 - Audit counters `plat_audit_enqueued_total`, `plat_audit_lost_total`
   (records abandoned on a full queue, plus deferred port-block release
   records that could not be queued because the sink is disconnected, i.e.

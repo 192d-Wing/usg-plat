@@ -2,7 +2,8 @@
 //! sweeper.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use ahash::RandomState;
 use crossbeam_utils::CachePadded;
@@ -17,7 +18,7 @@ use plat_packet::proto;
 
 use crate::pool::{AllocFail, BlockRef, Pool, SliceState};
 use crate::repl::{AdoptInput, Directory, ReplProducer, ReplRecord};
-use crate::shard::{Map, Sharded};
+use crate::shard::{Map, Sharded, lower_due};
 use crate::tcp::{self, Side, TcpState, Timer};
 
 /// An empty port block is kept this long before returning to the pool, so
@@ -218,6 +219,67 @@ pub struct SweepStats {
     /// Empty blocks kept for another pass because their release record
     /// could not be queued (not counted as lost audit records).
     pub releases_deferred: u64,
+    /// Shards skipped without locking because nothing in them was due.
+    pub shards_skipped: u64,
+    /// Shards walked (due hint passed).
+    pub shards_visited: u64,
+    /// Shard lock holds of the pass.
+    pub holds: u64,
+    /// Holds longer than 20 µs (preemption, or one BIB with very many
+    /// sessions).
+    pub long_holds: u64,
+    /// Longest single shard lock hold of the pass, in nanoseconds.
+    pub max_hold_ns: u64,
+    /// The pass reached the end of its cycle (`false`: the budget ran out
+    /// and the next pass resumes).
+    pub complete: bool,
+}
+
+impl SweepStats {
+    fn note_hold(&mut self, t: Instant) {
+        let ns = t.elapsed().as_nanos() as u64;
+        self.holds += 1;
+        if ns > 20_000 {
+            self.long_holds += 1;
+        }
+        self.max_hold_ns = self.max_hold_ns.max(ns);
+    }
+}
+
+/// `bib4` has this many times `nat64.table_shards` shards (at most
+/// [`BIB4_MAX_SHARDS`]): the sweeper walks a shard in place, in one hold,
+/// when it is small enough: at 4 M BIBs and the default 1024 that is about
+/// 250 BIBs per shard (POAM-012). Workers lock one shard per packet either
+/// way.
+pub const BIB4_SHARD_FACTOR: u32 = 16;
+/// Upper bound of the `bib4` shard count (8 MiB of padded shard headers).
+pub const BIB4_MAX_SHARDS: u32 = 1 << 16;
+/// Longest a sweeper lock hold runs before it releases the shard (checked
+/// about every 32 work units, POAM-012). A single BIB is never split, so one BIB
+/// with many sessions (at most `nat64.max_sessions_per_subscriber`) can
+/// take longer.
+pub const SWEEP_HOLD: Duration = Duration::from_micros(15);
+/// Default work-unit cap per sweeper lock hold ([`SWEEP_ENTRY_COST`] per
+/// BIB or subscriber plus one per session or block), on top of
+/// [`SWEEP_HOLD`]; tests lower it with [`State::set_sweep_chunk`].
+pub const SWEEP_CHUNK: usize = 1 << 16;
+/// Work units of one BIB or subscriber visit relative to one session or
+/// block.
+pub const SWEEP_ENTRY_COST: usize = 4;
+/// Keys copied per hold, per work unit of the chunk, when a shard continues
+/// from a key snapshot.
+pub const SWEEP_KEYS_PER_UNIT: usize = 8;
+
+/// Resume state of the sweeper (sweeper thread only, so its mutex is
+/// uncontended). The scratch vectors are reused across passes.
+#[derive(Debug, Default)]
+struct SweepCursor {
+    /// Next shard of the cycle: `bib4` shards `0..n`, then `subs` shards.
+    unit: usize,
+    keys4: Vec<Key4>,
+    subs: Vec<u128>,
+    gone: Vec<u128>,
+    dead: Vec<(Key4, Key6)>,
 }
 
 /// Cluster (sliced pool) settings of the engine.
@@ -352,8 +414,108 @@ pub struct State {
     releases_deferred: AtomicU64,
     /// `nat64.block_cooldown_secs` in ms.
     cooldown_ms: u64,
+    /// Sweeper resume cursor and scratch (POAM-012).
+    sweep_cur: parking_lot::Mutex<SweepCursor>,
+    sweep_chunk: AtomicUsize,
+    /// Cumulative passes that stopped on their budget (SI-4).
+    sweep_resumed: AtomicU64,
     /// Sliced-pool (HA) settings; `None` in legacy mode.
     cluster: Option<Box<ClusterCtx>>,
+}
+
+/// One bounded sweeper lock hold (POAM-012): full after `chunk` work
+/// units or [`SWEEP_HOLD`] of time, whichever comes first (the clock is read
+/// about every 32 work units). At least one entry is always processed.
+struct Hold {
+    t: Instant,
+    work: usize,
+    entries: usize,
+    chunk: usize,
+    check_at: usize,
+    over: bool,
+}
+
+/// Work units between two clock reads of a [`Hold`].
+const HOLD_CHECK_UNITS: usize = 32;
+
+impl Hold {
+    fn start(chunk: usize) -> Self {
+        Self { t: Instant::now(), work: 0, entries: 0, chunk, check_at: HOLD_CHECK_UNITS, over: false }
+    }
+
+    #[inline]
+    fn add(&mut self, work: usize) {
+        self.work += work;
+        self.entries += 1;
+        if self.work >= self.check_at {
+            self.check_at = self.work + HOLD_CHECK_UNITS;
+            self.over = self.t.elapsed() >= SWEEP_HOLD;
+        }
+    }
+
+    #[inline]
+    fn full(&self) -> bool {
+        self.entries > 0 && (self.over || self.work >= self.chunk)
+    }
+}
+
+/// Where a shard walk stopped: the next table position and the table's
+/// (length, capacity) at the end of the hold that visited the positions
+/// before it.
+#[derive(Debug, Clone, Copy)]
+struct Resume {
+    pos: usize,
+    len: usize,
+    cap: usize,
+}
+
+/// Copies the keys of shard `i` of `t` from position `from.pos` on into
+/// `out`, one bounded hold at a time (POAM-012).
+///
+/// Between holds the copy resumes by position. An insert before the
+/// position only repeats a key (processing is idempotent) and every insert
+/// lowers the due hint; a removal, or a rehash (capacity change), could move
+/// an unread key behind the position, so then the copy stops with the keys
+/// read so far and lowers the hint to `now`: the shard is walked again next
+/// pass.
+fn snapshot_keys<K: std::hash::Hash + Eq + Copy, V>(
+    t: &Sharded<K, V>,
+    i: usize,
+    chunk: usize,
+    now: u64,
+    from: Resume,
+    out: &mut Vec<K>,
+    st: &mut SweepStats,
+) {
+    out.clear();
+    let Some(due) = t.due_index(i) else { return };
+    let Resume { mut pos, len, cap } = from;
+    let mut shape = (len, cap);
+    let piece = chunk.saturating_mul(SWEEP_KEYS_PER_UNIT);
+    loop {
+        let g = t.lock_index(i);
+        let mut h = Hold::start(piece);
+        if g.len() < shape.0 || g.capacity() != shape.1 {
+            lower_due(due, now);
+            st.note_hold(h.t);
+            return;
+        }
+        let mut more = false;
+        for k in g.keys().skip(pos) {
+            if h.full() {
+                more = true;
+                break;
+            }
+            h.add(1);
+            out.push(*k);
+        }
+        pos += h.entries;
+        shape = (g.len(), g.capacity());
+        st.note_hold(h.t);
+        if !more {
+            return;
+        }
+    }
 }
 
 /// Rate-limit slots for `Limit` records, indexed by `LimitKind as usize`.
@@ -391,7 +553,7 @@ impl State {
         let cooldown_ms = u64::from(n.block_cooldown_secs) * 1000;
         Self {
             bib6: Sharded::new(shards),
-            bib4: Sharded::new(shards),
+            bib4: Sharded::new(shards.saturating_mul(BIB4_SHARD_FACTOR).min(BIB4_MAX_SHARDS)),
             subs: Sharded::new(shards),
             pool: pool.with_cooldown(cooldown_ms),
             sessions: CachePadded::new(AtomicU64::new(0)),
@@ -424,6 +586,9 @@ impl State {
             hasher: RandomState::new(),
             releases_deferred: AtomicU64::new(0),
             cooldown_ms,
+            sweep_cur: parking_lot::Mutex::new(SweepCursor::default()),
+            sweep_chunk: AtomicUsize::new(SWEEP_CHUNK),
+            sweep_resumed: AtomicU64::new(0),
             cluster,
         }
     }
@@ -633,11 +798,14 @@ impl State {
         let Some(ai) = self.pool.index(k4.addr) else { return };
         let Some(r) = self.pool.block_of(ai, k4.port) else { return };
         let now = self.clock.now_ms();
-        let mut g = self.subs.lock(&sub);
+        let (mut g, due) = self.subs.lock_due(&sub);
         if let Some(s) = g.get_mut(&sub)
             && let Some(b) = s.blocks.iter_mut().find(|b| b.r == r)
         {
             b.free(proto_idx(k4.proto), k4.port - self.pool.port_lo(r), now);
+            if b.in_use == 0 {
+                lower_due(due, now + BLOCK_LINGER_MS);
+            }
         }
     }
 
@@ -683,7 +851,7 @@ impl State {
         }
         let sub = k6.addr & self.sub_mask;
         let (k4, ai, sub_sessions) = {
-            let mut gs = self.subs.lock(&sub);
+            let (mut gs, sub_due) = self.subs.lock_due(&sub);
             let is_new = !gs.contains_key(&sub);
             if is_new && let Some(c) = &self.cluster {
                 self.check_home(c, sub, counters)?;
@@ -723,6 +891,11 @@ impl State {
                     return Err(DropReason::AggregateSubscriberLimit);
                 }
             }
+            if is_new {
+                // A new entry may shift a sweeper key snapshot of this shard
+                // (see `snapshot_keys`): have the shard walked again.
+                lower_due(sub_due, self.clock.now_ms());
+            }
             let s = gs.entry(sub).or_insert_with(|| Subscriber {
                 blocks: Vec::new(),
                 sessions: Arc::new(AtomicU32::new(0)),
@@ -751,7 +924,8 @@ impl State {
             self.free_port(sub, k4);
             return Err(DropReason::AuditUnavailable);
         }
-        self.bib4.lock(&k4).insert(
+        let (mut g4, due) = self.bib4.lock_due(&k4);
+        g4.insert(
             k4,
             Bib {
                 k6,
@@ -765,6 +939,9 @@ impl State {
                     .then(|| Box::new(Map::with_hasher(self.hasher.clone()))),
             },
         );
+        // A new BIB has no session yet: the sweeper must see it (POAM-012).
+        lower_due(due, self.clock.now_ms());
+        drop(g4);
         g6.insert(k6, Mapped { k4, idx: ai });
         counters.inc(Counter::BibCreated);
         if let Some(slice) = self.pool.slice_of_idx(ai) {
@@ -843,8 +1020,12 @@ impl State {
     /// Refreshes a session. Stores only when a value changes: the coarse
     /// clock moves every 10 ms, so most packets leave the session's cache
     /// line clean instead of dirtying it on every packet.
+    ///
+    /// A refresh only lowers the shard's due hint when a TCP transition
+    /// shortens the lifetime (rare); a steady-state refresh never touches it
+    /// (POAM-012).
     #[inline]
-    fn refresh(&self, p: u8, s: &mut Session, side: Side, flags: u8, now: u64) {
+    fn refresh(&self, p: u8, s: &mut Session, side: Side, flags: u8, now: u64, due: &AtomicU64) {
         let timer = match s.tcp {
             Some(st) => {
                 let (n, t) = tcp::step(st, side, flags);
@@ -861,6 +1042,9 @@ impl State {
             Timer::Established => now + self.timeout(p, s.tcp),
         };
         if s.expires_ms != expires {
+            if expires < s.expires_ms {
+                lower_due(due, expires);
+            }
             s.expires_ms = expires;
         }
     }
@@ -879,11 +1063,11 @@ impl State {
     /// BIB vanished concurrently; the caller retries once.
     pub fn outbound(&self, k4: Key4, remote: (u32, u16), flags: u8, counters: &Counters) -> Result<(), DropReason> {
         let now = self.clock.now_ms();
-        let mut g = self.bib4.lock(&k4);
+        let (mut g, due) = self.bib4.lock_due(&k4);
         let bib = g.get_mut(&k4).ok_or(DropReason::NoBinding)?;
         match bib.sessions.get_mut(&remote) {
             Some(s) if s.expires_ms > now => {
-                self.refresh(k4.proto, s, Side::V6, flags, now);
+                self.refresh(k4.proto, s, Side::V6, flags, now, due);
                 return Ok(());
             }
             Some(_) => self.drop_expired(bib, remote),
@@ -900,6 +1084,7 @@ impl State {
         };
         self.admit_session(bib)?;
         bib.insert_session(remote, Session { expires_ms: now + life, tcp });
+        lower_due(due, now + life);
         counters.inc(Counter::SessionCreated);
         Ok(())
     }
@@ -933,11 +1118,11 @@ impl State {
     /// Returns the IPv6 transport address.
     pub fn inbound(&self, k4: Key4, remote: (u32, u16), flags: u8, counters: &Counters) -> Result<Key6, DropReason> {
         let now = self.clock.now_ms();
-        let mut g = self.bib4.lock(&k4);
+        let (mut g, due) = self.bib4.lock_due(&k4);
         let bib = g.get_mut(&k4).ok_or(DropReason::NoBinding)?;
         match bib.sessions.get_mut(&remote) {
             Some(s) if s.expires_ms > now => {
-                self.refresh(k4.proto, s, Side::V4, flags, now);
+                self.refresh(k4.proto, s, Side::V4, flags, now, due);
                 return Ok(bib.k6);
             }
             // RFC-102: an expired, not yet swept session neither passes the
@@ -964,7 +1149,9 @@ impl State {
             None
         };
         self.admit_session(bib)?;
-        bib.insert_session(remote, Session { expires_ms: now + self.timeout(k4.proto, tcp), tcp });
+        let expires = now + self.timeout(k4.proto, tcp);
+        bib.insert_session(remote, Session { expires_ms: expires, tcp });
+        lower_due(due, expires);
         counters.inc(Counter::SessionCreated);
         Ok(bib.k6)
     }
@@ -1025,14 +1212,14 @@ impl State {
         self.lookup4_session(k4, Some(remote)).is_ok()
     }
 
-    /// One incremental pass: expire sessions shard by shard, then remove
-    /// empty BIBs, then release lingering empty blocks.
+    /// One full sweeper cycle: expire sessions and remove empty BIBs shard
+    /// by shard, then release lingering empty blocks. Starts a new cycle
+    /// (any cycle left unfinished by [`State::sweep_budget`] is abandoned
+    /// and restarted) and has no time budget.
     ///
     /// COMPLIANCE MAPPING:
     /// - NIST 800-53: SC-10 (Network Disconnect) - idle sessions removed
     /// - RFC 6146 §3.5.4 - session and BIB lifetime
-    // POAM: POAM-012 the sweeper walks every BIB under each shard lock on
-    // every pass; no per-shard expiry hint or per-pass time budget yet.
     pub fn sweep(&self) -> SweepStats {
         self.sweep_with(None)
     }
@@ -1040,41 +1227,204 @@ impl State {
     /// [`State::sweep`] that also replicates BIB deletions, block releases
     /// and subscriber removals through `repl` (the sweeper's own ring).
     pub fn sweep_with(&self, repl: Option<&ReplProducer>) -> SweepStats {
+        self.sweep_run(repl, None)
+    }
+
+    /// One sweeper pass of at most about `budget`: resumes the current
+    /// cycle where the previous pass stopped and stops at the end of the
+    /// cycle or after the first shard that ends past the budget
+    /// (`SweepStats::complete == false`; the next pass resumes there).
+    /// Every pass makes progress (at least one shard).
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: SC-5 - bounded sweeper work per pass and per lock
+    ///   hold (POAM-012)
+    /// - NIST 800-53: SC-10 - an entry is reclaimed by the first cycle
+    ///   that starts after it is due; a cycle that fits the budget is one
+    ///   pass, so reclamation lags expiry by at most one sweep interval
+    ///   plus the pass (a resumed cycle is counted in
+    ///   [`State::sweep_resumed_total`]). Data-plane lookups never use an
+    ///   expired session (RFC-102), so the lag holds resources, not access.
+    pub fn sweep_budget(&self, repl: Option<&ReplProducer>, budget: Duration) -> SweepStats {
+        self.sweep_run(repl, Some(Instant::now() + budget))
+    }
+
+    /// Work units the sweeper processes per shard lock hold (see
+    /// [`SWEEP_ENTRY_COST`]; also the keys copied per hold; default
+    /// [`SWEEP_CHUNK`]; at least 1). For tuning and tests.
+    pub fn set_sweep_chunk(&self, n: usize) {
+        self.sweep_chunk.store(n.max(1), Ordering::Relaxed);
+    }
+
+    /// Sweeper passes that ran out of budget before the end of their cycle
+    /// (cumulative).
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: SI-4, SC-10 - a sweeper that cannot keep up within
+    ///   one interval is visible (`plat_sweep_resumed_total`)
+    pub fn sweep_resumed_total(&self) -> u64 {
+        self.sweep_resumed.load(Ordering::Relaxed)
+    }
+
+    /// The sweeper pass. Lock order: each `bib4` shard alone (chunks), then
+    /// dead BIBs `bib6 → bib4` (released) and `subs` for the port; then
+    /// each `subs` shard alone (`→ aggs`).
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: SC-5 - a shard whose due hint is in the future is
+    ///   skipped without taking its lock; a visited shard is walked in
+    ///   chunks of `sweep_chunk` work units, releasing the lock between
+    ///   chunks, so a worker waits at most one chunk (POAM-012 closed)
+    /// - NIST 800-53: SC-10 - see [`State::sweep_budget`]
+    fn sweep_run(&self, repl: Option<&ReplProducer>, deadline: Option<Instant>) -> SweepStats {
+        let mut guard = self.sweep_cur.lock();
+        let cur = &mut *guard;
+        if deadline.is_none() {
+            cur.unit = 0;
+        }
         let now = self.clock.now_ms();
         let mut st = SweepStats::default();
         self.pool.promote(now);
-        let mut dead: Vec<(Key4, Key6)> = Vec::new();
-        for i in 0..self.bib4.shard_count() {
+        let chunk = self.sweep_chunk.load(Ordering::Relaxed).max(1);
+        let (n4, ns) = (self.bib4.shard_count(), self.subs.shard_count());
+        let mut first = true;
+        while cur.unit < n4 + ns {
+            if !first && deadline.is_some_and(|d| Instant::now() >= d) {
+                break;
+            }
+            first = false;
+            if cur.unit < n4 {
+                self.sweep_bib_shard(cur.unit, now, chunk, cur, &mut st, repl);
+            } else {
+                self.sweep_sub_shard(cur.unit - n4, now, chunk, cur, &mut st, repl);
+            }
+            cur.unit += 1;
+        }
+        st.complete = cur.unit >= n4 + ns;
+        if st.complete {
+            cur.unit = 0;
+        } else {
+            self.sweep_resumed.fetch_add(1, Ordering::Relaxed);
+        }
+        // PERF-302: skip the shared-line RMW on the common no-deferral pass.
+        if st.releases_deferred != 0 {
+            self.releases_deferred.fetch_add(st.releases_deferred, Ordering::Relaxed);
+        }
+        st
+    }
+
+    /// Sweeps `bib4` shard `i` if its due hint has passed.
+    ///
+    /// The first hold walks the table in place, in table order, and resets
+    /// the hint to "never" (a BIB or session inserted later lowers it
+    /// again). A shard that does not fit one hold continues from a key
+    /// snapshot of the rest ([`snapshot_keys`]), processed by key, one
+    /// bounded hold at a time. Every visited BIB that stays lowers the hint
+    /// to its own next due time, so nothing is lost from the hint across
+    /// lock releases. Dead BIBs are removed after the walk (`bib6 → bib4`).
+    fn sweep_bib_shard(
+        &self,
+        i: usize,
+        now: u64,
+        chunk: usize,
+        cur: &mut SweepCursor,
+        st: &mut SweepStats,
+        repl: Option<&ReplProducer>,
+    ) {
+        let Some(due) = self.bib4.due_index(i) else { return };
+        if due.load(Ordering::Relaxed) > now {
+            st.shards_skipped += 1;
+            return;
+        }
+        st.shards_visited += 1;
+        let SweepCursor { keys4, dead, .. } = cur;
+        keys4.clear();
+        let rest = {
             let mut g = self.bib4.lock_index(i);
+            let mut h = Hold::start(chunk);
+            due.store(u64::MAX, Ordering::Relaxed);
+            let mut next = u64::MAX;
+            let mut pos = 0;
+            let mut more = false;
             for (k4, bib) in g.iter_mut() {
-                let before = bib.sessions.len();
-                let Bib { sessions, remotes, .. } = bib;
-                sessions.retain(|(addr, _), s| {
-                    let keep = s.expires_ms > now;
-                    if !keep {
-                        forget_remote(remotes, *addr);
-                    }
-                    keep
-                });
-                let gone = (before - bib.sessions.len()) as u64;
-                if gone > 0 {
-                    self.sessions.fetch_sub(gone, Ordering::Relaxed);
-                    bib.sub_sessions.fetch_sub(gone as u32, Ordering::Relaxed);
-                    st.sessions_expired += gone;
+                if h.full() {
+                    more = true;
+                    break;
                 }
-                if bib.sessions.is_empty() {
-                    match bib.empty_since {
-                        None => bib.empty_since = Some(now),
-                        Some(t) if now.saturating_sub(t) >= BIB_GRACE_MS && bib.adopt_until_ms <= now => {
-                            dead.push((*k4, bib.k6))
-                        }
-                        Some(_) => {}
-                    }
+                pos += 1;
+                h.add(SWEEP_ENTRY_COST + bib.sessions.len());
+                next = next.min(self.sweep_bib(*k4, bib, now, st, dead));
+            }
+            lower_due(due, next);
+            let rest = more.then_some(Resume { pos, len: g.len(), cap: g.capacity() });
+            st.note_hold(h.t);
+            rest
+        };
+        if let Some(from) = rest {
+            snapshot_keys(&self.bib4, i, chunk, now, from, keys4, st);
+            let mut pos = 0;
+            while pos < keys4.len() {
+                let mut g = self.bib4.lock_index(i);
+                let mut h = Hold::start(chunk);
+                let mut next = u64::MAX;
+                while !h.full()
+                    && let Some(k4) = keys4.get(pos)
+                {
+                    pos += 1;
+                    let Some(bib) = g.get_mut(k4) else { continue };
+                    h.add(SWEEP_ENTRY_COST + bib.sessions.len());
+                    next = next.min(self.sweep_bib(*k4, bib, now, st, dead));
                 }
+                lower_due(due, next);
+                st.note_hold(h.t);
             }
         }
+        self.remove_dead(dead, st, repl);
+    }
 
-        for (k4, k6) in dead {
+    /// Expires `bib`'s sessions and marks it empty or dead. Returns the
+    /// next time it needs the sweeper (`u64::MAX`: never, or queued in
+    /// `dead`).
+    fn sweep_bib(&self, k4: Key4, bib: &mut Bib, now: u64, st: &mut SweepStats, dead: &mut Vec<(Key4, Key6)>) -> u64 {
+        let before = bib.sessions.len();
+        let mut next = u64::MAX;
+        let Bib { sessions, remotes, .. } = bib;
+        sessions.retain(|(addr, _), s| {
+            let keep = s.expires_ms > now;
+            if keep {
+                next = next.min(s.expires_ms);
+            } else {
+                forget_remote(remotes, *addr);
+            }
+            keep
+        });
+        let gone = (before - bib.sessions.len()) as u64;
+        if gone > 0 {
+            self.sessions.fetch_sub(gone, Ordering::Relaxed);
+            bib.sub_sessions.fetch_sub(gone as u32, Ordering::Relaxed);
+            st.sessions_expired += gone;
+        }
+        if !bib.sessions.is_empty() {
+            return next;
+        }
+        match bib.empty_since {
+            None => {
+                bib.empty_since = Some(now);
+                (now + BIB_GRACE_MS).max(bib.adopt_until_ms)
+            }
+            // A session inserted before the removal lowers the hint again.
+            Some(t) if now.saturating_sub(t) >= BIB_GRACE_MS && bib.adopt_until_ms <= now => {
+                dead.push((k4, bib.k6));
+                u64::MAX
+            }
+            Some(t) => (t + BIB_GRACE_MS).max(bib.adopt_until_ms),
+        }
+    }
+
+    /// Removes the BIBs in `dead` that are still empty (`bib6 → bib4`,
+    /// released) and returns their ports (`subs`).
+    fn remove_dead(&self, dead: &mut Vec<(Key4, Key6)>, st: &mut SweepStats, repl: Option<&ReplProducer>) {
+        for (k4, k6) in dead.drain(..) {
             let removed = {
                 let mut g6 = self.bib6.lock(&k6);
                 let mut g4 = self.bib4.lock(&k4);
@@ -1112,78 +1462,168 @@ impl State {
                 st.bibs_removed += 1;
             }
         }
+    }
 
-        for i in 0..self.subs.shard_count() {
+    /// Sweeps `subs` shard `i` if its due hint has passed (same in-place
+    /// first hold and snapshot fallback as [`State::sweep_bib_shard`]).
+    fn sweep_sub_shard(
+        &self,
+        i: usize,
+        now: u64,
+        chunk: usize,
+        cur: &mut SweepCursor,
+        st: &mut SweepStats,
+        repl: Option<&ReplProducer>,
+    ) {
+        let Some(due) = self.subs.due_index(i) else { return };
+        if due.load(Ordering::Relaxed) > now {
+            st.shards_skipped += 1;
+            return;
+        }
+        st.shards_visited += 1;
+        let SweepCursor { subs: keys, gone, .. } = cur;
+        keys.clear();
+        let rest = {
             let mut g = self.subs.lock_index(i);
-            g.retain(|sub, s| {
-                s.blocks.retain_mut(|b| {
-                    let release =
-                        b.in_use == 0 && b.empty_since.is_some_and(|t| now.saturating_sub(t) >= BLOCK_LINGER_MS);
-                    if !release {
-                        return true;
-                    }
-                    let wall = Clock::wall_us();
-                    let lo = self.pool.port_lo(b.r);
-                    // COMPLIANCE MAPPING:
-                    // - NIST 800-53: AU-12, AU-10 - a block returns to the pool
-                    //   only after its release record is queued; otherwise it
-                    //   stays with this subscriber and is retried next pass,
-                    //   so attribution windows never overlap in the queued
-                    //   record stream. A record lost after queuing (file
-                    //   down, crash in the flush window) shows as a sequence
-                    //   gap and `audit_output_failure` (AU-5).
-                    // - NIST 800-53: AU-5, SI-4 - `try_emit`: a deferred
-                    //   release is retried; a full queue is never counted as
-                    //   lost (NIST-201), and a disconnected sink (logger
-                    //   stopped) counts the abandoned record exactly once
-                    //   per quarantined block (NIST-401).
-                    let outcome = self.audit.try_emit(Event::PortBlockRelease {
-                        ts_us: wall,
-                        sub: *sub,
-                        sub_len: self.sub_len,
-                        v4: self.pool.addr(b.r.addr_idx),
-                        port_lo: lo,
-                        port_hi: lo + (self.pool.block_size() - 1),
-                        held_secs: (wall.saturating_sub(b.wall_us) / 1_000_000) as u32,
-                        reason: None,
-                    });
-                    match outcome {
-                        TryEmit::Queued => {}
-                        TryEmit::Full => {
-                            st.releases_deferred += 1;
-                            return true;
-                        }
-                        TryEmit::Disconnected => {
-                            if !b.loss_counted {
-                                b.loss_counted = true;
-                                self.audit.count_lost();
-                            }
-                            st.releases_deferred += 1;
-                            return true;
-                        }
-                    }
-                    self.pool.release(b.r, now);
-                    if let Some(slice) = self.pool.slice_of_idx(b.r.addr_idx) {
-                        let block = self.wire_block(b.r);
-                        self.repl(repl, ReplRecord::BlockRelease { slice, sub: *sub, block });
-                    }
-                    st.blocks_released += 1;
-                    false
-                });
-                let keep = !s.blocks.is_empty() || s.sessions.load(Ordering::Relaxed) > 0;
-                if !keep {
-                    self.sub_count.fetch_sub(1, Ordering::Relaxed);
-                    self.agg_release(*sub);
-                    self.repl(repl, ReplRecord::SubGone { sub: *sub });
+            let mut h = Hold::start(chunk);
+            due.store(u64::MAX, Ordering::Relaxed);
+            let mut next = u64::MAX;
+            let mut pos = 0;
+            let mut more = false;
+            gone.clear();
+            for (sub, s) in g.iter_mut() {
+                if h.full() {
+                    more = true;
+                    break;
                 }
-                keep
+                pos += 1;
+                h.add(SWEEP_ENTRY_COST + s.blocks.len());
+                let (keep, d) = self.sweep_sub(*sub, s, now, st, repl);
+                if keep {
+                    next = next.min(d);
+                } else {
+                    gone.push(*sub);
+                }
+            }
+            // Removing visited entries only moves the unvisited ones down
+            // by as many positions.
+            pos -= gone.len();
+            for sub in gone.drain(..) {
+                g.remove(&sub);
+                self.sub_gone(sub, repl);
+            }
+            lower_due(due, next);
+            let rest = more.then_some(Resume { pos, len: g.len(), cap: g.capacity() });
+            st.note_hold(h.t);
+            rest
+        };
+        let Some(from) = rest else { return };
+        snapshot_keys(&self.subs, i, chunk, now, from, keys, st);
+        let mut pos = 0;
+        while pos < keys.len() {
+            let mut g = self.subs.lock_index(i);
+            let mut h = Hold::start(chunk);
+            let mut next = u64::MAX;
+            while !h.full()
+                && let Some(&sub) = keys.get(pos)
+            {
+                pos += 1;
+                let Some(s) = g.get_mut(&sub) else { continue };
+                h.add(SWEEP_ENTRY_COST + s.blocks.len());
+                let (keep, d) = self.sweep_sub(sub, s, now, st, repl);
+                if keep {
+                    next = next.min(d);
+                } else {
+                    g.remove(&sub);
+                    self.sub_gone(sub, repl);
+                }
+            }
+            lower_due(due, next);
+            st.note_hold(h.t);
+        }
+    }
+
+    /// Accounting for a subscriber entry the sweeper removed (its `subs`
+    /// shard held; `aggs` is a leaf).
+    fn sub_gone(&self, sub: u128, repl: Option<&ReplProducer>) {
+        self.sub_count.fetch_sub(1, Ordering::Relaxed);
+        self.agg_release(sub);
+        self.repl(repl, ReplRecord::SubGone { sub });
+    }
+
+    /// Releases `s`'s lingering empty blocks. Returns whether the
+    /// subscriber stays and when it next needs the sweeper.
+    fn sweep_sub(
+        &self,
+        sub: u128,
+        s: &mut Subscriber,
+        now: u64,
+        st: &mut SweepStats,
+        repl: Option<&ReplProducer>,
+    ) -> (bool, u64) {
+        let mut next = u64::MAX;
+        s.blocks.retain_mut(|b| {
+            let Some(t) = b.empty_since.filter(|_| b.in_use == 0) else { return true };
+            if now.saturating_sub(t) < BLOCK_LINGER_MS {
+                next = next.min(t + BLOCK_LINGER_MS);
+                return true;
+            }
+            let wall = Clock::wall_us();
+            let lo = self.pool.port_lo(b.r);
+            // COMPLIANCE MAPPING:
+            // - NIST 800-53: AU-12, AU-10 - a block returns to the pool
+            //   only after its release record is queued; otherwise it
+            //   stays with this subscriber and is retried next pass,
+            //   so attribution windows never overlap in the queued
+            //   record stream. A record lost after queuing (file
+            //   down, crash in the flush window) shows as a sequence
+            //   gap and `audit_output_failure` (AU-5).
+            // - NIST 800-53: AU-5, SI-4 - `try_emit`: a deferred
+            //   release is retried; a full queue is never counted as
+            //   lost (NIST-201), and a disconnected sink (logger
+            //   stopped) counts the abandoned record exactly once
+            //   per quarantined block (NIST-401).
+            let outcome = self.audit.try_emit(Event::PortBlockRelease {
+                ts_us: wall,
+                sub,
+                sub_len: self.sub_len,
+                v4: self.pool.addr(b.r.addr_idx),
+                port_lo: lo,
+                port_hi: lo + (self.pool.block_size() - 1),
+                held_secs: (wall.saturating_sub(b.wall_us) / 1_000_000) as u32,
+                reason: None,
             });
+            match outcome {
+                TryEmit::Queued => {}
+                TryEmit::Full => {
+                    st.releases_deferred += 1;
+                    next = now;
+                    return true;
+                }
+                TryEmit::Disconnected => {
+                    if !b.loss_counted {
+                        b.loss_counted = true;
+                        self.audit.count_lost();
+                    }
+                    st.releases_deferred += 1;
+                    next = now;
+                    return true;
+                }
+            }
+            self.pool.release(b.r, now);
+            if let Some(slice) = self.pool.slice_of_idx(b.r.addr_idx) {
+                let block = self.wire_block(b.r);
+                self.repl(repl, ReplRecord::BlockRelease { slice, sub, block });
+            }
+            st.blocks_released += 1;
+            false
+        });
+        let keep = !s.blocks.is_empty() || s.sessions.load(Ordering::Relaxed) > 0;
+        if keep && s.blocks.is_empty() {
+            // Sessions still counted without a block: look again next pass.
+            next = now;
         }
-        // PERF-302: skip the shared-line RMW on the common no-deferral pass.
-        if st.releases_deferred != 0 {
-            self.releases_deferred.fetch_add(st.releases_deferred, Ordering::Relaxed);
-        }
-        st
+        (keep, next)
     }
 
     /// Port-block releases deferred since start because the release record
@@ -1699,7 +2139,9 @@ impl State {
         let mut in_use: Vec<BlockRef> = Vec::with_capacity(adopted.len());
         let mut sessions_of: Map<u128, Arc<AtomicU32>> = Map::with_hasher(self.hasher.clone());
         for &(r, sub, alloc_wall) in &adopted {
-            let mut g = self.subs.lock(&sub);
+            let (mut g, due) = self.subs.lock_due(&sub);
+            // An adopted block starts empty (lingering) until a BIB marks it.
+            lower_due(due, now + BLOCK_LINGER_MS);
             let sx = match g.entry(sub) {
                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                 std::collections::hash_map::Entry::Vacant(e) => {
@@ -1733,10 +2175,11 @@ impl State {
             let until = now + if k4.proto == proto::TCP { c.tcp_adopt_ms } else { self.timeout(k4.proto, None) };
             let inserted = {
                 let mut g6 = self.bib6.lock(&k6);
-                let mut g4 = self.bib4.lock(&k4);
+                let (mut g4, due) = self.bib4.lock_due(&k4);
                 if g6.contains_key(&k6) || g4.contains_key(&k4) {
                     false
                 } else {
+                    lower_due(due, now);
                     g4.insert(
                         k4,
                         Bib {
@@ -1795,6 +2238,38 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// POAM-012: a key snapshot resumes by position across holds and stops
+    /// (shard due again now) when the table shrank or was rebuilt between
+    /// holds, since an unread key may then sit behind the position.
+    #[test]
+    fn snapshot_keys_resume_and_shape_change() {
+        let t: Sharded<u32, ()> = Sharded::new(1);
+        let mut g = t.lock_index(0);
+        for k in 0..100 {
+            g.insert(k, ());
+        }
+        let (len, cap) = (g.len(), g.capacity());
+        drop(g);
+        let mut st = SweepStats::default();
+        let mut out = Vec::new();
+        let due = t.due_index(0).unwrap();
+        due.store(u64::MAX, Ordering::Relaxed);
+        // Pieces of 8 keys, from position 10: the other 90 keys.
+        snapshot_keys(&t, 0, 1, 5, Resume { pos: 10, len, cap }, &mut out, &mut st);
+        assert_eq!(out.len(), 90);
+        assert!(st.holds >= 90 / 8);
+        assert_eq!(due.load(Ordering::Relaxed), u64::MAX);
+        let mut all: Vec<u32> = t.lock_index(0).keys().take(10).copied().collect();
+        all.extend(&out);
+        all.sort_unstable();
+        assert_eq!(all, (0..100).collect::<Vec<_>>());
+        // An entry removed since the caller's hold: stop, due now.
+        t.lock_index(0).remove(&0);
+        snapshot_keys(&t, 0, 1, 5, Resume { pos: 10, len, cap }, &mut out, &mut st);
+        assert!(out.is_empty());
+        assert_eq!(due.load(Ordering::Relaxed), 5);
+    }
 
     fn cluster_state() -> (State, crossbeam_channel::Receiver<Event>) {
         let t = include_str!("../../../config/platd.example.toml")

@@ -259,7 +259,9 @@ fn full_teardown_removes_subscriber_and_new_flow_logs_new_block() {
     assert_eq!(evs.iter().filter(|e| matches!(e, Event::PortBlockRelease { .. })).count(), 1);
     assert_eq!(evs.iter().filter(|e| matches!(e, Event::PortBlockAlloc { .. })).count(), 1);
     // Idempotent: nothing more to do.
-    assert_eq!(fx.nat.state().sweep(), Default::default());
+    let st = fx.nat.state().sweep();
+    assert_eq!((st.sessions_expired, st.bibs_removed, st.blocks_released, st.releases_deferred), (0, 0, 0, 0));
+    assert!(st.complete);
 }
 
 #[test]

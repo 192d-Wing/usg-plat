@@ -128,6 +128,8 @@ max_subscribers = 1000000
 # turns the limit off); a /56 holds exactly 256 /64 subscribers.
 aggregate_prefix_len = 56
 max_subscribers_per_aggregate = 256
+# Lock shards per table; the IPv4 BIB table uses 16x this (at most 65536) so
+# the sweeper walks each shard in short lock holds.
 table_shards = 1024
 # Released port blocks are held back this long before reuse (RFC 6888
 # REQ-12; 120..=3600).
