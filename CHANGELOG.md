@@ -4,6 +4,42 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 
 ## [Unreleased]
 
+### RFC 6888 citation fixes (branch `fix/rfc6888-req12-citations`)
+
+Documentation and comments only; no behaviour or schema change.
+
+- RFC 6888 REQ-12 is "SHOULD NOT log destination addresses or ports", not
+  port-block logging. The released-block cool-down now cites REQ-8 (120 s
+  hold before reallocation); port-block logging cites §4 and REQ-14 with
+  RFC 7422. `RFC_COMPLIANCE.md` gains REQ-8 (Partial) and REQ-12 rows; REQ-12
+  is met by construction (no translation record carries a destination).
+- New POAM-036: REQ-8's configurable maximum number of ports in cool-down
+  is not implemented.
+
+### Pool sizing guidance
+
+- When the pool cannot give every subscriber one block, `platd check-config`
+  adds `hint:` lines naming smaller uniform layouts with the same maximum
+  ports per subscriber (e.g. 128 x 16 instead of 512 x 4: 129 024 instead of
+  32 256 one-block subscribers per /24) and their port randomness. New
+  `Nat64Config::capacity_with` helper.
+- With HA on, `check-config` warns when `port_block_size x
+  cluster.ha.reserve_ahead_blocks` is below 4 096 ports (the default
+  512 x 8). Warning only; exit codes, defaults, config schema and SIEM schema
+  are unchanged.
+- `docs/performance.md` "Port-block sizing" and the example config explain
+  the 512 x 4 / 256 x 8 / 128 x 16 trade-offs. New criterion group
+  `nat64_block_layout` (new-flow churn, 512 x 4 against 128 x 16).
+
+### Pool capacity report
+
+- `platd check-config` prints the port-block capacity of this node's share
+  of the pool (blocks per address, total blocks, subscribers served at 1
+  block and at `nat64.max_blocks_per_subscriber`) and a `WARNING` when it is
+  below `nat64.max_subscribers`. Exit codes are unchanged. The shipped
+  example config triggers the warning (a /24 serves 32 256 one-block
+  subscribers, `max_subscribers` is 1 000 000).
+
 ### Memory sizing checked against the config (branch `fix/poams-021-018-012`)
 
 Closes POAM-021. SIEM schema unchanged.

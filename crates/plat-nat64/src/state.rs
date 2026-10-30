@@ -828,7 +828,7 @@ impl State {
         // COMPLIANCE MAPPING:
         // - NIST 800-53: AU-12, AU-5 - attribution record precedes use; under
         //   refuse_new_bindings an unloggable block is never handed out.
-        // - RFC 6888 REQ-12 / RFC 7422 §2 - port-block logging.
+        // - RFC 6888 §4, REQ-14 / RFC 7422 - port-block logging (no destinations, REQ-12).
         if !self.emit_port_block_alloc(wall, sub, r, lo, size) && self.refuse_on_overflow {
             self.pool.unalloc(r);
             return Err(DropReason::AuditUnavailable);
@@ -2024,7 +2024,7 @@ impl State {
     /// - NIST 800-53: AU-10, CP-10 - attribution continuity: the same
     ///   subscriber keeps the same blocks and mappings
     /// - RFC 6146 §3.5.1.1 - endpoint-independent mapping kept across takeover
-    /// - RFC 7422 §2, RFC 6888 REQ-12 - no block of unknown attribution is
+    /// - RFC 6888 REQ-8, RFC 7422 - no block of unknown attribution is
     ///   reused before the hold-back ends
     pub fn adopt_slice(&self, s: SliceId, input: &AdoptInput, meta: AdoptMeta) -> Result<AdoptStats, AdoptError> {
         let Some(c) = &self.cluster else { return Err(AdoptError::NotSliced) };
