@@ -143,9 +143,26 @@ I/O backend (POAM-016), not lock changes (POAM-015).
   `max_blocks_per_subscriber`. Ports inside a block are chosen randomly
   (RFC 6056). An empty block lingers 60 s before release to avoid log churn,
   and returns to the pool only after its release record is queued.
-- **Sweeper** thread runs every `dataplane.sweep_interval_ms`: it walks every
-  shard (no cursor or time budget, POAM-012), expires sessions, removes BIBs
-  that have been empty for ≥ 2 s, and releases lingering blocks.
+- **Sweeper** thread runs every `dataplane.sweep_interval_ms`: it expires
+  sessions, removes BIBs that have been empty for ≥ 2 s, and releases
+  lingering blocks. It is incremental (POAM-012):
+  - every `bib4` and `subs` shard carries a due hint, a lower bound of the
+    earliest time anything in it needs the sweeper. Creates, a TCP
+    transition that shortens a lifetime and a block becoming empty lower it
+    (`fetch_min`, only when lower, on the shard mutex's cache line); a
+    steady-state refresh never touches it. A pass skips a shard whose hint
+    is in the future without locking it, and recomputes the hint of every
+    shard it walks;
+  - a walk holds a shard lock for at most about 15 µs (or a work cap): the
+    first hold walks the table in place, the rest of a larger shard comes
+    from a key snapshot processed by key. If the table shrank or was rebuilt
+    between holds the walk stops and the shard is walked again next pass. A
+    single BIB is never split;
+  - each daemon pass is budgeted to half the interval and resumes at the
+    next shard (`plat_sweep_resumed_total`); `State::sweep` runs a whole
+    cycle;
+  - `bib4` has 16 × `table_shards` shards (at most 65 536), so a shard of a
+    4 M-BIB table fits about one hold.
 
 Lock order: `bib6 → subs (→ aggs)` (released) `→ bib4`; sweeper `bib6 → bib4`
 (released) then `subs (→ aggs)`. Nothing acquires `bib6` or `subs` while holding `bib4`.

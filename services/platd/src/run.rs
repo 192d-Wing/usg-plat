@@ -90,13 +90,32 @@ pub fn worker<Q: PacketQueue>(
     }
 }
 
+/// Start-up memory check (Linux; cgroup v2 and RAM read from the fixed
+/// kernel paths). Fails closed: an OOM kill drops every mapping without
+/// release records, which is worse than a refused start.
+#[cfg(target_os = "linux")]
+fn memory_gate(cfg: &Config, workers: usize) -> Result<(), String> {
+    use plat_common::memory;
+    let req = memory::required_bytes(cfg, workers);
+    let limits = memory::HostLimits::read(
+        std::path::Path::new("/proc"),
+        std::path::Path::new("/sys/fs/cgroup"),
+        std::path::Path::new("/sys/devices/system/node"),
+    )?;
+    memory::check(req, limits)?;
+    tracing::info!(required = req, cgroup_max = ?limits.cgroup_max, ram = ?limits.ram, "memory sizing OK");
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn memory_gate(_cfg: &Config, _workers: usize) -> Result<(), String> {
+    Ok(())
+}
+
 /// `dataplane.workers = 0`: one worker per CPU, leaving one CPU for the
 /// logger, sweeper, clock and kernel TUN work (at least one worker).
 fn worker_count(cfg: &Config) -> usize {
-    match cfg.dataplane.workers {
-        0 => std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(1).max(1)),
-        n => n,
-    }
+    plat_common::memory::worker_count(cfg)
 }
 
 /// Emits the stop record and waits for the logger to drain (NIST 800-53
@@ -226,6 +245,12 @@ pub fn run(cfg: Config) -> ExitCode {
         tracing::error!("{e}");
         return ExitCode::FAILURE;
     }
+    // SC-5, CP-10 (POAM-021): refuse a config that cannot fit the cgroup
+    // memory.max or 90 % of RAM, rather than be OOM-killed under load.
+    if let Err(e) = memory_gate(&cfg, n) {
+        tracing::error!("{e}");
+        return ExitCode::FAILURE;
+    }
 
     // The queue exists before the TLS material is loaded, so revocation
     // records produced from here on wait in it until the logger is up.
@@ -327,10 +352,14 @@ pub fn run(cfg: Config) -> ExitCode {
     {
         let (nat, stop) = (nat.clone(), stop.clone());
         let every = Duration::from_millis(cfg.dataplane.sweep_interval_ms);
+        // COMPLIANCE MAPPING:
+        // - NIST 800-53: SC-5, SC-10 - each pass is budgeted to half the
+        //   interval and resumes where the last one stopped (POAM-012)
+        let budget = (every / 2).max(Duration::from_millis(1));
         threads.push(std::thread::Builder::new().name("plat-sweep".into()).spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(every);
-                let s = nat.state().sweep_with(sweep_repl.as_ref());
+                let s = nat.state().sweep_budget(sweep_repl.as_ref(), budget);
                 tracing::debug!(?s, "sweep");
             }
         }));

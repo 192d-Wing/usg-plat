@@ -130,8 +130,13 @@ Deployment notes:
 - The unit stops restarting after 5 failed starts in 60 s
   (`systemctl reset-failed platd` after fixing the cause).
 - The daemon runs with no capabilities. Size `MemoryMax` in the unit for
-  your `nat64.max_sessions` (formula in the unit file; the shipped 8G does not
-  scale on its own, POAM-021).
+  your `nat64.max_sessions` (formula in the unit file; the shipped 8G covers
+  the default 4 M sessions). `platd check-config` prints the required memory
+  (`PLAT_MEMORY_REQUIRED_BYTES` with `--format env`) and warns when the
+  installed unit's (or `--unit <file>`'s) `MemoryMax` is lower. `platd run`
+  refuses to start when the requirement exceeds its cgroup v2 `memory.max`
+  (the smallest along the cgroup path) or 90 % of RAM, so a mis-sized node
+  fails its start instead of being OOM-killed under load (POAM-021).
 - The Linux-specific behaviour (unit sandbox, forward policy and guard, TUN
   attach, audit lifecycle) was verified on one Ubuntu 24.04 / systemd 255
   host; results and open items are in
@@ -407,8 +412,9 @@ Silicon development host (8 performance + 4 efficiency cores).
 
 In these engine-only benches, shared-table scaling at high thread counts is
 limited by per-packet shard locks (POAM-015); with TUN I/O this cost is
-negligible (see below). UDP syslog sends one datagram per record, about
-310 k records/s per destination (POAM-018).
+negligible (see below). UDP syslog sends one datagram per record, batched
+with `sendmmsg` on Linux: about 580 k records/s per destination on Linux
+loopback (`audit_logger/udp_e2e_100k`; 310–360 k before POAM-018).
 
 These are engine numbers without kernel I/O.
 

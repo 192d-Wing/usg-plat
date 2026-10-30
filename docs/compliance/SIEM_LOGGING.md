@@ -645,12 +645,16 @@ newest checkpoint is also not detectable locally.
 - RFC 5424, facility local0. Severity per record type (table above).
   `MSGID` = `event.action`. `APP-NAME` = `audit.syslog.app_name` (default
   `platd`, 1–48 printable ASCII).
-- UDP: one datagram (one `send`) per record (RFC 5426), on the destination's
-  own thread. Measured ceiling about **310 k records/s per destination**
-  (macOS loopback); above it records are counted in
-  `plat_audit_remote_lost_total` and recorded as `audit_remote_loss`. For
-  sustained rates near that (e.g. `audit.mode = "session"`), use TCP or
-  several collectors (POAM-018).
+- UDP: one datagram per record (RFC 5426 §3.1), in sequence order, on the
+  destination's own thread. On Linux a batch goes out in `sendmmsg` calls of
+  up to 64 datagrams; a partial send resumes at the first unsent datagram,
+  and each datagram the kernel refuses (e.g. oversize, unreachable
+  collector) is one lost record. Other platforms send one datagram per
+  `send`. Measured about **580 k records/s per destination** on Linux
+  loopback (before batching: about 310–360 k); above it records are
+  counted in `plat_audit_remote_lost_total` and recorded as
+  `audit_remote_loss`. For sustained rates near that (e.g.
+  `audit.mode = "session"`), use TCP or several collectors.
 - TCP: RFC 6587 octet-counting, one write per batch, 2 s connect and write
   timeouts, 5 s reconnect back-off. A failed write counts the whole batch as
   lost (some frames may have arrived).
@@ -846,6 +850,10 @@ for `nat_port_block_release` (same address and range), `service_stop`,
 - Counter `plat_pool_releases_deferred_total`: port-block releases the
   sweeper deferred because the `nat_port_block_release` record could not
   yet be queued (the block stays out of the pool until it is).
+- Counter `plat_sweep_resumed_total`: sweeper passes that reached their
+  budget (half of `dataplane.sweep_interval_ms`) before the end of their
+  cycle; the next pass resumes there (POAM-012). A steadily rising value
+  means reclamation lags expiry by more than one interval.
 - Audit counters `plat_audit_enqueued_total`, `plat_audit_lost_total`
   (records abandoned on a full queue, plus deferred port-block release
   records that could not be queued because the sink is disconnected, i.e.

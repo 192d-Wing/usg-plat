@@ -774,3 +774,57 @@ fn aggregate_counts_survive_adoption_and_handover() {
     run(&mut a.fx, &udp6(sub(4, 1), 1000, SERVER, 53, b"q")).unwrap();
     assert_eq!(a.fx.nat.state().aggregate_count(sub(1, 1)), 1);
 }
+
+/// POAM-012: adopted BIBs and blocks go through the chunked, hinted and
+/// budgeted sweeper like local ones: the adopt window is honoured, every
+/// release is replicated after its record, and the subscriber and
+/// aggregate counts return to zero.
+#[test]
+fn chunked_budgeted_sweep_of_adopted_state() {
+    let mut a = node(&[]);
+    start_all(&a);
+    make_flows(&mut a, &[(1, 4000, proto::UDP), (1, 4001, proto::UDP), (2, 4000, proto::UDP), (3, 4000, proto::TCP)]);
+    let shadow = shadow_for(&a);
+    for r in drain(&a) {
+        shadow.apply(&r, 0).unwrap();
+    }
+    let b = node(&[]);
+    adopt_from(&b, &shadow);
+    let _ = drain(&b);
+    let _ = events(&b.fx);
+    let st = b.fx.nat.state();
+    st.set_sweep_chunk(1);
+    assert_eq!(st.subscriber_count(), 3);
+    assert_eq!(st.aggregate_count(sub(1, 1)), 3);
+    // Budgeted passes until the cycle completes (zero budget: one shard
+    // per pass).
+    let full = |b: &Node| {
+        let mut sum = (0, 0);
+        loop {
+            let s = b.fx.nat.state().sweep_budget(Some(&b.sweeper), Duration::ZERO);
+            sum.0 += s.bibs_removed;
+            sum.1 += s.blocks_released;
+            if s.complete {
+                return sum;
+            }
+        }
+    };
+    // Inside the adopt window (UDP timeout 300 s, TCP pickup 300 s).
+    b.fx.clock.advance(Duration::from_secs(250));
+    assert_eq!(full(&b), (0, 0));
+    b.fx.clock.advance(Duration::from_secs(51));
+    assert_eq!(full(&b), (4, 0), "adopted BIBs leave when the window ends");
+    assert!(st.sweep_resumed_total() > 0);
+    b.fx.clock.advance(Duration::from_secs(61));
+    assert_eq!(full(&b), (0, 3), "blocks linger, then go");
+    assert_eq!(st.subscriber_count(), 0);
+    assert_eq!(st.aggregate_count(sub(1, 1)), 0);
+    assert_eq!(st.bib4.len(), 0);
+    let recs = drain(&b);
+    let n = |f: fn(&ReplRecord) -> bool| recs.iter().filter(|r| f(r)).count();
+    assert_eq!(n(|r| matches!(r, ReplRecord::BibDelete { .. })), 4);
+    assert_eq!(n(|r| matches!(r, ReplRecord::BlockRelease { .. })), 3);
+    assert_eq!(n(|r| matches!(r, ReplRecord::SubGone { .. })), 3);
+    let evs = events(&b.fx);
+    assert_eq!(evs.iter().filter(|e| matches!(e, Event::PortBlockRelease { .. })).count(), 3);
+}

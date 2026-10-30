@@ -42,6 +42,10 @@ enum Cmd {
         /// owned pool cover).
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
+        /// systemd unit or drop-in whose `MemoryMax=` is compared with the
+        /// required memory (text format; default: the installed unit, if any).
+        #[arg(long)]
+        unit: Option<PathBuf>,
     },
     /// Run the cluster witness: a tie-breaking voter for two-node HA
     /// clusters (mutual TLS only, no data plane).
@@ -162,6 +166,9 @@ fn render_env(cfg: &Config, owned: &[u32], fips: bool) -> Result<String, String>
     // POAM-024: pool-sourced IPv4 is admitted only on these interfaces.
     let _ = writeln!(o, "PLAT_CROSS_NODE_HAIRPIN={}", u8::from(cfg.translation.cross_node_hairpin));
     let _ = writeln!(o, "PLAT_CLUSTER_IFACES={}", cfg.translation.cluster_interfaces.join(" "));
+    // SC-5 (POAM-021): memory this config needs with this host's workers.
+    let req = plat_common::memory::required_bytes(cfg, plat_common::memory::worker_count(cfg));
+    let _ = writeln!(o, "PLAT_MEMORY_REQUIRED_BYTES={req}");
     Ok(o)
 }
 
@@ -175,6 +182,38 @@ fn fips_active() -> bool {
 #[cfg(not(feature = "tls"))]
 fn fips_active() -> bool {
     false
+}
+
+/// Installed unit paths checked by `check-config` when `--unit` is not given
+/// (later entries override earlier ones, as in systemd).
+const UNIT_PATHS: [&str; 2] = ["/usr/lib/systemd/system/platd.service", "/etc/systemd/system/platd.service"];
+
+/// The `check-config` memory section: the requirement and, when a unit file
+/// is found, a warning if its `MemoryMax=` is lower. `platd run` enforces the
+/// limit itself; this only catches a mis-sized unit before a restart.
+///
+/// COMPLIANCE MAPPING:
+/// - NIST 800-53: SC-5, CP-10 - memory sizing derived from the configured
+///   limits (POAM-021).
+fn memory_summary(cfg: &Config, unit: Option<&std::path::Path>) -> String {
+    use plat_common::memory;
+    let workers = memory::worker_count(cfg);
+    let req = memory::required_bytes(cfg, workers);
+    let mut o = format!("memory required: {req} bytes ({workers} workers; SC-5, see platd.service)\n");
+    let path = unit
+        .map(std::path::Path::to_path_buf)
+        .or_else(|| UNIT_PATHS.iter().rev().map(PathBuf::from).find(|p| p.is_file()));
+    if let Some(p) = path {
+        match std::fs::read_to_string(&p).map_err(|e| e.to_string()).and_then(|t| memory::parse_unit_memory_max(&t)) {
+            Ok(Some(max)) if max < req => o.push_str(&format!(
+                "WARNING: {} MemoryMax={max} is below the required {req} bytes: platd run will refuse to start\n",
+                p.display()
+            )),
+            Ok(_) => {}
+            Err(e) => o.push_str(&format!("WARNING: {}: {e}\n", p.display())),
+        }
+    }
+    o
 }
 
 /// The `check-config` TLS section (fails closed on unusable TLS files).
@@ -210,7 +249,7 @@ fn main() -> ExitCode {
         },
         // QA-003 / NIST-002: both formats load and check the TLS files (key
         // permissions included) and fail closed with exit 2.
-        Cmd::CheckConfig { config, format: OutputFormat::Env } => match Config::load(&config) {
+        Cmd::CheckConfig { config, format: OutputFormat::Env, .. } => match Config::load(&config) {
             Ok(cfg) => {
                 match tls_summary(&cfg).and_then(|_| render_env(&cfg, &cluster::owned_addrs(&cfg), fips_active())) {
                     Ok(s) => {
@@ -228,7 +267,7 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
-        Cmd::CheckConfig { config, format: OutputFormat::Text } => match Config::load(&config) {
+        Cmd::CheckConfig { config, format: OutputFormat::Text, unit } => match Config::load(&config) {
             Ok(cfg) => {
                 let owned = cluster::owned_addrs(&cfg);
                 println!("config OK: node {} ({}/{})", cfg.node.name, cfg.node.id, cfg.cluster.node_count);
@@ -240,6 +279,7 @@ fn main() -> ExitCode {
                     println!("  range {} - {}", Ipv4Addr::from(*a), Ipv4Addr::from(*b));
                 }
                 println!("fragment memory per worker: {} bytes (SC-5)", cfg.translation.fragments.memory_per_worker());
+                print!("{}", memory_summary(&cfg, unit.as_deref()));
                 if let Some(f) = cfg.audit.file.as_ref() {
                     println!("audit file min_free_bytes: {} (AU-5(1))", f.min_free_bytes);
                 }
@@ -442,6 +482,24 @@ mod tests {
         Config::from_toml(&text).unwrap()
     }
 
+    /// POAM-021: check-config warns when the unit's MemoryMax is too low.
+    #[test]
+    fn memory_summary_warns_on_small_unit_limit() {
+        let cfg = example(&[]);
+        let dir = std::env::temp_dir().join(format!("platd-unit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let unit = dir.join("platd.service");
+        std::fs::write(&unit, "[Service]\nMemoryMax=8G\nMemoryMax=64M\n").unwrap();
+        let s = memory_summary(&cfg, Some(&unit));
+        assert!(
+            s.starts_with("memory required: ") && s.contains("WARNING:") && s.contains("MemoryMax=67108864"),
+            "{s}"
+        );
+        std::fs::write(&unit, "[Service]\nMemoryMax=1T\n").unwrap();
+        assert!(!memory_summary(&cfg, Some(&unit)).contains("WARNING"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// SEC-012: the setup script's routes and forward policy come from the
     /// validated config, for this node's slice of the pool only.
     #[test]
@@ -450,17 +508,21 @@ mod tests {
         let s = render_env(&cfg, &plat_cluster::owned(&cfg), true).unwrap();
         assert_eq!(
             s,
-            "PLAT_IF=plat0\nPLAT_NODE_ID=0\nPLAT_NAT64_PREFIX=64:ff9b:1::/96\n\
+            format!(
+                "PLAT_IF=plat0\nPLAT_NODE_ID=0\nPLAT_NAT64_PREFIX=64:ff9b:1::/96\n\
              PLAT_CLIENT_PREFIXES=2001:db8:100::/40\nPLAT_OWNED_POOL=192.0.2.0/24\nPLAT_FIPS=1\nPLAT_MGMT_TLS=0\n\
              PLAT_CLUSTER_HA=0\nPLAT_POOL_ALL=192.0.2.0/24\n\
-             PLAT_CROSS_NODE_HAIRPIN=0\nPLAT_CLUSTER_IFACES=\n"
+             PLAT_CROSS_NODE_HAIRPIN=0\nPLAT_CLUSTER_IFACES=\n\
+             PLAT_MEMORY_REQUIRED_BYTES={}\n",
+                plat_common::memory::required_bytes(&cfg, plat_common::memory::worker_count(&cfg))
+            )
         );
         // Two nodes: node 1 gets only its half of the pool.
         let cfg = example(&[("id = 0", "id = 1"), ("node_count = 1", "node_count = 2")]);
         let s = render_env(&cfg, &plat_cluster::owned(&cfg), false).unwrap();
         assert!(s.contains("PLAT_OWNED_POOL=192.0.2.128/25\n"), "{s}");
         assert!(
-            s.ends_with("PLAT_FIPS=0\nPLAT_MGMT_TLS=0\nPLAT_CLUSTER_HA=0\nPLAT_POOL_ALL=192.0.2.0/24\nPLAT_CROSS_NODE_HAIRPIN=0\nPLAT_CLUSTER_IFACES=\n"),
+            s.contains("PLAT_FIPS=0\nPLAT_MGMT_TLS=0\nPLAT_CLUSTER_HA=0\nPLAT_POOL_ALL=192.0.2.0/24\nPLAT_CROSS_NODE_HAIRPIN=0\nPLAT_CLUSTER_IFACES=\nPLAT_MEMORY_REQUIRED_BYTES="),
             "{s}"
         );
         // Nothing shell-special reaches the script.

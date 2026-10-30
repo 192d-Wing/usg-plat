@@ -57,12 +57,17 @@ SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources
 SystemCallFilter=sched_setaffinity
 SystemCallErrorNumber=EPERM
-# SC-5 backstop against runaway memory or threads (tables and queues are
-# bounded by the config; size MemoryMax to about
-# nat64.max_sessions x 800 B + audit.queue_capacity x 64 B + 256 MiB headroom;
-# measured on aarch64: ~780 B/session, 3.05 GB at 3.91 M sessions with a
-# 1 Mi-record queue). 8G covers the default 4 M sessions; on a host with
-# 8 GiB of RAM or less it is no backstop, so lower it there.
+# SC-5, CP-10 backstop against runaway memory or threads (tables and queues
+# are bounded by the config). The memory the config needs is
+#   nat64.max_sessions x 800 B + audit.queue_capacity x 64 B
+#   + workers x fragment memory per worker
+#   + (workers + 1) x cluster.ha.repl_ring_entries x 64 B (HA only)
+#   + 128 B x (4 + min(16, 65536 / table_shards)) x table_shards + 256 MiB
+# (measured on aarch64: ~780 B/session, 3.05 GB at 3.91 M sessions with a
+# 1 Mi-record queue). `platd check-config` prints it (PLAT_MEMORY_REQUIRED_BYTES
+# in env format) and warns if MemoryMax below is lower; `platd run` refuses
+# to start if it exceeds this cgroup's memory.max or 90 % of RAM (POAM-021).
+# 8G covers the default 4 M sessions; raise it with max_sessions.
 MemoryMax=8G
 TasksMax=1024
 # Audit logs (AU-9): writable by plat only; readable by group plat-log
