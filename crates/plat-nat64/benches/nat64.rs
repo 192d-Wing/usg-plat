@@ -68,6 +68,108 @@ fn bench(c: &mut Criterion) {
         })
     });
 
+    // POAM-001: fragmented datagrams through the per-worker fragment
+    // table. Each iteration is one two-fragment datagram (first fragment:
+    // normal path plus a table insert; last fragment: one probe and a
+    // header rewrite, no shard lock), rotating over 1024 Identifications.
+    let pair4: Vec<[Vec<u8>; 2]> = (0..1024u16)
+        .map(|id| {
+            let full = udp4(0xc633_6407, 53, fa, fp, &[0u8; 504]);
+            let mut a = full[..20 + 256].to_vec();
+            write_v4_header(&mut a, 0, 276, id, false, true, 0, 64, plat_packet::proto::UDP, 0xc633_6407, fa);
+            let mut b = vec![0u8; 20 + 256];
+            write_v4_header(&mut b, 0, 276, id, false, false, 32, 64, plat_packet::proto::UDP, 0xc633_6407, fa);
+            b[20..].copy_from_slice(&full[20 + 256..]);
+            [a, b]
+        })
+        .collect();
+    let pair6: Vec<[Vec<u8>; 2]> = (0..1024u32)
+        .map(|id| {
+            let full = udp6(sub(1, 2), 5000, 0xc633_6407, 53, &[0u8; 504]);
+            let mk = |off: usize, more: bool| {
+                let mut p = vec![0u8; 48 + 256];
+                plat_xlat::siit::write_v6_header(
+                    &mut p,
+                    0,
+                    264,
+                    plat_packet::proto::FRAGMENT,
+                    64,
+                    sub(1, 2),
+                    synth(0xc633_6407),
+                );
+                p[40] = plat_packet::proto::UDP;
+                plat_packet::put16(&mut p, 42, ((off / 8) as u16) << 3 | u16::from(more));
+                plat_packet::put32(&mut p, 44, id);
+                p[48..].copy_from_slice(&full[40 + off..40 + off + 256]);
+                p
+            };
+            [mk(0, true), mk(256, false)]
+        })
+        .collect();
+    for (name, pairs) in [("frag_pair_v4_2x276B", &pair4), ("frag_pair_v6_2x304B", &pair6)] {
+        let mut k = 0usize;
+        g.bench_function(name, |b| {
+            b.iter(|| {
+                for f in &pairs[k & 1023] {
+                    buf[HEADROOM..HEADROOM + f.len()].copy_from_slice(f);
+                    black_box(frag.nat.process(&mut buf, HEADROOM, f.len(), &mut frag.ctx));
+                }
+                k = k.wrapping_add(1);
+            })
+        });
+    }
+    // Fragmented ICMPv6 echo: reassembly (copy into a slot) then the normal
+    // path on the whole datagram.
+    let echo: Vec<[Vec<u8>; 2]> = (0..1024u32)
+        .map(|id| {
+            let s = sub(1, 3);
+            let mut e = vec![0u8; 40 + 8 + 200];
+            plat_xlat::siit::write_v6_header(&mut e, 0, 208, plat_packet::proto::ICMPV6, 64, s, synth(0xc633_6407));
+            e[40] = 128;
+            plat_packet::put16(&mut e, 44, 9);
+            l4_sum6(&mut e, s, synth(0xc633_6407), plat_packet::proto::ICMPV6, 2);
+            let mk = |off: usize, len: usize, more: bool| {
+                let mut p = vec![0u8; 48 + len];
+                plat_xlat::siit::write_v6_header(
+                    &mut p,
+                    0,
+                    (8 + len) as u16,
+                    plat_packet::proto::FRAGMENT,
+                    64,
+                    s,
+                    synth(0xc633_6407),
+                );
+                p[40] = plat_packet::proto::ICMPV6;
+                plat_packet::put16(&mut p, 42, ((off / 8) as u16) << 3 | u16::from(more));
+                plat_packet::put32(&mut p, 44, id);
+                p[48..].copy_from_slice(&e[40 + off..40 + off + len]);
+                p
+            };
+            [mk(0, 104, true), mk(104, 104, false)]
+        })
+        .collect();
+    let mut k = 0usize;
+    g.bench_function("reassemble_icmp_echo_2frag", |b| {
+        b.iter(|| {
+            for f in &echo[k & 1023] {
+                buf[HEADROOM..HEADROOM + f.len()].copy_from_slice(f);
+                black_box(frag.nat.process(&mut buf, HEADROOM, f.len(), &mut frag.ctx));
+            }
+            k = k.wrapping_add(1);
+        })
+    });
+    // RFC 7915 §5.1 / POAM-002: a 1048-byte IPv6 packet with ipv4_mtu 576
+    // becomes two IPv4 fragments.
+    let mut m576 = fixture(&[("ipv4_mtu = 1500", "ipv4_mtu = 576")]);
+    let p576 = udp6(sub(1, 4), 5000, 0xc633_6407, 53, &[0u8; 1000]);
+    assert_eq!(run_all(&mut m576, &p576).unwrap().len(), 2);
+    g.bench_function("v6_to_v4_fragments_576", |b| {
+        b.iter(|| {
+            buf[HEADROOM..HEADROOM + p576.len()].copy_from_slice(&p576);
+            black_box(m576.nat.process(&mut buf, HEADROOM, p576.len(), &mut m576.ctx));
+        })
+    });
+
     // SEC-004 / PERF-001: unsolicited inbound packets (dropped by
     // address-dependent filtering) against a BIB holding 4000 sessions.
     // Must not grow with the number of sessions in the BIB.

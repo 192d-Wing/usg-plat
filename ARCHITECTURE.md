@@ -37,11 +37,13 @@ flowchart TD
         direction TB
         read["read into buf[64..]<br/>(64 B headroom for header growth)"]
         parse["parse<br/>(plat-packet, bounds-checked)"]
+        frag["fragment table (per worker)<br/>non-first: header rewrite with the first fragment's mapping;<br/>early: hold; ICMP / zero-checksum UDP: reassemble"]
         policy["policy<br/>client prefix, RFC 6052 §3.1, non-global deny,<br/>filtering, ICMP error validation"]
         state["state<br/>sharded BIB/session lookup; create on first packet"]
         rewrite["rewrite in place<br/>(plat-xlat, RFC 1624 incremental checksums)"]
-        write["write back to the same queue:<br/>one packet (Verdict::Forward),<br/>IPv6 fragments of a DF=0 IPv4 packet (Verdict::ForwardFragments),<br/>or a locally generated PTB / Frag-Needed"]
+        write["write back to the same queue:<br/>one packet (Verdict::Forward),<br/>fragments (Verdict::ForwardFragments),<br/>nothing for a held fragment (Verdict::Consumed),<br/>or a locally generated ICMP error"]
         read --> parse --> policy --> state --> rewrite --> write
+        parse --> frag --> rewrite
     end
 
     w0 & w1 & w2 & wn --> read
@@ -51,15 +53,50 @@ flowchart TD
 ```
 
 - **No per-packet allocation.** Each worker owns a 64 KiB packet buffer, a
-  2 KiB scratch area (ICMP errors) and a 72 KiB fragment buffer, all
-  allocated once. Translation rewrites the header in front of the payload
+  scratch area (ICMP errors and reassembly output; at least 2 KiB), a
+  72 KiB output-fragment buffer (up to 128 packets), its fragment table and
+  its IPv4 Identification table, all allocated once. Translation rewrites the header in front of the payload
   instead of copying it.
 - **Fragmentation (RFC 7915 §4).** A DF=0 IPv4 packet whose IPv6 form exceeds
   `translation.lowest_ipv6_mtu` (default 1280) is split into IPv6 fragments
   in the worker's fragment buffer; the worker transmits each in order. A DF=1
-  packet that does not fit gets a rate-limited ICMPv4 Fragmentation Needed;
-  an IPv6 packet too big for the IPv4 MTU gets an ICMPv6 Packet Too Big. The
-  token bucket (`translation.icmp_errors_per_sec`) is per worker.
+  packet that does not fit gets a rate-limited ICMPv4 Fragmentation Needed,
+  decided before the session update and only when the read-only
+  `State::filter_inbound` admits it. An IPv6 packet of at most 1280 bytes
+  whose IPv4 form exceeds `ipv4_mtu` is sent as IPv4 fragments (DF=0); a
+  larger one gets an ICMPv6 Packet Too Big. The token bucket
+  (`translation.icmp_errors_per_sec`) is per worker and shared by every
+  locally generated error; a quarter is reserved for Packet Too Big and
+  Fragmentation Needed.
+- **Fragments (RFC 6146 §3.4, `crates/plat-nat64/src/frag.rs`).** Each
+  worker owns a preallocated, randomly keyed 4-way set-associative table
+  keyed by (src, dst, Identification, protocol, direction), sized by
+  `[translation.fragments]`. The first fragment of a TCP/UDP datagram takes
+  the normal path (filters, mapping, audit) and stores its translation;
+  non-first fragments are translated by a header rewrite with that mapping,
+  without a shard lock, and are re-checked against the pool slice. Fragments
+  that arrive early are held in a bounded slot pool and flushed after the
+  first fragment. Fragmented ICMP echo, ICMP errors and zero-checksum IPv4
+  UDP are reassembled in a few bounded slots and then run the normal path.
+  Entries expire `timeout_ms` after the first fragment (housekeeping every
+  64 packets and on an idle receive); overlaps poison the datagram
+  (RFC 5722); per-source caps keep one source from filling the table,
+  buffer or slots. Locally generated errors quoting fragments we sent are
+  mapped through alias entries. State is per worker: a fragment that reaches
+  another worker is dropped (POAM-035; Linux multiqueue TUN kept fragments of
+  one datagram on one queue in LINUX_VERIFICATION L24). A stored mapping has
+  no BIB generation (POAM-034).
+- **IPv4 Identification (RFC 7739 §5.3, `crates/plat-nat64/src/ident.rs`).**
+  Each worker has 4096 16-bit counters with random initial values; a keyed
+  hash of (source, destination, protocol) with a per-engine random key picks
+  the counter and a per-flow offset; each packet advances the counter by a
+  random 1..=8. A fragmented IPv6 datagram gets one fresh ID for all its
+  IPv4 fragments. The key is redacted from `Debug`.
+- **Locally generated ICMP errors.** Time Exceeded (both directions),
+  Destination Unreachable when no mapping can be created, Parameter Problem
+  for an active Routing header, opt-in inbound Unreachable and Source Route
+  Failed; never about an ICMP error or a non-first fragment. See
+  `docs/compliance/RFC_COMPLIANCE.md` for the deviations.
 - **Back-pressure.** A full TUN queue (`EAGAIN`) drops the packet at once and
   counts `tx_queue_full`; the worker never sleeps on transmit.
 - **Two shard locks per steady-state packet**: `bib6` (IPv6 key → IPv4 key)

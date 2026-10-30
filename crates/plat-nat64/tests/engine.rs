@@ -147,11 +147,19 @@ fn per_subscriber_port_limit_and_paired_pooling() {
         addrs.insert(v4_tuple(&out).0);
     }
     assert_eq!(addrs.len(), 1, "paired pooling keeps one IPv4 address");
-    assert_eq!(run(&mut fx, &udp6(s, 20_000, SERVER, 53, b"x")).unwrap_err(), DropReason::SubscriberLimit);
+    // Limit reached: ICMPv6 Destination Unreachable / Address Unreachable
+    // back to the subscriber (RFC 6146 §3.5.1.1, POAM-002), still counted
+    // as a subscriber_limit drop.
+    let e = run(&mut fx, &udp6(s, 20_000, SERVER, 53, b"x")).unwrap();
+    assert_eq!((e[0] >> 4, e[6], e[40], e[41]), (6, proto::ICMPV6, 1, 3));
+    assert_eq!(plat_packet::be128(&e, 24), s);
     // TCP has its own port space within the same blocks.
     assert!(run(&mut fx, &tcp6(s, 20_000, SERVER, 443, 0x02)).is_ok());
     // A different host in the same /64 is the same subscriber.
-    assert_eq!(run(&mut fx, &udp6(sub(3, 2), 1, SERVER, 53, b"x")).unwrap_err(), DropReason::SubscriberLimit);
+    let e = run(&mut fx, &udp6(sub(3, 2), 1, SERVER, 53, b"x")).unwrap();
+    assert_eq!((e[40], e[41]), (1, 3));
+    assert_eq!(fx.ctx.counters.drops(DropReason::SubscriberLimit), 2);
+    assert_eq!(fx.ctx.counters.get(plat_common::Counter::IcmpUnreachableSent), 2);
     let evs = events(&fx);
     assert_eq!(evs.iter().filter(|e| matches!(e, Event::PortBlockAlloc { .. })).count(), 2);
     assert!(evs.iter().any(|e| matches!(e, Event::Limit { kind: LimitKind::SubscriberBlocks, .. })));

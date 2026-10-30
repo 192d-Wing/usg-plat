@@ -235,6 +235,7 @@ fn main() -> ExitCode {
                 if let (Some(a), Some(b)) = (owned.first(), owned.last()) {
                     println!("  range {} - {}", Ipv4Addr::from(*a), Ipv4Addr::from(*b));
                 }
+                println!("fragment memory per worker: {} bytes (SC-5)", cfg.translation.fragments.memory_per_worker());
                 print!("{}", cluster::summary(&cfg));
                 match tls_summary(&cfg) {
                     Ok(t) => {

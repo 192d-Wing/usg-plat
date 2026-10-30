@@ -27,6 +27,8 @@
 //! every engine lock.
 
 pub mod engine;
+pub mod frag;
+pub mod ident;
 pub mod pool;
 pub mod repl;
 pub mod shard;

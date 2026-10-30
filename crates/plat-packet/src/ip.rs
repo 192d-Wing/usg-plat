@@ -15,8 +15,16 @@ pub enum ParseError {
     BadHeaderChecksum,
     TooManyExtHeaders,
     UnsupportedExtHeader,
-    RoutingHeaderActive,
+    /// Routing header with Segments Left != 0. `ptr` is the offset of the
+    /// Segments Left field from the start of the packet (the ICMPv6
+    /// Parameter Problem pointer, RFC 7915 §5.1 / RFC 4443 §3.4).
+    RoutingHeaderActive {
+        ptr: u16,
+    },
     UnsupportedProto,
+    /// First fragment that does not hold the whole extension-header chain
+    /// (RFC 7112, RFC 8200 §4.5).
+    TinyFragment,
     /// Malformed IPv4 option list (bad length, overruns the header).
     BadOptions,
     /// IPv4 Loose/Strict Source Route option with an unexpired route.
@@ -36,7 +44,7 @@ const OPT_SSRR: u8 = 137;
 /// - RFC 7915 §4.1 - a packet with an unexpired LSRR/SSRR option MUST NOT be
 ///   translated.
 /// - NIST 800-53: SI-10 (Information Input Validation), SC-7
-fn check_v4_options(opts: &[u8]) -> Result<(), ParseError> {
+fn check_v4_options(opts: &[u8], allow_srr: bool) -> Result<(), ParseError> {
     let mut i = 0;
     while let Some(&ty) = opts.get(i) {
         match ty {
@@ -54,7 +62,7 @@ fn check_v4_options(opts: &[u8]) -> Result<(), ParseError> {
                     // RFC 791: the route is exhausted once the pointer
                     // (1-based, minimum 4) exceeds the option length.
                     let ptr = usize::from(*opts.get(i + 2).ok_or(ParseError::BadOptions)?);
-                    if ptr <= len {
+                    if ptr <= len && !allow_srr {
                         return Err(ParseError::SourceRouteActive);
                     }
                 }
@@ -105,7 +113,20 @@ impl Ipv4Hdr {
 
 /// Parses and validates an IPv4 header. `pkt` may carry trailing padding
 /// beyond Total Length; callers use `total_len`.
+#[inline]
 pub fn parse_v4(pkt: &[u8]) -> Result<Ipv4Hdr, ParseError> {
+    parse_v4_impl(pkt, false)
+}
+
+/// [`parse_v4`] that accepts an unexpired source route option, for building
+/// the ICMPv4 Source Route Failed reply about the packet (RFC 1812
+/// §5.2.4.1). Every other check still applies.
+pub fn parse_v4_ignore_source_route(pkt: &[u8]) -> Result<Ipv4Hdr, ParseError> {
+    parse_v4_impl(pkt, true)
+}
+
+#[inline(always)]
+fn parse_v4_impl(pkt: &[u8], allow_srr: bool) -> Result<Ipv4Hdr, ParseError> {
     if pkt.len() < 20 {
         return Err(ParseError::Truncated);
     }
@@ -124,7 +145,7 @@ pub fn parse_v4(pkt: &[u8]) -> Result<Ipv4Hdr, ParseError> {
         return Err(ParseError::BadHeaderChecksum);
     }
     if hdr_len > 20 {
-        check_v4_options(&pkt[20..hdr_len])?;
+        check_v4_options(&pkt[20..hdr_len], allow_srr)?;
     }
     let ff = be16(pkt, 6);
     let offset = ff & 0x1fff;
@@ -194,6 +215,9 @@ pub struct Ipv6Hdr {
     /// Offset of the upper-layer header from the start of the packet.
     pub l4_off: usize,
     pub frag: Option<Frag>,
+    /// Offset just past the Fragment Header (0 without one). For a
+    /// non-first fragment this equals `l4_off`.
+    pub frag_end: usize,
 }
 
 impl Ipv6Hdr {
@@ -209,14 +233,14 @@ impl Ipv6Hdr {
     }
 }
 
-fn parse_v6_impl(pkt: &[u8], strict_len: bool) -> Result<Ipv6Hdr, ParseError> {
+#[inline(always)]
+fn parse_v6_impl(pkt: &[u8], strict_len: bool, allow_routing: bool) -> Result<Ipv6Hdr, ParseError> {
     if pkt.len() < 40 {
         return Err(ParseError::Truncated);
     }
     if pkt[0] >> 4 != 6 {
         return Err(ParseError::BadVersion);
     }
-    let vtf = be32(pkt, 0);
     let payload_len = usize::from(be16(pkt, 4));
     // The quoted packet inside an ICMPv6 error may be truncated.
     let avail = if strict_len {
@@ -229,7 +253,31 @@ fn parse_v6_impl(pkt: &[u8], strict_len: bool) -> Result<Ipv6Hdr, ParseError> {
     };
     let mut next = pkt[6];
     let mut off = 40;
-    let mut frag = None;
+    let mut frag: Option<Frag> = None;
+    let mut frag_end = 0;
+    // RFC 7112: once past a Fragment Header, running out of bytes means the
+    // first fragment did not carry the whole header chain.
+    let short = |frag: Option<Frag>| {
+        if strict_len && frag.is_some() { ParseError::TinyFragment } else { ParseError::Truncated }
+    };
+    // PERF-001: a nested fn (not a closure capturing the slice) so the
+    // header is built directly in the return slot.
+    #[inline(always)]
+    fn hdr(pkt: &[u8], payload_len: usize, next: u8, off: usize, frag: Option<Frag>, frag_end: usize) -> Ipv6Hdr {
+        let vtf = be32(pkt, 0);
+        Ipv6Hdr {
+            traffic_class: (vtf >> 20) as u8,
+            flow_label: vtf & 0x000f_ffff,
+            payload_len,
+            hop_limit: pkt[7],
+            src: be128(pkt, 8),
+            dst: be128(pkt, 24),
+            proto: next,
+            l4_off: off,
+            frag,
+            frag_end,
+        }
+    }
     for _ in 0..=MAX_EXT_HEADERS {
         match next {
             proto::HOPOPT | proto::DSTOPTS | proto::ROUTING => {
@@ -239,12 +287,12 @@ fn parse_v6_impl(pkt: &[u8], strict_len: bool) -> Result<Ipv6Hdr, ParseError> {
                     return Err(ParseError::UnsupportedExtHeader);
                 }
                 if off + 8 > avail {
-                    return Err(ParseError::Truncated);
+                    return Err(short(frag));
                 }
                 // RFC 7915 §5.1: a Routing header with Segments Left != 0
                 // must not be translated.
-                if next == proto::ROUTING && pkt[off + 3] != 0 {
-                    return Err(ParseError::RoutingHeaderActive);
+                if next == proto::ROUTING && pkt[off + 3] != 0 && !allow_routing {
+                    return Err(ParseError::RoutingHeaderActive { ptr: (off + 3) as u16 });
                 }
                 let len = (usize::from(pkt[off + 1]) + 1) * 8;
                 next = pkt[off];
@@ -258,22 +306,23 @@ fn parse_v6_impl(pkt: &[u8], strict_len: bool) -> Result<Ipv6Hdr, ParseError> {
                 frag = Some(Frag { id: be32(pkt, off + 4), offset: fo >> 3, more: fo & 1 != 0 });
                 next = pkt[off];
                 off += 8;
+                frag_end = off;
+                // A non-first fragment carries no header chain after the
+                // Fragment Header: its payload continues the first
+                // fragment's (RFC 8200 §4.5), so the walk stops and `proto`
+                // is the upper layer the Fragment Header names.
+                if fo >> 3 != 0 {
+                    return match next {
+                        proto::TCP | proto::UDP | proto::ICMPV6 => Ok(hdr(pkt, payload_len, next, off, frag, frag_end)),
+                        _ => Err(ParseError::UnsupportedProto),
+                    };
+                }
             }
             proto::TCP | proto::UDP | proto::ICMPV6 => {
                 if off > avail {
-                    return Err(ParseError::Truncated);
+                    return Err(short(frag));
                 }
-                return Ok(Ipv6Hdr {
-                    traffic_class: (vtf >> 20) as u8,
-                    flow_label: vtf & 0x000f_ffff,
-                    payload_len,
-                    hop_limit: pkt[7],
-                    src: be128(pkt, 8),
-                    dst: be128(pkt, 24),
-                    proto: next,
-                    l4_off: off,
-                    frag,
-                });
+                return Ok(hdr(pkt, payload_len, next, off, frag, frag_end));
             }
             _ => return Err(ParseError::UnsupportedProto),
         }
@@ -283,12 +332,19 @@ fn parse_v6_impl(pkt: &[u8], strict_len: bool) -> Result<Ipv6Hdr, ParseError> {
 
 /// Parses an IPv6 header and walks its extension-header chain.
 pub fn parse_v6(pkt: &[u8]) -> Result<Ipv6Hdr, ParseError> {
-    parse_v6_impl(pkt, true)
+    parse_v6_impl(pkt, true, false)
+}
+
+/// [`parse_v6`] that walks past a Routing header with Segments Left != 0,
+/// for building the ICMPv6 Parameter Problem reply about the packet
+/// (RFC 7915 §5.1). Every other check still applies.
+pub fn parse_v6_ignore_routing(pkt: &[u8]) -> Result<Ipv6Hdr, ParseError> {
+    parse_v6_impl(pkt, true, true)
 }
 
 /// Lenient variant for packets quoted inside ICMPv6 errors.
 pub fn parse_v6_inner(pkt: &[u8]) -> Result<Ipv6Hdr, ParseError> {
-    parse_v6_impl(pkt, false)
+    parse_v6_impl(pkt, false, false)
 }
 
 /// Transport identifiers used for mapping.
@@ -404,7 +460,8 @@ mod tests {
         p[6] = proto::ROUTING;
         p[40] = proto::UDP;
         p[43] = 1;
-        assert_eq!(parse_v6(&p).unwrap_err(), ParseError::RoutingHeaderActive);
+        assert_eq!(parse_v6(&p).unwrap_err(), ParseError::RoutingHeaderActive { ptr: 43 });
+        assert_eq!(parse_v6_ignore_routing(&p).unwrap().proto, proto::UDP);
     }
 
     #[test]
@@ -464,6 +521,49 @@ mod tests {
         assert_eq!(parse_v6(&p).unwrap_err(), ParseError::UnsupportedExtHeader);
     }
 
+    #[test]
+    fn v6_non_first_fragment_stops_at_fragment_header() {
+        // FRAG (offset 8 units, next = DSTOPTS in the first fragment's chain
+        // would be unsupported here): payload bytes are not walked.
+        let mut p = vec![0u8; 40 + 8 + 16];
+        p[0] = 0x60;
+        p[4..6].copy_from_slice(&24u16.to_be_bytes());
+        p[6] = proto::FRAGMENT;
+        p[40] = proto::UDP;
+        p[42..44].copy_from_slice(&(8u16 << 3).to_be_bytes());
+        p[48] = 0xff; // garbage that would fail a header walk
+        let h = parse_v6(&p).unwrap();
+        assert_eq!((h.proto, h.l4_off, h.frag_end), (proto::UDP, 48, 48));
+        assert_eq!(h.frag, Some(Frag { id: 0, offset: 8, more: false }));
+        p[40] = proto::DSTOPTS;
+        assert_eq!(parse_v6(&p).unwrap_err(), ParseError::UnsupportedProto);
+    }
+
+    #[test]
+    fn v6_first_fragment_must_hold_header_chain() {
+        // RFC 7112: FRAG (first, M=1) -> DSTOPTS that runs past the packet.
+        let mut p = vec![0u8; 40 + 8 + 4];
+        p[0] = 0x60;
+        p[4..6].copy_from_slice(&12u16.to_be_bytes());
+        p[6] = proto::FRAGMENT;
+        p[40] = proto::DSTOPTS;
+        p[43] = 1;
+        assert_eq!(parse_v6(&p).unwrap_err(), ParseError::TinyFragment);
+        // Without a Fragment Header the same shortfall is plain truncation.
+        p[6] = proto::DSTOPTS;
+        assert_eq!(parse_v6(&p).unwrap_err(), ParseError::Truncated);
+    }
+
+    #[test]
+    fn v4_source_route_can_be_parsed_for_the_error_reply() {
+        let p = v4_with_opts(&[131, 7, 4, 10, 0, 0, 1, 0]);
+        assert_eq!(parse_v4(&p).unwrap_err(), ParseError::SourceRouteActive);
+        let h = parse_v4_ignore_source_route(&p).unwrap();
+        assert_eq!((h.hdr_len, h.dst), (28, 0xc633_6407));
+        // Malformed options are still refused.
+        assert_eq!(parse_v4_ignore_source_route(&v4_with_opts(&[7u8, 0, 0, 0])).unwrap_err(), ParseError::BadOptions);
+    }
+
     proptest! {
         // SI-10: arbitrary bytes never panic the parsers.
         #[test]
@@ -472,6 +572,8 @@ mod tests {
             let _ = parse_v4_inner(&data);
             let _ = parse_v6(&data);
             let _ = parse_v6_inner(&data);
+            let _ = parse_v4_ignore_source_route(&data);
+            let _ = parse_v6_ignore_routing(&data);
             for p in [6u8, 17, 1, 58] {
                 let _ = parse_l4(&data, 20, data.len(), p);
                 let _ = parse_l4_inner(&data, 40, p);

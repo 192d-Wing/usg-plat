@@ -23,6 +23,11 @@ never limits forwarding.
 | 6 | Branch `fix/linux-validation` (unreleased). New record `audit_recovery` (`plat.reason` `empty_file`/`missing_header`/`truncated_tail`, `plat.audit.last_checkpoint_seq`, `plat.audit.max_seq`, `plat.audit.lease_state` `ok`/`absent`/`corrupt`/`inflated`/`high`; CEF `reason`, `cn3` `lastCheckpointSeq`, `cn2` `maxSeq`, `cs4` `leaseState`). `audit_output_failure` may carry `plat.reason` (`truncate_failed`, `seq_lease_failed`, `seq_exhausted`; CEF `reason`). New lease file `.<name>.seq`. `verify-log` exit 3 and `--allow-recovery`. |
 | 7 | Branch `feat/cluster-ha` (unreleased). Cluster high availability. New records `cluster_view_change`, `cluster_member_state`, `cluster_slice_acquire`, `cluster_slice_release`, `nat_port_block_adopt`, `cluster_peer_rejected`, `cluster_peer_suppressed`, `cluster_replication_gap`, `cluster_hook`, `cluster_operator_command`. `nat_port_block_release` may carry `plat.release_reason` (`handover`; CEF `reason`). `service_start` may carry `cluster.node_id`, `cluster.mode`, `cluster.config_digest`, `cluster.slices`, `cluster.slice_count`, `cluster.member_count` (CEF `cs2`/`cs3`/`cs4`/`cn3`). `tls_revocation_check` gains roles `cluster_peer_client` / `cluster_peer_server`. Chain format unchanged. |
 
+Branch `feat/protocol-completeness` (unreleased) adds drop reasons, counters
+and one gauge but changes no record type or field name, so the schema stays
+7. New `plat.counter.name` values can appear in `dataplane_counter` records
+(see below); parsers that enumerate counter names must accept them.
+
 Files written by the v1 chain (schema 1) **no longer verify** with
 `platd verify-log`: the first line must be an `audit_chain_continue` header.
 Files written under schemas 2–7 use the same chain v2 and verify.
@@ -269,6 +274,29 @@ Every `audit.summary_interval_secs` (default 60; 0 disables), one record per
 process started (they reset on restart). Only drop reasons appear here;
 non-drop counters such as `tx_queue_full`, `icmp_errors_generated` or
 `fragmented_v4_to_v6` are only in `/metrics`.
+
+Fragment and ICMP drop reasons (`feat/protocol-completeness`, schema
+unchanged) appear here as `plat.counter.name`: `fragment_timeout`,
+`fragment_overlap`, `fragment_tiny`, `fragment_too_many`,
+`fragment_table_full`, `fragment_buffer_full`, `reassembly_full`,
+`reassembly_too_big`, `fragment_unmatched`, `icmp_quote_unmatched`. A drop
+answered with a locally generated ICMP error is still counted under its
+reason (for example `hop_limit`, `port_exhausted`, `too_big`). Inbound
+TTL ≤ 1 packets that the inbound filter refuses are counted `no_binding` or
+`filtered`, not `hop_limit` (Time Exceeded is filter-gated); a too-big DF
+IPv4 packet the filter refuses is counted the same way, not `too_big`.
+
+```json
+{"@timestamp":"2026-10-29T14:17:00.000000Z","plat.schema":7,"event.sequence":41,"event.kind":"event","event.category":"network","event.action":"dataplane_counter","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"plat.counter.name":"fragment_overlap","plat.counter.value":3}
+```
+
+SIEM guidance: a rising `fragment_overlap` or `fragment_tiny` indicates
+fragment-evasion or Teardrop-style traffic; `fragment_table_full`,
+`fragment_buffer_full` and `reassembly_full` indicate a fragment flood
+against the per-worker limits (SC-5); `fragment_unmatched` /
+`icmp_quote_unmatched` that do not follow a flood can indicate fragments
+steered across workers (POAM-035). Correlate with the source by packet
+capture: these counters carry no addresses.
 
 ```json
 {"@timestamp":"2026-10-28T14:17:00.000000Z","plat.schema":7,"event.sequence":40,"event.kind":"event","event.category":"network","event.action":"dataplane_counter","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"plat.counter.name":"filtered","plat.counter.value":12}
@@ -782,16 +810,33 @@ for `nat_port_block_release` (same address and range), `service_stop`,
   `icmp_untranslatable`, `wrong_node`, `source_route`,
   `subscriber_table_full`, `cluster_fenced` (slice fenced or adopting on
   this node), `missteered` (HA `steering.mode = "drop"`: new subscriber
-  homed on another member).
+  homed on another member); fragments: `fragment_timeout` (incomplete
+  datagram expired), `fragment_overlap` (overlap or duplicate, RFC 5722;
+  the datagram is poisoned), `fragment_tiny` (first fragment short of the
+  transport header or the IPv6 header chain, IPv4 TCP offset 1),
+  `fragment_too_many` (above `max_fragments_per_datagram` or more than 8
+  gaps), `fragment_table_full`, `fragment_buffer_full`, `reassembly_full`,
+  `reassembly_too_big`, `fragment_unmatched` (non-first fragment with no
+  entry while buffering is off or full, or on another worker),
+  `icmp_quote_unmatched` (ICMP error quoting a non-first fragment this
+  worker cannot map). `fragment` remains for reassembly turned off
+  (`reassembly_slots = 0`), zero-checksum UDP under
+  `udp_zero_checksum = "drop"` and other unsupported fragment shapes.
 - `plat_<name>_total` for `rx_packets`, `tx_packets`, `rx_bytes`,
   `tx_bytes`, `v6_to_v4`, `v4_to_v6`, `hairpin`, `icmp_errors_translated`,
   `icmp_errors_generated`, `icmp_errors_rate_limited`,
-  `fragmented_v4_to_v6`, `bib_created`, `session_created`, `io_errors`,
+  `fragmented_v4_to_v6`, `fragmented_v6_to_v4`, `fragments_in_v6`,
+  `fragments_in_v4`, `fragments_forwarded`, `fragments_buffered`,
+  `datagrams_reassembled`, `icmp_time_exceeded_sent`,
+  `icmp_unreachable_sent` (Destination Unreachable, including Source Route
+  Failed), `icmp_param_problem_sent`, `bib_created`, `session_created`, `io_errors`,
   `tx_queue_full` (TUN `EAGAIN` back-pressure, separate from `io_errors`);
   `plat_worker_rx_packets_total{worker=...}`.
 - Gauges `plat_sessions`, `plat_bibs`, `plat_pool_blocks_free`,
   `plat_pool_blocks_total`, `plat_audit_queue_depth`, `plat_audit_degraded`,
-  `plat_audit_storage_low`.
+  `plat_audit_storage_low`, `plat_fragment_entries` (live fragment-table
+  entries summed over workers, updated by each worker's housekeeping, every
+  64 packets and on an idle receive).
 - Counter `plat_pool_releases_deferred_total`: port-block releases the
   sweeper deferred because the `nat_port_block_release` record could not
   yet be queued (the block stays out of the pool until it is).

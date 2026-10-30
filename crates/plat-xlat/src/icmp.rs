@@ -8,7 +8,7 @@
 use plat_packet::ip::{parse_l4_inner, parse_v4_inner, parse_v6_inner};
 use plat_packet::{Ipv4Hdr, Ipv6Hdr, L4, be16, be32, checksum as ck, proto, put16, put32};
 
-use crate::siit::{Map4, Map6, XlatError, l4_4to6, l4_6to4, write_v4_header, write_v6_header};
+use crate::siit::{Map4, Map6, XlatError, l4_4to6, l4_6to4, proto_4to6, proto_6to4, write_v4_header, write_v6_header};
 
 /// RFC 1812 §4.3.2.3: ICMPv4 errors carry at most 576 bytes in total.
 pub const ICMP4_ERR_MAX: usize = 576;
@@ -26,34 +26,42 @@ pub fn is_icmp4_error(ty: u8) -> bool {
     matches!(ty, 3 | 4 | 5 | 11 | 12)
 }
 
-/// Parses the packet quoted in an ICMPv6 error.
-pub fn quoted_v6(pkt: &[u8], h: &Ipv6Hdr) -> Result<(Ipv6Hdr, L4), XlatError> {
+/// Parses the packet quoted in an ICMPv6 error. The transport identifiers
+/// are `None` when the quoted packet is a non-first fragment, which carries
+/// no transport header (RFC-103); the caller resolves it through its
+/// fragment state (RFC 7915 §5.3, RFC 6146 §3.4).
+pub fn quoted_v6(pkt: &[u8], h: &Ipv6Hdr) -> Result<(Ipv6Hdr, Option<L4>), XlatError> {
     let inner = pkt.get(h.l4_off + 8..h.total_len()).ok_or(XlatError::Truncated)?;
     let ih = parse_v6_inner(inner).map_err(|_| XlatError::Truncated)?;
     if ih.frag.is_some_and(|f| !f.is_first()) {
-        // A non-first fragment carries no transport header (RFC-103).
-        return Err(XlatError::NonFirstFragment);
+        return Ok((ih, None));
     }
     let l4 = parse_l4_inner(inner, ih.l4_off, ih.proto).map_err(|_| XlatError::Truncated)?;
     if matches!(l4, L4::Icmp { ty, .. } if is_icmp6_error(ty)) {
         // Never translate an error about an error (RFC 4443 §2.4(e)).
         return Err(XlatError::Untranslatable);
     }
-    Ok((ih, l4))
+    Ok((ih, Some(l4)))
 }
 
-/// Parses the packet quoted in an ICMPv4 error.
-pub fn quoted_v4(pkt: &[u8], h: &Ipv4Hdr) -> Result<(Ipv4Hdr, L4), XlatError> {
+/// Parses the packet quoted in an ICMPv4 error; see [`quoted_v6`].
+pub fn quoted_v4(pkt: &[u8], h: &Ipv4Hdr) -> Result<(Ipv4Hdr, Option<L4>), XlatError> {
     let inner = pkt.get(h.hdr_len + 8..h.total_len).ok_or(XlatError::Truncated)?;
     let ih = parse_v4_inner(inner).map_err(|_| XlatError::Truncated)?;
     if ih.frag.is_some_and(|f| !f.is_first()) {
-        return Err(XlatError::NonFirstFragment);
+        return Ok((ih, None));
     }
     let l4 = parse_l4_inner(inner, ih.hdr_len, ih.proto).map_err(|_| XlatError::Truncated)?;
     if matches!(l4, L4::Icmp { ty, .. } if is_icmp4_error(ty)) {
         return Err(XlatError::Untranslatable);
     }
-    Ok((ih, l4))
+    Ok((ih, Some(l4)))
+}
+
+/// Is `ih` a non-first fragment (a quote with no transport header)?
+#[inline]
+fn non_first(f: Option<plat_packet::Frag>) -> bool {
+    f.is_some_and(|f| !f.is_first())
 }
 
 /// RFC 7915 §5.2 Figure 6: IPv6 Parameter Problem pointer → IPv4 pointer.
@@ -137,7 +145,9 @@ pub fn icmp6_err_to_v4(
     let copy = iq_l4.len().min(room);
     let body = out.get_mut(48..48 + copy).ok_or(XlatError::Truncated)?;
     body.copy_from_slice(&iq_l4[..copy]);
-    let ip4 = l4_6to4(body, ih, inner, true)?;
+    // RFC 7915 §5.3: a quoted non-first fragment has only its IP header
+    // translated (addresses from the caller's fragment state).
+    let ip4 = if non_first(ih.frag) { proto_6to4(ih.proto) } else { l4_6to4(body, ih, inner, true)? };
 
     let (more, off, id) = match ih.frag {
         Some(f) => (f.more, f.offset, f.id as u16),
@@ -231,16 +241,27 @@ pub fn icmp4_err_to_v6(
     let quoted = &icmp[8..];
     let end = quoted.len().min(ih.total_len);
     let iq_l4 = quoted.get(ih.hdr_len..end).ok_or(XlatError::Truncated)?;
-    let room = ICMP6_ERR_MAX.min(out.len()).saturating_sub(88);
+    // RFC 7915 §4.3: a quoted non-first fragment is translated like the
+    // fragment itself, Fragment Header included, with no transport rewrite.
+    let nf = non_first(ih.frag);
+    let ihl = if nf { 96 } else { 88 };
+    let room = ICMP6_ERR_MAX.min(out.len()).saturating_sub(ihl);
     let copy = iq_l4.len().min(room);
-    let body = out.get_mut(88..88 + copy).ok_or(XlatError::Truncated)?;
+    let body = out.get_mut(ihl..ihl + copy).ok_or(XlatError::Truncated)?;
     body.copy_from_slice(&iq_l4[..copy]);
-    let ip6 = l4_4to6(body, ih, inner, true)?;
+    let ip6 = if nf { proto_4to6(ih.proto) } else { l4_4to6(body, ih, inner, true)? };
 
-    let inner_payload = ih.payload_len().min(65535) as u16;
-    write_v6_header(&mut out[48..88], ih.tos, inner_payload, ip6, ih.ttl, inner.src, inner.dst);
+    let inner_payload = (ih.payload_len() + ihl - 88).min(65535) as u16;
+    let next = if nf { proto::FRAGMENT } else { ip6 };
+    write_v6_header(&mut out[48..88], ih.tos, inner_payload, next, ih.ttl, inner.src, inner.dst);
+    if let (true, Some(f)) = (nf, ih.frag) {
+        out[88] = ip6;
+        out[89] = 0;
+        put16(out, 90, (f.offset << 3) | u16::from(f.more));
+        put32(out, 92, f.id);
+    }
 
-    let total = 88 + copy;
+    let total = ihl + copy;
     let icmp_len = (total - 40) as u32;
     out[40] = ty6;
     out[41] = code6;

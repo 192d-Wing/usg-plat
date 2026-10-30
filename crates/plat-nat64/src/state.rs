@@ -901,6 +901,31 @@ impl State {
         Ok(bib.k6)
     }
 
+    /// Read-only form of the [`State::inbound`] filter decision: would a
+    /// packet from `remote` to BIB `k4` be admitted? Nothing is created or
+    /// refreshed (one `bib4` shard lock). `Err(NoBinding)` without a BIB,
+    /// `Err(Filtered)` when filtering refuses the remote. Gates locally
+    /// generated errors and reassembly for inbound packets.
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: SC-7 - no ICMP or reassembly for packets the filter
+    ///   would drop (NIST-002, NIST-004, SEC-001, SEC-005)
+    /// - RFC 4787 REQ-8 / RFC 6146 §3.5.1.2 - same rule as `inbound`
+    pub fn filter_inbound(&self, k4: Key4, remote: (u32, u16)) -> Result<Key6, DropReason> {
+        let now = self.clock.now_ms();
+        let g = self.bib4.lock(&k4);
+        let bib = g.get(&k4).ok_or(DropReason::NoBinding)?;
+        if bib.sessions.get(&remote).is_some_and(|s| s.expires_ms > now) {
+            return Ok(bib.k6);
+        }
+        let allowed = match self.filtering {
+            Filtering::EndpointIndependent => true,
+            Filtering::AddressDependent => bib.has_remote(remote.0),
+            Filtering::AddressPortDependent => false,
+        };
+        if allowed { Ok(bib.k6) } else { Err(DropReason::Filtered) }
+    }
+
     /// Read-only BIB lookup by pool address (for quoted packets in ICMP errors).
     pub fn lookup4(&self, k4: Key4) -> Option<Key6> {
         self.bib4.lock(&k4).get(&k4).map(|b| b.k6)
