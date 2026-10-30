@@ -653,9 +653,12 @@ fn block_is_not_reused_before_its_release_record_is_queued() {
     assert_eq!(fx.nat.state().subscriber_count(), 1);
     assert!(matches!(events(&fx)[..], [plat_audit::Event::PortBlockAlloc { .. }]));
     assert_eq!(fx.nat.state().sweep().blocks_released, 1);
-    assert_eq!(fx.nat.state().pool.free_blocks(), total);
+    assert_eq!(fx.nat.state().pool.free_blocks(), total - 1, "cool-down after the release (POAM-010)");
     assert_eq!(fx.nat.state().subscriber_count(), 0);
     assert!(matches!(events(&fx)[..], [plat_audit::Event::PortBlockRelease { .. }]));
+    fx.clock.advance(Duration::from_secs(120));
+    fx.nat.state().sweep();
+    assert_eq!(fx.nat.state().pool.free_blocks(), total);
 }
 
 // ------------------------------------------------- PERF-106: token refill

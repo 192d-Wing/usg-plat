@@ -12,6 +12,7 @@ plat-common.workspace = true
 plat-packet.workspace = true
 plat-xlat.workspace = true
 plat-audit.workspace = true
+plat-cluster.workspace = true
 ahash.workspace = true
 crossbeam-utils.workspace = true
 parking_lot.workspace = true

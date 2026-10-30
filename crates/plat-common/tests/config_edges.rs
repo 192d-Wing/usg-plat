@@ -3,7 +3,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use plat_common::Config;
-use plat_common::config::{ConfigError, MAX_POOL_ADDRS};
+use plat_common::config::{ConfigError, MAX_POOL_ADDRS, Partition, SteeringMode};
 
 const EXAMPLE: &str = include_str!("../../../config/platd.example.toml");
 
@@ -238,4 +238,263 @@ fn management_listen_edges() {
     valid(&[("127.0.0.1:9464", "[::1]:9464")]);
     invalid(&[("127.0.0.1:9464", "[::]:9464")]);
     invalid(&[("127.0.0.1:9464", "192.0.2.1:9464")]);
+}
+
+// ---- Cluster HA (WU2) ----
+
+/// A valid two-node HA cluster section (node 0) with a witness.
+fn ha_section(members: usize, ha_extra: &str, cluster_extra: &str) -> String {
+    let mut s = format!("node_count = {members}\npartition = \"slices\"\n{cluster_extra}\n");
+    for i in 0..members {
+        let name = if i == 0 { "plat-01".to_string() } else { format!("plat-{:02}", i + 1) };
+        s.push_str(&format!(
+            "[[cluster.members]]\nid = {i}\nname = \"{name}\"\npeer_addr = \"198.51.100.{}:7946\"\n\
+             identity = \"dns:{name}.cluster.example\"\n",
+            11 + i
+        ));
+    }
+    s.push_str(&format!(
+        "[cluster.ha]\nenabled = true\nlisten = \"198.51.100.11:7946\"\n{ha_extra}\n\
+         [cluster.ha.tls]\ncert_file = \"/etc/plat/tls/peer.pem\"\nkey_file = \"/etc/plat/tls/peer.key\"\n\
+         ca_file = \"/etc/plat/tls/cluster-ca.pem\"\n"
+    ));
+    s
+}
+
+const WITNESS: &str = "witness = { addr = \"198.51.100.20:7946\", identity = \"dns:witness.cluster.example\" }";
+
+fn ha(members: usize, ha_extra: &str) -> Result<Config, ConfigError> {
+    with(&[(NC, &ha_section(members, ha_extra, ""))])
+}
+
+#[track_caller]
+fn ha_invalid(members: usize, ha_extra: &str, want: &str) {
+    match ha(members, ha_extra) {
+        Err(ConfigError::Invalid(m)) => assert!(m.contains(want), "{ha_extra}: {m}"),
+        other => panic!("expected Invalid for {ha_extra:?}, got {other:?}"),
+    }
+}
+
+#[track_caller]
+fn ha_valid(members: usize, ha_extra: &str) -> Config {
+    ha(members, ha_extra).unwrap_or_else(|e| panic!("expected valid for {ha_extra:?}: {e}"))
+}
+
+#[test]
+fn ha_off_by_default() {
+    let c = with(&[]).unwrap();
+    assert!(!c.cluster.ha_enabled() && !c.cluster.auto_failover());
+    assert_eq!(c.cluster.partition, Partition::Contiguous);
+    assert_eq!(c.cluster.slice_prefix_len, 28);
+    assert_eq!(c.cluster.steering_mode(), SteeringMode::Count);
+    assert_eq!(c.nat64.block_cooldown_secs, 120);
+    // Present but not enabled: HA stays off, legacy partition still allowed.
+    let off = ha_section(2, "", "").replace("enabled = true\n", "").replace("partition = \"slices\"\n", "");
+    let c = with(&[(NC, &off)]).unwrap();
+    assert!(!c.cluster.ha_enabled() && c.cluster.ha_active().is_none());
+}
+
+#[test]
+fn ha_defaults_and_auto_failover() {
+    let c = ha_valid(2, WITNESS);
+    let h = c.cluster.ha_active().unwrap();
+    assert_eq!((h.lease_ms, h.heartbeat_ms, h.drift_margin_pct), (3000, 500, 10));
+    assert_eq!((h.tcp_adopt_secs, h.takeover_quarantine_secs, h.reserve_ahead_blocks), (300, 600, 8));
+    assert_eq!((h.failback_delay_secs, h.max_concurrent_handovers, h.repl_ring_entries), (60, 4, 65_536));
+    assert_eq!((h.peer_queue_bytes, h.max_frame_bytes, h.hook_timeout_ms), (64 << 20, 1 << 20, 5000));
+    assert_eq!(h.shutdown_handover_ms, 10_000);
+    assert_eq!(h.state_dir.to_str(), Some("/var/lib/plat/cluster"));
+    assert!(c.cluster.auto_failover());
+    assert_eq!(c.cluster.steering_mode(), SteeringMode::Drop, "drop is the HA default");
+    // Two members, no witness: auto failover is off and cannot be forced on.
+    let c = ha_valid(2, "");
+    assert!(!c.cluster.auto_failover());
+    ha_invalid(2, "auto_failover = true", "witness");
+    ha_valid(2, "auto_failover = false");
+    // Three members form a quorum without a witness.
+    assert!(ha_valid(3, "").cluster.auto_failover());
+    ha_valid(3, "auto_failover = true");
+    assert!(!ha_valid(3, "auto_failover = false").cluster.auto_failover());
+    // Steering can be relaxed to count explicitly; forward is phase 2.
+    let s = format!("{}[cluster.steering]\nmode = \"count\"\n", ha_section(2, "", ""));
+    assert_eq!(with(&[(NC, &s)]).unwrap().cluster.steering_mode(), SteeringMode::Count);
+    let s = format!("{}[cluster.steering]\nmode = \"forward\"\n", ha_section(2, "", ""));
+    assert!(matches!(with(&[(NC, &s)]), Err(ConfigError::Invalid(m)) if m.contains("forward")));
+    let s = format!("{}[cluster.steering]\nmode = \"bogus\"\n", ha_section(2, "", ""));
+    assert!(matches!(with(&[(NC, &s)]), Err(ConfigError::Parse(_))));
+}
+
+#[test]
+fn ha_numeric_edges() {
+    for (accept, reject, want) in [
+        ("lease_ms = 1000\nheartbeat_ms = 250", "lease_ms = 999\nheartbeat_ms = 50", "lease_ms"),
+        ("lease_ms = 30000", "lease_ms = 30001", "lease_ms"),
+        ("heartbeat_ms = 750", "heartbeat_ms = 751", "heartbeat_ms"),
+        ("heartbeat_ms = 50", "heartbeat_ms = 49", "heartbeat_ms"),
+        ("drift_margin_pct = 1", "drift_margin_pct = 0", "drift_margin_pct"),
+        ("drift_margin_pct = 50", "drift_margin_pct = 51", "drift_margin_pct"),
+        ("tcp_adopt_secs = 0", "tcp_adopt_secs = 3601", "tcp_adopt_secs"),
+        ("tcp_adopt_secs = 3600", "tcp_adopt_secs = 3601", "tcp_adopt_secs"),
+        // Longest of udp 300 / tcp_trans 240 / icmp 60 in the example.
+        ("takeover_quarantine_secs = 300", "takeover_quarantine_secs = 299", "takeover_quarantine_secs"),
+        ("takeover_quarantine_secs = 86400", "takeover_quarantine_secs = 86401", "takeover_quarantine_secs"),
+        ("reserve_ahead_blocks = 1", "reserve_ahead_blocks = 0", "reserve_ahead_blocks"),
+        ("reserve_ahead_blocks = 64", "reserve_ahead_blocks = 65", "reserve_ahead_blocks"),
+        ("failback_delay_secs = 0", "failback_delay_secs = 86401", "failback_delay_secs"),
+        ("max_concurrent_handovers = 1", "max_concurrent_handovers = 0", "max_concurrent_handovers"),
+        ("max_concurrent_handovers = 64", "max_concurrent_handovers = 65", "max_concurrent_handovers"),
+        ("repl_ring_entries = 1024", "repl_ring_entries = 512", "repl_ring_entries"),
+        ("repl_ring_entries = 1048576", "repl_ring_entries = 2097152", "repl_ring_entries"),
+        ("repl_ring_entries = 4096", "repl_ring_entries = 5000", "repl_ring_entries"),
+        ("peer_queue_bytes = 1073741824", "peer_queue_bytes = 1073741825", "peer_queue_bytes"),
+        (
+            "peer_queue_bytes = 1048576\nmax_frame_bytes = 262144",
+            "peer_queue_bytes = 1048575\nmax_frame_bytes = 65536",
+            "peer_queue_bytes",
+        ),
+        ("max_frame_bytes = 65536", "max_frame_bytes = 65535", "max_frame_bytes"),
+        (
+            "peer_queue_bytes = 67108864\nmax_frame_bytes = 16777216",
+            "peer_queue_bytes = 67108864\nmax_frame_bytes = 16777217",
+            "max_frame_bytes",
+        ),
+        (
+            "peer_queue_bytes = 4194304\nmax_frame_bytes = 1048576",
+            "peer_queue_bytes = 4194303\nmax_frame_bytes = 1048576",
+            "peer_queue_bytes / 4",
+        ),
+        ("hook_timeout_ms = 100", "hook_timeout_ms = 99", "hook_timeout_ms"),
+        ("hook_timeout_ms = 60000", "hook_timeout_ms = 60001", "hook_timeout_ms"),
+        ("shutdown_handover_ms = 1000", "shutdown_handover_ms = 999", "shutdown_handover_ms"),
+        ("shutdown_handover_ms = 60000", "shutdown_handover_ms = 60001", "shutdown_handover_ms"),
+    ] {
+        ha_valid(2, accept);
+        ha_invalid(2, reject, want);
+    }
+    // Quarantine follows the configured timeouts.
+    let s = ha_section(2, "takeover_quarantine_secs = 600", "");
+    invalid(&[(NC, &s), ("udp_secs = 300", "udp_secs = 601")]);
+    valid(&[(NC, &s), ("udp_secs = 300", "udp_secs = 600")]);
+    // Negative or wrong-typed values are parse errors.
+    for bad in ["lease_ms = -1", "repl_ring_entries = \"big\"", "auto_failover = 1"] {
+        assert!(matches!(ha(2, bad), Err(ConfigError::Parse(_))), "{bad}");
+    }
+}
+
+#[test]
+fn ha_structure_rules() {
+    // HA needs slices, two or more members, and no owned_pool.
+    let s = ha_section(2, "", "").replace("partition = \"slices\"", "partition = \"contiguous\"");
+    invalid(&[(NC, &s)]);
+    let s = ha_section(2, "", "owned_pool = [\"192.0.2.0/25\"]");
+    invalid(&[(NC, &s)]);
+    assert!(matches!(ha(1, ""), Err(ConfigError::Invalid(m)) if m.contains("two")));
+    // Listener: no wildcard unless allowed, no port 0.
+    let wild = ha_section(2, "", "").replace("listen = \"198.51.100.11:7946\"", "listen = \"0.0.0.0:7946\"");
+    invalid(&[(NC, &wild)]);
+    let wild6 = ha_section(2, "", "").replace("listen = \"198.51.100.11:7946\"", "listen = \"[::]:7946\"");
+    invalid(&[(NC, &wild6)]);
+    let allowed = wild.replace("enabled = true\n", "enabled = true\nallow_wildcard = true\n");
+    valid(&[(NC, &allowed)]);
+    let p0 = ha_section(2, "", "").replace("listen = \"198.51.100.11:7946\"", "listen = \"198.51.100.11:0\"");
+    invalid(&[(NC, &p0)]);
+    // Witness identity/address must be typed and distinct from members.
+    ha_invalid(2, "witness = { addr = \"198.51.100.20:7946\", identity = \"witness\" }", "witness.identity");
+    ha_invalid(
+        2,
+        "witness = { addr = \"198.51.100.20:7946\", identity = \"dns:plat-02.cluster.example\" }",
+        "witness.identity",
+    );
+    ha_invalid(2, "witness = { addr = \"198.51.100.12:7946\", identity = \"dns:w.example\" }", "witness.addr");
+    ha_invalid(2, "witness = { addr = \"0.0.0.0:7946\", identity = \"dns:w.example\" }", "witness.addr");
+    // Paths absolute; revocation override validated under its own prefix.
+    for (from, what) in [
+        ("/etc/plat/tls/peer.pem", "cert_file"),
+        ("/etc/plat/tls/peer.key", "key_file"),
+        ("/etc/plat/tls/cluster-ca.pem", "ca_file"),
+    ] {
+        let s = ha_section(2, "", "").replace(from, "rel.pem");
+        assert!(matches!(with(&[(NC, &s)]), Err(ConfigError::Invalid(m)) if m.contains(what)), "{what}");
+    }
+    ha_invalid(2, "state_dir = \"cluster\"", "state_dir");
+    ha_invalid(2, "[cluster.ha.hooks]\nannounce = \"frr.sh\"", "hooks.announce");
+    ha_invalid(2, "[cluster.ha.hooks]\nwithdraw = \"frr.sh\"", "hooks.withdraw");
+    ha_valid(2, "[cluster.ha.hooks]\nannounce = \"/usr/libexec/plat/a.sh\"\nwithdraw = \"/usr/libexec/plat/w.sh\"");
+    let rev = format!("{}[cluster.ha.tls.revocation]\nbudget_ms = 100\n", ha_section(2, "", ""));
+    assert!(matches!(with(&[(NC, &rev)]), Err(ConfigError::Invalid(m)) if m.contains("cluster.ha.tls.revocation")));
+    // Unknown keys in every new table.
+    for t in [
+        ha_section(2, "bogus = 1", ""),
+        format!("{}[cluster.ha.tls.revocation]\nbogus = 1\n", ha_section(2, "", "")),
+        format!("{}[cluster.steering]\nbogus = 1\n", ha_section(2, "", "")),
+        ha_section(2, "[cluster.ha.hooks]\nbogus = \"/x\"", ""),
+        ha_section(2, "witness = { addr = \"198.51.100.20:7946\", identity = \"dns:w.example\", x = 1 }", ""),
+        ha_section(2, "", "").replacen("id = 1\n", "id = 1\nbogus = 1\n", 1),
+    ] {
+        assert!(matches!(with(&[(NC, &t)]), Err(ConfigError::Parse(_))), "{t}");
+    }
+}
+
+#[test]
+fn slice_partition_edges() {
+    let slices = |extra: &str| format!("node_count = 1\npartition = \"slices\"\n{extra}");
+    let c = with(&[(NC, &slices(""))]).unwrap();
+    assert_eq!(c.cluster.slice_count(&c.nat64.pool), 16, "/24 at /28");
+    valid(&[(NC, &slices("slice_prefix_len = 24"))]);
+    valid(&[(NC, &slices("slice_prefix_len = 32"))]);
+    invalid(&[(NC, &slices("slice_prefix_len = 33"))]);
+    invalid(&[(NC, &slices("slice_prefix_len = 15"))]);
+    // A pool entry narrower than a slice is rejected.
+    invalid(&[(NC, &slices("slice_prefix_len = 23"))]);
+    // 4096-slice cap: a /16 at /28 is 4096 slices, a /15 is 8192.
+    valid(&[("pool = [\"192.0.2.0/24\"]", "pool = [\"10.0.0.0/16\"]"), (NC, &slices(""))]);
+    invalid(&[("pool = [\"192.0.2.0/24\"]", "pool = [\"10.0.0.0/15\"]"), (NC, &slices(""))]);
+    valid(&[("pool = [\"192.0.2.0/24\"]", "pool = [\"10.0.0.0/15\"]"), (NC, &slices("slice_prefix_len = 27"))]);
+    // Contiguous mode ignores the slice length.
+    valid(&[(NC, "node_count = 1\nslice_prefix_len = 99")]);
+    invalid(&[(NC, &slices("owned_pool = [\"192.0.2.0/25\"]"))]);
+    assert!(matches!(with(&[(NC, &slices("partition = \"mesh\""))]), Err(ConfigError::Parse(_))));
+}
+
+#[test]
+fn member_list_rules() {
+    let base = ha_section(3, "", "");
+    let edit = |a: &str, b: &str| base.replacen(a, b, 1);
+    valid(&[(NC, &base)]);
+    // node_count must match; ids unique and in range.
+    invalid(&[(NC, &edit("node_count = 3", "node_count = 4"))]);
+    invalid(&[(NC, &edit("id = 2", "id = 1"))]);
+    invalid(&[(NC, &edit("id = 2", "id = 3"))]);
+    // Names, identities and peer addresses unique and well formed.
+    invalid(&[(NC, &edit("name = \"plat-03\"", "name = \"plat-02\""))]);
+    invalid(&[(NC, &edit("name = \"plat-03\"", "name = \"plat 03\""))]);
+    invalid(&[(NC, &edit("dns:plat-03.cluster.example", "dns:plat-02.cluster.example"))]);
+    invalid(&[(NC, &edit("dns:plat-03.cluster.example", "plat-03"))]);
+    invalid(&[(NC, &edit("dns:plat-03.cluster.example", "dns:*.cluster.example"))]);
+    invalid(&[(NC, &edit("198.51.100.13:7946", "198.51.100.12:7946"))]);
+    invalid(&[(NC, &edit("198.51.100.13:7946", "198.51.100.13:0"))]);
+    invalid(&[(NC, &edit("198.51.100.13:7946", "0.0.0.0:7946"))]);
+    invalid(&[(NC, &edit("198.51.100.13:7946", "224.0.0.1:7946"))]);
+    // This node's entry must carry node.name.
+    invalid(&[(NC, &edit("name = \"plat-01\"", "name = \"plat-00\""))]);
+    // Weight 1..=100.
+    let w = |v: &str| edit("id = 1\n", &format!("id = 1\nweight = {v}\n"));
+    valid(&[(NC, &w("1"))]);
+    valid(&[(NC, &w("100"))]);
+    invalid(&[(NC, &w("0"))]);
+    invalid(&[(NC, &w("101"))]);
+    // steer_addr only with forward mode (phase 2), so always rejected now.
+    invalid(&[(NC, &edit("id = 1\n", "id = 1\nsteer_addr = \"2001:db8::11\"\n"))]);
+    // A member list without HA still has to be consistent.
+    let legacy = base.split("[cluster.ha]").next().unwrap().replace("partition = \"slices\"\n", "");
+    valid(&[(NC, &legacy)]);
+    invalid(&[(NC, &legacy.replacen("node_count = 3", "node_count = 2", 1))]);
+}
+
+#[test]
+fn block_cooldown_edges() {
+    valid(&[("block_cooldown_secs = 120", "block_cooldown_secs = 3600")]);
+    invalid(&[("block_cooldown_secs = 120", "block_cooldown_secs = 119")]);
+    invalid(&[("block_cooldown_secs = 120", "block_cooldown_secs = 3601")]);
+    assert_eq!(with(&[("block_cooldown_secs = 120\n", "")]).unwrap().nat64.block_cooldown_secs, 120);
 }

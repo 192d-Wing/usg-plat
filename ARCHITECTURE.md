@@ -189,24 +189,118 @@ flowchart LR
     n2 -- "announces" --- p2
 ```
 
-- Every node reads the same `nat64.pool`, `cluster.node_count`, and its own
-  `node.id`, and computes a disjoint contiguous slice (`plat-cluster`).
-  `platd check-config` prints the prefixes to announce;
+Three partition modes, chosen by `cluster.partition` and `[cluster.ha]`
+(`service_start` records the mode as `cluster.mode`):
+
+| Mode | Ownership | Failover |
+|------|-----------|----------|
+| `contiguous` (default, legacy) | each node computes a disjoint contiguous share of `nat64.pool` from `cluster.node_count` and its `node.id` (or `cluster.owned_pool`) | none: a lost node's subscribers re-establish on a survivor with a new mapping |
+| `slices` without HA | the pool is cut into fixed slices (`cluster.slice_prefix_len`, default /28, at most 4096); each node takes its weighted-rendezvous primaries of the full member set at start | none |
+| `slices` with `[cluster.ha] enabled = true` | primaries and backups come from rendezvous over the **live** members of the current view and move at run time | backup takes over with the same mappings |
+
+Legacy notes (both non-HA modes):
+
+- `platd check-config` prints the prefixes to announce;
   `platd check-config --format env` gives the same data to
-  `plat-tun-setup.sh`, which routes only this node's slice to the TUN.
+  `plat-tun-setup.sh`, which routes only this node's share to the TUN.
 - IPv4 return traffic routes to the owning node, so no session state crosses
-  nodes on the packet path. Adding capacity means adding a node and
-  re-partitioning (or using `cluster.owned_pool` for explicit slices).
+  nodes on the packet path.
 - The IPv6 side must keep a subscriber on one node: ECMP with L3-only
   hashing on the source address, or a load balancer that uses
-  `owner_of_subscriber` (rendezvous hashing, ~1/N subscribers move on growth).
-- Node failure affects only that node's subscribers (their flows re-establish
-  on a survivor with a new mapping). Session-state replication for hitless
-  failover is on the roadmap (POAM-007).
-- Not automated or checked by the software (POAM-017): re-partitioning
-  (changing `node_count` moves slices and disrupts the moved subscribers),
-  IPv6-side steering, and detection of a duplicate `node.id` or overlapping
-  `cluster.owned_pool` across nodes.
+  `owner_of_subscriber`.
+- Duplicate `node.id` or overlapping `cluster.owned_pool` is not detected by
+  the software (no peer channel); compare `cluster.config_digest` in the
+  SIEM (POAM-017(c)).
+
+### Cluster high availability (`feat/cluster-ha`, unreleased)
+
+Tested in-process (loopback mTLS, simulated clocks and links); the three-VM
+test (LINUX_VERIFICATION L19–L23) is not yet run.
+
+```mermaid
+flowchart LR
+    subgraph A["node A (member 0)"]
+        wa["workers"] -- "SPSC rings" --> ra["plat-repl"]
+        ca["plat-cluster-ctl"]
+    end
+    subgraph B["node B (member 1)"]
+        sb["shadow (backup state)"]
+        cb["plat-cluster-ctl"]
+    end
+    W["platd witness<br/>(votes only)"]
+    ra -- "mTLS 1.3 peer channel<br/>blocks, BIBs, directory" --> sb
+    ca <-- "heartbeats, views" --> cb
+    ca <--> W
+    cb <--> W
+    ca -- "announce / withdraw hooks" --> frr["FRR / BGP"]
+```
+
+- **Membership** (`crates/plat-cluster`, sans-IO): the configured members plus
+  an optional witness vote; the leader issues **views** (`epoch`, live
+  members, standby) and grants round-trip-anchored leases (`lease_ms` 3000,
+  `heartbeat_ms` 500, `drift_margin_pct` 10). A member self-fences at
+  `lease × (1 − m)`; a new owner starts no earlier than
+  `lease × (1 + m) + 200 ms` after the last grant, or at the old owner's
+  `HandoverFence`. Only monotonic clocks are used. Epochs and votes are
+  persisted in `state_dir/cluster.state` (fsynced before acting). Automatic
+  failover needs a quorum that survives one loss: 3+ members, or 2 members
+  plus `platd witness`; otherwise `auto_failover = false` and takeover is an
+  operator command.
+- **Ownership in the engine**: each slice has an `AtomicU8` state
+  (`Inactive`, `Adopting`, `Active`, `Fenced`). The worker path checks it with
+  one relaxed load (the BIB stores the pool index); the legacy path is a
+  separate monomorphised copy without the check. Non-owned slices drop as
+  `wrong_node`, fenced or adopting ones as `cluster_fenced`.
+- **Replication** (asynchronous, ordered per slice): workers and the sweeper
+  push block, BIB and directory records into bounded per-worker SPSC rings
+  (no lock, allocation or syscall; a full ring drops, counts and marks the
+  slice dirty). `plat-repl` sends a snapshot then the stream to the slice's
+  backup; the backup is **in sync** after the snapshot end is acked. Sessions
+  are not replicated.
+- **Block reservation**: while an in-sync backup exists, the primary hands
+  out only blocks the backup has acked in a `Reserve` (top-up off the packet
+  path, `reserve_ahead_blocks`), so no block is used that the backup cannot
+  know about.
+- **Takeover**: the gaining node takes the shadow, queues
+  `cluster_slice_acquire` and one `nat_port_block_adopt` per block, imports
+  blocks and BIBs, rebuilds the free list (unknown reserved blocks held for
+  `takeover_quarantine_secs`, recent releases finish their cool-down) and
+  only then sets the slice Active and runs the announce hook. Adopted TCP
+  BIBs accept a pickup on the transitory timer for `tcp_adopt_secs`
+  (POAM-028).
+- **Handover** (failback, growth, graceful shutdown): the old owner fences,
+  flushes, logs release(`handover`) records, runs the withdraw hook and sends
+  `HandoverFence`; the new owner adopts. A view moves every affected slice at
+  once (no leader-side batching; POAM-017(a)). Shutdown has no leave message
+  (POAM-030).
+- **Peer channel** (`services/platd/src/cluster/peer.rs`): mutual TLS 1.3 via
+  `plat_tls::peer_configs` (FIPS, no resumption, both EKUs). The accepting
+  side pins the source address to `members[id].peer_addr` before TLS
+  (the dialer does not bind its source, POAM-031); after TLS a `Hello`
+  checks version, identity ↔ claimed id, digest, overlap and duplicate id.
+  Control frames go before data; data queues are bounded and lossy (counted,
+  resync). Replication is accepted only from the slice's primary or recorded
+  handover source. All members share one trust domain (POAM-032).
+- **Steering**: every node keeps a subscriber directory (`SubHome`/`SubGone`);
+  on subscriber creation a remote home is counted and, by default with HA,
+  dropped (`missteered`). Forwarding to the owner is phase 2
+  (POAM-017(b)).
+- **Routes**: platd does not speak BGP. Serialized out-of-process hooks
+  (`<slice-cidr> <epoch> <reason>`, cleared environment, own process group,
+  killed on timeout, directory ownership re-checked before each exec) plus
+  `state_dir/announce.d/`. With HA `plat-tun-setup.sh` routes the whole pool
+  (`PLAT_POOL_ALL`) to the TUN because ownership changes at run time.
+- **Operator**: `platd cluster status|takeover --member N [--force]|restore
+  --member N` over `state_dir/ctl.sock` (uid 0 or the daemon uid, from peer
+  credentials; served one client at a time, POAM-033); every takeover,
+  restore and refusal is audited (`cluster_operator_command`). `GET /cluster`
+  on the management listener returns the view and slice owners.
+- **Threads** (no async runtime): `plat-peer-accept`, `plat-peer-in`,
+  `plat-peer-<id>`, `plat-cluster-ctl` (ticks at heartbeat/10),
+  `plat-repl`, `plat-cluster-hook`, `plat-cluster-cli`. None is on the
+  packet path.
+- **Failover time** (simulation): member crash ≤ about 4.7 s, leader crash
+  up to about 6.2 s, against a 5 s target; pending three-VM data (POAM-007).
 
 ## Trust boundaries
 
@@ -216,6 +310,7 @@ flowchart LR
 | PLAT → IPv4 Internet | never-translatable destinations always denied; RFC 6890 non-global destinations denied by default under every prefix (`translation.allow_non_global_destinations`; the cluster pool is exempt) |
 | IPv4 Internet → PLAT | pool ownership check, filtering, never-translatable and (by default) non-global data sources refused, unexpired source routes dropped |
 | Host forwarding | nftables `inet plat` forward chain, default drop, installed by `plat-tun-setup.sh` before forwarding is enabled, persisted in `/etc/nftables.d/plat.nft` (glob include), and guarded by `plat-fwguard` (forwarding off if the table is missing or modified; residual window for direct `nft` changes, POAM-019). Verified on Linux (LINUX_VERIFICATION.md L5, L15) |
+| Cluster peers (HA) | mutual TLS 1.3 with a dedicated peer CA, typed identity bound to the claimed member id, source address pinned on the accepting side, config digest cross-check, duplicate-id refusal, replication accepted only from the slice owner; one trust domain (POAM-032); operator socket limited to uid 0 or the daemon uid |
 | Management | read-only metrics and health; plaintext only on loopback, otherwise mutual TLS 1.3 with client certificate, full-chain revocation and typed allow-list, per-IP and global connection caps; every mTLS connection audited |
 | Revocation sources (OCSP responders, CRL distribution points) | plaintext HTTP of signed objects; strict DER and HTTP parsing, size caps, per-chain time budget; `hard_fail` by default; DNS has no timeout (POAM-025) |
 | Audit destinations | local 0640 file in a `plat:plat-log` 2750 directory with an unkeyed hash chain (POAM-003); best-effort syslog to SIEM collectors; TLS 1.3 (RFC 5425) with CA-pinned, revocation-checked collectors when `transport = "tls"` |

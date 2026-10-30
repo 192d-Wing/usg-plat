@@ -65,6 +65,8 @@ pub fn revocation_event(r: &RevocationRecord) -> Event {
             role: match r.role {
                 Role::MgmtClient => TlsRole::MgmtClient,
                 Role::SyslogServer => TlsRole::SyslogServer,
+                Role::PeerClient => TlsRole::PeerClient,
+                Role::PeerServer => TlsRole::PeerServer,
             },
             cert_sha256: r.cert_sha256,
             serial_hex: AuditText::new(&r.serial_hex, AuditText::SHORT_MAX),

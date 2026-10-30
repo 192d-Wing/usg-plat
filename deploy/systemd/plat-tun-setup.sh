@@ -74,6 +74,8 @@ IF=
 PREFIX=
 CLIENTS=
 POOL=
+HA=0
+POOL_ALL=
 while IFS= read -r line; do
     [ -n "$line" ] || continue
     printf '%s\n' "$line" | grep -Eq '^PLAT_[A-Z0-9_]+=' ||
@@ -85,6 +87,8 @@ while IFS= read -r line; do
         PLAT_NAT64_PREFIX) PREFIX=$value ;;
         PLAT_CLIENT_PREFIXES) CLIENTS=$value ;;
         PLAT_OWNED_POOL) POOL=$value ;;
+        PLAT_CLUSTER_HA) HA=$value ;;
+        PLAT_POOL_ALL) POOL_ALL=$value ;;
         *) ;;
     esac
 done <<EOF
@@ -101,6 +105,21 @@ check interface "$IF" '[A-Za-z0-9_.-]{1,15}'
 check nat64_prefix "$PREFIX" "$V6"
 check client_prefixes "$CLIENTS" "$V6( $V6)*"
 check owned_pool "$POOL" "$V4( $V4)*"
+
+# Cluster HA (partition = "slices", cluster.ha.enabled): slice ownership
+# changes at run time (takeover, handover, failback), so the TUN carries the
+# WHOLE pool on every HA node and the forward policy admits all of it. The
+# engine drops traffic for slices this node does not own (`wrong_node`,
+# `cluster_fenced`), and upstream routing follows only the per-slice
+# announcements of the cluster hooks (plan §1.5).
+# COMPLIANCE MAPPING:
+# - NIST 800-53: SC-7 (Boundary Protection), CP-10 (System Recovery)
+check cluster_ha "$HA" '[01]'
+if [ "$HA" = 1 ]; then
+    [ -n "$POOL_ALL" ] || die "PLAT_CLUSTER_HA=1 without PLAT_POOL_ALL"
+    check pool_all "$POOL_ALL" "$V4( $V4)*"
+    POOL=$POOL_ALL
+fi
 
 # Audit log directory (AU-9, AC-6): plat:plat-log 2750 - the dedicated
 # read-only group plat-log (log shippers and verify-log operators join it,
@@ -217,7 +236,7 @@ else
 fi
 
 ip link set dev "$IF" mtu "$MTU" up
-# Only this node's routes on the TUN, whatever their protocol: drop every
+# Only this node's routes (with HA: the whole pool) on the TUN, whatever their protocol: drop every
 # route (an old prefix, the whole pool, another node's slice, a static route
 # someone added), then add the configured ones.
 ip -4 route flush dev "$IF" 2>/dev/null || true
@@ -235,7 +254,7 @@ done
 norm() { sed -e 's#/32$##' -e 's#/128$##' | sort; }
 want4=$(for p in $POOL; do echo "$p"; done | norm)
 got4=$(ip -4 route show dev "$IF" | awk '{print $1}' | norm)
-[ "$got4" = "$want4" ] || die "IPv4 routes on $IF [$got4] do not match this node's pool [$want4]"
+[ "$got4" = "$want4" ] || die "IPv4 routes on $IF [$got4] do not match the pool routed here [$want4]"
 want6=$(printf '%s\n' "$PREFIX" | norm)
 got6=$(ip -6 route show dev "$IF" | awk '$1 !~ /^fe80:/ {print $1}' | norm)
 [ "$got6" = "$want6" ] || die "IPv6 routes on $IF [$got6] do not match the NAT64 prefix [$want6]"

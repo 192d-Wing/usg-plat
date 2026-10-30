@@ -174,7 +174,12 @@ fn expiry_releases_bib_and_block() {
     assert_eq!(fx.nat.state().sweep().blocks_released, 1);
     let evs = events(&fx);
     assert!(evs.iter().any(|e| matches!(e, Event::PortBlockRelease { v4, .. } if *v4 == src4)));
-    assert_eq!(fx.nat.state().pool.free_blocks(), fx.nat.state().pool.total_blocks());
+    // POAM-010: the released block cools down before it is free again.
+    let total = fx.nat.state().pool.total_blocks();
+    assert_eq!(fx.nat.state().pool.free_blocks(), total - 1);
+    fx.clock.advance(Duration::from_secs(120));
+    fx.nat.state().sweep();
+    assert_eq!(fx.nat.state().pool.free_blocks(), total);
 }
 
 #[test]

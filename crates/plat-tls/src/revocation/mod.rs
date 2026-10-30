@@ -63,6 +63,10 @@ use crate::TlsError;
 pub enum Role {
     MgmtClient,
     SyslogServer,
+    /// A cluster peer that connected to this node (client side of the chain).
+    PeerClient,
+    /// A cluster peer this node connected to (server side of the chain).
+    PeerServer,
 }
 
 /// Where a status came from (`plat.revocation.source`).

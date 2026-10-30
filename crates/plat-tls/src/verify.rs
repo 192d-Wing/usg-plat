@@ -71,6 +71,7 @@ fn revocation_error(o: ChainOutcome) -> Error {
 /// revocation for the full chain (stapled OCSP covers the leaf).
 pub struct RevocationServerVerifier {
     inner: Arc<WebPkiServerVerifier>,
+    role: Role,
     anchors: Arc<Anchors>,
     rev: Option<Arc<RevocationChecker>>,
 }
@@ -93,7 +94,7 @@ impl ServerCertVerifier for RevocationServerVerifier {
         let ok = self.inner.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)?;
         if let Some(rev) = &self.rev {
             let stapled = (!ocsp_response.is_empty()).then_some(ocsp_response);
-            let v = rev.check_chain(Role::SyslogServer, end_entity, intermediates, &self.anchors, stapled, now);
+            let v = rev.check_chain(self.role, end_entity, intermediates, &self.anchors, stapled, now);
             if !v.outcome.is_accepted() {
                 return Err(revocation_error(v.outcome));
             }
@@ -128,6 +129,7 @@ impl ServerCertVerifier for RevocationServerVerifier {
 /// the client CA, then revocation for the full chain.
 pub struct RevocationClientVerifier {
     inner: Arc<dyn ClientCertVerifier>,
+    role: Role,
     anchors: Arc<Anchors>,
     rev: Option<Arc<RevocationChecker>>,
 }
@@ -159,7 +161,7 @@ impl ClientCertVerifier for RevocationClientVerifier {
     ) -> Result<ClientCertVerified, Error> {
         let ok = self.inner.verify_client_cert(end_entity, intermediates, now)?;
         if let Some(rev) = &self.rev {
-            let v = rev.check_chain(Role::MgmtClient, end_entity, intermediates, &self.anchors, None, now);
+            let v = rev.check_chain(self.role, end_entity, intermediates, &self.anchors, None, now);
             if !v.outcome.is_accepted() {
                 return Err(revocation_error(v.outcome));
             }
@@ -190,8 +192,8 @@ impl ClientCertVerifier for RevocationClientVerifier {
     }
 }
 
-/// Builds the management client verifier (mandatory client auth).
-pub fn mgmt_client_verifier(
+fn client_verifier(
+    role: Role,
     ca: &CaBundle,
     provider: Arc<CryptoProvider>,
     rev: Option<Arc<RevocationChecker>>,
@@ -199,7 +201,28 @@ pub fn mgmt_client_verifier(
     let inner = WebPkiClientVerifier::builder_with_provider(ca.roots.clone(), provider)
         .build()
         .map_err(|e| TlsError::Verifier(e.to_string()))?;
-    Ok(Arc::new(RevocationClientVerifier { inner, anchors: ca.anchors.clone(), rev }))
+    Ok(Arc::new(RevocationClientVerifier { inner, role, anchors: ca.anchors.clone(), rev }))
+}
+
+fn server_verifier(
+    role: Role,
+    ca: &CaBundle,
+    provider: Arc<CryptoProvider>,
+    rev: Option<Arc<RevocationChecker>>,
+) -> Result<Arc<RevocationServerVerifier>, TlsError> {
+    let inner = WebPkiServerVerifier::builder_with_provider(ca.roots.clone(), provider)
+        .build()
+        .map_err(|e| TlsError::Verifier(e.to_string()))?;
+    Ok(Arc::new(RevocationServerVerifier { inner, role, anchors: ca.anchors.clone(), rev }))
+}
+
+/// Builds the management client verifier (mandatory client auth).
+pub fn mgmt_client_verifier(
+    ca: &CaBundle,
+    provider: Arc<CryptoProvider>,
+    rev: Option<Arc<RevocationChecker>>,
+) -> Result<Arc<RevocationClientVerifier>, TlsError> {
+    client_verifier(Role::MgmtClient, ca, provider, rev)
 }
 
 /// Builds the syslog collector verifier.
@@ -208,8 +231,25 @@ pub fn syslog_server_verifier(
     provider: Arc<CryptoProvider>,
     rev: Option<Arc<RevocationChecker>>,
 ) -> Result<Arc<RevocationServerVerifier>, TlsError> {
-    let inner = WebPkiServerVerifier::builder_with_provider(ca.roots.clone(), provider)
-        .build()
-        .map_err(|e| TlsError::Verifier(e.to_string()))?;
-    Ok(Arc::new(RevocationServerVerifier { inner, anchors: ca.anchors.clone(), rev }))
+    server_verifier(Role::SyslogServer, ca, provider, rev)
+}
+
+/// Builds the verifier for peers connecting to this node (mandatory client
+/// auth over the cluster CA, revocation as [`Role::PeerClient`]).
+pub fn peer_client_verifier(
+    ca: &CaBundle,
+    provider: Arc<CryptoProvider>,
+    rev: Option<Arc<RevocationChecker>>,
+) -> Result<Arc<RevocationClientVerifier>, TlsError> {
+    client_verifier(Role::PeerClient, ca, provider, rev)
+}
+
+/// Builds the verifier for peers this node connects to (cluster CA,
+/// revocation as [`Role::PeerServer`]).
+pub fn peer_server_verifier(
+    ca: &CaBundle,
+    provider: Arc<CryptoProvider>,
+    rev: Option<Arc<RevocationChecker>>,
+) -> Result<Arc<RevocationServerVerifier>, TlsError> {
+    server_verifier(Role::PeerServer, ca, provider, rev)
 }

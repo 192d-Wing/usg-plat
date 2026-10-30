@@ -1,6 +1,6 @@
 # SIEM Logging and NAT Attribution
 
-Schema version: **6** (`plat.schema`, `plat_audit::LOG_SCHEMA_VERSION`).
+Schema version: **7** (`plat.schema`, `plat_audit::LOG_SCHEMA_VERSION`).
 Source: `crates/plat-audit`.
 
 ## Purpose
@@ -18,13 +18,14 @@ never limits forwarding.
 | 1 | Initial schema; chain v1 (`SHA-256("usg-plat audit chain v1")` genesis). |
 | 2 | Chain v2: `audit_chain_continue` file header, header-seeded chain, checkpoint `seq_first`/`seq_last` hashed. New records `audit_output_failure`, `audit_remote_loss`. Checkpoints gain `plat.schema` and `plat.node_id`. New `event.reason` `subscriber_table_limit`. Every CEF record gains `cn4` (node id), `cs6` (schema) and `outcome`. |
 | 3 | New records `audit_storage_threshold` (AU-5(1)) and `audit_retention_prune` (AU-9, AU-11). |
+| 4 | `audit_retention_prune` gains `plat.audit.state` (`scheduled` with outcome `unknown`, then `deleted` / `failed`; CEF `act=`). `audit_storage_threshold` gains state `unknown` (free space undeterminable; no `plat.audit.available_bytes`). |
 | 5 | TLS (branch `feat/fips-tls`). `service_start` gains `plat.fips` / `plat.fips_provider` (CEF `cn2`/`cs1`). `audit_remote_loss` gains optional `plat.reason` (`io`, `tls_handshake`, `tls_verify`, `tls_revocation`; CEF `reason`); TCP losses now carry `io`. New records `management_connection`, `management_connection_suppressed`, `tls_revocation_check`, `revocation_source_refresh`. First records that carry peer-supplied text (certificate subject, SANs, issuer DN, serial, URLs), sanitised and capped (see Injection safety). |
 | 6 | Branch `fix/linux-validation` (unreleased). New record `audit_recovery` (`plat.reason` `empty_file`/`missing_header`/`truncated_tail`, `plat.audit.last_checkpoint_seq`, `plat.audit.max_seq`, `plat.audit.lease_state` `ok`/`absent`/`corrupt`/`inflated`/`high`; CEF `reason`, `cn3` `lastCheckpointSeq`, `cn2` `maxSeq`, `cs4` `leaseState`). `audit_output_failure` may carry `plat.reason` (`truncate_failed`, `seq_lease_failed`, `seq_exhausted`; CEF `reason`). New lease file `.<name>.seq`. `verify-log` exit 3 and `--allow-recovery`. |
-| 4 | `audit_retention_prune` gains `plat.audit.state` (`scheduled` with outcome `unknown`, then `deleted` / `failed`; CEF `act=`). `audit_storage_threshold` gains state `unknown` (free space undeterminable; no `plat.audit.available_bytes`). |
+| 7 | Branch `feat/cluster-ha` (unreleased). Cluster high availability. New records `cluster_view_change`, `cluster_member_state`, `cluster_slice_acquire`, `cluster_slice_release`, `nat_port_block_adopt`, `cluster_peer_rejected`, `cluster_peer_suppressed`, `cluster_replication_gap`, `cluster_hook`, `cluster_operator_command`. `nat_port_block_release` may carry `plat.release_reason` (`handover`; CEF `reason`). `service_start` may carry `cluster.node_id`, `cluster.mode`, `cluster.config_digest`, `cluster.slices`, `cluster.slice_count`, `cluster.member_count` (CEF `cs2`/`cs3`/`cs4`/`cn3`). `tls_revocation_check` gains roles `cluster_peer_client` / `cluster_peer_server`. Chain format unchanged. |
 
 Files written by the v1 chain (schema 1) **no longer verify** with
 `platd verify-log`: the first line must be an `audit_chain_continue` header.
-Files written under schemas 2–6 use the same chain v2 and verify.
+Files written under schemas 2–7 use the same chain v2 and verify.
 
 ## Controls
 
@@ -42,6 +43,7 @@ Files written under schemas 2–6 use the same chain v2 and verify.
 | AC-17, AU-2 (management) | One `management_connection` record per management connection (mTLS mode): accepted always; rejections through a token bucket (10/s, burst 20) with a `management_connection_suppressed` summary. | `services/platd/src/mgmt/tests.rs::rejected_clients_are_refused_and_audited_once`, `rejection_flood_is_rate_limited_and_summarised` |
 | IA-5(2), AU-2 (revocation) | One `tls_revocation_check` per checked certificate (every non-root certificate of the chain); `revocation_source_refresh` on refresher state transitions only. | `plat-tls/tests/revocation_fallback.rs`; `format.rs::revocation_records` |
 | SC-13 | `service_start` records whether the FIPS module is active. | `services/platd/src/run.rs::service_start_records_fips_state` |
+| AU-2, AU-3, AU-12 (cluster, schema 7) | With `[cluster.ha]`: view changes, member state, slice acquire/release, one `nat_port_block_adopt` per taken-over block, peer refusals (rate-limited, with a summary), replication gaps, route-hook runs and operator commands (peer uid/pid). A slice is set Active only after its `cluster_slice_acquire` and every adopt record are queued; under `refuse_new_bindings` the slice stays fenced until they all fit. A planned handover writes `nat_port_block_release` with `plat.release_reason:"handover"` for every block given away. `service_start` carries the node's cluster mode and config digest. | `plat-audit/src/format.rs::cluster_records_schema_7`; `plat-audit/tests/pipeline.rs::cluster_records_verify`; `plat-nat64/tests/cluster.rs::adoption_is_logged_before_use_and_refused_without_queue_room`, `handover_release_logs_and_clears_the_slice`; `plat-nat64/src/state.rs::adopt_retry_queues_each_record_once`, `refused_then_retried_adoption_logs_each_record_once`; `services/platd/src/cluster/tests.rs::join_replicate_takeover_rejoin_failback`, `manual_takeover_and_restore`, `operator_command_waits_for_audit_room`, `regain_waits_for_audit_room`, `non_owner_replication_is_refused`, `duplicate_id_and_digest_mismatch_are_refused` |
 | AU-10 | Planned: hash chain gives integrity against editors who cannot recompute it, not origin authentication. | POAM-003 |
 | AU-11 | `max_files > 0` deletes the oldest rotated files after a size rotation, each deletion recorded (`audit_retention_prune`); default 0 keeps every file. The site sets the retention period and archives before deletion. | `health.rs::retention_keeps_at_most_max_files`, `retention_records_every_deletion`, `retention_follows_the_chain_after_a_backward_clock_step` |
 
@@ -74,8 +76,8 @@ Common fields on every sequenced record:
 | Field | Type | Meaning |
 |-------|------|---------|
 | `@timestamp` | RFC 3339 UTC, µs | Event time |
-| `plat.schema` | int | Schema version (6) |
-| `event.sequence` | int | Monotonically increasing. With `[audit.file]` configured it continues across restarts and across files, and is never reused while any audit file is present; numbers of records after the last checkpoint of a crashed file are skipped, not reused. Without a file (syslog only) it restarts at 1 with each process. A gap means records were lost (see AU-5 records). |
+| `plat.schema` | int | Schema version (7) |
+| `event.sequence` | int | Monotonically increasing. With `[audit.file]` configured it continues across restarts and across files, and is never reused while any audit file or the lease file `.<name>.seq` is present (with every audit file removed but the lease kept, numbering resumes above the lease, `lease_state` `high`); numbers of records after the last checkpoint of a crashed file are skipped, not reused. Without a file (syslog only) it restarts at 1 with each process. A gap means records were lost (see AU-5 records). |
 | `event.kind`, `event.category` | `event`, `network` | ECS categorisation |
 | `event.action` | string | Record type, below; also the syslog MSGID |
 | `observer.type`, `observer.name` | `nat64`, node name | Which PLAT |
@@ -91,11 +93,12 @@ local file, are never sent to syslog, and carry no `event.sequence`,
 | `event.action` | Syslog severity | `event.outcome` | Extra fields |
 |----------------|-----------------|-----------------|--------------|
 | `nat_port_block_allocate` | 6 | `success` | `source.ip` (subscriber prefix address), `plat.subscriber.prefix`, `source.nat.ip`, `plat.nat.port_start`, `plat.nat.port_end` |
-| `nat_port_block_release` | 6 | `success` | as allocate, plus `event.duration` (ns, whole seconds the block was held) |
+| `nat_port_block_release` | 6 | `success` | as allocate, plus `event.duration` (ns, whole seconds the block was held); optional `plat.release_reason` (`handover`, schema 7) |
+| `nat_port_block_adopt` | 6 | `success` | as allocate, plus `plat.block.allocated_us` (original allocation, UTC µs), `cluster.epoch`, optional `cluster.prev_owner` |
 | `nat_binding_create` | 6 | `success` | `network.transport` (`tcp`/`udp`/`icmp`), `source.ip` (full IPv6 host), `source.port`, `source.nat.ip`, `source.nat.port` |
 | `nat_binding_delete` | 6 | `success` | as create, plus `event.duration` |
 | `nat_resource_limit` | 4 | `failure` | `event.reason`, `source.ip`, `plat.subscriber.prefix` |
-| `service_start`, `service_stop` | 5 | `success` | `service.version`; `service_start` also `plat.fips` (bool), `plat.fips_provider` |
+| `service_start`, `service_stop` | 5 | `success` | `service.version`; `service_start` also `plat.fips` (bool), `plat.fips_provider`, and (schema 7) `cluster.node_id`, `cluster.mode`, `cluster.config_digest`, `cluster.slices`, `cluster.slice_count`, `cluster.member_count` |
 | `dataplane_counter` | 6 | (none) | `plat.counter.name`, `plat.counter.value` |
 | `audit_queue_overflow` | 4 | `failure` | `plat.audit.lost` |
 | `audit_output_failure` | 3 (`degraded`), 4 (`recovered`) | `failure` | `plat.audit.destination` (`file`), `plat.audit.state` (`degraded` / `recovered`), `plat.audit.lost`, `plat.reason` (optional: `truncate_failed`, `seq_lease_failed`, `seq_exhausted`) |
@@ -106,12 +109,21 @@ local file, are never sent to syslog, and carry no `event.sequence`,
 | `tls_revocation_check` | 6 (`good` and allowed), 4 (otherwise) | `success` if the certificate was allowed, else `failure` | `plat.tls.role`, `tls.client.hash.sha256` or `tls.server.hash.sha256`, `x509.serial_number`, `x509.issuer.distinguished_name`, `plat.revocation.chain_index`, `.status`, `.source`, `.policy`, optional `plat.ocsp.reason`, `plat.crl.reason`, `plat.revocation.reason`, `plat.revocation.date`, `plat.ocsp.responder`, `plat.crl.source` |
 | `revocation_source_refresh` | 5 (`recovered`), 4 (otherwise) | `success` (`recovered`), `failure` | `plat.revocation.transition`, `plat.crl.source` or `plat.ocsp.key`, optional `event.reason` |
 | `audit_storage_threshold` | 4 (`below_threshold`, `unknown`), 5 (`recovered`) | `failure` / `success` (`recovered`) | `plat.audit.destination` (`file`), `plat.audit.state`, `plat.audit.available_bytes` (omitted for `unknown`), `plat.audit.min_free_bytes` |
+| `cluster_view_change` | 5 | `success` | `cluster.epoch`, `cluster.leader`, `cluster.members_live` (array of ids), `cluster.reason` |
+| `cluster_member_state` | 4 (`down`), 5 | `success` | `cluster.peer.id`, `cluster.peer.name`, `cluster.peer.identity`, `cluster.peer.ip`, `cluster.peer.state`, `cluster.epoch` |
+| `cluster_slice_acquire` | 5 (in sync), 4 (not in sync) | `success` (in sync), `unknown` (not in sync) | `cluster.slice`, `cluster.epoch`, optional `cluster.prev_owner`, `cluster.reason`, `cluster.blocks_adopted`, `cluster.bibs_adopted`, `cluster.blocks_quarantined`, `cluster.in_sync` |
+| `cluster_slice_release` | 5, 4 (`fenced`, `lease_lost`) | `success` | `cluster.slice`, `cluster.epoch`, optional `cluster.new_owner`, `cluster.reason` |
+| `cluster_peer_rejected` | 4 | `failure` | `source.ip`, `source.port`, optional `tls.client.identity`, optional `cluster.claimed_id`, `cluster.reason` |
+| `cluster_peer_suppressed` | 4 | `failure` | `cluster.suppressed`, `cluster.window_secs` |
+| `cluster_replication_gap` | 4 | `failure` | `cluster.slice`, `cluster.lost`, `cluster.action` (`resync`) |
+| `cluster_hook` | 5 (success), 4 (failure) | `success` / `failure` | `cluster.hook`, `cluster.slice`, `cluster.epoch`, optional `process.exit_code`, `event.duration` (ns) |
+| `cluster_operator_command` | 4 (accepted `takeover`/`restore`, and every refusal) | `success` (accepted), `failure` (refused) | `cluster.command`, optional `cluster.member`, `cluster.force`, optional `user.id`, optional `process.pid`, `cluster.reason` (refused only) |
 | `audit_retention_prune` | 5 (`scheduled`, `deleted`), 4 (`failed`) | `unknown` (`scheduled`), `success` (`deleted`), `failure` (`failed`) | `plat.audit.state`, `plat.audit.pruned_rotated_us`, `plat.audit.pruned_seq_first`, `plat.audit.pruned_seq_last`, `plat.audit.pruned_chain_prefix` |
 
 ### `nat_port_block_allocate` / `nat_port_block_release`
 
 ```json
-{"@timestamp":"2026-10-28T14:16:00.000001Z","plat.schema":6,"event.sequence":7,"event.kind":"event","event.category":"network","event.action":"nat_port_block_allocate","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"success","source.ip":"2001:db8:100:1::","plat.subscriber.prefix":"2001:db8:100:1::/64","source.nat.ip":"192.0.2.10","plat.nat.port_start":1024,"plat.nat.port_end":1535}
+{"@timestamp":"2026-10-28T14:16:00.000001Z","plat.schema":7,"event.sequence":7,"event.kind":"event","event.category":"network","event.action":"nat_port_block_allocate","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"success","source.ip":"2001:db8:100:1::","plat.subscriber.prefix":"2001:db8:100:1::/64","source.nat.ip":"192.0.2.10","plat.nat.port_start":1024,"plat.nat.port_end":1535}
 ```
 
 A block is released after it has been empty for 60 s, and only once its
@@ -122,7 +134,7 @@ record at shutdown or on a crash (POAM-009).
 ### `nat_binding_create` / `nat_binding_delete` (`audit.mode = "session"`)
 
 ```json
-{"@timestamp":"2026-10-28T14:16:00.120000Z","plat.schema":6,"event.sequence":8,"event.kind":"event","event.category":"network","event.action":"nat_binding_create","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"success","network.transport":"udp","source.ip":"2001:db8:100:1::5","source.port":40000,"source.nat.ip":"192.0.2.10","source.nat.port":1100}
+{"@timestamp":"2026-10-28T14:16:00.120000Z","plat.schema":7,"event.sequence":8,"event.kind":"event","event.category":"network","event.action":"nat_binding_create","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"success","network.transport":"udp","source.ip":"2001:db8:100:1::5","source.port":40000,"source.nat.ip":"192.0.2.10","source.nat.port":1100}
 ```
 
 Destinations are deliberately **not** logged (privacy; not needed for
@@ -135,7 +147,7 @@ attribution).
 `subscriber_table_limit`. Rate-limited to one record per second per reason.
 
 ```json
-{"@timestamp":"2026-10-28T14:16:01.000000Z","plat.schema":6,"event.sequence":9,"event.kind":"event","event.category":"network","event.action":"nat_resource_limit","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","event.reason":"subscriber_block_limit","source.ip":"2001:db8:100:1::","plat.subscriber.prefix":"2001:db8:100:1::/64"}
+{"@timestamp":"2026-10-28T14:16:01.000000Z","plat.schema":7,"event.sequence":9,"event.kind":"event","event.category":"network","event.action":"nat_resource_limit","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","event.reason":"subscriber_block_limit","source.ip":"2001:db8:100:1::","plat.subscriber.prefix":"2001:db8:100:1::/64"}
 ```
 
 ### `service_start` / `service_stop`
@@ -154,8 +166,101 @@ exists, so a `service_start` with `plat.fips:false` means the operator set
 `require_fips = false` and no TLS configured).
 
 ```json
-{"@timestamp":"2026-10-28T14:00:00.000000Z","plat.schema":6,"event.sequence":1,"event.kind":"event","event.category":"network","event.action":"service_start","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"success","service.version":"0.1.0","plat.fips":true,"plat.fips_provider":"aws-lc-rs-fips"}
+{"@timestamp":"2026-10-28T14:00:00.000000Z","plat.schema":7,"event.sequence":1,"event.kind":"event","event.category":"network","event.action":"service_start","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"success","service.version":"0.1.0","plat.fips":true,"plat.fips_provider":"aws-lc-rs-fips"}
 ```
+
+With clustering (schema 7) `service_start` also records this node's cluster
+identity (CM-2, CM-3; POAM-017(c)): `cluster.node_id`, `cluster.mode`
+(`contiguous`, `slices` or `ha`), `cluster.config_digest` (SHA-256 hex over
+the cluster-relevant configuration: pool, port range and block size,
+subscriber prefix length, paired pooling, partition, slice length, members
+and HA timing), `cluster.slices` (owned CIDRs at start, at most 256 written;
+contiguous mode prints its share, HA prints `[]` and the
+`cluster_slice_acquire` records follow), `cluster.slice_count` (full count)
+and `cluster.member_count`. All nodes of one cluster must log the same
+digest; a different digest is refused on the peer channel
+(`cluster_peer_rejected` `digest_mismatch`).
+
+```json
+{"@timestamp":"2026-10-29T08:00:00.000000Z","plat.schema":7,"event.sequence":1,"event.kind":"event","event.category":"network","event.action":"service_start","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"success","service.version":"0.1.0","plat.fips":true,"plat.fips_provider":"aws-lc-rs-fips","cluster.node_id":0,"cluster.mode":"ha","cluster.config_digest":"9f2c…(64 hex)","cluster.slices":[],"cluster.slice_count":0,"cluster.member_count":2}
+```
+
+### Cluster records (schema 7)
+
+Written only with `[cluster.ha]` enabled (except `service_start` fields
+above). They are control-plane records (cluster threads), never per packet.
+
+- `cluster_view_change`: a view (`epoch`, leader, live members) took effect
+  after a majority acknowledged it. `cluster.reason` ∈ `election`,
+  `member_joined`, `member_lost`, `leader_lost`, `manual`.
+- `cluster_member_state`: a peer went `up`, `down`, `syncing` or `in_sync`.
+- `cluster_slice_acquire`: this node became owner of `cluster.slice`.
+  `cluster.reason` ∈ `startup`, `takeover`, `handover`, `failback`, `manual`.
+  It and every `nat_port_block_adopt` for the slice are queued **before** the
+  node translates or allocates in that slice (AU-10). `cluster.in_sync:false`
+  means the replicated state was incomplete (outcome `unknown`): blocks of
+  that slice without an adopt record may have been in use on the previous
+  owner, and `cluster.blocks_quarantined` blocks are held back before reuse.
+- `cluster_slice_release`: this node stopped using a slice. `cluster.reason`
+  ∈ `handover` (graceful; each handed-over block also gets a
+  `nat_port_block_release` with `plat.release_reason:"handover"`), `fenced`,
+  `shutdown`, `lease_lost` (self-fence after losing quorum).
+- `nat_port_block_adopt`: a block taken over from `cluster.prev_owner`, with
+  its original allocation time `plat.block.allocated_us`. It continues the
+  allocation that the previous owner logged; the subscriber and range are
+  unchanged.
+- `cluster_peer_rejected`: a peer connection or replication input was
+  refused. `cluster.reason` ∈ `not_allowed` (address or identity not a
+  member, or replication for a slice the sender does not own),
+  `id_mismatch`, `duplicate_id`, `digest_mismatch`, `version`, `overlap`,
+  `handshake`, `protocol` (malformed or unexpected frame on an established
+  connection), `invalid_input` (replicated record outside the slice, pool
+  or client prefixes), `capacity` (connection or pending-handshake limit). `tls.client.identity` is peer-supplied
+  text (sanitised and capped like `tls.client.subject`). Rate-limited, with a
+  `cluster_peer_suppressed` summary.
+- `cluster_replication_gap`: replication records for a slice were lost
+  (ring or peer queue full); the slice resyncs by snapshot. At most one per
+  slice per 10 s.
+- `cluster_hook`: one run of the `announce`/`withdraw` route hook.
+  `process.exit_code` is absent when the hook was killed on timeout.
+- `cluster_operator_command`: a command on the operator socket
+  (`platd cluster status|takeover|restore`). Accepted `takeover` and
+  `restore` are logged before they act; every refusal (of any command) is
+  logged. An accepted `status` is read-only and is **not** logged (the
+  formatter would give it severity 5, but the daemon never emits it). With
+  `audit.on_overflow = "refuse_new_bindings"` an accepted command whose
+  record cannot be queued is not run (the client gets
+  `error: audit queue full, command not run; retry`); refusal records are
+  best-effort. `user.id` and `process.pid`
+  are the peer credentials of the client (`SO_PEERCRED`; `getpeereid` on
+  macOS, without a pid). Only uid 0 and the daemon's own uid are accepted.
+  `cluster.force:true` marks `takeover --force` of a member whose peer link
+  is up. `cluster.reason` ∈ `not_authorized`, `no_credentials`,
+  `auto_failover`, `member_up`, `unknown_member`, `invalid`, `rejected`.
+
+```json
+{"@timestamp":"2026-10-29T08:10:03.200000Z","plat.schema":7,"event.sequence":5120,"event.kind":"event","event.category":"network","event.action":"cluster_slice_acquire","observer.type":"nat64","observer.name":"plat-02","plat.node_id":1,"event.outcome":"success","cluster.slice":"192.0.2.16/28","cluster.epoch":9,"cluster.prev_owner":0,"cluster.reason":"takeover","cluster.blocks_adopted":5,"cluster.bibs_adopted":70,"cluster.blocks_quarantined":1,"cluster.in_sync":true}
+{"@timestamp":"2026-10-29T08:10:03.200010Z","plat.schema":7,"event.sequence":5121,"event.kind":"event","event.category":"network","event.action":"nat_port_block_adopt","observer.type":"nat64","observer.name":"plat-02","plat.node_id":1,"event.outcome":"success","source.ip":"2001:db8:100:1::","plat.subscriber.prefix":"2001:db8:100:1::/64","source.nat.ip":"192.0.2.17","plat.nat.port_start":1024,"plat.nat.port_end":1535,"plat.block.allocated_us":1793260000000000,"cluster.epoch":9,"cluster.prev_owner":0}
+{"@timestamp":"2026-10-29T08:10:04.000000Z","plat.schema":7,"event.sequence":5190,"event.kind":"event","event.category":"network","event.action":"cluster_peer_rejected","observer.type":"nat64","observer.name":"plat-02","plat.node_id":1,"event.outcome":"failure","source.ip":"198.51.100.30","source.port":40000,"tls.client.identity":"dns:plat-01.cluster.example","cluster.claimed_id":0,"cluster.reason":"duplicate_id"}
+```
+
+More schema-7 examples (field order as in the golden test
+`plat-audit/src/format.rs::cluster_records_schema_7`; values illustrative):
+
+```json
+{"@timestamp":"2026-10-29T08:10:00.100000Z","plat.schema":7,"event.sequence":5101,"event.kind":"event","event.category":"network","event.action":"cluster_view_change","observer.type":"nat64","observer.name":"plat-02","plat.node_id":1,"event.outcome":"success","cluster.epoch":9,"cluster.leader":1,"cluster.members_live":[1,2],"cluster.reason":"member_lost"}
+{"@timestamp":"2026-10-29T08:10:00.000000Z","plat.schema":7,"event.sequence":5100,"event.kind":"event","event.category":"network","event.action":"cluster_member_state","observer.type":"nat64","observer.name":"plat-02","plat.node_id":1,"event.outcome":"success","cluster.peer.id":0,"cluster.peer.name":"plat-01","cluster.peer.identity":"dns:plat-01.cluster.example","cluster.peer.ip":"198.51.100.11","cluster.peer.state":"down","cluster.epoch":8}
+{"@timestamp":"2026-10-29T08:09:58.000000Z","plat.schema":7,"event.sequence":7310,"event.kind":"event","event.category":"network","event.action":"cluster_slice_release","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"success","cluster.slice":"192.0.2.16/28","cluster.epoch":8,"cluster.reason":"lease_lost"}
+{"@timestamp":"2026-10-29T09:00:00.000000Z","plat.schema":7,"event.sequence":7400,"event.kind":"event","event.category":"network","event.action":"nat_port_block_release","observer.type":"nat64","observer.name":"plat-02","plat.node_id":1,"event.outcome":"success","source.ip":"2001:db8:100:1::","plat.subscriber.prefix":"2001:db8:100:1::/64","source.nat.ip":"192.0.2.17","plat.nat.port_start":1024,"plat.nat.port_end":1535,"event.duration":3000000000000,"plat.release_reason":"handover"}
+{"@timestamp":"2026-10-29T08:11:00.000000Z","plat.schema":7,"event.sequence":5200,"event.kind":"event","event.category":"network","event.action":"cluster_peer_suppressed","observer.type":"nat64","observer.name":"plat-02","plat.node_id":1,"event.outcome":"failure","cluster.suppressed":12,"cluster.window_secs":60}
+{"@timestamp":"2026-10-29T08:12:00.000000Z","plat.schema":7,"event.sequence":5300,"event.kind":"event","event.category":"network","event.action":"cluster_replication_gap","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","cluster.slice":"192.0.2.16/28","cluster.lost":33,"cluster.action":"resync"}
+{"@timestamp":"2026-10-29T08:10:03.201500Z","plat.schema":7,"event.sequence":5140,"event.kind":"event","event.category":"network","event.action":"cluster_hook","observer.type":"nat64","observer.name":"plat-02","plat.node_id":1,"event.outcome":"success","cluster.hook":"announce","cluster.slice":"192.0.2.16/28","cluster.epoch":9,"process.exit_code":0,"event.duration":1500000}
+{"@timestamp":"2026-10-29T08:20:00.000000Z","plat.schema":7,"event.sequence":5400,"event.kind":"event","event.category":"network","event.action":"cluster_operator_command","observer.type":"nat64","observer.name":"plat-02","plat.node_id":1,"event.outcome":"success","cluster.command":"takeover","cluster.member":0,"cluster.force":true,"user.id":"0","process.pid":4242}
+{"@timestamp":"2026-10-29T08:20:05.000000Z","plat.schema":7,"event.sequence":5401,"event.kind":"event","event.category":"network","event.action":"cluster_operator_command","observer.type":"nat64","observer.name":"plat-02","plat.node_id":1,"event.outcome":"failure","cluster.command":"takeover","cluster.member":0,"cluster.force":false,"user.id":"1001","process.pid":5150,"cluster.reason":"not_authorized"}
+```
+
+A `cluster_hook` killed on timeout has no `process.exit_code` and outcome
+`failure`. `user.id` is a string (ECS); `process.pid` is absent on macOS.
 
 ### `dataplane_counter`
 
@@ -166,7 +271,7 @@ non-drop counters such as `tx_queue_full`, `icmp_errors_generated` or
 `fragmented_v4_to_v6` are only in `/metrics`.
 
 ```json
-{"@timestamp":"2026-10-28T14:17:00.000000Z","plat.schema":6,"event.sequence":40,"event.kind":"event","event.category":"network","event.action":"dataplane_counter","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"plat.counter.name":"filtered","plat.counter.value":12}
+{"@timestamp":"2026-10-28T14:17:00.000000Z","plat.schema":7,"event.sequence":40,"event.kind":"event","event.category":"network","event.action":"dataplane_counter","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"plat.counter.name":"filtered","plat.counter.value":12}
 ```
 
 ### `audit_queue_overflow`
@@ -191,7 +296,7 @@ opened or rotated.
   because records were lost.
 
 ```json
-{"@timestamp":"2026-10-28T14:20:00.000000Z","plat.schema":6,"event.sequence":512,"event.kind":"event","event.category":"network","event.action":"audit_output_failure","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","plat.audit.destination":"file","plat.audit.state":"degraded","plat.audit.lost":12}
+{"@timestamp":"2026-10-28T14:20:00.000000Z","plat.schema":7,"event.sequence":512,"event.kind":"event","event.category":"network","event.action":"audit_output_failure","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","plat.audit.destination":"file","plat.audit.state":"degraded","plat.audit.lost":12}
 ```
 
 `plat_audit_file_lost_total` also counts records that reached the failed file
@@ -231,7 +336,7 @@ without `\n`, e.g. a power cut). Severity 4, `event.outcome` `failure`.
   lease).
 
 ```json
-{"@timestamp":"2026-10-29T06:01:00.000000Z","plat.schema":6,"event.sequence":2099522,"event.kind":"event","event.category":"network","event.action":"audit_recovery","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","plat.audit.destination":"file","plat.reason":"truncated_tail","plat.audit.last_checkpoint_seq":1699072,"plat.audit.max_seq":2099521,"plat.audit.lease_state":"ok"}
+{"@timestamp":"2026-10-29T06:01:00.000000Z","plat.schema":7,"event.sequence":2099522,"event.kind":"event","event.category":"network","event.action":"audit_recovery","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","plat.audit.destination":"file","plat.reason":"truncated_tail","plat.audit.last_checkpoint_seq":1699072,"plat.audit.max_seq":2099521,"plat.audit.lease_state":"ok"}
 ```
 
 A clean start (intact newest file) writes no `audit_recovery`, even if the
@@ -263,7 +368,7 @@ counted as delivered. Every lost batch is counted once; the sum of
 `plat_audit_remote_lost_total` for that destination.
 
 ```json
-{"@timestamp":"2026-10-28T14:21:00.000000Z","plat.schema":6,"event.sequence":700,"event.kind":"event","event.category":"network","event.action":"audit_remote_loss","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","plat.audit.destination":"syslog","destination.ip":"198.51.100.10","destination.port":6514,"plat.audit.lost":3,"plat.reason":"tls_verify"}
+{"@timestamp":"2026-10-28T14:21:00.000000Z","plat.schema":7,"event.sequence":700,"event.kind":"event","event.category":"network","event.action":"audit_remote_loss","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","plat.audit.destination":"syslog","destination.ip":"198.51.100.10","destination.port":6514,"plat.audit.lost":3,"plat.reason":"tls_verify"}
 ```
 
 ### `audit_storage_threshold`
@@ -279,7 +384,7 @@ Free space on the log volume, checked at most once per second when
   `plat.audit.available_bytes`; it clears with a `recovered` record.
 
 ```json
-{"@timestamp":"2026-10-28T14:22:00.000000Z","plat.schema":6,"event.sequence":800,"event.kind":"event","event.category":"network","event.action":"audit_storage_threshold","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","plat.audit.destination":"file","plat.audit.state":"below_threshold","plat.audit.available_bytes":1073741824,"plat.audit.min_free_bytes":2147483648}
+{"@timestamp":"2026-10-28T14:22:00.000000Z","plat.schema":7,"event.sequence":800,"event.kind":"event","event.category":"network","event.action":"audit_storage_threshold","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","plat.audit.destination":"file","plat.audit.state":"below_threshold","plat.audit.available_bytes":1073741824,"plat.audit.min_free_bytes":2147483648}
 ```
 
 ### `audit_retention_prune`
@@ -297,7 +402,7 @@ file's header carries the full value). Two phases:
    at the next rotation with a new `scheduled` record.
 
 ```json
-{"@timestamp":"2026-10-28T15:00:00.000000Z","plat.schema":6,"event.sequence":90001,"event.kind":"event","event.category":"network","event.action":"audit_retention_prune","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"unknown","plat.audit.state":"scheduled","plat.audit.pruned_rotated_us":1793196960000000,"plat.audit.pruned_seq_first":1,"plat.audit.pruned_seq_last":45000,"plat.audit.pruned_chain_prefix":"9f2c4e01b7a6d3c8"}
+{"@timestamp":"2026-10-28T15:00:00.000000Z","plat.schema":7,"event.sequence":90001,"event.kind":"event","event.category":"network","event.action":"audit_retention_prune","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"unknown","plat.audit.state":"scheduled","plat.audit.pruned_rotated_us":1793196960000000,"plat.audit.pruned_seq_first":1,"plat.audit.pruned_seq_last":45000,"plat.audit.pruned_chain_prefix":"9f2c4e01b7a6d3c8"}
 ```
 
 ### `management_connection` (mTLS management only)
@@ -307,7 +412,7 @@ One record per TCP connection accepted by the mTLS listener
 
 | `plat.mgmt.reason` | Meaning |
 |--------------------|---------|
-| `accepted` | handshake, revocation check and allow-list passed; `url.path` is `/metrics`, `/healthz` or `other` (also `other` when the request read failed) |
+| `accepted` | handshake, revocation check and allow-list passed; `url.path` is `/metrics`, `/healthz`, `/cluster` (schema 7, read-only cluster view) or `other` (also `other` when the request read failed) |
 | `no_client_cert` | the client presented no certificate |
 | `bad_cert` | chain or certificate rejected by path validation |
 | `revoked` | a certificate in the client chain is revoked |
@@ -337,7 +442,7 @@ One record per TCP connection accepted by the mTLS listener
   `source.ip` still records the full address.
 
 ```json
-{"@timestamp":"2026-10-28T14:30:00.000000Z","plat.schema":6,"event.sequence":901,"event.kind":"event","event.category":"network","event.action":"management_connection","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"success","source.ip":"2001:db8:ff::10","source.port":50412,"plat.mgmt.reason":"accepted","tls.client.subject":"prometheus-01","tls.client.hash.sha256":"<64 hex>","url.path":"/metrics","plat.mgmt.allow_entry":"dns:prometheus-01.ops.example.net","tls.client.x509.alternative_names":["dns:prometheus-01.ops.example.net"]}
+{"@timestamp":"2026-10-28T14:30:00.000000Z","plat.schema":7,"event.sequence":901,"event.kind":"event","event.category":"network","event.action":"management_connection","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"success","source.ip":"2001:db8:ff::10","source.port":50412,"plat.mgmt.reason":"accepted","tls.client.subject":"prometheus-01","tls.client.hash.sha256":"<64 hex>","url.path":"/metrics","plat.mgmt.allow_entry":"dns:prometheus-01.ops.example.net","tls.client.x509.alternative_names":["dns:prometheus-01.ops.example.net"]}
 ```
 
 ### `management_connection_suppressed`
@@ -346,7 +451,7 @@ One record per TCP connection accepted by the mTLS listener
 by the token bucket during the last `plat.mgmt.window_secs` seconds.
 
 ```json
-{"@timestamp":"2026-10-28T14:31:00.000000Z","plat.schema":6,"event.sequence":950,"event.kind":"event","event.category":"network","event.action":"management_connection_suppressed","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","plat.mgmt.suppressed":41,"plat.mgmt.window_secs":60}
+{"@timestamp":"2026-10-28T14:31:00.000000Z","plat.schema":7,"event.sequence":950,"event.kind":"event","event.category":"network","event.action":"management_connection_suppressed","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","plat.mgmt.suppressed":41,"plat.mgmt.window_secs":60}
 ```
 
 ### `tls_revocation_check`
@@ -354,7 +459,10 @@ by the token bucket during the last `plat.mgmt.window_secs` seconds.
 One record per non-root certificate of a checked chain (leaf
 `chain_index` 0, then intermediates), for management clients
 (`plat.tls.role:"mgmt_client"`, hash field `tls.client.hash.sha256`) and
-syslog collectors (`"syslog_server"`, `tls.server.hash.sha256`). With
+syslog collectors (`"syslog_server"`, `tls.server.hash.sha256`), and
+(schema 7) cluster peers (`"cluster_peer_client"` for a peer that connected
+here, `tls.client.hash.sha256`; `"cluster_peer_server"` for a peer this node
+dialed, `tls.server.hash.sha256`). With
 `tls.revocation.mode = "off"` the leaf gets one `not_checked` record.
 
 - `plat.revocation.status`: `good`, `revoked`, `unavailable`, `fatal`
@@ -384,7 +492,7 @@ syslog collectors (`"syslog_server"`, `tls.server.hash.sha256`). With
 - `plat.ocsp.responder` / `plat.crl.source`: `host:port` of the source used.
 
 ```json
-{"@timestamp":"2026-10-28T14:32:00.000000Z","plat.schema":6,"event.sequence":960,"event.kind":"event","event.category":"network","event.action":"tls_revocation_check","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","plat.tls.role":"syslog_server","tls.server.hash.sha256":"<64 hex>","x509.serial_number":"01ab","x509.issuer.distinguished_name":"CN=Intermediate,O=Example","plat.revocation.chain_index":1,"plat.revocation.status":"revoked","plat.revocation.source":"crl_fetch","plat.revocation.policy":"hard_fail","plat.ocsp.reason":"connect","plat.revocation.reason":"key_compromise","plat.revocation.date":"2026-10-20T00:00:00.000000Z","plat.ocsp.responder":"ocsp.example.net:80","plat.crl.source":"crl.example.net:80"}
+{"@timestamp":"2026-10-28T14:32:00.000000Z","plat.schema":7,"event.sequence":960,"event.kind":"event","event.category":"network","event.action":"tls_revocation_check","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","plat.tls.role":"syslog_server","tls.server.hash.sha256":"<64 hex>","x509.serial_number":"01ab","x509.issuer.distinguished_name":"CN=Intermediate,O=Example","plat.revocation.chain_index":1,"plat.revocation.status":"revoked","plat.revocation.source":"crl_fetch","plat.revocation.policy":"hard_fail","plat.ocsp.reason":"connect","plat.revocation.reason":"key_compromise","plat.revocation.date":"2026-10-20T00:00:00.000000Z","plat.ocsp.responder":"ocsp.example.net:80","plat.crl.source":"crl.example.net:80"}
 ```
 
 ### `revocation_source_refresh`
@@ -402,13 +510,13 @@ watched source (a CRL URL/file/CDP, or an OCSP watch entry):
 | `state_persist_failed` | writing `crl-numbers` failed (`event.reason` `state_write_failed`); retried at the next store, one record per failure streak |
 
 ```json
-{"@timestamp":"2026-10-28T14:33:00.000000Z","plat.schema":6,"event.sequence":970,"event.kind":"event","event.category":"network","event.action":"revocation_source_refresh","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","plat.revocation.transition":"failing","plat.crl.source":"crl.example.net:80","event.reason":"timeout"}
+{"@timestamp":"2026-10-28T14:33:00.000000Z","plat.schema":7,"event.sequence":970,"event.kind":"event","event.category":"network","event.action":"revocation_source_refresh","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","plat.revocation.transition":"failing","plat.crl.source":"crl.example.net:80","event.reason":"timeout"}
 ```
 
 ### `audit_chain_continue` (local file only, first line of every file)
 
 ```json
-{"@timestamp":"2026-10-28T14:00:00.000000Z","plat.schema":6,"event.action":"audit_chain_continue","observer.name":"plat-01","plat.node_id":0,"plat.audit.prev_chain":"<64 hex digits; all zero if no predecessor is known>","plat.audit.prev_seq":45000,"plat.audit.next_seq":45001}
+{"@timestamp":"2026-10-28T14:00:00.000000Z","plat.schema":7,"event.action":"audit_chain_continue","observer.name":"plat-01","plat.node_id":0,"plat.audit.prev_chain":"<64 hex digits; all zero if no predecessor is known>","plat.audit.prev_seq":45000,"plat.audit.next_seq":45001}
 ```
 
 `prev_chain` / `prev_seq`: the previous file's final checkpoint chain and its
@@ -417,7 +525,7 @@ watched source (a CRL URL/file/CDP, or an OCSP watch entry):
 ### `audit_checkpoint` (local file only, after every batch)
 
 ```json
-{"@timestamp":"2026-10-28T14:00:00.100000Z","plat.schema":6,"event.action":"audit_checkpoint","observer.name":"plat-01","plat.node_id":0,"plat.audit.seq_first":45001,"plat.audit.seq_last":45012,"plat.audit.batch_sha256":"<64 hex>","plat.audit.chain_sha256":"<64 hex>"}
+{"@timestamp":"2026-10-28T14:00:00.100000Z","plat.schema":7,"event.action":"audit_checkpoint","observer.name":"plat-01","plat.node_id":0,"plat.audit.seq_first":45001,"plat.audit.seq_last":45012,"plat.audit.batch_sha256":"<64 hex>","plat.audit.chain_sha256":"<64 hex>"}
 ```
 
 Chain v2:
@@ -531,7 +639,7 @@ newest checkpoint is also not detectable locally.
 ### CEF
 
 ```text
-<134>1 2026-10-28T14:16:00.000001Z plat-01 platd 4242 nat_port_block_allocate - CEF:0|USG|usg-plat|0.1.0|nat_port_block_allocate|nat_port_block_allocate|3|rt=1793196960000 dvchost=plat-01 cn1=7 cn1Label=sequence cn4=0 cn4Label=nodeId cs6=6 cs6Label=schema outcome=success c6a2=2001:db8:100:1:: cn2=64 cn2Label=subscriberPrefixLen sourceTranslatedAddress=192.0.2.10 cs1=1024-1535 cs1Label=portRange
+<134>1 2026-10-28T14:16:00.000001Z plat-01 platd 4242 nat_port_block_allocate - CEF:0|USG|usg-plat|0.1.0|nat_port_block_allocate|nat_port_block_allocate|3|rt=1793196960000 dvchost=plat-01 cn1=7 cn1Label=sequence cn4=0 cn4Label=nodeId cs6=7 cs6Label=schema outcome=success c6a2=2001:db8:100:1:: cn2=64 cn2Label=subscriberPrefixLen sourceTranslatedAddress=192.0.2.10 cs1=1024-1535 cs1Label=portRange
 ```
 
 Header: `CEF:0|USG|usg-plat|<version>|<event.action>|<event.action>|<severity>`.
@@ -543,10 +651,20 @@ keeps microseconds), `dvchost` (node name), `cn1` (`sequence`), `cn4`
 
 | Record | Extension keys |
 |--------|----------------|
-| `nat_port_block_allocate`, `nat_port_block_release` | `c6a2` (subscriber prefix address), `cn2` (`subscriberPrefixLen`), `sourceTranslatedAddress`, `cs1` (`portRange`, `start-end`) |
+| `nat_port_block_allocate`, `nat_port_block_release` | `c6a2` (subscriber prefix address), `cn2` (`subscriberPrefixLen`), `sourceTranslatedAddress`, `cs1` (`portRange`, `start-end`); release adds `reason=handover` when handed over |
+| `nat_port_block_adopt` | as allocate, plus `cs3` (`epoch`), `cs4` (`allocatedUs`), `cn3` (`prevOwner`, optional) |
+| `cluster_view_change` | `reason`, `cn2` (`epoch`), `cn3` (`leader`), `cs1` (`membersLive`, comma-separated) |
+| `cluster_member_state` | `act` (state), `src`/`c6a2` (peer IP), `cn2` (`epoch`), `cn3` (`peerId`), `cs1` (`peerName`), `cs2` (`peerIdentity`) |
+| `cluster_slice_acquire` | `reason`, `cs1` (`slice`), `cn2` (`epoch`), `cs2` (`adopted`, `blocks:N bibs:N quarantined:N`), `cs4` (`inSync`), `cn3` (`prevOwner`, optional) |
+| `cluster_slice_release` | `reason`, `cs1` (`slice`), `cn2` (`epoch`), `cn3` (`newOwner`, optional) |
+| `cluster_peer_rejected` | `act=reject`, `src`/`c6a2`, `spt`, `reason`, `suser` (identity, optional), `cn3` (`claimedId`, optional) |
+| `cluster_peer_suppressed` | `cn3` (`suppressed`), `cn2` (`windowSecs`) |
+| `cluster_replication_gap` | `act=resync`, `cs1` (`slice`), `cn3` (`lost`) |
+| `cluster_hook` | `act` (`announce`/`withdraw`), `cs1` (`slice`), `cn2` (`epoch`), `cs3` (`durationUs`), `cn3` (`exitCode`, optional) |
+| `cluster_operator_command` | `act` (command), `cs1` (`force`), `cn3` (`member`, optional), `suid`, `spid` (optional), `reason` (refused only) |
 | `nat_binding_create`, `nat_binding_delete` | `proto`, `c6a2`, `spt`, `sourceTranslatedAddress`, `sourceTranslatedPort` |
 | `nat_resource_limit` | `reason`, `c6a2`, `cn2` (`subscriberPrefixLen`) |
-| `service_start`, `service_stop` | none; `service_start` adds `cs1` (`fipsProvider`), `cn2` (`fips`, 1/0) |
+| `service_start`, `service_stop` | none; `service_start` adds `cs1` (`fipsProvider`), `cn2` (`fips`, 1/0), and with clustering `cs2` (`clusterMode`), `cs3` (`configDigest`), `cs4` (`slices`, comma-separated), `cn3` (`memberCount`); the node id is `cn4` |
 | `dataplane_counter` | `cs2` (`counter`), `cn3` (`value`) |
 | `audit_queue_overflow` | `cn3` (`lost`) |
 | `audit_output_failure` | `cs3=file` (`destination`), `cs4` (`state`), `cn3` (`lost`), `reason` (optional) |
@@ -575,7 +693,15 @@ Given `(ipv4, port, time)` from an external report:
    - a `service_stop` from the same `observer.name` (no release records are
      written at shutdown, POAM-009);
    - a `service_start` from the same `observer.name` (a crash writes no
-     `service_stop`; every allocation made before a restart is void after it).
+     `service_stop`; every allocation made before a restart is void after it);
+   - with HA (schema 7): a `cluster_slice_release` from that node for the
+     slice holding `ipv4`, or a `cluster_slice_acquire` for that slice from
+     **another** node with a higher `cluster.epoch` (crash takeover: the new
+     owner's acquire ends the earlier owner's allocations).
+   If the allocation was continued by a `nat_port_block_adopt` on the new
+   owner (same address, range and subscriber, `cluster.prev_owner` = the
+   first node), follow it on that node: the adopt record continues the same
+   attribution until its own release.
 3. Check for evidence gaps between the allocation and `time`: a gap in
    `event.sequence`, `audit_output_failure`, `audit_queue_overflow` or
    `audit_remote_loss` records from that node. A release can be deferred
@@ -584,9 +710,13 @@ Given `(ipv4, port, time)` from an external report:
 4. The subscriber is `plat.subscriber.prefix`; join with the access network's
    prefix-delegation (DHCPv6-PD/RADIUS) logs to identify the customer.
 5. Check that `observer.name` is the node that owned `ipv4` at `time`
-   (`platd check-config` prints each node's slice). Duplicate node identity or
-   overlapping `cluster.owned_pool` across nodes is **not** detected by the
-   software (POAM-017): verify node configuration as part of the evidence.
+   (`platd check-config` prints each node's slice). Without HA, duplicate node
+   identity or overlapping `cluster.owned_pool` across nodes is **not**
+   detected by the software (POAM-017): verify node configuration as part of
+   the evidence, and compare `cluster.config_digest` of every node's
+   `service_start`. With HA, ownership at `time` is the node with the latest
+   `cluster_slice_acquire` for the slice (highest `cluster.epoch`) not yet
+   followed by its `cluster_slice_release`.
 6. If the record falls in a pruned file, the newest `audit_retention_prune`
    records name what retention removed (`deleted`) and when.
 
@@ -604,6 +734,20 @@ Audit-integrity alerts (AU-5, AU-9, SI-4):
   disabled) are **journal-only**, not audit records (NIST-502): ship the
   systemd journal (`journalctl -u plat-fwguard -u nftables -p err`) to the
   SIEM and alert on `plat-fwguard:` messages.
+
+Cluster alerts (CP-10, IA-3, AU-10): alert on every `cluster_peer_rejected`
+(`duplicate_id` and `digest_mismatch` indicate a cloned or drifted
+configuration), every `cluster_slice_acquire` with `cluster.in_sync:false`,
+`cluster_slice_release` with `lease_lost`, failed `cluster_hook` records
+(routes may still point at the old owner), repeated
+`cluster_replication_gap` for one slice, every `cluster_operator_command`
+with `cluster.force:true` or `cluster.reason` `not_authorized` /
+`no_credentials` (AC-3), and every `cluster_view_change` with
+`cluster.reason:"manual"`. In manual mode (`auto_failover = false`) the
+software does not prove that a member taken over is stopped: correlate a
+manual takeover with the operator's change record. Takeover timing is not
+yet verified on a real multi-node network (LINUX_VERIFICATION L19–L23 not
+run).
 
 Management access review (AC-17, AU-6): group `management_connection` by
 `tls.client.hash.sha256` / `plat.mgmt.allow_entry`; alert on any
@@ -636,7 +780,9 @@ for `nat_port_block_release` (same address and range), `service_stop`,
   `port_exhausted`, `subscriber_limit`, `session_limit`,
   `audit_unavailable`, `fragment`, `too_big`, `hop_limit`,
   `icmp_untranslatable`, `wrong_node`, `source_route`,
-  `subscriber_table_full`.
+  `subscriber_table_full`, `cluster_fenced` (slice fenced or adopting on
+  this node), `missteered` (HA `steering.mode = "drop"`: new subscriber
+  homed on another member).
 - `plat_<name>_total` for `rx_packets`, `tx_packets`, `rx_bytes`,
   `tx_bytes`, `v6_to_v4`, `v4_to_v6`, `hairpin`, `icmp_errors_translated`,
   `icmp_errors_generated`, `icmp_errors_rate_limited`,
@@ -658,6 +804,22 @@ for `nat_port_block_release` (same address and range), `service_stop`,
   senders), `plat_audit_output_errors_total`, `plat_audit_file_lost_total`,
   `plat_audit_remote_lost_total`, `plat_audit_seq_lease_failures_total`
   (failed writes of the sequence lease `.<name>.seq`).
+- Cluster (HA): gauges `plat_cluster_epoch`, `plat_cluster_leader`,
+  `plat_cluster_lease_remaining_ms`, `plat_cluster_peer_up{peer}`,
+  `plat_cluster_slices{state}` (`active`, `fenced`, `backup_in_sync`,
+  `backup_syncing`, `unprotected`), `plat_cluster_repl_lag_records{peer}`,
+  `plat_cluster_directory_entries`; counters
+  `plat_cluster_repl_events_total`,
+  `plat_cluster_repl_dropped_total{reason}` (`ring`, `peer_queue`),
+  `plat_cluster_resync_total`, `plat_cluster_takeovers_total{reason}`,
+  `plat_cluster_handovers_total`, `plat_cluster_peer_rejected_total{reason}`,
+  `plat_cluster_hook_failures_total{hook}`,
+  `plat_cluster_state_persist_failures_total`, and the per-worker
+  `plat_cluster_steer_missteered_total`, `plat_cluster_reserve_starved_total`,
+  and `plat_pool_paired_exhausted_total` (strict paired pooling refused: the
+  subscriber's address is full while other addresses have free blocks).
+  `GET /cluster` returns the view and per-slice owners as JSON. `/healthz`
+  returns 503 for 60 s after a duplicate member id was seen.
 - Linux only: `plat_tun_rx_dropped_total{interface}` and
   `plat_tun_tx_dropped_total{interface}`, the kernel's drop counters for the
   TUN (`/sys/class/net/<if>/statistics/{rx,tx}_dropped`, read at scrape).

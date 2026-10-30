@@ -16,11 +16,26 @@
 //! `bib6 → bib4`, releases both, then `subs`. No path takes `bib6` or `subs`
 //! while holding `bib4`, so there is no cycle. Steady-state packets take at
 //! most two uncontended shard locks and never allocate.
+//!
+//! # Cluster HA (`cluster.partition = "slices"`)
+//!
+//! The pool is split into slices (`plat-cluster`); each has an atomic
+//! ownership state read on every packet ([`pool::SliceState`]). Workers push
+//! block/BIB/subscriber changes into their own bounded ring
+//! ([`repl::ReplProducer`]); the replicator (platd) drains them. The
+//! subscriber [`repl::Directory`] has its own shards and is a leaf after
+//! every engine lock.
 
 pub mod engine;
 pub mod pool;
+pub mod repl;
 pub mod shard;
 pub mod state;
 pub mod tcp;
 
 pub use engine::{Nat64, Verdict, WorkerCtx};
+pub use pool::{AllocFail, SliceState};
+pub use repl::{AdoptInput, Directory, Home, ReplHub, ReplProducer, ReplRecord, Shadow, ShadowError};
+pub use state::{
+    AdoptError, AdoptMeta, AdoptStats, ClusterSetup, ExportCursor, MAX_REPL_RING_BYTES, ReleaseStats, check_ring_memory,
+};

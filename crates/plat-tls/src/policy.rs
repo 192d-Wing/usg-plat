@@ -15,10 +15,11 @@
 //! - NIST SP 800-52 Rev 2 §3.1 (TLS 1.3 supported), RFC 9325 §4.1, §4.2
 //! - RFC 8446 §2.3 / §4.2.10 - no 0-RTT early data
 
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use plat_common::config::{ManagementTlsConfig, SyslogTlsConfig};
+use plat_common::config::{ClusterTlsConfig, ManagementTlsConfig, SyslogTlsConfig};
 use rustls::client::Resumption;
 use rustls::crypto::CryptoProvider;
 use rustls::crypto::aws_lc_rs::kx_group;
@@ -29,7 +30,9 @@ use rustls_pki_types::ServerName;
 use crate::TlsError;
 use crate::load::{load_certs, load_key};
 use crate::revocation::RevocationChecker;
-use crate::verify::{CaBundle, mgmt_client_verifier, syslog_server_verifier};
+use crate::verify::{
+    CaBundle, mgmt_client_verifier, peer_client_verifier, peer_server_verifier, syslog_server_verifier,
+};
 
 static VERSIONS: &[&SupportedProtocolVersion] = &[&rustls::version::TLS13];
 
@@ -163,6 +166,92 @@ pub fn server_config(s: &ServerSettings) -> Result<Arc<ServerConfig>, TlsError> 
     Ok(Arc::new(cfg))
 }
 
+/// Cluster peer channel settings: one certificate, key and CA for both
+/// roles (every node listens and dials). Client certificates are required
+/// in both directions.
+///
+/// COMPLIANCE MAPPING:
+/// - NIST 800-53: SC-8, SC-8(1), SC-13 - TLS 1.3 FIPS policy as above
+/// - NIST 800-53: IA-3, IA-5(2) - mutual authentication over the cluster CA
+///   with full-chain revocation; the caller binds the peer identity to the
+///   member (`AllowList` of that member's `identity`) after the handshake
+#[derive(Debug, Clone)]
+pub struct PeerSettings {
+    pub cert_file: PathBuf,
+    pub key_file: PathBuf,
+    pub ca_file: PathBuf,
+    pub pq_hybrid: bool,
+    pub revocation: Option<Arc<RevocationChecker>>,
+}
+
+impl PeerSettings {
+    pub fn from_config(t: &ClusterTlsConfig, pq_hybrid: bool, revocation: Option<Arc<RevocationChecker>>) -> Self {
+        Self {
+            cert_file: t.cert_file.clone(),
+            key_file: t.key_file.clone(),
+            ca_file: t.ca_file.clone(),
+            pq_hybrid,
+            revocation,
+        }
+    }
+}
+
+/// Server and client configs for the peer channel, built from one
+/// [`PeerSettings`] (CA, certificate and key loaded once).
+#[derive(Debug, Clone)]
+pub struct PeerConfigs {
+    /// Accepting side: client certificate required.
+    pub server: Arc<ServerConfig>,
+    /// Dialing side: presents the same certificate.
+    pub client: Arc<ClientConfig>,
+}
+
+/// Builds both peer configs. Fails closed on any unreadable or unusable CA,
+/// certificate or key, or a non-FIPS result.
+pub fn peer_configs(s: &PeerSettings) -> Result<PeerConfigs, TlsError> {
+    let provider = fips_provider(s.pq_hybrid)?;
+    let ca = CaBundle::load(&s.ca_file)?;
+    let chain = load_certs(&s.cert_file)?;
+    let key = load_key(&s.key_file)?;
+
+    let mut server = ServerConfig::builder_with_provider(provider.clone())
+        .with_protocol_versions(VERSIONS)?
+        .with_client_cert_verifier(peer_client_verifier(&ca, provider.clone(), s.revocation.clone())?)
+        .with_single_cert(chain.clone(), key.clone_key())?;
+    server.send_tls13_tickets = 0;
+    server.session_storage = Arc::new(NoServerSessionStorage {});
+    server.max_early_data_size = 0;
+    if !server.fips() {
+        return Err(TlsError::NotFips("peer server config".into()));
+    }
+
+    // COMPLIANCE MAPPING:
+    // - NIST 800-53: IA-3, IA-5(2)(b)(1) - as `client_config`: the custom
+    //   verifier delegates to `WebPkiServerVerifier` (cluster CA only) and
+    //   only adds the revocation check.
+    let mut client = ClientConfig::builder_with_provider(provider.clone())
+        .with_protocol_versions(VERSIONS)?
+        .dangerous()
+        .with_custom_certificate_verifier(peer_server_verifier(&ca, provider, s.revocation.clone())?)
+        .with_client_auth_cert(chain, key)?;
+    client.resumption = Resumption::disabled();
+    client.enable_early_data = false;
+    if !client.fips() {
+        return Err(TlsError::NotFips("peer client config".into()));
+    }
+    Ok(PeerConfigs { server: Arc::new(server), client: Arc::new(client) })
+}
+
+/// Server name used to dial a peer: the DNS name of a `dns:` identity,
+/// otherwise the peer's IP address (its certificate then needs an IP SAN).
+/// The typed identity itself is matched exactly after the handshake.
+pub fn peer_server_name(identity: &str, addr: IpAddr) -> Result<ServerName<'static>, TlsError> {
+    match identity.strip_prefix("dns:") {
+        Some(name) => server_name(name),
+        None => Ok(ServerName::IpAddress(addr.into())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,5 +273,16 @@ mod tests {
         server_name("siem.example.net").unwrap();
         server_name("2001:db8::10").unwrap();
         assert!(server_name("bad name").is_err());
+    }
+
+    #[test]
+    fn peer_server_names() {
+        let ip: IpAddr = "198.51.100.12".parse().unwrap();
+        assert_eq!(
+            peer_server_name("dns:plat-02.cluster.example", ip).unwrap(),
+            ServerName::try_from("plat-02.cluster.example").unwrap()
+        );
+        assert_eq!(peer_server_name("cn:plat-02", ip).unwrap(), ServerName::IpAddress(ip.into()));
+        assert!(peer_server_name("dns:bad name", ip).is_err());
     }
 }

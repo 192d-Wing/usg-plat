@@ -17,6 +17,9 @@ pub enum TcpState {
     V4FinRcv,
     BothFinRcv,
     Trans,
+    /// Picked up on an adopted BIB after a takeover (POAM-028): runs on the
+    /// transitory timer until the IPv4 side confirms the connection.
+    Pickup,
 }
 
 pub const FIN: u8 = 0x01;
@@ -44,6 +47,13 @@ pub fn initial(side: Side, flags: u8) -> Option<TcpState> {
     })
 }
 
+/// State of a session picked up from a non-SYN, non-RST outbound segment
+/// on an adopted BIB (RFC-002 / SEC-8): a FIN maps to V6 FIN RCV, anything
+/// else to [`TcpState::Pickup`]. Both start on the transitory timer.
+pub fn pickup(flags: u8) -> TcpState {
+    if flags & FIN != 0 { TcpState::V6FinRcv } else { TcpState::Pickup }
+}
+
 /// Advances the state machine for one packet.
 ///
 /// COMPLIANCE MAPPING:
@@ -56,7 +66,7 @@ pub fn step(s: TcpState, side: Side, flags: u8) -> (TcpState, Timer) {
         return match s {
             // INIT and BOTH FIN RCV already run on the transitory timer;
             // TRANS keeps its deadline (repeated RSTs never refresh it).
-            V6Init | V4Init | BothFinRcv | Trans => (s, Timer::Keep),
+            V6Init | V4Init | BothFinRcv | Trans | Pickup => (s, Timer::Keep),
             _ => (Trans, Timer::Transitory),
         };
     }
@@ -75,6 +85,12 @@ pub fn step(s: TcpState, side: Side, flags: u8) -> (TcpState, Timer) {
         (V4FinRcv, Side::V6) if fin => (BothFinRcv, Timer::Transitory),
         (V6FinRcv | V4FinRcv, _) => (s, Timer::Established),
         (BothFinRcv, _) => (BothFinRcv, Timer::Keep),
+        // RFC-002 / SEC-8: only the IPv4 peer's answer proves the picked-up
+        // connection is live; the IPv6 side alone never extends it.
+        (Pickup, Side::V4) if fin => (V4FinRcv, Timer::Established),
+        (Pickup, Side::V4) => (Established, Timer::Established),
+        (Pickup, Side::V6) if fin => (V6FinRcv, Timer::Transitory),
+        (Pickup, Side::V6) => (Pickup, Timer::Keep),
         (Trans, _) => (Established, Timer::Established),
     }
 }
@@ -106,6 +122,18 @@ mod tests {
         assert_eq!(step(V6Init, Side::V6, SYN), (V6Init, Timer::Transitory));
         assert_eq!(step(V4Init, Side::V4, SYN), (V4Init, Timer::Transitory));
         assert_eq!(step(V6Init, Side::V6, 0x10), (V6Init, Timer::Keep));
+    }
+
+    #[test]
+    fn pickup_needs_the_v4_side() {
+        use TcpState::*;
+        assert_eq!(pickup(0x10), Pickup);
+        assert_eq!(pickup(FIN | 0x10), V6FinRcv);
+        assert_eq!(step(Pickup, Side::V6, 0x10), (Pickup, Timer::Keep));
+        assert_eq!(step(Pickup, Side::V6, FIN | 0x10), (V6FinRcv, Timer::Transitory));
+        assert_eq!(step(Pickup, Side::V4, 0x10), (Established, Timer::Established));
+        assert_eq!(step(Pickup, Side::V4, FIN | 0x10), (V4FinRcv, Timer::Established));
+        assert_eq!(step(Pickup, Side::V4, RST), (Pickup, Timer::Keep));
     }
 
     #[test]

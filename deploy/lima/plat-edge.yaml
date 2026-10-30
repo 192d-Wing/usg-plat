@@ -1,0 +1,37 @@
+# Edge router + witness for the two-node cluster/HA test (plan §8.2).
+# Ubuntu 24.04, aarch64, vz. Runs:
+#   - FRR bgpd/bfdd peering with both translator nodes (BFD 300 ms x 3);
+#     IPv4 pool slices are learned from their announce hooks
+#   - an ECMP IPv6 route for the NAT64 prefix to both nodes (L3 hash)
+#   - network namespaces `cli` (IPv6 clients) and `inet` (IPv4 servers)
+#   - `platd witness` (tie-breaking voter, plan Q1)
+#
+#   limactl create --name=plat-edge deploy/lima/plat-edge.yaml
+#   limactl start plat-edge
+#
+# Network: Lima `user-v2`, see plat-linux-2.yaml (no host prerequisite).
+# Topology and addresses are configured by deploy/tests/cluster/setup.sh.
+vmType: vz
+arch: aarch64
+os: Linux
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/noble/release-20260926/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+    digest: "sha256:1d6bffe64b848468ac97f821d369a4846d983de1800ccf6b5ec8853e85cefc55"
+cpus: 2
+memory: 2GiB
+disk: 10GiB
+mounts: []
+networks:
+  - lima: user-v2
+provision:
+  - mode: system
+    script: |
+      #!/bin/sh
+      set -eu
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update -q
+      apt-get install -yq --no-install-recommends nftables iproute2 frr frr-pythontools \
+          iperf3 tcpdump python3 jq chrony openssl curl
+      sed -i -e 's/^bgpd=no/bgpd=yes/' -e 's/^bfdd=no/bfdd=yes/' /etc/frr/daemons
+      systemctl enable --now chrony frr

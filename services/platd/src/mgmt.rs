@@ -244,6 +244,17 @@ impl RejectLimiter {
     /// The `management_connection_suppressed` record when a window with
     /// suppressed records has ended (or at once with `flush`, at shutdown).
     pub fn summary(&self, flush: bool) -> Option<Event> {
+        self.take_suppressed(flush).map(|(suppressed, window_secs)| Event::ManagementSuppressed {
+            ts_us: Clock::wall_us(),
+            suppressed,
+            window_secs,
+        })
+    }
+
+    /// `(suppressed, window_secs)` when a window with suppressed records
+    /// has ended (or at once with `flush`); the caller builds its own
+    /// summary record (management or cluster peer).
+    pub fn take_suppressed(&self, flush: bool) -> Option<(u64, u32)> {
         let mut b = self.st.lock();
         let now = Instant::now();
         if !flush && now.saturating_duration_since(b.window_start) < self.window {
@@ -251,11 +262,7 @@ impl RejectLimiter {
         }
         b.window_start = now;
         let n = std::mem::take(&mut b.suppressed);
-        (n > 0).then(|| Event::ManagementSuppressed {
-            ts_us: Clock::wall_us(),
-            suppressed: n,
-            window_secs: u32::try_from(self.window.as_secs()).unwrap_or(u32::MAX),
-        })
+        (n > 0).then(|| (n, u32::try_from(self.window.as_secs()).unwrap_or(u32::MAX)))
     }
 }
 

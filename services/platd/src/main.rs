@@ -1,5 +1,6 @@
 //! `platd` — multithreaded 464XLAT PLAT (RFC 6877) / stateful NAT64 (RFC 6146).
 
+mod cluster;
 mod metrics;
 #[cfg(feature = "tls")]
 mod mgmt;
@@ -41,6 +42,22 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
     },
+    /// Run the cluster witness: a tie-breaking voter for two-node HA
+    /// clusters (mutual TLS only, no data plane).
+    Witness {
+        #[arg(short, long, default_value = "/etc/plat/witness.toml")]
+        config: PathBuf,
+    },
+    /// Operator commands for a running HA node (local socket in
+    /// `cluster.ha.state_dir`; only root and the daemon's user; audited as
+    /// `cluster_operator_command`). `takeover`/`restore` are refused unless
+    /// `cluster.ha.auto_failover = false`.
+    Cluster {
+        #[arg(short, long, default_value = "/etc/plat/platd.toml")]
+        config: PathBuf,
+        #[command(subcommand)]
+        op: ClusterOp,
+    },
     /// Verify the hash chain of audit log files (AU-9). Pass the live file
     /// and its rotated predecessors (any order) to check that they link
     /// into one chain.
@@ -67,6 +84,28 @@ enum Cmd {
         /// remote copy: exit 0 with a warning instead of 3.
         #[arg(long)]
         allow_recovery: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ClusterOp {
+    /// Print the view, peers and slice owners (JSON).
+    Status,
+    /// Declare member <id> lost and take over its slices. The operator
+    /// must have stopped that member first: refused while its peer link is
+    /// up, unless --force (then the slices are served only after the
+    /// takeover wait, lease * (1 + drift margin) + 200 ms).
+    Takeover {
+        #[arg(long)]
+        member: u16,
+        /// Take over although the member's peer link is up.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Return member <id> to the live set (run before restarting it).
+    Restore {
+        #[arg(long)]
+        member: u16,
     },
 }
 
@@ -111,6 +150,14 @@ fn render_env(cfg: &Config, owned: &[u32], fips: bool) -> Result<String, String>
         writeln!(o, "PLAT_OWNED_POOL={}", join(plat_cluster::cover(owned).iter().map(ToString::to_string).collect()));
     let _ = writeln!(o, "PLAT_FIPS={}", u8::from(fips));
     let _ = writeln!(o, "PLAT_MGMT_TLS={}", u8::from(cfg.management.tls.is_some()));
+    // HA: ownership moves at run time, so the whole pool is routed to the
+    // TUN and the engine drops what this node does not own.
+    let _ = writeln!(o, "PLAT_CLUSTER_HA={}", u8::from(cfg.cluster.ha_enabled()));
+    let _ = writeln!(
+        o,
+        "PLAT_POOL_ALL={}",
+        join(plat_cluster::cover(&plat_cluster::pool_addrs(&cfg.nat64.pool)).iter().map(ToString::to_string).collect())
+    );
     Ok(o)
 }
 
@@ -161,7 +208,7 @@ fn main() -> ExitCode {
         // permissions included) and fail closed with exit 2.
         Cmd::CheckConfig { config, format: OutputFormat::Env } => match Config::load(&config) {
             Ok(cfg) => {
-                match tls_summary(&cfg).and_then(|_| render_env(&cfg, &plat_cluster::owned(&cfg), fips_active())) {
+                match tls_summary(&cfg).and_then(|_| render_env(&cfg, &cluster::owned_addrs(&cfg), fips_active())) {
                     Ok(s) => {
                         print!("{s}");
                         ExitCode::SUCCESS
@@ -179,7 +226,7 @@ fn main() -> ExitCode {
         },
         Cmd::CheckConfig { config, format: OutputFormat::Text } => match Config::load(&config) {
             Ok(cfg) => {
-                let owned = plat_cluster::owned(&cfg);
+                let owned = cluster::owned_addrs(&cfg);
                 println!("config OK: node {} ({}/{})", cfg.node.name, cfg.node.id, cfg.cluster.node_count);
                 println!("owned pool addresses: {}", owned.len());
                 for p in plat_cluster::cover(&owned) {
@@ -188,6 +235,7 @@ fn main() -> ExitCode {
                 if let (Some(a), Some(b)) = (owned.first(), owned.last()) {
                     println!("  range {} - {}", Ipv4Addr::from(*a), Ipv4Addr::from(*b));
                 }
+                print!("{}", cluster::summary(&cfg));
                 match tls_summary(&cfg) {
                     Ok(t) => {
                         print!("{t}");
@@ -204,8 +252,61 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
+        Cmd::Witness { config } => witness(&config),
+        Cmd::Cluster { config, op } => cluster_cmd(&config, &op),
         Cmd::VerifyLog { files, allow_tail, allow_gap, allow_recovery } => {
             verify_log(&files, Allow { tail: allow_tail, gap: allow_gap, recovery: allow_recovery })
+        }
+    }
+}
+
+#[cfg(feature = "tls")]
+fn witness(config: &std::path::Path) -> ExitCode {
+    cluster::witness::run(config)
+}
+
+#[cfg(not(feature = "tls"))]
+fn witness(_config: &std::path::Path) -> ExitCode {
+    eprintln!("platd was built without TLS support (feature `tls`): the witness needs mutual TLS");
+    ExitCode::from(2)
+}
+
+/// `platd cluster ...`: one request on the running daemon's operator socket.
+fn cluster_cmd(config: &std::path::Path, op: &ClusterOp) -> ExitCode {
+    let cfg = match Config::load(config) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(2);
+        }
+    };
+    let Some(ha) = cfg.cluster.ha_active() else {
+        eprintln!("[cluster.ha] is not enabled in {}", config.display());
+        return ExitCode::from(2);
+    };
+    let line = match op {
+        ClusterOp::Status => "status".to_string(),
+        ClusterOp::Takeover { member, force: false } => format!("takeover {member}"),
+        ClusterOp::Takeover { member, force: true } => format!("takeover {member} --force"),
+        ClusterOp::Restore { member } => format!("restore {member}"),
+    };
+    #[cfg(feature = "tls")]
+    let r = cluster::control::cli_request(&ha.state_dir, &line);
+    #[cfg(not(feature = "tls"))]
+    let r: Result<String, String> =
+        Err(format!("{line}: platd was built without TLS support; no cluster runtime ({})", ha.state_dir.display()));
+    match r {
+        Ok(out) if out.starts_with("error") => {
+            eprint!("{out}");
+            ExitCode::from(1)
+        }
+        Ok(out) => {
+            print!("{out}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::from(2)
         }
     }
 }
@@ -342,13 +443,14 @@ mod tests {
         assert_eq!(
             s,
             "PLAT_IF=plat0\nPLAT_NODE_ID=0\nPLAT_NAT64_PREFIX=64:ff9b:1::/96\n\
-             PLAT_CLIENT_PREFIXES=2001:db8:100::/40\nPLAT_OWNED_POOL=192.0.2.0/24\nPLAT_FIPS=1\nPLAT_MGMT_TLS=0\n"
+             PLAT_CLIENT_PREFIXES=2001:db8:100::/40\nPLAT_OWNED_POOL=192.0.2.0/24\nPLAT_FIPS=1\nPLAT_MGMT_TLS=0\n\
+             PLAT_CLUSTER_HA=0\nPLAT_POOL_ALL=192.0.2.0/24\n"
         );
         // Two nodes: node 1 gets only its half of the pool.
         let cfg = example(&[("id = 0", "id = 1"), ("node_count = 1", "node_count = 2")]);
         let s = render_env(&cfg, &plat_cluster::owned(&cfg), false).unwrap();
         assert!(s.contains("PLAT_OWNED_POOL=192.0.2.128/25\n"), "{s}");
-        assert!(s.ends_with("PLAT_FIPS=0\nPLAT_MGMT_TLS=0\n"), "{s}");
+        assert!(s.ends_with("PLAT_FIPS=0\nPLAT_MGMT_TLS=0\nPLAT_CLUSTER_HA=0\nPLAT_POOL_ALL=192.0.2.0/24\n"), "{s}");
         // Nothing shell-special reaches the script.
         for bad in ["plat0;reboot", "plat 0", "plat$(x)", "averyveryverylongname"] {
             let cfg = example(&[("interface = \"plat0\"", &format!("interface = \"{bad}\""))]);
@@ -377,7 +479,7 @@ mod tests {
         let node = NodeIdent { name: "plat-test".into(), id: 1, pid: 1 };
         let h = Logger::new(cfg, node, rx, sink.stats().clone()).spawn().unwrap();
         for _ in 0..3 {
-            sink.emit(Event::Lifecycle { ts_us: 0, kind: LifecycleKind::Start, fips: None });
+            sink.emit(Event::Lifecycle { ts_us: 0, kind: LifecycleKind::Start, fips: None, cluster: None });
         }
         drop(sink);
         h.join();
@@ -416,7 +518,7 @@ mod tests {
         let node = NodeIdent { name: "plat-test".into(), id: 1, pid: 1 };
         let h = Logger::new(cfg, node, rx, sink.stats().clone()).spawn().unwrap();
         for _ in 0..3 {
-            sink.emit(Event::Lifecycle { ts_us: 0, kind: LifecycleKind::Start, fips: None });
+            sink.emit(Event::Lifecycle { ts_us: 0, kind: LifecycleKind::Start, fips: None, cluster: None });
         }
         drop(sink);
         h.join();
@@ -474,7 +576,7 @@ mod tests {
         let node = NodeIdent { name: "plat-test".into(), id: 1, pid: 1 };
         let h = Logger::new(cfg, node, rx, sink.stats().clone()).spawn().unwrap();
         for _ in 0..n {
-            sink.emit(Event::Lifecycle { ts_us: 0, kind: LifecycleKind::Start, fips: None });
+            sink.emit(Event::Lifecycle { ts_us: 0, kind: LifecycleKind::Start, fips: None, cluster: None });
         }
         drop(sink);
         h.join();

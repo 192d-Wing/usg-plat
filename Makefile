@@ -37,10 +37,11 @@ test:
 
 # Deploy scripts: POSIX syntax, shellcheck (required when CI=true) and a stubbed run
 # against the real `platd check-config --format env` output.
-DEPLOY_SH := deploy/systemd/plat-tun-setup.sh deploy/systemd/plat-fwguard.sh deploy/tests/deploy-scripts-test.sh
+DEPLOY_SH := deploy/systemd/plat-tun-setup.sh deploy/systemd/plat-fwguard.sh deploy/tests/deploy-scripts-test.sh \
+	deploy/hooks/frr-announce.sh deploy/hooks/frr-withdraw.sh deploy/systemd/plat-v6-announce.sh $(wildcard deploy/tests/cluster/*.sh)
 test-deploy:
 	for f in $(DEPLOY_SH); do sh -n $$f || exit 1; done
-	@if command -v shellcheck >/dev/null 2>&1; then shellcheck $(DEPLOY_SH); \
+	@if command -v shellcheck >/dev/null 2>&1; then shellcheck -x $(DEPLOY_SH); \
 	elif [ "$$CI" = true ]; then echo "ERROR: shellcheck is required in CI" >&2; exit 1; \
 	else echo "WARNING: shellcheck not installed; skipped" >&2; fi
 	sh deploy/tests/deploy-scripts-test.sh

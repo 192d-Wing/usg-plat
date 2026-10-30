@@ -1691,8 +1691,13 @@ impl Logger {
                 //   longer show every number used (an emptied file held
                 //   records); resume above the durable high-water mark so
                 //   no sequence number is reused. The skipped range is
-                //   announced by `audit_recovery` (`max_seq`).
-                if damage.is_some() {
+                //   announced by `audit_recovery` (`max_seq`). The same
+                //   applies when the lease is `high`: files holding the top
+                //   numbers were removed (or no file is left at all), so the
+                //   files alone would hand those numbers out again (A-1).
+                //   An intact restart keeps numbering from the files, so it
+                //   leaves no gap.
+                if damage.is_some() || lease_state == LeaseState::High {
                     seq = seq.max(lease);
                 }
                 // COMPLIANCE MAPPING:
@@ -2627,6 +2632,33 @@ mod tests {
         assert!(text.contains("\"plat.audit.lease_state\":\"high\""), "{text}");
         let r = verify(text.as_bytes()).unwrap();
         assert!(r.ok() && r.next_seq > planted, "{r:?}");
+    }
+
+    /// A-1: the audit files were moved away but `.<name>.seq` was kept.
+    /// Numbering continues above the lease instead of restarting at 1, so
+    /// no `event.sequence` is reused while the lease file exists. An intact
+    /// restart still continues from the files without a gap.
+    #[test]
+    fn removed_files_resume_above_the_lease() {
+        let dir = tmpdir("removedfiles");
+        let path = dir.join("audit.jsonl");
+        run_once(&path, cfg(&path, 1 << 30, 0, 0), (0..5).map(ev));
+        run_once(&path, cfg(&path, 1 << 30, 0, 0), (0..3).map(ev));
+        let files = verified(&dir);
+        let top = files.iter().map(|(_, r)| r.last_seq).max().unwrap();
+        assert!(issues(&files).is_empty(), "intact restart leaves no gap: {:?}", issues(&files));
+        let (lease, state) = read_lease(&path);
+        assert_eq!(state, LeaseState::Ok);
+        assert!(lease >= top);
+        for (p, _) in &files {
+            std::fs::remove_file(p).unwrap();
+        }
+        run_once(&path, cfg(&path, 1 << 30, 0, 0), (0..2).map(ev));
+        let r = verify(std::fs::read_to_string(&path).unwrap().as_bytes()).unwrap();
+        assert!(r.ok(), "{r:?}");
+        assert!(r.next_seq > lease, "resumed at {} below the lease {lease}", r.next_seq);
+        let (after, _) = read_lease(&path);
+        assert!(after >= r.last_seq);
     }
 
     /// SEC-302: a lease of u64::MAX that is within bounds of the files (they

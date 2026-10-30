@@ -1,6 +1,6 @@
 [package]
 name = "plat-cluster"
-description = "Deterministic IPv4 pool partitioning for scale-out usg-plat clusters"
+description = "Pool partitioning, slice ownership, membership and wire codec for usg-plat clusters (sans-IO)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,6 +9,8 @@ publish.workspace = true
 
 [dependencies]
 plat-common.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

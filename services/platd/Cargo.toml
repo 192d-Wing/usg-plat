@@ -28,6 +28,9 @@ clap.workspace = true
 core_affinity.workspace = true
 signal-hook.workspace = true
 parking_lot.workspace = true
+rustix.workspace = true
+serde.workspace = true
+toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
@@ -72,6 +75,11 @@ assets = [
     ["../../deploy/systemd/plat.tmpfiles.conf", "usr/lib/tmpfiles.d/plat.conf", "644"],
     ["../../config/platd.example.toml", "etc/plat/platd.toml", "640"],
     ["../../deploy/sysusers.d/plat.conf", "usr/lib/sysusers.d/", "644"],
+    ["../../deploy/systemd/plat-v6-announce.sh", "usr/libexec/plat/", "755"],
+    ["../../deploy/hooks/frr-announce.sh", "usr/libexec/plat/", "755"],
+    ["../../deploy/hooks/frr-withdraw.sh", "usr/libexec/plat/", "755"],
+    ["../../deploy/systemd/platd.service.d.example/v6-announce.conf", "usr/share/doc/platd/examples/platd.service.d/", "644"],
+    ["../../deploy/systemd/frr.service.d.example/plat-v6-announce.conf", "usr/share/doc/platd/examples/frr.service.d/", "644"],
 ]
 
 [package.metadata.generate-rpm]
@@ -92,4 +100,9 @@ assets = [
     { source = "../../deploy/systemd/plat.tmpfiles.conf", dest = "/usr/lib/tmpfiles.d/plat.conf", mode = "644" },
     { source = "../../config/platd.example.toml", dest = "/etc/plat/platd.toml", mode = "640", config = "noreplace" },
     { source = "../../deploy/sysusers.d/plat.conf", dest = "/usr/lib/sysusers.d/plat.conf", mode = "644" },
+    { source = "../../deploy/systemd/plat-v6-announce.sh", dest = "/usr/libexec/plat/plat-v6-announce.sh", mode = "755" },
+    { source = "../../deploy/hooks/frr-announce.sh", dest = "/usr/libexec/plat/frr-announce.sh", mode = "755" },
+    { source = "../../deploy/hooks/frr-withdraw.sh", dest = "/usr/libexec/plat/frr-withdraw.sh", mode = "755" },
+    { source = "../../deploy/systemd/platd.service.d.example/v6-announce.conf", dest = "/usr/share/doc/platd/examples/platd.service.d/v6-announce.conf", mode = "644", doc = true },
+    { source = "../../deploy/systemd/frr.service.d.example/plat-v6-announce.conf", dest = "/usr/share/doc/platd/examples/frr.service.d/plat-v6-announce.conf", mode = "644", doc = true },
 ]

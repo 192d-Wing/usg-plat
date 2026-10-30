@@ -41,6 +41,8 @@ pub struct LeafOpts {
     pub ips: Vec<std::net::IpAddr>,
     /// id-kp-serverAuth (otherwise clientAuth).
     pub server: bool,
+    /// Both id-kp-serverAuth and id-kp-clientAuth (cluster peer; overrides `server`).
+    pub peer: bool,
     pub cdp: Vec<String>,
     /// CDP as one fullName with this directoryName (DER of a Name) plus
     /// the `cdp` URIs (replaces the rcgen-built CDP).
@@ -161,8 +163,11 @@ impl Ca {
             .collect();
         p.is_ca = IsCa::ExplicitNoCa;
         p.key_usages = vec![KeyUsagePurpose::DigitalSignature];
-        p.extended_key_usages =
-            vec![if o.server { ExtendedKeyUsagePurpose::ServerAuth } else { ExtendedKeyUsagePurpose::ClientAuth }];
+        p.extended_key_usages = if o.peer {
+            vec![ExtendedKeyUsagePurpose::ServerAuth, ExtendedKeyUsagePurpose::ClientAuth]
+        } else {
+            vec![if o.server { ExtendedKeyUsagePurpose::ServerAuth } else { ExtendedKeyUsagePurpose::ClientAuth }]
+        };
         p.use_authority_key_identifier_extension = true;
         p.serial_number = Some(serial());
         if let Some(dn) = &o.cdp_dir {

@@ -78,11 +78,24 @@ TasksMax=1024
 # (after the plat user and plat-log group exist, see README); at boot
 # systemd-tmpfiles-setup.service recreates it (L5).
 ReadWritePaths=/var/log/plat
+# Cluster route hooks (cluster.ha.hooks.*) run as children of platd, so they
+# inherit this sandbox. The shipped FRR hooks call vtysh, which connects to
+# the FRR daemons' AF_UNIX sockets in /run/frr (already in
+# RestrictAddressFamilies); connect() needs no write access to the
+# file system, but the path must stay visible, hence "-" (optional) RW
+# here. vtysh also needs the plat user in the frrvty group (README:
+# usermod -aG frrvty plat); it is not set here so the unit starts on hosts
+# without FRR. No capability is added: hooks run unprivileged as plat.
+ReadWritePaths=-/run/frr
 # Optional CRL disk cache (tls.revocation.cache_dir =
 # "/var/lib/plat/revocation"): systemd creates it owned by plat:plat with
 # mode 0700, as check_cache_dir requires, and makes it writable under
 # ProtectSystem=strict (IA-5(2)(b)(2), SC-28). Harmless when unused.
-StateDirectory=plat/revocation
+# Cluster HA (cluster.ha.state_dir = "/var/lib/plat/cluster"): epoch and
+# vote state (cluster.state, fsynced), the operator socket ctl.sock (0600,
+# `platd cluster ...`) and announce.d/ for routing daemons; 0700 plat:plat
+# as platd checks at start (SC-24, AC-6). Harmless without HA.
+StateDirectory=plat/revocation plat/cluster
 StateDirectoryMode=0700
 DevicePolicy=closed
 DeviceAllow=/dev/net/tun rw

@@ -13,7 +13,8 @@ use plat_xlat::rfc6052::{is_never_translatable_v4, is_non_global_v4};
 use plat_xlat::siit::FRAG6_HDR;
 use plat_xlat::{Frags, Map4, Map6, Prefix6052, XlatError, v4_to_v6, v4_to_v6_fragments, v6_to_v4};
 
-use crate::state::{Key4, Key6, State};
+use crate::repl::ReplProducer;
+use crate::state::{ClusterSetup, Key4, Key6, State};
 use crate::tcp::{self, Side};
 
 /// Result of processing one packet.
@@ -50,6 +51,8 @@ pub struct WorkerCtx {
     /// Token bucket for locally generated ICMP errors.
     icmp_tokens: u32,
     icmp_last_ms: u64,
+    /// This worker's replication ring (HA only).
+    pub repl: Option<ReplProducer>,
 }
 
 impl WorkerCtx {
@@ -62,7 +65,14 @@ impl WorkerCtx {
             frags: Frags::default(),
             icmp_tokens: 0,
             icmp_last_ms: u64::MAX,
+            repl: None,
         }
+    }
+
+    /// Attaches this worker's replication ring (HA).
+    pub fn with_repl(mut self, repl: ReplProducer) -> Self {
+        self.repl = Some(repl);
+        self
     }
 
     #[inline]
@@ -148,6 +158,26 @@ enum Out {
 
 type R = Result<Out, DropReason>;
 
+/// Engine mode, fixed at construction and dispatched once per packet in
+/// [`Nat64::process`] (PERF-001): the legacy and sliced packet paths are
+/// compiled separately, so HA-off code carries no ownership checks.
+trait Mode {
+    const SLICED: bool;
+}
+
+/// Legacy (static partition, no HA).
+struct Legacy;
+/// Sliced cluster pool (`cluster.partition = "slices"`).
+struct SlicedPool;
+
+impl Mode for Legacy {
+    const SLICED: bool = false;
+}
+
+impl Mode for SlicedPool {
+    const SLICED: bool = true;
+}
+
 /// The stateful NAT64 translator.
 #[derive(Debug)]
 pub struct Nat64 {
@@ -162,6 +192,8 @@ pub struct Nat64 {
     mtu6: u16,
     /// RFC 7915 §4 lowest-ipv6-mtu, capped at `mtu6`.
     frag6: u16,
+    /// Sliced cluster pool: per-slice ownership checks apply.
+    sliced: bool,
     icmp_rate: u32,
     copy_tos: bool,
     wkp_non_global_icmp: bool,
@@ -188,6 +220,33 @@ impl Nat64 {
             mtu4: t.ipv4_mtu,
             mtu6: t.ipv6_mtu,
             frag6: t.lowest_ipv6_mtu.min(t.ipv6_mtu),
+            sliced: false,
+            icmp_rate: t.icmp_errors_per_sec,
+            copy_tos: t.copy_tos,
+            wkp_non_global_icmp: t.wkp_non_global_icmp_errors,
+            deny_non_global_dst: prefix.is_wkp() || !t.allow_non_global_destinations,
+            prefix,
+        })
+    }
+
+    /// Cluster engine (`cluster.partition = "slices"`): the whole cluster
+    /// pool is indexed and every slice starts Inactive; the control plane
+    /// activates slices through [`State::adopt_slice`] /
+    /// [`State::set_slice_state`].
+    pub fn new_cluster(cfg: &Config, setup: ClusterSetup, audit: AuditSink, clock: Clock) -> Result<Self, String> {
+        let t = &cfg.translation;
+        let prefix = Prefix6052::new(t.nat64_prefix.network(), t.nat64_prefix.prefix_len())
+            .ok_or_else(|| format!("invalid RFC 6052 prefix {}", t.nat64_prefix))?;
+        Ok(Self {
+            state: State::new_cluster(cfg, setup, audit, clock)?,
+            clients: t.client_prefixes.clone(),
+            cluster_pool: cfg.nat64.pool.clone(),
+            sub_mask: Ipv6Cidr::mask_of(cfg.nat64.subscriber_prefix_len),
+            filtering: cfg.nat64.filtering,
+            mtu4: t.ipv4_mtu,
+            mtu6: t.ipv6_mtu,
+            frag6: t.lowest_ipv6_mtu.min(t.ipv6_mtu),
+            sliced: true,
             icmp_rate: t.icmp_errors_per_sec,
             copy_tos: t.copy_tos,
             wkp_non_global_icmp: t.wkp_non_global_icmp_errors,
@@ -204,10 +263,10 @@ impl Nat64 {
     /// at least [`plat_xlat::HEADROOM`] bytes in front of the packet.
     #[inline]
     pub fn process(&self, buf: &mut [u8], start: usize, len: usize, ctx: &mut WorkerCtx) -> Verdict {
-        let r = match buf.get(start).map(|b| b >> 4) {
-            Some(6) => self.outbound_v6(buf, start, len, ctx),
-            Some(4) => self.inbound_v4(buf, start, len, false, ctx),
-            _ => Err(DropReason::Malformed),
+        let r = if self.sliced {
+            self.dispatch::<SlicedPool>(buf, start, len, ctx)
+        } else {
+            self.dispatch::<Legacy>(buf, start, len, ctx)
         };
         match r {
             Ok(Out::Pkt(start, len)) => Verdict::Forward { start, len },
@@ -216,6 +275,15 @@ impl Nat64 {
                 ctx.counters.record_drop(d);
                 Verdict::Drop(d)
             }
+        }
+    }
+
+    #[inline]
+    fn dispatch<M: Mode>(&self, buf: &mut [u8], start: usize, len: usize, ctx: &mut WorkerCtx) -> R {
+        match buf.get(start).map(|b| b >> 4) {
+            Some(6) => self.outbound_v6::<M>(buf, start, len, ctx),
+            Some(4) => self.inbound_v4::<M>(buf, start, len, false, ctx),
+            _ => Err(DropReason::Malformed),
         }
     }
 
@@ -251,7 +319,8 @@ impl Nat64 {
     }
 
     /// IPv6 → IPv4 (outbound from the CLAT side).
-    fn outbound_v6(&self, buf: &mut [u8], start: usize, len: usize, ctx: &mut WorkerCtx) -> R {
+    #[inline(never)]
+    fn outbound_v6<M: Mode>(&self, buf: &mut [u8], start: usize, len: usize, ctx: &mut WorkerCtx) -> R {
         let pkt = buf.get(start..start + len).ok_or(DropReason::Malformed)?;
         let h = parse_v6(pkt).map_err(from_parse)?;
         if h.hop_limit <= 1 {
@@ -268,7 +337,7 @@ impl Nat64 {
         {
             // Errors come from routers that need not be inside the client
             // prefixes (BNG, CPE WAN); icmp6_error applies its own checks.
-            return self.icmp6_error(buf, start, len, ctx);
+            return self.icmp6_error::<M>(buf, start, len, ctx);
         }
         // COMPLIANCE MAPPING:
         // - NIST 800-53: SC-7 - only configured client prefixes may translate
@@ -296,15 +365,21 @@ impl Nat64 {
 
         let k6 = Key6 { proto: p, addr: h.src, port: sport };
         let create = p != proto::TCP || tcp::initial(Side::V6, flags).is_some();
-        let mut k4 = self.state.bib_for(k6, create, &ctx.counters)?;
-        if let Err(e) = self.state.outbound(k4, (dst4, dport), flags, &ctx.counters) {
+        let mut m4 = self.state.bib_for(k6, create, &ctx.counters, &ctx.repl)?;
+        // A mapping in a slice this node no longer serves (fenced, or
+        // handed over) is never used (SC-24). The mapping carries its pool
+        // index, so this is one load (PERF-002); no code in legacy mode.
+        self.state.pool.check_idx_in(M::SLICED, m4.idx)?;
+        if let Err(e) = self.state.outbound(m4.k4, (dst4, dport), flags, &ctx.counters) {
             if e != DropReason::NoBinding {
                 return Err(e);
             }
             // BIB expired between lookup and session update; recreate once.
-            k4 = self.state.bib_for(k6, create, &ctx.counters)?;
-            self.state.outbound(k4, (dst4, dport), flags, &ctx.counters)?;
+            m4 = self.state.bib_for(k6, create, &ctx.counters, &ctx.repl)?;
+            self.state.pool.check_idx_in(M::SLICED, m4.idx)?;
+            self.state.outbound(m4.k4, (dst4, dport), flags, &ctx.counters)?;
         }
+        let k4 = m4.k4;
 
         let m = Map4 { src: k4.addr, dst: dst4, sport: k4.port, dport };
         let ident = ctx.next_ident();
@@ -314,10 +389,11 @@ impl Nat64 {
         }
         let (s, l) = v6_to_v4(buf, start, &h, &m, ident, self.mtu4).map_err(from_xlat)?;
         ctx.counters.inc(Counter::V6ToV4);
-        if self.state.pool.index(dst4).is_some() {
+        let own = self.state.pool.local_in(M::SLICED, dst4);
+        if own.is_some() {
             // RFC 6146 §3.8 hairpinning: loop the IPv4 result back inbound.
             ctx.counters.inc(Counter::Hairpin);
-            return self.inbound_v4(buf, s, l, true, ctx);
+            return self.inbound_v4::<M>(buf, s, l, true, ctx);
         }
         Ok(Out::Pkt(s, l))
     }
@@ -368,7 +444,8 @@ impl Nat64 {
     /// IPv4 → IPv6 (inbound to the CLAT side). `hairpin` is true only for
     /// an own-node hairpin looped back in-process by `outbound_v6`; packets
     /// read from the wire pass `false`.
-    fn inbound_v4(&self, buf: &mut [u8], start: usize, len: usize, hairpin: bool, ctx: &mut WorkerCtx) -> R {
+    #[inline(never)]
+    fn inbound_v4<M: Mode>(&self, buf: &mut [u8], start: usize, len: usize, hairpin: bool, ctx: &mut WorkerCtx) -> R {
         let pkt = buf.get(start..start + len).ok_or(DropReason::Malformed)?;
         let h = parse_v4(pkt).map_err(from_parse)?;
         if h.ttl <= 1 {
@@ -378,7 +455,7 @@ impl Nat64 {
             // POAM: POAM-001 fragment tracking/reassembly (RFC 6146 §3.4).
             return Err(DropReason::Fragment);
         }
-        if self.state.pool.index(h.dst).is_none() {
+        let Some(di) = self.state.pool.index(h.dst) else {
             // SI-4: another cluster node owns it (mis-steered return
             // traffic), or it was never pooled.
             return Err(if self.cluster_pool.iter().any(|c| c.contains(h.dst)) {
@@ -386,7 +463,10 @@ impl Nat64 {
             } else {
                 DropReason::NoBinding
             });
-        }
+        };
+        // Sliced pool: only an Active slice translates (`wrong_node` for
+        // another member's slice, `cluster_fenced` while fenced/adopting).
+        self.state.pool.check_idx_in(M::SLICED, di)?;
         let l4 = parse_l4(pkt, h.hdr_len, h.total_len, h.proto).map_err(from_parse)?;
         let is_err = matches!(l4, L4::Icmp { ty, .. } if icmp::is_icmp4_error(ty));
         // COMPLIANCE MAPPING:
@@ -414,7 +494,7 @@ impl Nat64 {
         //   as its source is spoofed and refused (SEC-301). Other nodes'
         //   slices stay accepted for cross-node hairpinning; the cluster edge
         //   must filter the pool prefix as a source on external ingress.
-        if !hairpin && self.state.pool.index(h.src).is_some() {
+        if !hairpin && self.state.pool.local_in(M::SLICED, h.src).is_some() {
             return Err(DropReason::SrcNotAllowed);
         }
         let (p, sport, dport, flags) = match l4 {
@@ -473,7 +553,7 @@ impl Nat64 {
     ///   affected mapping's pool address; the sender cannot choose it
     /// - RFC 6146 §3.5.3, RFC 7915 §5.2, RFC 6791 (source of errors from
     ///   non-translatable IPv6 addresses)
-    fn icmp6_error(&self, buf: &mut [u8], start: usize, len: usize, ctx: &mut WorkerCtx) -> R {
+    fn icmp6_error<M: Mode>(&self, buf: &mut [u8], start: usize, len: usize, ctx: &mut WorkerCtx) -> R {
         let pkt = buf.get(start..start + len).ok_or(DropReason::Malformed)?;
         let h = parse_v6(pkt).map_err(from_parse)?;
         if h.frag.is_some() {
@@ -497,7 +577,7 @@ impl Nat64 {
         if self.dst_forbidden(server4) {
             return Err(DropReason::DstForbidden);
         }
-        if self.state.pool.index(server4).is_some() {
+        if self.state.pool.local_in(M::SLICED, server4).is_some() {
             // Errors about hairpinned flows are not translated.
             return Err(DropReason::Filtered);
         }
@@ -515,6 +595,7 @@ impl Nat64 {
             L4::Icmp { id, .. } => (proto::ICMP, id, id),
         };
         let k4 = self.state.lookup6(Key6 { proto: p, addr: ih.dst, port: q_dport }).ok_or(DropReason::NoBinding)?;
+        self.state.pool.check_addr(k4.addr)?;
         let remote = if p == proto::ICMP { (server4, 0) } else { (server4, q_sport) };
         if !self.state.has_session(k4, remote) {
             return Err(DropReason::Filtered);

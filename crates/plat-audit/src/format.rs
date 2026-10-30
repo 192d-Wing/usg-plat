@@ -15,7 +15,7 @@ use std::io::Write;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use crate::LOG_SCHEMA_VERSION;
-use crate::event::{AuditText, Event, RefreshKind, StorageState, TlsRole};
+use crate::event::{AuditText, ClusterStart, ClusterView, Event, RefreshKind, SliceCidr, StorageState, TlsRole};
 use crate::logger::NodeIdent;
 
 /// Writes `ts_us` as RFC 3339 UTC with microseconds: `2026-10-28T14:16:00.123456Z`.
@@ -101,6 +101,39 @@ fn hex32(out: &mut Vec<u8>, h: &[u8; 32]) {
     }
 }
 
+impl std::fmt::Display for SliceCidr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", Ipv4Addr::from(self.net), self.len)
+    }
+}
+
+/// Appends `,"key":<n>` when `v` is set.
+fn json_opt_u16(out: &mut Vec<u8>, key: &str, v: Option<u16>) {
+    if let Some(v) = v {
+        let _ = write!(out, ",\"{key}\":{v}");
+    }
+}
+
+/// Appends the live member ids, capped, separated by `sep`.
+fn members_list(out: &mut Vec<u8>, v: &ClusterView, sep: u8) {
+    for (i, m) in v.members_live.iter().take(ClusterView::MEMBERS_MAX).enumerate() {
+        if i > 0 {
+            out.push(sep);
+        }
+        put_u64(out, u64::from(*m));
+    }
+}
+
+/// Appends the start-up CIDRs, capped, separated by `sep`, each wrapped in `q`.
+fn slices_list(out: &mut Vec<u8>, c: &ClusterStart, sep: u8, q: &str) {
+    for (i, sl) in c.slices.iter().take(ClusterStart::SLICES_MAX).enumerate() {
+        if i > 0 {
+            out.push(sep);
+        }
+        let _ = write!(out, "{q}{sl}{q}");
+    }
+}
+
 /// Appends one JSON object (no trailing newline).
 pub fn json(out: &mut Vec<u8>, seq: u64, node: &NodeIdent, ev: &Event) {
     out.extend_from_slice(b"{\"@timestamp\":\"");
@@ -125,7 +158,7 @@ pub fn json(out: &mut Vec<u8>, seq: u64, node: &NodeIdent, ev: &Event) {
                 Ipv4Addr::from(v4)
             );
         }
-        Event::PortBlockRelease { sub, sub_len, v4, port_lo, port_hi, held_secs, .. } => {
+        Event::PortBlockRelease { sub, sub_len, v4, port_lo, port_hi, held_secs, reason, .. } => {
             let _ = write!(
                 out,
                 ",\"event.outcome\":\"success\",\"source.ip\":\"{}\",\"plat.subscriber.prefix\":\"{}/{sub_len}\",\
@@ -136,6 +169,9 @@ pub fn json(out: &mut Vec<u8>, seq: u64, node: &NodeIdent, ev: &Event) {
                 Ipv4Addr::from(v4),
                 u64::from(held_secs) * 1_000_000_000
             );
+            if let Some(r) = reason {
+                let _ = write!(out, ",\"plat.release_reason\":\"{}\"", r.as_str());
+            }
         }
         Event::BibCreate { proto, v6, v6_port, v4, v4_port, .. } => {
             let _ = write!(
@@ -169,10 +205,26 @@ pub fn json(out: &mut Vec<u8>, seq: u64, node: &NodeIdent, ev: &Event) {
                 sub_addr(sub)
             );
         }
-        Event::Lifecycle { fips, .. } => {
+        Event::Lifecycle { fips, ref cluster, .. } => {
             let _ = write!(out, ",\"event.outcome\":\"success\",\"service.version\":\"{}\"", env!("CARGO_PKG_VERSION"));
             if let Some(f) = fips {
                 let _ = write!(out, ",\"plat.fips\":{},\"plat.fips_provider\":\"{}\"", f.active, f.provider);
+            }
+            if let Some(c) = cluster {
+                let _ = write!(
+                    out,
+                    ",\"cluster.node_id\":{},\"cluster.mode\":\"{}\",\"cluster.config_digest\":\"",
+                    c.node_id, c.mode
+                );
+                hex32(out, &c.config_digest);
+                out.extend_from_slice(b"\",\"cluster.slices\":[");
+                slices_list(out, c, b',', "\"");
+                let _ = write!(
+                    out,
+                    "],\"cluster.slice_count\":{},\"cluster.member_count\":{}",
+                    c.slices.len(),
+                    c.member_count
+                );
             }
         }
         Event::Counter { name, value, .. } => {
@@ -279,8 +331,8 @@ pub fn json(out: &mut Vec<u8>, seq: u64, node: &NodeIdent, ev: &Event) {
         Event::RevocationCheck { ref check, .. } => {
             let c = &**check;
             let side = match c.role {
-                TlsRole::MgmtClient => "client",
-                TlsRole::SyslogServer => "server",
+                TlsRole::MgmtClient | TlsRole::PeerClient => "client",
+                TlsRole::SyslogServer | TlsRole::PeerServer => "server",
             };
             let _ = write!(
                 out,
@@ -336,6 +388,130 @@ pub fn json(out: &mut Vec<u8>, seq: u64, node: &NodeIdent, ev: &Event) {
             json_text(out, key, &refresh.source);
             if let Some(r) = refresh.reason {
                 let _ = write!(out, ",\"event.reason\":\"{r}\"");
+            }
+        }
+        Event::ClusterViewChange { ref view, .. } => {
+            let _ = write!(
+                out,
+                ",\"event.outcome\":\"success\",\"cluster.epoch\":{},\"cluster.leader\":{},\"cluster.members_live\":[",
+                view.epoch, view.leader
+            );
+            members_list(out, view, b',');
+            let _ = write!(out, "],\"cluster.reason\":\"{}\"", view.reason.as_str());
+        }
+        Event::ClusterMemberState { ref member, .. } => {
+            let m = &**member;
+            let _ = write!(out, ",\"event.outcome\":\"success\",\"cluster.peer.id\":{}", m.peer_id);
+            json_text(out, "cluster.peer.name", &m.name);
+            json_text(out, "cluster.peer.identity", &m.identity);
+            let _ = write!(
+                out,
+                ",\"cluster.peer.ip\":\"{}\",\"cluster.peer.state\":\"{}\",\"cluster.epoch\":{}",
+                m.ip,
+                m.state.as_str(),
+                m.epoch
+            );
+        }
+        Event::ClusterSliceAcquire { ref acquire, .. } => {
+            let a = &**acquire;
+            let _ = write!(
+                out,
+                ",\"event.outcome\":\"{}\",\"cluster.slice\":\"{}\",\"cluster.epoch\":{}",
+                ev.outcome().unwrap_or("unknown"),
+                a.slice,
+                a.epoch
+            );
+            json_opt_u16(out, "cluster.prev_owner", a.prev_owner);
+            let _ = write!(
+                out,
+                ",\"cluster.reason\":\"{}\",\"cluster.blocks_adopted\":{},\"cluster.bibs_adopted\":{},\
+                 \"cluster.blocks_quarantined\":{},\"cluster.in_sync\":{}",
+                a.reason.as_str(),
+                a.blocks_adopted,
+                a.bibs_adopted,
+                a.blocks_quarantined,
+                a.in_sync
+            );
+        }
+        Event::ClusterSliceRelease { slice, epoch, new_owner, reason, .. } => {
+            let _ =
+                write!(out, ",\"event.outcome\":\"success\",\"cluster.slice\":\"{slice}\",\"cluster.epoch\":{epoch}");
+            json_opt_u16(out, "cluster.new_owner", new_owner);
+            let _ = write!(out, ",\"cluster.reason\":\"{}\"", reason.as_str());
+        }
+        Event::PortBlockAdopt { ref adopt, .. } => {
+            let a = &**adopt;
+            let _ = write!(
+                out,
+                ",\"event.outcome\":\"success\",\"source.ip\":\"{}\",\"plat.subscriber.prefix\":\"{}/{}\",\
+                 \"source.nat.ip\":\"{}\",\"plat.nat.port_start\":{},\"plat.nat.port_end\":{},\
+                 \"plat.block.allocated_us\":{},\"cluster.epoch\":{}",
+                sub_addr(a.sub),
+                sub_addr(a.sub),
+                a.sub_len,
+                Ipv4Addr::from(a.v4),
+                a.port_lo,
+                a.port_hi,
+                a.allocated_us,
+                a.epoch
+            );
+            json_opt_u16(out, "cluster.prev_owner", a.prev_owner);
+        }
+        Event::ClusterPeerRejected { ref rejected, .. } => {
+            let r = &**rejected;
+            let _ = write!(out, ",\"event.outcome\":\"failure\",\"source.ip\":\"{}\",\"source.port\":{}", r.ip, r.port);
+            if let Some(t) = &r.identity {
+                json_text(out, "tls.client.identity", t);
+            }
+            json_opt_u16(out, "cluster.claimed_id", r.claimed_id);
+            let _ = write!(out, ",\"cluster.reason\":\"{}\"", r.reason.as_str());
+        }
+        Event::ClusterPeerSuppressed { suppressed, window_secs, .. } => {
+            let _ = write!(
+                out,
+                ",\"event.outcome\":\"failure\",\"cluster.suppressed\":{suppressed},\"cluster.window_secs\":{window_secs}"
+            );
+        }
+        Event::ClusterReplicationGap { slice, lost, .. } => {
+            let _ = write!(
+                out,
+                ",\"event.outcome\":\"failure\",\"cluster.slice\":\"{slice}\",\"cluster.lost\":{lost},\
+                 \"cluster.action\":\"resync\""
+            );
+        }
+        Event::ClusterHook { ref run, .. } => {
+            let h = &**run;
+            let _ = write!(
+                out,
+                ",\"event.outcome\":\"{}\",\"cluster.hook\":\"{}\",\"cluster.slice\":\"{}\",\"cluster.epoch\":{}",
+                ev.outcome().unwrap_or("unknown"),
+                h.hook.as_str(),
+                h.slice,
+                h.epoch
+            );
+            if let Some(c) = h.exit_code {
+                let _ = write!(out, ",\"process.exit_code\":{c}");
+            }
+            let _ = write!(out, ",\"event.duration\":{}", h.duration_us.saturating_mul(1000));
+        }
+        Event::ClusterOperatorCommand { ref cmd, .. } => {
+            let c = &**cmd;
+            let _ = write!(
+                out,
+                ",\"event.outcome\":\"{}\",\"cluster.command\":\"{}\"",
+                ev.outcome().unwrap_or("unknown"),
+                c.command.as_str()
+            );
+            json_opt_u16(out, "cluster.member", c.member);
+            let _ = write!(out, ",\"cluster.force\":{}", c.force);
+            if let Some(u) = c.peer_uid {
+                let _ = write!(out, ",\"user.id\":\"{u}\"");
+            }
+            if let Some(p) = c.peer_pid {
+                let _ = write!(out, ",\"process.pid\":{p}");
+            }
+            if let Some(r) = c.refused {
+                let _ = write!(out, ",\"cluster.reason\":\"{}\"", r.as_str());
             }
         }
     }
@@ -407,6 +583,9 @@ pub fn cef(out: &mut Vec<u8>, seq: u64, node: &NodeIdent, ev: &Event) {
                 sub_addr(sub),
                 Ipv4Addr::from(v4)
             );
+            if let Event::PortBlockRelease { reason: Some(r), .. } = *ev {
+                let _ = write!(out, " reason={}", r.as_str());
+            }
         }
         Event::BibCreate { proto, v6, v6_port, v4, v4_port, .. }
         | Event::BibDelete { proto, v6, v6_port, v4, v4_port, .. } => {
@@ -476,10 +655,17 @@ pub fn cef(out: &mut Vec<u8>, seq: u64, node: &NodeIdent, ev: &Event) {
                 lease_state.as_str()
             );
         }
-        Event::Lifecycle { fips, .. } => {
+        Event::Lifecycle { fips, ref cluster, .. } => {
             if let Some(f) = fips {
                 let _ =
                     write!(out, " cs1={} cs1Label=fipsProvider cn2={} cn2Label=fips", f.provider, u8::from(f.active));
+            }
+            if let Some(c) = cluster {
+                let _ = write!(out, " cs2={} cs2Label=clusterMode cs3=", c.mode);
+                hex32(out, &c.config_digest);
+                out.extend_from_slice(b" cs3Label=configDigest cs4=");
+                slices_list(out, c, b',', "");
+                let _ = write!(out, " cs4Label=slices cn3={} cn3Label=memberCount", c.member_count);
             }
         }
         Event::ManagementConnection { ref conn, .. } => {
@@ -551,6 +737,118 @@ pub fn cef(out: &mut Vec<u8>, seq: u64, node: &NodeIdent, ev: &Event) {
             let _ = write!(out, " cs1Label={label}");
             if let Some(r) = refresh.reason {
                 let _ = write!(out, " reason={r}");
+            }
+        }
+        Event::ClusterViewChange { ref view, .. } => {
+            let _ = write!(
+                out,
+                " reason={} cn2={} cn2Label=epoch cn3={} cn3Label=leader cs1=",
+                view.reason.as_str(),
+                view.epoch,
+                view.leader
+            );
+            members_list(out, view, b',');
+            out.extend_from_slice(b" cs1Label=membersLive");
+        }
+        Event::ClusterMemberState { ref member, .. } => {
+            let m = &**member;
+            let _ = write!(out, " act={}", m.state.as_str());
+            cef_addr(out, m.ip);
+            let _ = write!(out, " cn2={} cn2Label=epoch cn3={} cn3Label=peerId cs1=", m.epoch, m.peer_id);
+            cef_str(out, m.name.as_str());
+            out.extend_from_slice(b" cs1Label=peerName cs2=");
+            cef_str(out, m.identity.as_str());
+            out.extend_from_slice(b" cs2Label=peerIdentity");
+        }
+        Event::ClusterSliceAcquire { ref acquire, .. } => {
+            let a = &**acquire;
+            let _ = write!(
+                out,
+                " reason={} cs1={} cs1Label=slice cn2={} cn2Label=epoch cs2=blocks:{} bibs:{} quarantined:{} \
+                 cs2Label=adopted cs4={} cs4Label=inSync",
+                a.reason.as_str(),
+                a.slice,
+                a.epoch,
+                a.blocks_adopted,
+                a.bibs_adopted,
+                a.blocks_quarantined,
+                a.in_sync
+            );
+            if let Some(p) = a.prev_owner {
+                let _ = write!(out, " cn3={p} cn3Label=prevOwner");
+            }
+        }
+        Event::ClusterSliceRelease { slice, epoch, new_owner, reason, .. } => {
+            let _ = write!(out, " reason={} cs1={slice} cs1Label=slice cn2={epoch} cn2Label=epoch", reason.as_str());
+            if let Some(n) = new_owner {
+                let _ = write!(out, " cn3={n} cn3Label=newOwner");
+            }
+        }
+        Event::PortBlockAdopt { ref adopt, .. } => {
+            let a = &**adopt;
+            let _ = write!(
+                out,
+                " c6a2={} cn2={} cn2Label=subscriberPrefixLen sourceTranslatedAddress={} cs1={}-{} cs1Label=portRange \
+                 cs3={} cs3Label=epoch cs4={} cs4Label=allocatedUs",
+                sub_addr(a.sub),
+                a.sub_len,
+                Ipv4Addr::from(a.v4),
+                a.port_lo,
+                a.port_hi,
+                a.epoch,
+                a.allocated_us
+            );
+            if let Some(p) = a.prev_owner {
+                let _ = write!(out, " cn3={p} cn3Label=prevOwner");
+            }
+        }
+        Event::ClusterPeerRejected { ref rejected, .. } => {
+            let r = &**rejected;
+            out.extend_from_slice(b" act=reject");
+            cef_addr(out, r.ip);
+            let _ = write!(out, " spt={} reason={}", r.port, r.reason.as_str());
+            if let Some(t) = &r.identity {
+                out.extend_from_slice(b" suser=");
+                cef_str(out, t.as_str());
+            }
+            if let Some(c) = r.claimed_id {
+                let _ = write!(out, " cn3={c} cn3Label=claimedId");
+            }
+        }
+        Event::ClusterPeerSuppressed { suppressed, window_secs, .. } => {
+            let _ = write!(out, " cn3={suppressed} cn3Label=suppressed cn2={window_secs} cn2Label=windowSecs");
+        }
+        Event::ClusterReplicationGap { slice, lost, .. } => {
+            let _ = write!(out, " act=resync cs1={slice} cs1Label=slice cn3={lost} cn3Label=lost");
+        }
+        Event::ClusterHook { ref run, .. } => {
+            let h = &**run;
+            let _ = write!(
+                out,
+                " act={} cs1={} cs1Label=slice cn2={} cn2Label=epoch cs3={} cs3Label=durationUs",
+                h.hook.as_str(),
+                h.slice,
+                h.epoch,
+                h.duration_us
+            );
+            if let Some(c) = h.exit_code {
+                let _ = write!(out, " cn3={c} cn3Label=exitCode");
+            }
+        }
+        Event::ClusterOperatorCommand { ref cmd, .. } => {
+            let c = &**cmd;
+            let _ = write!(out, " act={} cs1={} cs1Label=force", c.command.as_str(), c.force);
+            if let Some(m) = c.member {
+                let _ = write!(out, " cn3={m} cn3Label=member");
+            }
+            if let Some(u) = c.peer_uid {
+                let _ = write!(out, " suid={u}");
+            }
+            if let Some(p) = c.peer_pid {
+                let _ = write!(out, " spid={p}");
+            }
+            if let Some(r) = c.refused {
+                let _ = write!(out, " reason={}", r.as_str());
             }
         }
     }
@@ -794,11 +1092,12 @@ mod tests {
             ts_us: 0,
             kind: LifecycleKind::Start,
             fips: Some(FipsMark { active: true, provider: "aws-lc-rs-fips" }),
+            cluster: None,
         };
         let s = json_of(&ev);
         assert!(s.contains("\"plat.fips\":true,\"plat.fips_provider\":\"aws-lc-rs-fips\""), "{s}");
         assert!(cef_of(&ev).contains(" cs1=aws-lc-rs-fips cs1Label=fipsProvider cn2=1 cn2Label=fips"));
-        let stop = Event::Lifecycle { ts_us: 0, kind: LifecycleKind::Stop, fips: None };
+        let stop = Event::Lifecycle { ts_us: 0, kind: LifecycleKind::Stop, fips: None, cluster: None };
         assert!(!json_of(&stop).contains("plat.fips"));
         let loss = Event::RemoteLoss {
             ts_us: 0,
@@ -925,5 +1224,248 @@ mod tests {
         assert!(s.contains("\"event.outcome\":\"failure\",\"plat.revocation.transition\":\"stale_dropped\""), "{s}");
         assert!(s.contains("\"plat.crl.source\":\"crl.example.net:80\",\"event.reason\":\"timeout\""), "{s}");
         assert!(cef_of(&r).contains(" act=stale_dropped cs1=crl.example.net:80 cs1Label=crlSource reason=timeout"));
+    }
+
+    /// Schema 7: golden JSON for every cluster record, plus CEF keys.
+    #[test]
+    fn cluster_records_schema_7() {
+        use crate::event::*;
+        use std::sync::Arc;
+        let slice = SliceCidr { net: 0xc000_0210, len: 28 };
+        let golden = |ev: &Event, body: &str| {
+            let j = json_of(ev);
+            let head = format!(
+                "{{\"@timestamp\":\"1970-01-01T00:00:00.000000Z\",\"plat.schema\":7,\"event.sequence\":1,\
+                 \"event.kind\":\"event\",\"event.category\":\"network\",\"event.action\":\"{}\",\
+                 \"observer.type\":\"nat64\",\"observer.name\":\"plat-01\",\"plat.node_id\":3",
+                ev.action()
+            );
+            assert_eq!(j, format!("{head}{body}}}"));
+        };
+
+        let view = Event::ClusterViewChange {
+            ts_us: 0,
+            view: Arc::new(ClusterView {
+                epoch: 9,
+                leader: 1,
+                members_live: vec![0, 1, 2],
+                reason: ViewReason::MemberLost,
+            }),
+        };
+        golden(
+            &view,
+            ",\"event.outcome\":\"success\",\"cluster.epoch\":9,\"cluster.leader\":1,\"cluster.members_live\":[0,1,2],\
+             \"cluster.reason\":\"member_lost\"",
+        );
+        assert!(cef_of(&view).contains(" reason=member_lost cn2=9 cn2Label=epoch cn3=1 cn3Label=leader cs1=0,1,2"));
+
+        let member = Event::ClusterMemberState {
+            ts_us: 0,
+            member: Arc::new(ClusterMemberChange {
+                peer_id: 2,
+                name: AuditText::new("plat-02", AuditText::SHORT_MAX),
+                identity: AuditText::new("dns:plat-02.cluster.example", AuditText::SUBJECT_MAX),
+                ip: "198.51.100.12".parse().unwrap(),
+                state: MemberState::Down,
+                epoch: 9,
+            }),
+        };
+        assert_eq!(member.severity(), 4);
+        golden(
+            &member,
+            ",\"event.outcome\":\"success\",\"cluster.peer.id\":2,\"cluster.peer.name\":\"plat-02\",\
+             \"cluster.peer.identity\":\"dns:plat-02.cluster.example\",\"cluster.peer.ip\":\"198.51.100.12\",\
+             \"cluster.peer.state\":\"down\",\"cluster.epoch\":9",
+        );
+        assert!(cef_of(&member).contains(" act=down src=198.51.100.12 cn2=9 cn2Label=epoch cn3=2 cn3Label=peerId"));
+
+        let acq = |in_sync| Event::ClusterSliceAcquire {
+            ts_us: 0,
+            acquire: Arc::new(SliceAcquire {
+                slice,
+                epoch: 9,
+                prev_owner: Some(2),
+                reason: AcquireReason::Takeover,
+                blocks_adopted: 5,
+                bibs_adopted: 70,
+                blocks_quarantined: 1,
+                in_sync,
+            }),
+        };
+        golden(
+            &acq(true),
+            ",\"event.outcome\":\"success\",\"cluster.slice\":\"192.0.2.16/28\",\"cluster.epoch\":9,\
+             \"cluster.prev_owner\":2,\"cluster.reason\":\"takeover\",\"cluster.blocks_adopted\":5,\
+             \"cluster.bibs_adopted\":70,\"cluster.blocks_quarantined\":1,\"cluster.in_sync\":true",
+        );
+        assert_eq!((acq(false).outcome(), acq(false).severity(), acq(true).severity()), (Some("unknown"), 4, 5));
+        assert!(cef_of(&acq(true)).contains(" reason=takeover cs1=192.0.2.16/28 cs1Label=slice cn2=9"));
+
+        let rel = Event::ClusterSliceRelease {
+            ts_us: 0,
+            slice,
+            epoch: 10,
+            new_owner: None,
+            reason: SliceReleaseReason::LeaseLost,
+        };
+        golden(
+            &rel,
+            ",\"event.outcome\":\"success\",\"cluster.slice\":\"192.0.2.16/28\",\"cluster.epoch\":10,\
+             \"cluster.reason\":\"lease_lost\"",
+        );
+        assert_eq!(rel.severity(), 4);
+
+        let adopt = Event::PortBlockAdopt {
+            ts_us: 0,
+            adopt: Arc::new(BlockAdopt {
+                sub: 0x2001_0db8_0100_0001_0000_0000_0000_0000,
+                sub_len: 64,
+                v4: 0xc000_0211,
+                port_lo: 1024,
+                port_hi: 1535,
+                allocated_us: 1_000_000,
+                prev_owner: Some(2),
+                epoch: 9,
+            }),
+        };
+        golden(
+            &adopt,
+            ",\"event.outcome\":\"success\",\"source.ip\":\"2001:db8:100:1::\",\
+             \"plat.subscriber.prefix\":\"2001:db8:100:1::/64\",\"source.nat.ip\":\"192.0.2.17\",\
+             \"plat.nat.port_start\":1024,\"plat.nat.port_end\":1535,\"plat.block.allocated_us\":1000000,\
+             \"cluster.epoch\":9,\"cluster.prev_owner\":2",
+        );
+        assert!(cef_of(&adopt).contains(" sourceTranslatedAddress=192.0.2.17 cs1=1024-1535 cs1Label=portRange cs3=9"));
+
+        // Peer identity is hostile text: escaped in both formats.
+        let rej = Event::ClusterPeerRejected {
+            ts_us: 0,
+            rejected: Arc::new(PeerRejected {
+                ip: "2001:db8::9".parse().unwrap(),
+                port: 40_000,
+                identity: Some(AuditText::new("dns:x\",\"cluster.reason\":\"ok=1\n", AuditText::SUBJECT_MAX)),
+                claimed_id: Some(0),
+                reason: PeerRejectReason::DuplicateId,
+            }),
+        };
+        golden(
+            &rej,
+            ",\"event.outcome\":\"failure\",\"source.ip\":\"2001:db8::9\",\"source.port\":40000,\
+             \"tls.client.identity\":\"dns:x\\\",\\\"cluster.reason\\\":\\\"ok=1?\",\"cluster.claimed_id\":0,\
+             \"cluster.reason\":\"duplicate_id\"",
+        );
+        let c = cef_of(&rej);
+        assert!(
+            c.contains(
+                " act=reject c6a2=2001:db8::9 spt=40000 reason=duplicate_id suser=dns:x\",\"cluster.reason\":\"ok\\=1?"
+            ),
+            "{c}"
+        );
+
+        let sup = Event::ClusterPeerSuppressed { ts_us: 0, suppressed: 12, window_secs: 60 };
+        golden(&sup, ",\"event.outcome\":\"failure\",\"cluster.suppressed\":12,\"cluster.window_secs\":60");
+
+        let gap = Event::ClusterReplicationGap { ts_us: 0, slice, lost: 33 };
+        golden(
+            &gap,
+            ",\"event.outcome\":\"failure\",\"cluster.slice\":\"192.0.2.16/28\",\"cluster.lost\":33,\
+             \"cluster.action\":\"resync\"",
+        );
+        assert!(cef_of(&gap).contains(" act=resync cs1=192.0.2.16/28"));
+
+        let hook = |exit_code, success| Event::ClusterHook {
+            ts_us: 0,
+            run: Arc::new(HookRun { hook: HookKind::Announce, slice, epoch: 9, exit_code, duration_us: 1500, success }),
+        };
+        golden(
+            &hook(Some(0), true),
+            ",\"event.outcome\":\"success\",\"cluster.hook\":\"announce\",\"cluster.slice\":\"192.0.2.16/28\",\
+             \"cluster.epoch\":9,\"process.exit_code\":0,\"event.duration\":1500000",
+        );
+        // Killed on timeout: no exit code, failure, warning.
+        let t = hook(None, false);
+        assert_eq!((t.outcome(), t.severity()), (Some("failure"), 4));
+        assert!(!json_of(&t).contains("exit_code"));
+
+        // Operator command: accepted (before acting) and refused.
+        let op = |refused| Event::ClusterOperatorCommand {
+            ts_us: 0,
+            cmd: Arc::new(OperatorCommand {
+                command: OperatorCommandKind::Takeover,
+                member: Some(1),
+                force: true,
+                peer_uid: Some(0),
+                peer_pid: Some(4242),
+                refused,
+            }),
+        };
+        golden(
+            &op(None),
+            ",\"event.outcome\":\"success\",\"cluster.command\":\"takeover\",\"cluster.member\":1,\
+             \"cluster.force\":true,\"user.id\":\"0\",\"process.pid\":4242",
+        );
+        let refused = op(Some(OperatorRefusal::MemberUp));
+        assert_eq!((refused.outcome(), refused.severity()), (Some("failure"), 4));
+        assert!(json_of(&refused).ends_with(",\"cluster.reason\":\"member_up\"}"));
+        assert!(
+            cef_of(&refused).contains(
+                " act=takeover cs1=true cs1Label=force cn3=1 cn3Label=member suid=0 spid=4242 reason=member_up"
+            )
+        );
+
+        // nat_port_block_release with a handover reason.
+        let rel = |reason| Event::PortBlockRelease {
+            ts_us: 0,
+            sub: 1 << 64,
+            sub_len: 64,
+            v4: 0xc000_0211,
+            port_lo: 1024,
+            port_hi: 1535,
+            held_secs: 2,
+            reason,
+        };
+        assert!(json_of(&rel(Some(BlockReleaseReason::Handover))).ends_with(",\"plat.release_reason\":\"handover\"}"));
+        assert!(!json_of(&rel(None)).contains("release_reason"));
+        assert!(cef_of(&rel(Some(BlockReleaseReason::Handover))).ends_with(" reason=handover"));
+
+        // service_start with cluster fields.
+        let start = Event::Lifecycle {
+            ts_us: 0,
+            kind: LifecycleKind::Start,
+            fips: None,
+            cluster: Some(Arc::new(ClusterStart {
+                node_id: 3,
+                mode: "contiguous",
+                config_digest: [0xcd; 32],
+                slices: vec![SliceCidr { net: 0xc000_0200, len: 25 }, slice],
+                member_count: 4,
+            })),
+        };
+        let j = json_of(&start);
+        let want = format!(
+            ",\"cluster.node_id\":3,\"cluster.mode\":\"contiguous\",\"cluster.config_digest\":\"{}\",\
+             \"cluster.slices\":[\"192.0.2.0/25\",\"192.0.2.16/28\"],\"cluster.slice_count\":2,\"cluster.member_count\":4}}",
+            "cd".repeat(32)
+        );
+        assert!(j.ends_with(&want), "{j}");
+        let c = cef_of(&start);
+        assert!(c.contains(" cs2=contiguous cs2Label=clusterMode cs3=cdcd"), "{c}");
+        assert!(c.ends_with(" cs4=192.0.2.0/25,192.0.2.16/28 cs4Label=slices cn3=4 cn3Label=memberCount"), "{c}");
+        // HA start: empty slice list; output caps at SLICES_MAX.
+        let many = Event::Lifecycle {
+            ts_us: 0,
+            kind: LifecycleKind::Start,
+            fips: None,
+            cluster: Some(Arc::new(ClusterStart {
+                node_id: 0,
+                mode: "ha",
+                config_digest: [0; 32],
+                slices: vec![slice; ClusterStart::SLICES_MAX + 10],
+                member_count: 2,
+            })),
+        };
+        let j = json_of(&many);
+        assert_eq!(j.matches("192.0.2.16/28").count(), ClusterStart::SLICES_MAX);
+        assert!(j.contains(&format!("\"cluster.slice_count\":{}", ClusterStart::SLICES_MAX + 10)));
     }
 }

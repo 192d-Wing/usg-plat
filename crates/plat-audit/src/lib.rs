@@ -34,9 +34,12 @@ pub mod tls;
 pub mod verify;
 
 pub use event::{
-    AuditText, Event, FipsMark, LeaseState, LifecycleKind, LimitKind, MgmtConnection, MgmtPath, MgmtReason,
-    OutputFailureReason, PruneState, RecoveryReason, RefreshKind, RefreshTransition, RemoteLossReason, RevocationCheck,
-    RevocationRefresh, RevocationSource, RevocationStatus, StorageState, TlsRole,
+    AcquireReason, AuditText, BlockAdopt, BlockReleaseReason, ClusterMemberChange, ClusterStart, ClusterView, Event,
+    FipsMark, HookKind, HookRun, LeaseState, LifecycleKind, LimitKind, MemberState, MgmtConnection, MgmtPath,
+    MgmtReason, OperatorCommand, OperatorCommandKind, OperatorRefusal, OutputFailureReason, PeerRejectReason,
+    PeerRejected, PruneState, RecoveryReason, RefreshKind, RefreshTransition, RemoteLossReason, RevocationCheck,
+    RevocationRefresh, RevocationSource, RevocationStatus, SliceAcquire, SliceCidr, SliceReleaseReason, StorageState,
+    TlsRole, ViewReason,
 };
 pub use logger::{Logger, LoggerHandle, NodeIdent};
 pub use sink::{AuditSink, AuditStats, RemoteStats, TryEmit};
@@ -73,4 +76,12 @@ pub use sink::{AuditSink, AuditStats, RemoteStats, TryEmit};
 /// (CEF `reason`, `cn3`/`lastCheckpointSeq`, `cn2`/`maxSeq`).
 /// `audit_output_failure` may carry `plat.reason` (`truncate_failed`: a
 /// failed batch could not be cut back to the last checkpoint; CEF `reason`).
-pub const LOG_SCHEMA_VERSION: u32 = 6;
+///
+/// 7: cluster high availability (CP-10, AU-10, IA-3). New records
+/// `cluster_view_change`, `cluster_member_state`, `cluster_slice_acquire`,
+/// `cluster_slice_release`, `nat_port_block_adopt`, `cluster_peer_rejected`,
+/// `cluster_peer_suppressed`, `cluster_replication_gap` and `cluster_hook`.
+/// `nat_port_block_release` may carry `plat.release_reason` (`handover`).
+/// `service_start` may carry `cluster.node_id`, `cluster.mode`,
+/// `cluster.config_digest`, `cluster.slices` and `cluster.member_count`.
+pub const LOG_SCHEMA_VERSION: u32 = 7;
