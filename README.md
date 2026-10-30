@@ -194,6 +194,31 @@ Configuration changes to note when upgrading from an earlier build:
   certificates may be 0644.
 - TLS syslog collectors must support TLS 1.3 (RFC 5425 TLS 1.2 is not
   offered).
+- Fragments and ICMP generation (branch `feat/protocol-completeness`,
+  unreleased):
+  - **Breaking:** `translation.icmp_errors_per_sec` must be 0 or at least 4
+    (a quarter of the per-worker bucket is reserved for Packet Too Big and
+    Fragmentation Needed); a config with 1–3 fails validation.
+  - New `[translation.fragments]` (per worker, preallocated at start; the
+    defaults use about 1 MiB per worker and `check-config` prints the
+    figure, maximum 64 MiB): `max_entries` (4096), `timeout_ms` (2000, below
+    the UDP and ICMP timeouts), `max_fragments_per_datagram` (64),
+    `max_buffered_fragments` (64, 0 = off), `buffer_slot_bytes` (1536),
+    `reassembly_slots` (4), `max_reassembly_bytes` (65535),
+    `udp_zero_checksum` (`"reassemble"` or `"drop"`).
+  - New ICMP switches under `[translation]`: `send_time_exceeded`,
+    `send_unreachable`, `send_param_problem` (default `true`),
+    `send_inbound_unreachable`, `send_source_route_failed` (default
+    `false`), and optional `icmp_source_v6` (source of locally generated
+    ICMPv6 errors; unset = the synthesized destination).
+  - Behaviour: non-first fragments are now translated (they were dropped);
+    TTL / Hop Limit 1 now gets Time Exceeded (inbound only when the filter
+    admits the packet, otherwise counted `no_binding` / `filtered`);
+    subscribers get ICMPv6 Destination Unreachable when a limit refuses a
+    mapping (not for `port_exhausted` in a cluster slice pool).
+  - Fragment state is per worker; keep the kernel's default TUN queue
+    selection (fragments of one datagram stay on one queue, verified in
+    `docs/compliance/LINUX_VERIFICATION.md` L24).
 
 <!-- --8<-- [end:quickstart] -->
 

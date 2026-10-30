@@ -210,7 +210,7 @@ fn packet_too_big_v6_to_frag_needed_v4() {
 
     let h = parse_v6(&e).unwrap();
     let (ih, il4) = quoted_v6(&e, &h).unwrap();
-    assert!(matches!(il4, L4::Tcp { sport: 443, dport: 40000, .. }));
+    assert!(matches!(il4, Some(L4::Tcp { sport: 443, dport: 40000, .. })));
     let mut out = [0u8; 1500];
     let inner_map = Map4 { src: SERVER4, dst: POOL4, sport: 443, dport: 2048 };
     let n = icmp6_err_to_v4(&e, &h, &ih, (0x0a00_0001, SERVER4), &inner_map, 7, 1500, 1500, &mut out).unwrap();
@@ -291,4 +291,98 @@ proptest! {
             let _ = icmp4_err_to_v6(&e, &h, &ih, (1, 2), &Map6 { src: 3, dst: 4, sport: 5, dport: 6 }, 1500, 1500, &mut out);
         }
     }
+}
+
+// ---- Fragment helpers (POAM-001 / POAM-002) ------------------------------
+
+use plat_xlat::siit::{
+    FragSink, Frags, Hdr4, Hdr6, MAX_OUT, split_v4, split_v6, v4_frag_to_v6, v4_frag_to_v6_split, v6_frag_to_v4,
+};
+
+#[test]
+fn split_v4_and_v6_cover_the_payload_with_aligned_offsets() {
+    let payload: Vec<u8> = (0..3000u32).map(|i| i as u8).collect();
+    let mut out = vec![0u8; 8192];
+    let mut f = Frags::default();
+    let h4 = Hdr4 { tos: 0, ttl: 9, proto: proto::UDP, id: 0x1234, src: POOL4, dst: SERVER4 };
+    split_v4(&payload, 1000 * 8, true, &h4, 576, &mut FragSink { frags: &mut f, out: &mut out }).unwrap();
+    let mut seen = Vec::new();
+    for p in f.iter(&out) {
+        let h = parse_v4(p).unwrap();
+        assert!(p.len() <= 576 && !h.df && h.id == 0x1234);
+        let fr = h.frag.unwrap();
+        assert!(fr.more, "the input was not the last fragment");
+        assert_eq!(usize::from(fr.offset) * 8, 8000 + seen.len());
+        seen.extend_from_slice(&p[20..]);
+    }
+    assert_eq!(seen, payload);
+
+    let mut f = Frags::default();
+    let h6 = Hdr6 { tc: 0, hop: 9, next: proto::UDP, id: 77, src: SUB, dst: pfx().embed(SERVER4) };
+    split_v6(&payload, 0, false, &h6, 1280, &mut FragSink { frags: &mut f, out: &mut out }).unwrap();
+    let (mut seen, mut last_more) = (Vec::new(), true);
+    for p in f.iter(&out) {
+        let h = parse_v6(p).unwrap();
+        let fr = h.frag.unwrap();
+        assert_eq!((usize::from(fr.offset) * 8, fr.id), (seen.len(), 77));
+        last_more = fr.more;
+        seen.extend_from_slice(&p[48..]);
+    }
+    assert!(!last_more && seen == payload && f.count == 3);
+    // Bounds: misaligned base, output too small, too many packets.
+    assert_eq!(
+        split_v4(&payload, 3, false, &h4, 576, &mut FragSink { frags: &mut Frags::default(), out: &mut out }),
+        Err(XlatError::TooBig)
+    );
+    assert_eq!(
+        split_v4(&payload, 0, false, &h4, 576, &mut FragSink { frags: &mut Frags::default(), out: &mut [0u8; 100] }),
+        Err(XlatError::TooBig)
+    );
+    let mut f = Frags { count: MAX_OUT, ..Frags::default() };
+    assert_eq!(f.push(&mut out, 10), Err(XlatError::TooBig));
+}
+
+#[test]
+fn non_first_fragment_header_translation() {
+    // IPv6 non-first fragment -> IPv4: ID low 16 bits, offset, MF, DF=0.
+    let mut buf = vec![0u8; HEADROOM + 48 + 64];
+    let p = &mut buf[HEADROOM..];
+    write_v6_header(p, 0, 72, proto::FRAGMENT, 33, SUB, pfx().embed(SERVER4));
+    p[40] = proto::UDP;
+    put16(p, 42, (5 << 3) | 1);
+    put32(p, 44, 0xdead_beef);
+    p[48..].fill(0xaa);
+    let h = parse_v6(&buf[HEADROOM..]).unwrap();
+    let (s, l) = v6_frag_to_v4(&mut buf, HEADROOM, &h, POOL4, SERVER4, 1500).unwrap();
+    let h4 = parse_v4(&buf[s..s + l]).unwrap();
+    assert_eq!(h4.frag, Some(plat_packet::Frag { id: 0xbeef, offset: 5, more: true }));
+    assert_eq!((h4.src, h4.dst, h4.ttl, h4.df, l), (POOL4, SERVER4, 33, false, 84));
+    assert!(buf[s + 20..s + l].iter().all(|&b| b == 0xaa));
+    // Too big for the IPv4 MTU: the caller re-splits.
+    let mut buf2 = vec![0u8; HEADROOM + 48 + 64];
+    let h = {
+        let p = &mut buf2[HEADROOM..];
+        write_v6_header(p, 0, 72, proto::FRAGMENT, 33, SUB, pfx().embed(SERVER4));
+        p[40] = proto::UDP;
+        put16(p, 42, 5 << 3);
+        parse_v6(p).unwrap()
+    };
+    assert_eq!(v6_frag_to_v4(&mut buf2, HEADROOM, &h, POOL4, SERVER4, 60), Err(XlatError::TooBig));
+
+    // IPv4 non-first fragment -> IPv6 with a Fragment Header.
+    let mut buf = vec![0u8; HEADROOM + 20 + 1400];
+    write_v4_header(&mut buf[HEADROOM..], 0, 1420, 0x4321, false, false, 100, 50, proto::ICMP, SERVER4, POOL4);
+    let h = parse_v4(&buf[HEADROOM..]).unwrap();
+    let (src, dst) = (pfx().embed(SERVER4), SUB);
+    let (s, l) = v4_frag_to_v6(&mut buf, HEADROOM, &h, src, dst, 1500).unwrap();
+    let h6 = parse_v6(&buf[s..s + l]).unwrap();
+    assert_eq!((h6.proto, h6.frag), (proto::ICMPV6, Some(plat_packet::Frag { id: 0x4321, offset: 100, more: false })));
+    // At 1280 it is re-split; offsets continue from 800 bytes.
+    let pkt = buf[HEADROOM..HEADROOM + 1420].to_vec();
+    let mut out = vec![0u8; 4096];
+    let mut f = Frags::default();
+    v4_frag_to_v6_split(&pkt, &h, src, dst, 1280, &mut FragSink { frags: &mut f, out: &mut out }).unwrap();
+    let offs: Vec<(u16, bool)> =
+        f.iter(&out).map(|p| parse_v6(p).map(|h| h.frag.unwrap()).map(|x| (x.offset, x.more)).unwrap()).collect();
+    assert_eq!(offs, vec![(100, true), (100 + 154, false)]);
 }

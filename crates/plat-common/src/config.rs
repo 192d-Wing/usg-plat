@@ -488,6 +488,147 @@ pub struct TranslationConfig {
     /// - NIST 800-53: SC-7, SC-7(5) - deny by default at the boundary
     #[serde(default)]
     pub allow_non_global_destinations: bool,
+    /// ICMPv6/ICMPv4 Time Exceeded for packets arriving with Hop Limit/TTL
+    /// ≤ 1 (RFC 7915 §4.1/§5.1).
+    #[serde(default = "d_true")]
+    pub send_time_exceeded: bool,
+    /// ICMPv6 Destination Unreachable (Address Unreachable) to a subscriber
+    /// when no mapping can be created (RFC 6146 §3.5.1.1).
+    #[serde(default = "d_true")]
+    pub send_unreachable: bool,
+    /// ICMPv4 Host Unreachable / Communication Administratively Prohibited
+    /// to IPv4 remotes for inbound UDP/ICMP with no binding or refused by
+    /// filtering (RFC 6146 §3.5.2.2 SHOULD). Default `false`: a documented
+    /// deviation that keeps the pool from acting as a scanning oracle or
+    /// reflector (SC-5, SC-7).
+    #[serde(default)]
+    pub send_inbound_unreachable: bool,
+    /// ICMPv6 Parameter Problem for an active Routing header (RFC 7915 §5.1).
+    #[serde(default = "d_true")]
+    pub send_param_problem: bool,
+    /// ICMPv4 Source Route Failed for an unexpired LSRR/SSRR option
+    /// (RFC 7915 §4.1, RFC 1812 §5.2.4.1), only for packets the filter
+    /// would admit. Default `false`: source-routed packets are almost always
+    /// hostile, so they are dropped silently (SC-5, SC-7).
+    #[serde(default)]
+    pub send_source_route_failed: bool,
+    /// Source address of locally generated ICMPv6 errors (Time Exceeded,
+    /// Destination Unreachable, Packet Too Big, Parameter Problem). Unset:
+    /// the synthesized destination of the packet the error is about, so a
+    /// traceroute hop shows the IPv4 destination's mapped address. Must not
+    /// be inside a client prefix or the NAT64 prefix.
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - RFC 4443 §2.2 - errors sourced from an address of the translator
+    #[serde(default)]
+    pub icmp_source_v6: Option<std::net::Ipv6Addr>,
+    #[serde(default)]
+    pub fragments: FragmentsConfig,
+}
+
+/// Policy for fragmented IPv4 UDP datagrams with a zero checksum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UdpZeroChecksum {
+    /// Reassemble, compute the checksum, translate (RFC 7915 §4.5).
+    Reassemble,
+    /// Drop (RFC 7915 §4.5 allows it; `fragment` drop reason).
+    Drop,
+}
+
+/// Per-worker fragment handling limits (`[translation.fragments]`).
+///
+/// COMPLIANCE MAPPING:
+/// - NIST 800-53: SC-5 - every fragment structure is preallocated at
+///   worker start and bounded by these limits
+/// - RFC 6146 §3.4 - FRAGMENT_MIN (2 s) is the lowest accepted timeout
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FragmentsConfig {
+    /// Fragment-table entries per worker (rounded up to a power of two).
+    #[serde(default = "d_frag_entries")]
+    pub max_entries: u32,
+    #[serde(default = "d_frag_timeout")]
+    pub timeout_ms: u32,
+    #[serde(default = "d_frag_per_dgram")]
+    pub max_fragments_per_datagram: u16,
+    /// Out-of-order buffer slots (non-first fragments seen before their
+    /// first fragment); 0 disables buffering.
+    #[serde(default = "d_frag_buffered")]
+    pub max_buffered_fragments: u16,
+    #[serde(default = "d_frag_slot")]
+    pub buffer_slot_bytes: u16,
+    /// Concurrent reassemblies (fragmented ICMP and zero-checksum UDP); 0
+    /// drops those classes as `fragment`.
+    #[serde(default = "d_reasm_slots")]
+    pub reassembly_slots: u16,
+    #[serde(default = "d_reasm_bytes")]
+    pub max_reassembly_bytes: u32,
+    #[serde(default = "d_udp_zero")]
+    pub udp_zero_checksum: UdpZeroChecksum,
+}
+
+impl Default for FragmentsConfig {
+    fn default() -> Self {
+        Self {
+            max_entries: d_frag_entries(),
+            timeout_ms: d_frag_timeout(),
+            max_fragments_per_datagram: d_frag_per_dgram(),
+            max_buffered_fragments: d_frag_buffered(),
+            buffer_slot_bytes: d_frag_slot(),
+            reassembly_slots: d_reasm_slots(),
+            max_reassembly_bytes: d_reasm_bytes(),
+            udp_zero_checksum: d_udp_zero(),
+        }
+    }
+}
+
+/// Upper bound on one fragment-table entry, used for the memory estimate
+/// (the table asserts its entry fits).
+pub const FRAG_ENTRY_BYTES: u64 = 160;
+/// Bytes in front of and around each reassembly slot (headroom and the
+/// largest IPv4 header).
+pub const REASM_SLOT_OVERHEAD: u64 = 128;
+/// Ceiling on fragment memory per worker (SC-5).
+pub const MAX_FRAG_BYTES_PER_WORKER: u64 = 64 << 20;
+
+impl FragmentsConfig {
+    /// Entries after power-of-two rounding.
+    pub fn entries(&self) -> u32 {
+        self.max_entries.next_power_of_two()
+    }
+
+    /// Preallocated fragment memory per worker, in bytes.
+    pub fn memory_per_worker(&self) -> u64 {
+        u64::from(self.entries()) * FRAG_ENTRY_BYTES
+            + u64::from(self.max_buffered_fragments) * u64::from(self.buffer_slot_bytes)
+            + u64::from(self.reassembly_slots) * (u64::from(self.max_reassembly_bytes) + REASM_SLOT_OVERHEAD)
+    }
+}
+
+fn d_frag_entries() -> u32 {
+    4096
+}
+fn d_frag_timeout() -> u32 {
+    2000
+}
+fn d_frag_per_dgram() -> u16 {
+    64
+}
+fn d_frag_buffered() -> u16 {
+    64
+}
+fn d_frag_slot() -> u16 {
+    1536
+}
+fn d_reasm_slots() -> u16 {
+    4
+}
+fn d_reasm_bytes() -> u32 {
+    65535
+}
+fn d_udp_zero() -> UdpZeroChecksum {
+    UdpZeroChecksum::Reassemble
 }
 
 fn default_mtu() -> u16 {
@@ -1240,6 +1381,11 @@ impl Config {
         if t.icmp_errors_per_sec > 100_000 {
             return invalid("translation.icmp_errors_per_sec must be <= 100000");
         }
+        // SC-5: a quarter of the bucket is reserved for PMTU errors
+        // (see the engine token bucket); below 4 it would round to zero.
+        if (1..4).contains(&t.icmp_errors_per_sec) {
+            return invalid("translation.icmp_errors_per_sec must be 0 (off) or >= 4");
+        }
         // SC-7: a client prefix is a subscriber aggregate, never "everything",
         // and must not overlap the NAT64 prefix (which would let synthesized
         // addresses act as clients).
@@ -1251,6 +1397,23 @@ impl Config {
             let m = Ipv6Cidr::mask_of(common);
             if c.network() & m == t.nat64_prefix.network() & m {
                 return invalid(format!("translation.client_prefixes entry {c} overlaps nat64_prefix"));
+            }
+        }
+
+        if let Some(a) = t.icmp_source_v6 {
+            let v = u128::from(a);
+            if a.is_unspecified() || a.is_loopback() || a.is_multicast() {
+                return invalid("translation.icmp_source_v6 must be a unicast address");
+            }
+            // COMPLIANCE MAPPING:
+            // - NIST 800-53: SC-7 (Boundary Protection)
+            // - RFC 4291 §2.5.5.2/§2.5.6 - link-local and IPv4-mapped
+            //   addresses are not valid sources on the wire
+            if a.is_unicast_link_local() || a.to_ipv4_mapped().is_some() {
+                return invalid("translation.icmp_source_v6 must not be link-local or IPv4-mapped");
+            }
+            if t.nat64_prefix.contains(v) || t.client_prefixes.iter().any(|c| c.contains(v)) {
+                return invalid("translation.icmp_source_v6 must be outside nat64_prefix and client_prefixes");
             }
         }
 
@@ -1323,6 +1486,8 @@ impl Config {
         {
             return invalid(format!("timeouts must be <= {MAX_TIMEOUT_SECS} s"));
         }
+
+        self.validate_fragments()?;
 
         let a = &self.audit;
         if !(1024..=1 << 26).contains(&a.queue_capacity) {
@@ -1447,6 +1612,49 @@ impl Config {
             return invalid("nat64.block_cooldown_secs must be 120..=3600 (RFC 6888 REQ-12)");
         }
         self.validate_cluster()
+    }
+
+    /// `[translation.fragments]` ranges and the timeout ordering.
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: SC-5, CM-6 - bounded, validated fragment limits
+    /// - RFC 6146 §3.4 - fragment timeout at least FRAGMENT_MIN (2 s) and
+    ///   below the UDP/ICMP session timeouts, so a cached first-fragment
+    ///   mapping never outlives an idle session
+    fn validate_fragments(&self) -> Result<(), ConfigError> {
+        let f = &self.translation.fragments;
+        if !(64..=65536).contains(&f.max_entries) {
+            return invalid("translation.fragments.max_entries must be 64..=65536");
+        }
+        if !(2000..=60_000).contains(&f.timeout_ms) {
+            return invalid("translation.fragments.timeout_ms must be 2000..=60000 (RFC 6146 FRAGMENT_MIN)");
+        }
+        let min_session_ms = u64::from(self.timeouts.udp_secs.min(self.timeouts.icmp_secs)) * 1000;
+        if u64::from(f.timeout_ms) >= min_session_ms {
+            return invalid("translation.fragments.timeout_ms must be below timeouts.udp_secs and icmp_secs");
+        }
+        if !(2..=128).contains(&f.max_fragments_per_datagram) {
+            return invalid("translation.fragments.max_fragments_per_datagram must be 2..=128");
+        }
+        if f.max_buffered_fragments > 1024 {
+            return invalid("translation.fragments.max_buffered_fragments must be 0..=1024");
+        }
+        if !(1280..=9216).contains(&f.buffer_slot_bytes) {
+            return invalid("translation.fragments.buffer_slot_bytes must be 1280..=9216");
+        }
+        if f.reassembly_slots > 64 {
+            return invalid("translation.fragments.reassembly_slots must be 0..=64");
+        }
+        if !(1280..=65535).contains(&f.max_reassembly_bytes) {
+            return invalid("translation.fragments.max_reassembly_bytes must be 1280..=65535");
+        }
+        let mem = f.memory_per_worker();
+        if mem > MAX_FRAG_BYTES_PER_WORKER {
+            return invalid(format!(
+                "translation.fragments needs {mem} bytes per worker; maximum is {MAX_FRAG_BYTES_PER_WORKER}"
+            ));
+        }
+        Ok(())
     }
 
     /// Partition, member list, HA and steering rules.
@@ -1658,6 +1866,53 @@ mod tests {
     fn rejects_short_udp_timeout() {
         let bad = EXAMPLE.replace("udp_secs = 300", "udp_secs = 30");
         assert!(matches!(Config::from_toml(&bad), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn fragment_limits_are_validated() {
+        let c = Config::from_toml(EXAMPLE).unwrap();
+        let f = &c.translation.fragments;
+        assert_eq!((f.entries(), f.timeout_ms, f.udp_zero_checksum), (4096, 2000, UdpZeroChecksum::Reassemble));
+        assert!(f.memory_per_worker() < 2 << 20);
+        assert!(!c.translation.send_inbound_unreachable && c.translation.send_time_exceeded);
+        for (a, b) in [
+            ("max_entries = 4096", "max_entries = 63"),
+            ("max_entries = 4096", "max_entries = 65537"),
+            ("timeout_ms = 2000", "timeout_ms = 1999"),
+            ("timeout_ms = 2000", "timeout_ms = 60001"),
+            ("max_fragments_per_datagram = 64", "max_fragments_per_datagram = 1"),
+            ("max_fragments_per_datagram = 64", "max_fragments_per_datagram = 129"),
+            ("max_buffered_fragments = 64", "max_buffered_fragments = 1025"),
+            ("buffer_slot_bytes = 1536", "buffer_slot_bytes = 1279"),
+            ("buffer_slot_bytes = 1536", "buffer_slot_bytes = 9217"),
+            ("reassembly_slots = 4", "reassembly_slots = 65"),
+            ("max_reassembly_bytes = 65535", "max_reassembly_bytes = 1279"),
+            ("udp_zero_checksum = \"reassemble\"", "udp_zero_checksum = \"maybe\""),
+            ("udp_zero_checksum = \"reassemble\"", "udp_zero_checksum = \"drop\"\nbogus = 1"),
+        ] {
+            assert!(EXAMPLE.contains(a), "{a}");
+            assert!(Config::from_toml(&EXAMPLE.replace(a, b)).is_err(), "{b}");
+        }
+        // Boundaries accepted; 0 disables buffering / reassembly.
+        for (a, b) in [
+            ("max_entries = 4096", "max_entries = 65536"),
+            ("max_buffered_fragments = 64", "max_buffered_fragments = 0"),
+            ("reassembly_slots = 4", "reassembly_slots = 0"),
+            ("udp_zero_checksum = \"reassemble\"", "udp_zero_checksum = \"drop\""),
+        ] {
+            Config::from_toml(&EXAMPLE.replace(a, b)).unwrap();
+        }
+        // Timeout below the shortest session timeout (icmp 60 s).
+        assert!(Config::from_toml(&EXAMPLE.replace("timeout_ms = 2000", "timeout_ms = 60000")).is_err());
+        // Every key at its maximum still fits the per-worker ceiling, which
+        // stays as a backstop if a range is ever widened.
+        let big = EXAMPLE
+            .replace("reassembly_slots = 4", "reassembly_slots = 64")
+            .replace("max_buffered_fragments = 64", "max_buffered_fragments = 1024")
+            .replace("buffer_slot_bytes = 1536", "buffer_slot_bytes = 9216")
+            .replace("max_entries = 4096", "max_entries = 65536");
+        let m = Config::from_toml(&big).unwrap().translation.fragments.memory_per_worker();
+        assert!(m <= MAX_FRAG_BYTES_PER_WORKER && m > 20 << 20, "{m}");
     }
 
     #[test]

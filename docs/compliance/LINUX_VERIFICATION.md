@@ -64,6 +64,7 @@ each item.
 | L21 | Cluster HA rejoin, failback and growth (F5, F12) | CP-10, AU-12 | POAM-017(a), POAM-030 | PARTIAL (three-VM run, round 6). F5: A in sync after 833 ms, failback 63.2 s after rejoin, 8 release(handover) records, no `missteered` drops on the standby before failback, UDP max gap 50 ms; but 1/200 TCP flows lost and one flow gapped 26.8 s: the planned handover drops TCP state on the new owner (316 `tcp_no_state` on A in the minute after failback; sessions not replicated, POAM-007(1)/POAM-028). F12 grow: B serves 6/16 after 64.5 s, 6 handed over (6 in flight is the documented deviation POAM-017(a)), TCP 184/200 (92 %) for the same reason |
 | L22 | Cluster HA identity and config digest: duplicate id, digest mismatch (F6, F7) | IA-3, CM-6, AC-3 | POAM-017(c), POAM-032 | PASS (three-VM run, round 6). F6 impostor refused `duplicate_id` (witness), serves no slice; F7 digest mismatch refused and audited, no replication, `service_start` digests differ |
 | L23 | Cluster HA replication back-pressure and mis-steer (F8, F13) | SC-5, SI-4, SC-7 | POAM-017(b), POAM-029 | PASS (three-VM run, round 6). F8: worker rate within noise (3596 vs 3533 pps), no replication loss, B in sync. F13 fresh /64 (2001:db8:100:336b::/64): mis-steer counted and dropped (13), no block on the non-home node, in steady state and after a platd restart of that node |
+| L24 | Multiqueue TUN keeps every fragment of a datagram on one queue (Q2) | SC-5(2), SC-5 | POAM-035 | PASS (2026-10-29, performance review of `feat/protocol-completeness`): 0/64 IPv4 and 0/64 IPv6 datagrams split across 4 queues |
 
 ## Procedures, pass criteria and results
 
@@ -440,3 +441,22 @@ node as well; the result decides whether the target or `lease_ms` changes
 (POAM-007).
 
 Result: **NOT RUN.**
+
+### L24 — fragment steering on multiqueue TUN (POAM-035, Q2)
+
+- Fragment state is per worker (`crates/plat-nat64/src/frag.rs`). With a
+  4-queue TUN and default queue selection, send fragmented IPv4 and IPv6
+  datagrams into the TUN and record, for each datagram, whether all its
+  fragments were read from the same queue.
+- Pass: no datagram is split across queues. A split datagram would be
+  dropped as `fragment_unmatched` / `icmp_quote_unmatched` (fail closed).
+
+Result: **PASS** (2026-10-29, Lima VM `plat-linux`, kernel 6.8; performance
+reviewer of `feat/protocol-completeness`, run record
+`target/agent-workflow/protocol/findings-perf.md`, not in the repository):
+0 of 64 IPv4 and 0 of 64 IPv6 fragmented datagrams were split across the 4
+queues; the kernel selects the queue for fragments from the addresses only.
+The risk recorded in POAM-035 was not observed with default queue
+selection. Not covered: other queue-selection settings, other kernels and
+other I/O backends (AF_XDP, POAM-016); the harness used for the check is not
+in the repository.

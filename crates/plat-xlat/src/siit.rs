@@ -306,28 +306,180 @@ pub fn v4_to_v6(buf: &mut [u8], start: usize, h: &Ipv4Hdr, m: &Map6, mtu6: u16) 
     Ok((new_start, total))
 }
 
-/// Layout of the fragments written by [`v4_to_v6_fragments`]: `count`
-/// packets back to back, each `frag_len` bytes except the last
-/// (`last_len`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Upper bound on packets one [`Frags`] can describe: a 65535-byte IPv6
+/// datagram split for a 576-byte IPv4 MTU is 119 fragments.
+pub const MAX_OUT: usize = 128;
+
+/// Packets written back to back into a caller-owned output buffer (the
+/// worker's preallocated fragment area). `lens[i]` is the length of packet
+/// `i`; `used` the bytes written so far. Appending never allocates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Frags {
     pub count: usize,
-    pub frag_len: usize,
-    pub last_len: usize,
+    pub used: usize,
+    pub lens: [u16; MAX_OUT],
+}
+
+impl Default for Frags {
+    fn default() -> Self {
+        Self { count: 0, used: 0, lens: [0; MAX_OUT] }
+    }
+}
+
+impl Frags {
+    #[inline]
+    pub fn clear(&mut self) {
+        self.count = 0;
+        self.used = 0;
+    }
+
+    /// Reserves the next packet of `len` bytes in `out`.
+    pub fn push<'a>(&mut self, out: &'a mut [u8], len: usize) -> Result<&'a mut [u8], XlatError> {
+        if self.count == MAX_OUT || len > usize::from(u16::MAX) {
+            return Err(XlatError::TooBig);
+        }
+        let s = self.used;
+        let o = out.get_mut(s..s + len).ok_or(XlatError::TooBig)?;
+        self.lens[self.count] = len as u16;
+        self.count += 1;
+        self.used += len;
+        Ok(o)
+    }
+
+    /// Copies `pkt` in as the next packet.
+    pub fn push_copy(&mut self, out: &mut [u8], pkt: &[u8]) -> Result<(), XlatError> {
+        self.push(out, pkt.len())?.copy_from_slice(pkt);
+        Ok(())
+    }
+
+    /// The packets, in order.
+    pub fn iter<'a>(&self, out: &'a [u8]) -> impl Iterator<Item = &'a [u8]> + 'a {
+        let f = *self;
+        let mut s = 0usize;
+        (0..f.count).filter_map(move |i| {
+            let l = usize::from(f.lens[i]);
+            let p = out.get(s..s + l);
+            s += l;
+            p
+        })
+    }
+}
+
+/// Where translator-generated packets go: the layout and the buffer it
+/// describes (the worker's preallocated fragment area).
+#[derive(Debug)]
+pub struct FragSink<'a> {
+    pub frags: &'a mut Frags,
+    pub out: &'a mut [u8],
+}
+
+impl FragSink<'_> {
+    #[inline]
+    fn push(&mut self, len: usize) -> Result<&mut [u8], XlatError> {
+        self.frags.push(self.out, len)
+    }
 }
 
 /// Bytes of IPv6 + Fragment Header in front of each fragment.
 pub const FRAG6_HDR: usize = 48;
 
+/// IPv6 header fields shared by every fragment of one datagram.
+#[derive(Debug, Clone, Copy)]
+pub struct Hdr6 {
+    pub tc: u8,
+    pub hop: u8,
+    /// Upper-layer protocol (Fragment Header Next Header).
+    pub next: u8,
+    pub id: u32,
+    pub src: u128,
+    pub dst: u128,
+}
+
+/// IPv4 header fields shared by every fragment of one datagram.
+#[derive(Debug, Clone, Copy)]
+pub struct Hdr4 {
+    pub tos: u8,
+    pub ttl: u8,
+    pub proto: u8,
+    pub id: u16,
+    pub src: u32,
+    pub dst: u32,
+}
+
+/// Splits `payload` (the fragmentable part, starting `base` bytes into the
+/// original datagram; `base` is a multiple of 8) into IPv6 fragments of at
+/// most `max_len` bytes appended to `sink`. The last fragment's M
+/// flag is `more_last`.
+///
+/// COMPLIANCE MAPPING:
+/// - RFC 7915 §4.1 - Fragment Header fields (Identification, offset, M)
+pub fn split_v6(
+    payload: &[u8],
+    base: usize,
+    more_last: bool,
+    h: &Hdr6,
+    max_len: u16,
+    sink: &mut FragSink<'_>,
+) -> Result<(), XlatError> {
+    let chunk = usize::from(max_len).saturating_sub(FRAG6_HDR) & !7;
+    if chunk == 0 || !base.is_multiple_of(8) || base + payload.len() > 65535 {
+        return Err(XlatError::TooBig);
+    }
+    let count = payload.len().div_ceil(chunk).max(1);
+    for i in 0..count {
+        let off = i * chunk;
+        let len = chunk.min(payload.len() - off);
+        let more = i + 1 < count || more_last;
+        let f = sink.push(FRAG6_HDR + len)?;
+        write_v6_header(f, h.tc, (8 + len) as u16, proto::FRAGMENT, h.hop, h.src, h.dst);
+        f[40] = h.next;
+        f[41] = 0;
+        put16(f, 42, ((((base + off) / 8) as u16) << 3) | u16::from(more));
+        put32(f, 44, h.id);
+        f[FRAG6_HDR..].copy_from_slice(&payload[off..off + len]);
+    }
+    Ok(())
+}
+
+/// Splits `payload` into IPv4 fragments (DF=0) of at most `mtu4` bytes
+/// appended to `sink`; see [`split_v6`].
+///
+/// COMPLIANCE MAPPING:
+/// - RFC 7915 §5.1 - IPv6 packets of up to 1280 bytes are fragmented as
+///   IPv4 when the IPv4 MTU is smaller; fragments keep DF=0
+pub fn split_v4(
+    payload: &[u8],
+    base: usize,
+    more_last: bool,
+    h: &Hdr4,
+    mtu4: u16,
+    sink: &mut FragSink<'_>,
+) -> Result<(), XlatError> {
+    let chunk = usize::from(mtu4).saturating_sub(20) & !7;
+    if chunk == 0 || !base.is_multiple_of(8) || base + payload.len() > 65535 - 20 {
+        return Err(XlatError::TooBig);
+    }
+    let count = payload.len().div_ceil(chunk).max(1);
+    for i in 0..count {
+        let off = i * chunk;
+        let len = chunk.min(payload.len() - off);
+        let more = i + 1 < count || more_last;
+        let f = sink.push(20 + len)?;
+        let fo = ((base + off) / 8) as u16;
+        write_v4_header(f, h.tos, (20 + len) as u16, h.id, false, more, fo, h.ttl, h.proto, h.src, h.dst);
+        f[20..].copy_from_slice(&payload[off..off + len]);
+    }
+    Ok(())
+}
+
 /// Translates an IPv4 packet with DF=0 (or an IPv4 first fragment) to IPv6
-/// and splits it into IPv6 fragments of at most `max_len` bytes, written back
-/// to back into `out`. The transport checksum is updated over the whole
-/// datagram before splitting. The packet in `buf` is modified (transport
-/// header rewritten) but not moved.
+/// and splits it into IPv6 fragments of at most `max_len` bytes appended to
+/// `sink`. The transport checksum is updated over the whole datagram
+/// before splitting. The packet in `buf` is modified (transport header
+/// rewritten) but not moved.
 ///
 /// The Fragment Header Identification is the IPv4 Identification (high 16
-/// bits zero); offsets continue the IPv4 fragment's offset; the last
-/// fragment's M flag copies the IPv4 MF flag.
+/// bits zero); the last fragment's M flag copies the IPv4 MF flag.
 ///
 /// COMPLIANCE MAPPING:
 /// - RFC 7915 §4 - IPv4 packets with DF=0 that exceed lowest-ipv6-mtu are
@@ -338,38 +490,164 @@ pub fn v4_to_v6_fragments(
     h: &Ipv4Hdr,
     m: &Map6,
     max_len: u16,
-    out: &mut [u8],
-) -> Result<Frags, XlatError> {
+    sink: &mut FragSink<'_>,
+) -> Result<(), XlatError> {
     if h.frag.is_some_and(|f| !f.is_first()) {
         return Err(XlatError::NonFirstFragment);
     }
-    let chunk = usize::from(max_len).saturating_sub(FRAG6_HDR) & !7;
-    if chunk == 0 {
+    let l4_start = start + h.hdr_len;
+    let l4_len = h.payload_len();
+    let l4 = buf.get_mut(l4_start..l4_start + l4_len).ok_or(XlatError::Truncated)?;
+    let p6 = l4_4to6(l4, h, m, false)?;
+    let h6 = Hdr6 { tc: h.tos, hop: h.ttl, next: p6, id: u32::from(h.id), src: m.src, dst: m.dst };
+    split_v6(l4, 0, h.frag.is_some_and(|f| f.more), &h6, max_len, sink)
+}
+
+/// Translates an IPv6 packet (unfragmented, or a first fragment) to IPv4
+/// and splits it into IPv4 fragments of at most `mtu4` bytes, DF=0. The
+/// packet in `buf` is modified (transport header rewritten) but not moved.
+/// `ident` is used for an unfragmented packet; a fragment keeps the low 16
+/// bits of its Identification (RFC 7915 §5.1).
+///
+/// COMPLIANCE MAPPING:
+/// - RFC 7915 §5.1 - translator fragmentation of packets ≤ 1280 bytes
+pub fn v6_to_v4_fragments(
+    buf: &mut [u8],
+    start: usize,
+    h: &Ipv6Hdr,
+    m: &Map4,
+    ident: u16,
+    mtu4: u16,
+    sink: &mut FragSink<'_>,
+) -> Result<(), XlatError> {
+    if h.frag.is_some_and(|f| !f.is_first()) {
+        return Err(XlatError::NonFirstFragment);
+    }
+    let l4 = buf.get_mut(start + h.l4_off..start + h.total_len()).ok_or(XlatError::Truncated)?;
+    let p4 = l4_6to4(l4, h, m, false)?;
+    let (id, more) = match h.frag {
+        Some(f) => (f.id as u16, f.more),
+        None => (ident, false),
+    };
+    let h4 = Hdr4 { tos: h.traffic_class, ttl: h.hop_limit, proto: p4, id, src: m.src, dst: m.dst };
+    split_v4(l4, 0, more, &h4, mtu4, sink)
+}
+
+/// IPv4 protocol number for an IPv6 upper-layer protocol.
+#[inline]
+pub fn proto_6to4(p: u8) -> u8 {
+    if p == proto::ICMPV6 { proto::ICMP } else { p }
+}
+
+/// IPv6 upper-layer protocol for an IPv4 protocol number.
+#[inline]
+pub fn proto_4to6(p: u8) -> u8 {
+    if p == proto::ICMP { proto::ICMPV6 } else { p }
+}
+
+/// Header-only translation of an IPv6 **non-first** fragment to IPv4, in
+/// place: the payload (no transport header) is untouched. Returns the
+/// `(start, len)` of the IPv4 fragment, or `TooBig` when it exceeds `mtu4`
+/// (use [`v6_frag_to_v4_split`]).
+///
+/// COMPLIANCE MAPPING:
+/// - RFC 7915 §5.1 - Fragment Header → IPv4 Identification (low 16 bits),
+///   offset and MF; DF=0
+/// - RFC 6146 §3.4 - non-first fragments use the first fragment's mapping
+pub fn v6_frag_to_v4(
+    buf: &mut [u8],
+    start: usize,
+    h: &Ipv6Hdr,
+    src: u32,
+    dst: u32,
+    mtu4: u16,
+) -> Result<(usize, usize), XlatError> {
+    let f = h.frag.ok_or(XlatError::Untranslatable)?;
+    let total = 20 + h.l4_len();
+    if total > usize::from(mtu4) {
+        return Err(XlatError::TooBig);
+    }
+    let new_start = (start + h.l4_off).checked_sub(20).ok_or(XlatError::Headroom)?;
+    let hdr = buf.get_mut(new_start..new_start + 20).ok_or(XlatError::Truncated)?;
+    let p4 = proto_6to4(h.proto);
+    write_v4_header(
+        hdr,
+        h.traffic_class,
+        total as u16,
+        f.id as u16,
+        false,
+        f.more,
+        f.offset,
+        h.hop_limit,
+        p4,
+        src,
+        dst,
+    );
+    Ok((new_start, total))
+}
+
+/// [`v6_frag_to_v4`] for a fragment larger than `mtu4`: re-split into
+/// IPv4 fragments appended to `sink` (`pkt` is the IPv6 fragment).
+pub fn v6_frag_to_v4_split(
+    pkt: &[u8],
+    h: &Ipv6Hdr,
+    src: u32,
+    dst: u32,
+    mtu4: u16,
+    sink: &mut FragSink<'_>,
+) -> Result<(), XlatError> {
+    let f = h.frag.ok_or(XlatError::Untranslatable)?;
+    let payload = pkt.get(h.l4_off..h.total_len()).ok_or(XlatError::Truncated)?;
+    let h4 = Hdr4 { tos: h.traffic_class, ttl: h.hop_limit, proto: proto_6to4(h.proto), id: f.id as u16, src, dst };
+    split_v4(payload, usize::from(f.offset) * 8, f.more, &h4, mtu4, sink)
+}
+
+/// Header-only translation of an IPv4 **non-first** fragment to IPv6 with a
+/// Fragment Header, in place (the 48-byte header is written into the
+/// headroom). Returns `TooBig` when the result exceeds `max_len` (use
+/// [`v4_frag_to_v6_split`]).
+///
+/// COMPLIANCE MAPPING:
+/// - RFC 7915 §4.1 - IPv4 fragment → Fragment Header (Identification =
+///   IPv4 Identification, offset, M = MF); options dropped
+/// - RFC 6146 §3.4 - non-first fragments use the first fragment's mapping
+pub fn v4_frag_to_v6(
+    buf: &mut [u8],
+    start: usize,
+    h: &Ipv4Hdr,
+    src: u128,
+    dst: u128,
+    max_len: u16,
+) -> Result<(usize, usize), XlatError> {
+    let f = h.frag.ok_or(XlatError::Untranslatable)?;
+    let len = h.payload_len();
+    let total = FRAG6_HDR + len;
+    if total > usize::from(max_len) {
         return Err(XlatError::TooBig);
     }
     let l4_start = start + h.hdr_len;
-    let l4_len = h.payload_len();
-    let count = l4_len.div_ceil(chunk).max(1);
-    if count * FRAG6_HDR + l4_len > out.len() {
-        return Err(XlatError::TooBig);
-    }
-    let l4 = buf.get_mut(l4_start..l4_start + l4_len).ok_or(XlatError::Truncated)?;
-    let p6 = l4_4to6(l4, h, m, false)?;
-    let id = u32::from(h.id);
-    let more_last = h.frag.is_some_and(|f| f.more);
-    let mut o = 0;
-    for i in 0..count {
-        let off = i * chunk;
-        let len = chunk.min(l4_len - off);
-        let more = i + 1 < count || more_last;
-        let f = &mut out[o..o + FRAG6_HDR + len];
-        write_v6_header(f, h.tos, (8 + len) as u16, proto::FRAGMENT, h.ttl, m.src, m.dst);
-        f[40] = p6;
-        f[41] = 0;
-        put16(f, 42, (((off / 8) as u16) << 3) | u16::from(more));
-        put32(f, 44, id);
-        f[FRAG6_HDR..].copy_from_slice(&l4[off..off + len]);
-        o += FRAG6_HDR + len;
-    }
-    Ok(Frags { count, frag_len: FRAG6_HDR + chunk, last_len: FRAG6_HDR + (l4_len - (count - 1) * chunk) })
+    let new_start = l4_start.checked_sub(FRAG6_HDR).ok_or(XlatError::Headroom)?;
+    let o = buf.get_mut(new_start..l4_start).ok_or(XlatError::Truncated)?;
+    write_v6_header(o, h.tos, (8 + len) as u16, proto::FRAGMENT, h.ttl, src, dst);
+    o[40] = proto_4to6(h.proto);
+    o[41] = 0;
+    put16(o, 42, (f.offset << 3) | u16::from(f.more));
+    put32(o, 44, f.id);
+    Ok((new_start, total))
+}
+
+/// [`v4_frag_to_v6`] for a fragment larger than `max_len`: re-split into
+/// IPv6 fragments appended to `sink` (`pkt` is the IPv4 fragment).
+pub fn v4_frag_to_v6_split(
+    pkt: &[u8],
+    h: &Ipv4Hdr,
+    src: u128,
+    dst: u128,
+    max_len: u16,
+    sink: &mut FragSink<'_>,
+) -> Result<(), XlatError> {
+    let f = h.frag.ok_or(XlatError::Untranslatable)?;
+    let payload = pkt.get(h.hdr_len..h.total_len).ok_or(XlatError::Truncated)?;
+    let h6 = Hdr6 { tc: h.tos, hop: h.ttl, next: proto_4to6(h.proto), id: f.id, src, dst };
+    split_v6(payload, usize::from(f.offset) * 8, f.more, &h6, max_len, sink)
 }

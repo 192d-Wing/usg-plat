@@ -100,6 +100,82 @@ fn drain(n: &Node) -> Vec<ReplRecord> {
     v
 }
 
+/// SC-24: a slice fenced between the first and a later fragment drops the
+/// rest of the datagram in both directions (the stored mapping is never
+/// used once the slice is no longer served).
+#[test]
+fn fragments_respect_slice_fencing() {
+    use plat_packet::{put16, put32};
+    use plat_xlat::siit::{write_v4_header, write_v6_header};
+    let mut a = node(&[]);
+    start_all(&a);
+    let s = sub(1, 1);
+    let full = udp6(s, 1000, SERVER, 53, &[1; 200]);
+    let frag = |off: usize, len: usize, id: u32| {
+        let mut p = vec![0u8; 48 + len];
+        write_v6_header(&mut p, 0, (8 + len) as u16, proto::FRAGMENT, 64, s, synth(SERVER));
+        p[40] = proto::UDP;
+        put16(&mut p, 42, ((off / 8) as u16) << 3 | u16::from(off + len < 208));
+        put32(&mut p, 44, id);
+        p[48..].copy_from_slice(&full[40 + off..40 + off + len]);
+        p
+    };
+    let out = run(&mut a.fx, &frag(0, 104, 1)).unwrap();
+    let (v4, p4) = tuple4(&out);
+    // Inbound first fragment from the server, then fence.
+    let back = udp4(SERVER, 53, v4, p4, &[2; 200]);
+    let mut f1 = back[..20 + 104].to_vec();
+    write_v4_header(&mut f1, 0, 124, 9, false, true, 0, 64, proto::UDP, SERVER, v4);
+    let mut f2 = vec![0u8; 20 + 104];
+    write_v4_header(&mut f2, 0, 124, 9, false, false, 13, 64, proto::UDP, SERVER, v4);
+    f2[20..].copy_from_slice(&back[124..]);
+    assert!(run(&mut a.fx, &f1).is_ok());
+    a.fx.nat.state().fence_slice((v4 & 3) as u16);
+    assert_eq!(run_all(&mut a.fx, &frag(104, 104, 1)).unwrap_err(), DropReason::ClusterFenced);
+    assert_eq!(run_all(&mut a.fx, &f2).unwrap_err(), DropReason::ClusterFenced);
+}
+
+/// POAM-034 (accepted risk, documented behaviour): the fragment entry keeps
+/// the first fragment's mapping without a BIB generation. If the BIB is
+/// released and the slice served again within `timeout_ms`, the remaining
+/// fragments still use the old mapping; after `timeout_ms` they are not
+/// translated.
+#[test]
+fn poam_034_stale_fragment_mapping_within_timeout() {
+    use plat_packet::{put16, put32};
+    use plat_xlat::siit::write_v6_header;
+    let mut a = node(&[]);
+    start_all(&a);
+    let s = sub(1, 1);
+    let full = udp6(s, 1000, SERVER, 53, &[1; 300]);
+    let frag = |off: usize, len: usize, id: u32| {
+        let mut p = vec![0u8; 48 + len];
+        write_v6_header(&mut p, 0, (8 + len) as u16, proto::FRAGMENT, 64, s, synth(SERVER));
+        p[40] = proto::UDP;
+        put16(&mut p, 42, ((off / 8) as u16) << 3 | u16::from(off + len < 308));
+        put32(&mut p, 44, id);
+        p[48..].copy_from_slice(&full[40 + off..40 + off + len]);
+        p
+    };
+    let out = run(&mut a.fx, &frag(0, 104, 1)).unwrap();
+    let (v4, p4) = tuple4(&out);
+    let slice = (v4 & 3) as u16;
+    // Explicit release of the slice (handover): the BIB is gone.
+    a.fx.nat.state().release_slice(slice, Some(BlockReleaseReason::Handover));
+    assert!(a.fx.nat.state().lookup4(Key4 { proto: proto::UDP, addr: v4, port: p4 }).is_none());
+    // While fenced, the per-fragment slice check refuses it (SC-24).
+    assert_eq!(run_all(&mut a.fx, &frag(208, 100, 1)).unwrap_err(), DropReason::ClusterFenced);
+    // Served again within timeout_ms: the stale mapping is still used.
+    a.fx.nat.state().set_slice_state(slice, SliceState::Active);
+    let out = run(&mut a.fx, &frag(104, 104, 1)).unwrap();
+    let h = plat_packet::parse_v4(&out).unwrap();
+    assert_eq!(h.src, v4, "POAM-034: old mapping reused without a BIB");
+    // After timeout_ms the entry is gone: the last fragment is no longer
+    // translated (it is only held, waiting for a first fragment).
+    a.fx.clock.advance(Duration::from_millis(2_001));
+    assert!(run_all(&mut a.fx, &frag(208, 100, 1)).unwrap().is_empty());
+}
+
 #[test]
 fn fenced_slice_drops_and_never_allocates() {
     let mut a = node(&[]);
@@ -612,6 +688,9 @@ fn paired_subscribers_under_connection_load_get_reserved_blocks() {
             // four rounds.
             for f in 0..16u16 {
                 match run(&mut fx, &udp6(sub(n + 1, 1), 1000 + round * 16 + f, SERVER, 53, b"q")) {
+                    // max_blocks_per_subscriber reached: ICMPv6 Destination
+                    // Unreachable back to the subscriber (POAM-002).
+                    Ok(p) if p[0] >> 4 == 6 => {}
                     Ok(_) => ok[usize::from(n)] += 1,
                     Err(DropReason::PortExhausted) => refused += 1,
                     // max_blocks_per_subscriber reached: the goal.

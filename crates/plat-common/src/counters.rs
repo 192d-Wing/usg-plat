@@ -54,6 +54,24 @@ define_enum!(
         ClusterFenced => "cluster_fenced",
         // New subscriber homed on another node (`cluster.steering.mode = "drop"`).
         Missteered => "missteered",
+        // Fragments (RFC 6146 §3.4, translation.fragments): incomplete
+        // datagram expired; overlap or duplicate (RFC 5722); first fragment
+        // short of the transport header or IPv4 offset 1 TCP (RFC 1858,
+        // RFC 3128, RFC 7112); more than max_fragments_per_datagram.
+        FragmentTimeout => "fragment_timeout",
+        FragmentOverlap => "fragment_overlap",
+        FragmentTiny => "fragment_tiny",
+        FragmentTooMany => "fragment_too_many",
+        // No fragment-table entry could be made (every way of the set holds
+        // buffered data), or a pass-through entry was evicted.
+        FragmentTableFull => "fragment_table_full",
+        FragmentBufferFull => "fragment_buffer_full",
+        ReassemblyFull => "reassembly_full",
+        ReassemblyTooBig => "reassembly_too_big",
+        // Non-first fragment with no entry while buffering is off or full.
+        FragmentUnmatched => "fragment_unmatched",
+        // ICMP error quoting a non-first fragment this worker cannot map.
+        IcmpQuoteUnmatched => "icmp_quote_unmatched",
     }
 );
 
@@ -82,6 +100,17 @@ define_enum!(
         // Strict paired pooling refused: the subscriber's address is full
         // while other addresses have free blocks.
         PoolPairedExhausted => "pool_paired_exhausted",
+        FragmentsInV6 => "fragments_in_v6",
+        FragmentsInV4 => "fragments_in_v4",
+        // Non-first fragments translated with a first fragment's mapping.
+        FragmentsForwarded => "fragments_forwarded",
+        FragmentsBuffered => "fragments_buffered",
+        DatagramsReassembled => "datagrams_reassembled",
+        // IPv6 packets ≤ 1280 bytes fragmented as IPv4 (RFC 7915 §5.1).
+        FragmentedV6ToV4 => "fragmented_v6_to_v4",
+        IcmpTimeExceededSent => "icmp_time_exceeded_sent",
+        IcmpUnreachableSent => "icmp_unreachable_sent",
+        IcmpParamProblemSent => "icmp_param_problem_sent",
     }
 );
 
@@ -90,6 +119,9 @@ define_enum!(
 pub struct Counters {
     drops: [CachePadded<AtomicU64>; DropReason::COUNT],
     events: [CachePadded<AtomicU64>; Counter::COUNT],
+    /// Gauge: live fragment-table entries of this worker, written by the
+    /// worker once per housekeeping pass (`plat_fragment_entries`).
+    fragment_entries: CachePadded<AtomicU64>,
 }
 
 impl Default for Counters {
@@ -97,6 +129,7 @@ impl Default for Counters {
         Self {
             drops: std::array::from_fn(|_| CachePadded::new(AtomicU64::new(0))),
             events: std::array::from_fn(|_| CachePadded::new(AtomicU64::new(0))),
+            fragment_entries: CachePadded::new(AtomicU64::new(0)),
         }
     }
 }
@@ -123,6 +156,23 @@ impl Counters {
 
     pub fn get(&self, c: Counter) -> u64 {
         self.events[c as usize].load(Ordering::Relaxed)
+    }
+
+    /// Records `n` drops of one reason.
+    #[inline]
+    pub fn record_drops(&self, r: DropReason, n: u64) {
+        if n > 0 {
+            self.drops[r as usize].fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub fn set_fragment_entries(&self, n: u64) {
+        self.fragment_entries.store(n, Ordering::Relaxed);
+    }
+
+    pub fn fragment_entries(&self) -> u64 {
+        self.fragment_entries.load(Ordering::Relaxed)
     }
 }
 

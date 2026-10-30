@@ -53,6 +53,8 @@ pub fn render(s: &Sources) -> String {
         let v: u64 = s.workers.iter().map(|w| w.get(*c)).sum();
         let _ = writeln!(o, "# TYPE plat_{}_total counter\nplat_{}_total {v}", c.as_str(), c.as_str());
     }
+    let frag_entries: u64 = s.workers.iter().map(|w| w.fragment_entries()).sum();
+    let _ = writeln!(o, "# TYPE plat_fragment_entries gauge\nplat_fragment_entries {frag_entries}");
     for (i, w) in s.workers.iter().enumerate() {
         let _ = writeln!(o, "plat_worker_rx_packets_total{{worker=\"{i}\"}} {}", w.get(Counter::RxPackets));
     }
