@@ -416,6 +416,11 @@ fn join_replicate_takeover_rejoin_failback() {
         })
         .collect();
     assert_eq!(takeovers, a_slices, "{rs:?}");
+    // The counter is bumped at the end of the acquire path (after the hook),
+    // so it can trail `active()` by the last slice.
+    wait("takeover counter", Duration::from_secs(5), || {
+        b.h().shared.takeovers("takeover") - counted >= a_slices as u64
+    });
     assert_eq!(b.h().shared.takeovers("takeover") - counted, a_slices as u64);
     assert!(
         b.has(|e| matches!(e, Event::PortBlockAdopt { adopt, .. } if adopt.v4 == v4 && adopt.prev_owner == Some(0)))

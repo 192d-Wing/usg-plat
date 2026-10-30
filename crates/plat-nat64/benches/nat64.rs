@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use common::{Fx, config, fixture, fixture_q, l4_sum4, l4_sum6, run, run_all, sub, synth, udp4, udp6};
-use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use plat_audit::{AcquireReason, AuditSink};
 use plat_cluster::SliceMap;
 use plat_common::config::SteeringMode;
@@ -18,6 +18,7 @@ use plat_common::{Clock, Counters};
 use plat_nat64::{AdoptInput, AdoptMeta, ClusterSetup, Directory, Nat64, ReplHub, WorkerCtx};
 use plat_xlat::HEADROOM;
 use plat_xlat::siit::write_v4_header;
+use std::hint::black_box;
 
 fn bench(c: &mut Criterion) {
     let mut fx = fixture(&[]);
