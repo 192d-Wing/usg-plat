@@ -114,6 +114,19 @@ udp_zero_checksum = "reassemble"
 pool = ["192.0.2.0/24"]
 port_min = 1024
 port_max = 65535
+# Port blocks (RFC 7422): one allocate and one release record per block.
+# This /24 holds 126 blocks per address = 32 256 one-block subscribers.
+# If the pool is tight, smaller uniform blocks with the same maximum
+# (port_block_size x max_blocks_per_subscriber = 2048) serve more light
+# subscribers: 256 x 8 gives 64 512 (8 bits of in-block port randomness),
+# 128 x 16 gives 129 024 (7 bits), against 9 bits at 512. Fewer bits make
+# off-path spoofing (DNS poisoning, TCP RST injection) easier, so add pool
+# addresses first. Heavy subscribers write up to 4x the block records at
+# 128 x 16: re-size audit.queue_capacity and the log volume (max_bytes,
+# min_free_bytes) to match (AU-4). With HA scale
+# cluster.ha.reserve_ahead_blocks by the same factor. All cluster members
+# must change together (config digest). `platd check-config` prints the
+# numbers; see docs/performance.md "Port-block sizing".
 port_block_size = 512
 max_blocks_per_subscriber = 4
 subscriber_prefix_len = 64
