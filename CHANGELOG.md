@@ -4,6 +4,21 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 
 ## [Unreleased]
 
+### Pool sizing guidance
+
+- When the pool cannot give every subscriber one block, `platd check-config`
+  adds `hint:` lines naming smaller uniform layouts with the same maximum
+  ports per subscriber (e.g. 128 x 16 instead of 512 x 4: 129 024 instead of
+  32 256 one-block subscribers per /24) and their port randomness. New
+  `Nat64Config::capacity_with` helper.
+- With HA on, `check-config` warns when `port_block_size x
+  cluster.ha.reserve_ahead_blocks` is below 4 096 ports (the default
+  512 x 8). Warning only; exit codes, defaults, config schema and SIEM schema
+  are unchanged.
+- `docs/performance.md` "Port-block sizing" and the example config explain
+  the 512 x 4 / 256 x 8 / 128 x 16 trade-offs. New criterion group
+  `nat64_block_layout` (new-flow churn, 512 x 4 against 128 x 16).
+
 ### Pool capacity report
 
 - `platd check-config` prints the port-block capacity of this node's share

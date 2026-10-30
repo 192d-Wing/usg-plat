@@ -787,8 +787,12 @@ pub struct PoolCapacity {
 impl Nat64Config {
     /// Blocks per pool address (same arithmetic as `plat_nat64::pool`).
     pub fn blocks_per_addr(&self) -> u64 {
+        self.blocks_per_addr_with(self.port_block_size)
+    }
+
+    fn blocks_per_addr_with(&self, block_size: u16) -> u64 {
         let range = (u32::from(self.port_max) + 1).saturating_sub(u32::from(self.port_min));
-        u64::from((range / u32::from(self.port_block_size.max(1))).min(u32::from(u16::MAX)))
+        u64::from((range / u32::from(block_size.max(1))).min(u32::from(u16::MAX)))
     }
 
     /// Capacity of `owned_addrs` pool addresses (this node's share).
@@ -798,12 +802,27 @@ impl Nat64Config {
     ///   serve `max_subscribers` before `pool_exhausted` appears in service
     /// - RFC 6888 REQ-4, RFC 7422 - port-block sizing
     pub fn capacity(&self, owned_addrs: u64) -> PoolCapacity {
-        let total = owned_addrs.saturating_mul(self.blocks_per_addr());
+        self.capacity_with(self.port_block_size, self.max_blocks_per_subscriber, owned_addrs)
+    }
+
+    /// Capacity the same pool and port range would have with another block
+    /// layout, for the `check-config` sizing hint (e.g. 128 x 16 instead of
+    /// 512 x 4: same maximum ports per subscriber, 4x the one-block
+    /// subscribers). Pure arithmetic; the layout is not validated.
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: CM-6, SC-5 (planning support only, no enforcement;
+    ///   SC-5 is enforced by the pool limits and `State::admit_session`) -
+    ///   capacity planning guidance
+    /// - RFC 6888 REQ-4, RFC 7422 - port-block sizing
+    pub fn capacity_with(&self, block_size: u16, max_blocks: u16, owned_addrs: u64) -> PoolCapacity {
+        let per_addr = self.blocks_per_addr_with(block_size);
+        let total = owned_addrs.saturating_mul(per_addr);
         PoolCapacity {
-            blocks_per_addr: self.blocks_per_addr(),
+            blocks_per_addr: per_addr,
             total_blocks: total,
             subscribers_at_one_block: total,
-            subscribers_at_max_blocks: total / u64::from(self.max_blocks_per_subscriber.max(1)),
+            subscribers_at_max_blocks: total / u64::from(max_blocks.max(1)),
         }
     }
 }
@@ -2026,6 +2045,20 @@ mod tests {
         assert_eq!(c.nat64.capacity(0).total_blocks, 0);
         let whole = Config::from_toml(&EXAMPLE.replace("port_block_size = 512", "port_block_size = 64512")).unwrap();
         assert_eq!(whole.nat64.capacity(1).subscribers_at_max_blocks, 0);
+    }
+
+    #[test]
+    fn pool_capacity_alternative_layouts() {
+        // Same 2048 ports per subscriber at the maximum; smaller blocks serve
+        // more one-block subscribers on the same /24.
+        let n = Config::from_toml(EXAMPLE).unwrap().nat64;
+        assert_eq!(n.capacity_with(512, 4, 256), n.capacity(256));
+        for (size, max, per_addr, one) in [(512, 4, 126, 32_256), (256, 8, 252, 64_512), (128, 16, 504, 129_024)] {
+            let c = n.capacity_with(size, max, 256);
+            assert_eq!((c.blocks_per_addr, c.subscribers_at_one_block), (per_addr, one), "{size}x{max}");
+            assert_eq!(c.subscribers_at_max_blocks, 8064, "{size}x{max}");
+        }
+        assert_eq!(n.capacity_with(0, 0, 1).blocks_per_addr, 64_512);
     }
 
     #[test]
