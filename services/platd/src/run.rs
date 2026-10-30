@@ -90,13 +90,32 @@ pub fn worker<Q: PacketQueue>(
     }
 }
 
+/// Start-up memory check (Linux; cgroup v2 and RAM read from the fixed
+/// kernel paths). Fails closed: an OOM kill drops every mapping without
+/// release records, which is worse than a refused start.
+#[cfg(target_os = "linux")]
+fn memory_gate(cfg: &Config, workers: usize) -> Result<(), String> {
+    use plat_common::memory;
+    let req = memory::required_bytes(cfg, workers);
+    let limits = memory::HostLimits::read(
+        std::path::Path::new("/proc"),
+        std::path::Path::new("/sys/fs/cgroup"),
+        std::path::Path::new("/sys/devices/system/node"),
+    )?;
+    memory::check(req, limits)?;
+    tracing::info!(required = req, cgroup_max = ?limits.cgroup_max, ram = ?limits.ram, "memory sizing OK");
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn memory_gate(_cfg: &Config, _workers: usize) -> Result<(), String> {
+    Ok(())
+}
+
 /// `dataplane.workers = 0`: one worker per CPU, leaving one CPU for the
 /// logger, sweeper, clock and kernel TUN work (at least one worker).
 fn worker_count(cfg: &Config) -> usize {
-    match cfg.dataplane.workers {
-        0 => std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(1).max(1)),
-        n => n,
-    }
+    plat_common::memory::worker_count(cfg)
 }
 
 /// Emits the stop record and waits for the logger to drain (NIST 800-53
@@ -223,6 +242,12 @@ pub fn run(cfg: Config) -> ExitCode {
     // SC-7(5), AC-4 (POAM-024): cross-node hairpin only behind the host
     // pool-source guard; fail closed before anything is started.
     if let Err(e) = crate::hairpin_guard::check(&cfg, std::path::Path::new(crate::hairpin_guard::SNAPSHOT)) {
+        tracing::error!("{e}");
+        return ExitCode::FAILURE;
+    }
+    // SC-5, CP-10 (POAM-021): refuse a config that cannot fit the cgroup
+    // memory.max or 90 % of RAM, rather than be OOM-killed under load.
+    if let Err(e) = memory_gate(&cfg, n) {
         tracing::error!("{e}");
         return ExitCode::FAILURE;
     }

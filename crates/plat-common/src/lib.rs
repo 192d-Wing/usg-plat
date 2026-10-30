@@ -4,6 +4,7 @@
 pub mod clock;
 pub mod config;
 pub mod counters;
+pub mod memory;
 pub mod net;
 
 pub use clock::Clock;

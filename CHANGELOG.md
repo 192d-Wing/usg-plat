@@ -4,6 +4,19 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 
 ## [Unreleased]
 
+### Memory sizing checked against the config (branch `fix/poam-021`)
+
+Closes POAM-021. SIEM schema unchanged.
+
+- `platd check-config` prints the memory the configuration needs
+  (sessions × 800 B + audit queue × 64 B + fragment memory per worker +
+  HA replication rings + 256 MiB); `--format env` adds
+  `PLAT_MEMORY_REQUIRED_BYTES`. The text format warns when the installed
+  unit's (or `--unit <file>`'s) `MemoryMax` is lower.
+- **Behaviour change:** `platd run` on Linux refuses to start when that
+  requirement exceeds its cgroup v2 `memory.max` or 90 % of RAM, or when RAM
+  cannot be determined. Raise `MemoryMax` or lower the limits.
+
 ### Review fixes for POAM-020/024/013 (branch `fix/poams-020-024-013`)
 
 - The cluster configuration digest now also covers

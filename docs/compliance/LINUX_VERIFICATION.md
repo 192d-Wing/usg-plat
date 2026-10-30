@@ -189,6 +189,12 @@ Result: PASS (run 2). 4 M sessions configured, 5 workers, queue 1 048 576:
 count, about 14 % above the measurement. `MemoryMax=8G` equalled the VM's
 RAM, so it was not a backstop on this host (POAM-021).
 
+Since `fix/poam-021` (not yet re-run on Linux): `platd run` reads its cgroup
+v2 `memory.max` and RAM and refuses to start when the configured requirement
+(formula above plus fragment and HA ring memory) exceeds `memory.max` or 90 %
+of RAM. Re-run check: with `MemoryMax=1G` and the example config the start
+fails with a `memory.max` error; with 8G it starts and logs `memory sizing OK`.
+
 ### L10 — two-node cluster
 
 - Two nodes with `cluster.node_count = 2`: each routes only its own `/25` of
