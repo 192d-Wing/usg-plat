@@ -4,6 +4,26 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 
 ## [Unreleased]
 
+### Audit free-space threshold on by default (branch `fix/poam-020`)
+
+Closes POAM-020. SIEM schema unchanged.
+
+#### Breaking
+
+- `audit.file.min_free_bytes` must be at least 1048576; an explicit `0`
+  (formerly "disabled") fails validation. When `[audit.file]` omits it, it
+  defaults to max(2 × `max_bytes`, 1 GiB) instead of 0.
+
+#### Changed
+
+- `check-config` (text) prints `audit file min_free_bytes: <n> (AU-5(1))`.
+
+#### Compliance
+
+- AU-5(1) and the FAU_STG.4 row are Implemented; CM-6 secure default
+  caveat removed. Tests: `config_edges.rs::audit_edges`,
+  `qa_check_config.rs::exit_codes_basic`.
+
 ### Protocol completeness (branch `feat/protocol-completeness`)
 
 Stacked on `feat/cluster-ha`. Closes POAM-001, POAM-002, POAM-011 and

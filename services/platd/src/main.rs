@@ -236,6 +236,9 @@ fn main() -> ExitCode {
                     println!("  range {} - {}", Ipv4Addr::from(*a), Ipv4Addr::from(*b));
                 }
                 println!("fragment memory per worker: {} bytes (SC-5)", cfg.translation.fragments.memory_per_worker());
+                if let Some(f) = cfg.audit.file.as_ref() {
+                    println!("audit file min_free_bytes: {} (AU-5(1))", f.min_free_bytes);
+                }
                 print!("{}", cluster::summary(&cfg));
                 match tls_summary(&cfg) {
                     Ok(t) => {

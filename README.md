@@ -194,6 +194,12 @@ Configuration changes to note when upgrading from an earlier build:
   certificates may be 0644.
 - TLS syslog collectors must support TLS 1.3 (RFC 5425 TLS 1.2 is not
   offered).
+- **Breaking (POAM-020):** `audit.file.min_free_bytes = 0` (and any value
+  below 1048576) is refused; the storage-capacity warning (AU-5(1)) can no
+  longer be disabled. Remove the key to get the default, max(2 ×
+  `max_bytes`, 1 GiB), or set a value ≥ 1 MiB. Configs that omitted it now
+  get that default: the volume needs that much free space or new bindings
+  are refused. `check-config` prints the effective value.
 - Fragments and ICMP generation (branch `feat/protocol-completeness`,
   unreleased):
   - **Breaking:** `translation.icmp_errors_per_sec` must be 0 or at least 4

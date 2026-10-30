@@ -841,35 +841,62 @@ fn d_summary() -> u64 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "RawAuditFileConfig")]
 pub struct AuditFileConfig {
     pub path: PathBuf,
-    #[serde(default = "d_max_bytes")]
     pub max_bytes: u64,
     /// Rotated files kept next to the live file (`<path>.<µs>`); the oldest
     /// are deleted beyond this. 0 keeps every file (archive externally).
     ///
     /// COMPLIANCE MAPPING:
     /// - NIST 800-53: AU-4 (Audit Log Storage Capacity), AU-11 (Retention)
-    #[serde(default)]
     pub max_files: u32,
     /// Free space (bytes) the log volume must keep. Below it the pipeline
     /// is degraded (new bindings refused under `refuse_new_bindings`,
     /// `/healthz` 503) and an `audit_storage_threshold` record is written,
-    /// while records keep being written. 0 disables the check. If free
-    /// space cannot be determined (`statvfs` fails), the check fails closed
-    /// the same way (state `unknown`).
+    /// while records keep being written. If free space cannot be determined
+    /// (`statvfs` fails), the check fails closed the same way (state
+    /// `unknown`). When omitted it defaults to
+    /// [`default_min_free_bytes`]; an explicit 0 is refused by validation
+    /// (the warning cannot be switched off).
     ///
     /// COMPLIANCE MAPPING:
-    /// - NIST 800-53: AU-5(1) (Storage Capacity Warning), AU-4
-    // POAM: POAM-020 defaults to 0 (storage-capacity warning off); the SSP
-    // must require a non-zero value.
-    #[serde(default)]
+    /// - NIST 800-53: AU-5(1) (Storage Capacity Warning), AU-4, CM-6
     pub min_free_bytes: u64,
+}
+
+/// On-disk form of [`AuditFileConfig`]: `min_free_bytes` stays optional so
+/// its default can depend on `max_bytes`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAuditFileConfig {
+    path: PathBuf,
+    #[serde(default = "d_max_bytes")]
+    max_bytes: u64,
+    #[serde(default)]
+    max_files: u32,
+    #[serde(default)]
+    min_free_bytes: Option<u64>,
+}
+
+impl From<RawAuditFileConfig> for AuditFileConfig {
+    fn from(r: RawAuditFileConfig) -> Self {
+        let min_free_bytes = r.min_free_bytes.unwrap_or_else(|| default_min_free_bytes(r.max_bytes));
+        Self { path: r.path, max_bytes: r.max_bytes, max_files: r.max_files, min_free_bytes }
+    }
 }
 
 fn d_max_bytes() -> u64 {
     1 << 30
+}
+
+/// Default `audit.file.min_free_bytes`: max(2 × `max_bytes`, 1 GiB), so one
+/// full rotation still fits after the warning fires (saturating).
+///
+/// COMPLIANCE MAPPING:
+/// - NIST 800-53: AU-5(1) (Storage Capacity Warning) - on by default
+pub fn default_min_free_bytes(max_bytes: u64) -> u64 {
+    max_bytes.saturating_mul(2).max(1 << 30)
 }
 
 /// Largest accepted `audit.file.max_files`.
@@ -1512,8 +1539,9 @@ impl Config {
         if a.file.as_ref().is_some_and(|f| f.max_files > MAX_AUDIT_FILES) {
             return invalid(format!("audit.file.max_files must be 0 (keep all) or 1..={MAX_AUDIT_FILES}"));
         }
-        if a.file.as_ref().is_some_and(|f| f.min_free_bytes != 0 && f.min_free_bytes < MIN_FILE_BYTES) {
-            return invalid("audit.file.min_free_bytes must be 0 (disabled) or >= 1048576");
+        if a.file.as_ref().is_some_and(|f| f.min_free_bytes < MIN_FILE_BYTES) {
+            // AU-5(1): the storage-capacity warning cannot be disabled.
+            return invalid("audit.file.min_free_bytes must be >= 1048576 (0 is refused; omit it for the default)");
         }
         // RFC 5424 §6.2.5 APP-NAME: 1*48PRINTUSASCII.
         for sl in &a.syslog {

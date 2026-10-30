@@ -538,7 +538,7 @@ mod tests {
         let text = include_str!("../../../config/platd.example.toml")
             .replace("/var/log/plat/nat64-audit.jsonl", &dir.join("audit.jsonl").display().to_string())
             .replace("queue_capacity = 1048576", "queue_capacity = 4096")
-            .replace("min_free_bytes = 2147483648", "min_free_bytes = 0")
+            .replace("min_free_bytes = 2147483648", "min_free_bytes = 1048576")
             .replace("interface = \"plat0\"", "interface = \"plat0-name-longer-than-ifnamsiz\"")
             .replace("[[audit.syslog]]\naddress = \"198.51.100.10:514\"\ntransport = \"udp\"\nformat = \"json\"\napp_name = \"platd\"\n", "")
             .replace("# [management.tls]", extra);

@@ -155,8 +155,10 @@ max_bytes = 1073741824
 max_files = 0
 # AU-5(1): when the log volume has less free space than this, write an
 # audit_storage_threshold record, report /healthz 503 and refuse new
-# bindings (existing ones keep being logged). 0 disables. Keep it above
-# max_bytes plus a few minutes of peak record volume.
+# bindings (existing ones keep being logged). Must be >= 1048576; 0 is
+# refused (the warning cannot be disabled). When omitted it defaults to
+# max(2 x max_bytes, 1 GiB). Keep it above max_bytes plus a few minutes of
+# peak record volume.
 min_free_bytes = 2147483648
 
 [[audit.syslog]]
