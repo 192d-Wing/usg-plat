@@ -49,7 +49,7 @@ pub fn fips_gate(cfg: &Config) -> Result<FipsMark, String> {
     Ok(FipsMark { active, provider: st.provider })
 }
 
-const ROLES: usize = 2;
+const ROLES: usize = 4;
 const STATUSES: usize = 5;
 const SOURCES: usize = 7;
 
@@ -57,13 +57,15 @@ fn role_ix(r: Role) -> usize {
     match r {
         Role::MgmtClient => 0,
         Role::SyslogServer => 1,
+        Role::PeerClient => 2,
+        Role::PeerServer => 3,
     }
 }
 
 const STATUS_NAMES: [&str; STATUSES] = ["good", "revoked", "unavailable", "fatal", "not_checked"];
 const SOURCE_NAMES: [&str; SOURCES] =
     ["ocsp_stapled", "ocsp_cache", "ocsp_fetch", "crl_cache", "crl_fetch", "crl_file", "none"];
-const ROLE_NAMES: [&str; ROLES] = ["mgmt_client", "syslog_server"];
+const ROLE_NAMES: [&str; ROLES] = ["mgmt_client", "syslog_server", "cluster_peer_client", "cluster_peer_server"];
 
 fn status_ix(s: RecordStatus) -> usize {
     match s {
@@ -203,6 +205,8 @@ pub struct TlsRuntime {
     pub hook: RevocationHook,
     pub metrics: Arc<RevocationMetrics>,
     pub mgmt: Option<MgmtTls>,
+    /// Cluster peer channel (`[cluster.ha.tls]`), both roles.
+    pub peer: Option<plat_tls::PeerConfigs>,
     pub mgmt_stats: Arc<MgmtStats>,
     pub limiter: Arc<RejectLimiter>,
     /// `(role, file, notAfter)` for `plat_tls_cert_expiry_seconds`.
@@ -262,6 +266,7 @@ pub fn prepare(cfg: &Config, sink: &HookSink) -> Result<TlsRuntime, String> {
         hook: hook.clone(),
         metrics: metrics.clone(),
         mgmt: None,
+        peer: None,
         mgmt_stats: Arc::new(MgmtStats::default()),
         limiter,
         expiry: Vec::new(),
@@ -292,6 +297,19 @@ pub fn prepare(cfg: &Config, sink: &HookSink) -> Result<TlsRuntime, String> {
             max_per_ip: usize::try_from(t.max_connections_per_ip).unwrap_or(1),
             handshake_timeout: Duration::from_millis(t.handshake_timeout_ms),
         });
+    }
+    // SC-8, IA-3: the cluster peer channel. A `[cluster.ha.tls.revocation]`
+    // override gets its own checker (same audit hook).
+    if let Some(h) = cfg.cluster.ha_active() {
+        let rev = match &h.tls.revocation {
+            Some(r) => RevocationChecker::new(RevocationSettings::from(r), rt.hook.clone())
+                .map_err(|e| format!("cluster.ha.tls.revocation: {e}"))?,
+            None => checker.clone(),
+        };
+        let settings = plat_tls::PeerSettings::from_config(&h.tls, cfg.tls.pq_hybrid, Some(rev));
+        rt.peer = Some(plat_tls::peer_configs(&settings).map_err(|e| format!("cluster.ha.tls: {e}"))?);
+        let (_, exp) = first_cert_expiry(&h.tls.cert_file).map_err(|e| format!("cluster.ha.tls: {e}"))?;
+        rt.expiry.push(("cluster_peer", file_label(&h.tls.cert_file), exp));
     }
     for s in cfg.audit.syslog.iter().filter(|s| s.transport == SyslogTransport::Tls) {
         if let Some(c) = s.tls.as_ref().and_then(|t| t.cert_file.as_ref()) {
@@ -481,6 +499,16 @@ pub fn summary(cfg: &Config) -> Result<String, String> {
                 "audit.syslog {}: revocation override has its own caches and no background refresher",
                 s.address
             ));
+            describe_revocation(&mut o, &mut warn, r, "    ");
+        }
+    }
+    if let Some(h) = cfg.cluster.ha_active() {
+        let _ = writeln!(o, "  cluster peers: mTLS {}, {} member(s)", h.listen, cfg.cluster.members.len());
+        let settings = plat_tls::PeerSettings::from_config(&h.tls, cfg.tls.pq_hybrid, None);
+        plat_tls::peer_configs(&settings).map_err(|e| format!("cluster.ha.tls: {e}"))?;
+        describe_cert(&mut o, &mut warn, "peer certificate", &h.tls.cert_file, now)?;
+        describe_cert(&mut o, &mut warn, "cluster CA", &h.tls.ca_file, now)?;
+        if let Some(r) = &h.tls.revocation {
             describe_revocation(&mut o, &mut warn, r, "    ");
         }
     }

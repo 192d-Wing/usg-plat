@@ -30,6 +30,16 @@ pub struct Sources {
     /// FIPS module active (`plat_fips_mode`, SC-13).
     pub fips: bool,
     pub extra: Vec<Section>,
+    /// `[cluster.ha]`: the `/cluster` view and the cluster health check.
+    pub cluster: Option<ClusterSource>,
+}
+
+/// Read-only cluster status for `/cluster` and `/healthz`.
+pub struct ClusterSource {
+    /// JSON view (`/cluster`).
+    pub json: Box<dyn Fn() -> String + Send + Sync>,
+    /// A problem that makes `/healthz` 503 (duplicate member id).
+    pub health: Box<dyn Fn() -> Option<&'static str> + Send + Sync>,
 }
 
 pub fn render(s: &Sources) -> String {
@@ -164,7 +174,19 @@ pub fn route(line: &str, src: &Sources) -> (MgmtPath, &'static str, String) {
         (MgmtPath::Metrics, "200 OK", render(src))
     } else if line.starts_with("GET /healthz ") {
         let (code, body) = health(&src.audit);
-        (MgmtPath::Healthz, code, body)
+        match src.cluster.as_ref().and_then(|c| (c.health)()) {
+            Some(p) if code.starts_with("200") => {
+                (MgmtPath::Healthz, "503 Service Unavailable", format!("unhealthy: {p}\n"))
+            }
+            Some(p) => (MgmtPath::Healthz, code, format!("{}, {p}\n", body.trim_end())),
+            None => (MgmtPath::Healthz, code, body),
+        }
+    } else if line.starts_with("GET /cluster ")
+        && let Some(c) = &src.cluster
+    {
+        // CM-7: read-only; same listener rules as /metrics (mTLS or
+        // loopback plaintext).
+        (MgmtPath::Cluster, "200 OK", (c.json)())
     } else {
         (MgmtPath::Other, "404 Not Found", String::new())
     }
@@ -237,7 +259,7 @@ mod tests {
     use plat_audit::{Event, LifecycleKind};
 
     fn ev() -> Event {
-        Event::Lifecycle { ts_us: 0, kind: LifecycleKind::Start, fips: None }
+        Event::Lifecycle { ts_us: 0, kind: LifecycleKind::Start, fips: None, cluster: None }
     }
 
     #[test]

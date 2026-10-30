@@ -197,6 +197,143 @@ Configuration changes to note when upgrading from an earlier build:
 
 <!-- --8<-- [end:quickstart] -->
 
+## Cluster and HA install
+
+Two or more translators can share one pool with per-slice failover
+(`partition = "slices"`, `[cluster.ha]`; see `ARCHITECTURE.md`). HA is off by
+default. On every node, after the single-node install above:
+
+```bash
+# Hooks: root-owned, not group/world-writable (platd refuses them otherwise).
+sudo install -D -m 0755 -o root -g root deploy/hooks/frr-announce.sh /usr/libexec/plat/frr-announce.sh
+sudo install -D -m 0755 -o root -g root deploy/hooks/frr-withdraw.sh /usr/libexec/plat/frr-withdraw.sh
+sudo usermod -aG frrvty plat          # the example hooks call vtysh as plat
+sudo install -d -m 0700 -o plat -g plat /var/lib/plat/cluster   # cluster.ha.state_dir
+# Peer certificate, key and CA (the key root:plat 0640, as for the other TLS keys).
+sudo install -D -m 0644 cluster.crt /etc/plat/tls/cluster.crt
+sudo install -D -m 0640 -o root -g plat cluster.key /etc/plat/tls/cluster.key
+sudo install -D -m 0644 ca.crt /etc/plat/tls/ca.crt
+platd check-config -c /etc/plat/platd.toml   # prints the slice table and this node's primary/backup slices
+```
+
+- **Peer certificates** are used both to accept and to dial peers (mutual
+  TLS), so each node and witness certificate needs **both the `serverAuth`
+  and `clientAuth` extended key usages**, and a SAN matching its
+  `identity` (e.g. `dns:plat-1.cluster.example`). Every member must have the
+  same `[cluster]` and pool settings: a different configuration digest is
+  refused (`digest_mismatch`), and so is a second node with the same id
+  (`duplicate_id`: a second connection for a live id, a peer claiming the
+  receiver's own id, or a claim of a connected member's id with another
+  member's certificate or from another address; `/healthz` reports degraded
+  for 60 s on the node that refused it).
+- **Witness**: a two-node cluster needs a third voter for automatic failover.
+  Run `platd witness` (same binary, own mTLS certificate, votes only, holds no
+  state) on a small third host and set `cluster.ha.witness`. Its file needs an
+  `[audit]` section with a file or syslog destination (it refuses to start
+  without one). Without a
+  witness, `auto_failover` is forced off: state is still replicated, and a
+  takeover needs the operator. Clusters of three or more members use a
+  majority of members.
+- **Hooks**: platd does not speak BGP. On acquire it runs
+  `hooks.announce <slice-cidr> <epoch> <reason>`, on release
+  `hooks.withdraw` with the same arguments (exec'd with argv, serialized, in
+  its own process group, which is killed as a whole after `hook_timeout_ms`),
+  and each run is audited as `cluster_hook`. The hook and every directory
+  above it must be owned by root (or the plat user) and not group- or
+  world-writable; this is checked at start and again before each run.
+  The example hooks drive FRR (`network <cidr>`; FRR needs one `router bgp`
+  and `no bgp network import-check`) and also maintain
+  `<state_dir>/announce.d/<a.b.c.d_len>` for bird/exabgp. Exit codes: 0 ok,
+  64 bad arguments, 69 vtysh or `router bgp` missing, 73 announce file error,
+  75 vtysh refused. A failing hook leaves the slice active; alert on
+  `plat_cluster_hook_failures_total`. Use BFD on the BGP sessions so a
+  crashed node's routes go away within about a second.
+- **IPv6 prefix announcement (tie it to platd and slice ownership)**: the
+  NAT64 IPv6 prefix (e.g. `64:ff9b:1::/96`) must not stay announced from a
+  node whose platd is down, or ECMP keeps sending that node its share of
+  subscribers (BGP and BFD stay up when only platd dies). With HA it must
+  also not be announced by a node that owns no slice (a restarted or
+  rejoining standby waiting for failback), which would drop that share as
+  `missteered`/`wrong_node` (D-2). Do not use a static FRR `network` for it.
+  Install the shipped helper and drop-ins instead:
+
+  ```bash
+  sudo install -D -m 0755 -o root -g root deploy/systemd/plat-v6-announce.sh /usr/libexec/plat/plat-v6-announce.sh
+  # PLAT_V6_MODE=cluster with [cluster.ha]; omit (standalone) otherwise.
+  # PLAT_STATE_DIR only if cluster.ha.state_dir is not /var/lib/plat/cluster.
+  printf 'PLAT_BGP_ASN=64513\nPLAT_NAT64_PREFIX=64:ff9b:1::/96\nPLAT_V6_MODE=cluster\n' | sudo tee /etc/default/plat-v6-announce
+  sudo install -D -m 0644 deploy/systemd/platd.service.d.example/v6-announce.conf /etc/systemd/system/platd.service.d/v6-announce.conf
+  sudo install -D -m 0644 deploy/systemd/frr.service.d.example/plat-v6-announce.conf /etc/systemd/system/frr.service.d/plat-v6-announce.conf
+  sudo systemctl daemon-reload
+  ```
+
+  Standalone: `ExecStartPost=` announces. Cluster: the prefix follows the
+  slices. platd writes `<state_dir>/announce.d/` before each slice hook,
+  and the shipped `frr-announce.sh`/`frr-withdraw.sh` then run
+  `plat-v6-announce.sh slices`, which announces the prefix while
+  `announce.d` holds at least one slice of the current platd lifetime
+  (first acquire, 0 → 1) and withdraws it when the last one is released
+  (1 → 0). Custom hooks must call `plat-v6-announce.sh slices` the same way.
+- **Crash cleanup (D-3)**: with `[cluster.ha]` and the FRR hooks, install
+  the drop-in above even without the IPv6 settings. A `kill -9` runs no
+  withdraw hook, so FRR would keep every slice `network` and `announce.d`
+  would keep stale files. The drop-in handles this:
+  - `ExecStopPost=` (`off`) runs after every exit, including SIGKILL. It
+    withdraws every slice listed in `announce.d`, plus any FRR IPv4
+    `network` inside `PLAT_V4_POOL` (optional, e.g.
+    `PLAT_V4_POOL="192.0.2.0/24"`), then empties `announce.d` and withdraws
+    the IPv6 prefix. It is idempotent, and safe with FRR down (the files are
+    still cleared).
+  - `ExecStartPre=` (`prestart`) does the same cleanup before platd starts.
+    It then writes platd's `INVOCATION_ID` to `/run/plat-announce.owner`.
+    Slice files count only while that file exists and, for the FRR `sync`,
+    only while it matches platd's current InvocationID. Files from an
+    earlier, crashed platd therefore never cause an announcement.
+  - `ExecStartPost=` applies the (empty) state, so nothing is announced
+    until a slice hook runs for an Active slice.
+  - The FRR drop-in (`sync`) withdraws everything while platd is down.
+    While platd runs, it re-announces only the current lifetime's slices,
+    and the prefix only while one exists.
+- **Subscriber home**: a subscriber (`/64` by default) is homed on every
+  node that holds one of its port blocks. The home a node announces to its
+  peers (`SubHome`) is the slice of the subscriber's first block in an
+  Active slice. Peers re-announce all homes on link up, on every view
+  change and on every slice acquisition. A node that holds none of a
+  subscriber's blocks, while a peer has announced it, counts new traffic
+  for it as `plat_cluster_steer_missteered_total` and, with
+  `steering.mode = "drop"`, drops it as `missteered` without allocating.
+  After a takeover or failback a long-lived subscriber can hold blocks in
+  slices owned by both nodes. It is then homed on both: each node
+  translates with its own blocks, each attributed by that node's
+  allocate/adopt records, and no block is ever held by two nodes. Such a
+  subscriber is not mis-steered on either node. Its blocks drift back to a
+  single home as they idle out and are released.
+- **Failback** waits for `failback_delay_secs` **and** until the returning
+  member reports every slice it backs up in sync (`plat_cluster_slices{state="backup_syncing"} 0`
+  on that member). A backup that sees a replication gap asks its primary for
+  a new snapshot; an awaited snapshot or reservation ack that does not come
+  within 3 s of the queue draining restarts the snapshot
+  (`plat_cluster_repl_ack_timeouts_total`). Lost replication is counted in
+  `plat_cluster_repl_dropped_total{reason="ring|peer_queue|link|gap"}`.
+- **Routing**: with HA, `plat-tun-setup.sh` routes the whole pool to the TUN
+  on every node (ownership moves at run time; platd drops traffic for slices it
+  does not own), and upstream routing follows only the hook announcements.
+- **Manual takeover** (witness-less two-node clusters, or a lost quorum):
+  `sudo platd cluster takeover --member <id>` on the surviving node, over the
+  local Unix socket (root or the plat user only, by peer credentials), audited
+  as `cluster_operator_command`. Only use it once the other node is known to
+  be down (powered off or fenced), since the cluster cannot then prevent two
+  owners. It is refused while the member's peer link is up; `--force`
+  overrides that and serves the slices only after the takeover wait
+  (`lease_ms * (1 + drift_margin_pct/100) + 200 ms`). `platd cluster restore
+  --member <id>` hands the slices back.
+- **Test bed**: `deploy/lima/` (plat-linux-2, plat-edge) and
+  `deploy/tests/cluster/` (setup.sh, failure cases F1-F13 via run-all.sh,
+  attrib-check.sh). The VMs share the Lima `user-v2` network (no host
+  prerequisite beyond Lima; add it to an existing plat-linux with
+  `limactl edit plat-linux --network lima:user-v2`), with a VXLAN overlay
+  for the test addresses.
+
 <!-- --8<-- [start:performance] -->
 ## Measured performance
 

@@ -12,7 +12,7 @@ use plat_audit::FipsMark;
 use plat_audit::{AuditSink, Event, LifecycleKind, Logger, LoggerHandle, NodeIdent};
 use plat_common::{Clock, Config, Counter, Counters, DropReason};
 use plat_io::PacketQueue;
-use plat_nat64::{Nat64, Verdict, WorkerCtx};
+use plat_nat64::{AdoptInput, AdoptMeta, ClusterSetup, Nat64, ReplHub, ReplProducer, Verdict, WorkerCtx};
 use plat_xlat::HEADROOM;
 
 use crate::metrics;
@@ -40,9 +40,19 @@ fn transmit<Q: PacketQueue>(q: &mut Q, pkt: &[u8], counters: &Counters) {
 }
 
 /// Run-to-completion worker: read → translate in place → write.
-pub fn worker<Q: PacketQueue>(mut q: Q, nat: Arc<Nat64>, counters: Arc<Counters>, id: u16, stop: Arc<AtomicBool>) {
+pub fn worker<Q: PacketQueue>(
+    mut q: Q,
+    nat: Arc<Nat64>,
+    counters: Arc<Counters>,
+    id: u16,
+    repl: Option<ReplProducer>,
+    stop: Arc<AtomicBool>,
+) {
     let mut buf = vec![0u8; HEADROOM + MAX_PKT].into_boxed_slice();
     let mut ctx = WorkerCtx::new(counters.clone(), id.wrapping_mul(0x9e37));
+    if let Some(r) = repl {
+        ctx = ctx.with_repl(r);
+    }
     while !stop.load(Ordering::Relaxed) {
         let n = match q.recv(&mut buf[HEADROOM..]) {
             Ok(Some(n)) => n,
@@ -82,7 +92,7 @@ fn worker_count(cfg: &Config) -> usize {
 /// AU-12: every exit after start is recorded). Callers drop every other
 /// `AuditSink` clone (including the engine's) first.
 fn stop_audit(sink: AuditSink, hooks: &HookSink, logger: LoggerHandle) {
-    sink.emit(Event::Lifecycle { ts_us: Clock::wall_us(), kind: LifecycleKind::Stop, fips: None });
+    sink.emit(Event::Lifecycle { ts_us: Clock::wall_us(), kind: LifecycleKind::Stop, fips: None, cluster: None });
     drop(sink);
     // The revocation checker (held by the syslog senders' TLS configs)
     // reaches the queue only through this slot; empty it so the logger
@@ -146,6 +156,36 @@ fn open_queues(_cfg: &Config, _n: usize) -> std::io::Result<Vec<plat_io::mem::Me
     Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "the TUN data plane requires Linux"))
 }
 
+/// The engine for the configured partition: legacy contiguous, static
+/// slices (every node serves its rendezvous primaries of the full member
+/// set), or HA (every slice Inactive until the cluster acquires it; the
+/// replication rings are returned, one per worker plus the sweeper's).
+pub(crate) type Engine = (Nat64, Option<(Arc<ReplHub>, Vec<ReplProducer>)>);
+
+pub(crate) fn build_engine(cfg: &Config, workers: usize, sink: &AuditSink, clock: &Clock) -> Result<Engine, String> {
+    if cfg.cluster.partition != plat_common::config::Partition::Slices {
+        return Ok((Nat64::new(cfg, plat_cluster::owned(cfg), sink.clone(), clock.clone())?, None));
+    }
+    let setup = ClusterSetup::from_config(cfg)?;
+    let slices = setup.slices.len();
+    let nat = Nat64::new_cluster(cfg, setup, sink.clone(), clock.clone())?;
+    if let Some(h) = cfg.cluster.ha_active() {
+        let (hub, prods) = ReplHub::new(workers + 1, h.repl_ring_entries as usize, slices);
+        return Ok((nat, Some((hub, prods))));
+    }
+    // Static slices: adopt this node's primaries at once (AU-12: each with
+    // its acquire record before use).
+    if let Some((_, primary, _)) = crate::cluster::home_slices(cfg) {
+        for s in primary {
+            let meta = AdoptMeta { epoch: 0, prev_owner: None, reason: plat_audit::AcquireReason::Startup };
+            nat.state()
+                .adopt_slice(s, &AdoptInput { in_sync: true, ..AdoptInput::default() }, meta)
+                .map_err(|e| format!("slice {s}: {e:?}"))?;
+        }
+    }
+    Ok((nat, None))
+}
+
 pub fn run(cfg: Config) -> ExitCode {
     let stop = Arc::new(AtomicBool::new(false));
     for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
@@ -155,7 +195,7 @@ pub fn run(cfg: Config) -> ExitCode {
         }
     }
 
-    let owned = plat_cluster::owned(&cfg);
+    let owned = crate::cluster::owned_addrs(&cfg);
     let n = worker_count(&cfg);
     let counters: Vec<Arc<Counters>> = (0..n).map(|_| Arc::new(Counters::default())).collect();
 
@@ -202,11 +242,16 @@ pub fn run(cfg: Config) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    sink.emit(Event::Lifecycle { ts_us: Clock::wall_us(), kind: LifecycleKind::Start, fips: Some(fips) });
+    sink.emit(Event::Lifecycle {
+        ts_us: Clock::wall_us(),
+        kind: LifecycleKind::Start,
+        fips: Some(fips),
+        cluster: Some(crate::cluster::cluster_start(&cfg)),
+    });
 
     let clock = Clock::new();
-    let nat = match Nat64::new(&cfg, owned.clone(), sink.clone(), clock.clone()) {
-        Ok(n) => Arc::new(n),
+    let (nat, repl) = match build_engine(&cfg, n, &sink, &clock) {
+        Ok((nat, repl)) => (Arc::new(nat), repl),
         Err(e) => {
             tracing::error!("{e}");
             stop_audit(sink, &hooks, logger);
@@ -224,6 +269,32 @@ pub fn run(cfg: Config) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // CP-10: the cluster runtime (peer channel, membership, replication,
+    // hooks) starts before the workers; every slice stays Inactive until
+    // it is acquired (and logged).
+    let (hub, mut producers) = match repl {
+        Some((h, p)) => (Some(h), p.into_iter().map(Some).collect::<Vec<_>>()),
+        None => (None, Vec::new()),
+    };
+    let sweep_repl = if producers.len() > n { producers.pop().flatten() } else { None };
+    #[cfg(feature = "tls")]
+    let cluster = match (&hub, tls.peer.clone()) {
+        (Some(h), Some(peer)) => match crate::cluster::start(&cfg, nat.clone(), h.clone(), sink.clone(), peer) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::error!("{e}");
+                stop.store(true, Ordering::Relaxed);
+                drop(queues);
+                drop(producers);
+                drop(nat);
+                stop_audit(sink, &hooks, logger);
+                return ExitCode::FAILURE;
+            }
+        },
+        _ => None,
+    };
+    #[cfg(not(feature = "tls"))]
+    let _ = &hub;
     let cores = if cfg.dataplane.pin_cpus { core_affinity::get_core_ids().unwrap_or_default() } else { Vec::new() };
 
     let mut threads = Vec::new();
@@ -242,19 +313,20 @@ pub fn run(cfg: Config) -> ExitCode {
         threads.push(std::thread::Builder::new().name("plat-sweep".into()).spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(every);
-                let s = nat.state().sweep();
+                let s = nat.state().sweep_with(sweep_repl.as_ref());
                 tracing::debug!(?s, "sweep");
             }
         }));
     }
     for (i, q) in queues.into_iter().enumerate() {
         let (nat, c, stop) = (nat.clone(), counters[i].clone(), stop.clone());
+        let prod = producers.get_mut(i).and_then(Option::take);
         let core = cores.get(i % cores.len().max(1)).copied();
         threads.push(std::thread::Builder::new().name(format!("plat-w{i}")).spawn(move || {
             if let Some(core) = core {
                 core_affinity::set_for_current(core);
             }
-            worker(q, nat, c, i as u16, stop);
+            worker(q, nat, c, i as u16, prod, stop);
         }));
     }
     // IA-5(2): background revocation refresher (joined before the logger
@@ -270,8 +342,22 @@ pub fn run(cfg: Config) -> ExitCode {
     // L17: kernel-side TUN drops (back-pressure) are otherwise invisible.
     let mut extra = extra;
     extra.push(metrics::tun_section(cfg.dataplane.interface.clone()));
-    let src =
-        metrics::Sources { nat: nat.clone(), workers: counters.clone(), audit: sink.clone(), fips: fips.active, extra };
+    #[cfg(feature = "tls")]
+    let cluster_src = cluster.as_ref().map(|c| {
+        let (m, j, h) = (c.shared.clone(), c.shared.clone(), c.shared.clone());
+        extra.push(Box::new(move |o: &mut String| m.render_metrics(o)));
+        metrics::ClusterSource { json: Box::new(move || j.view_json()), health: Box::new(move || h.health_problem()) }
+    });
+    #[cfg(not(feature = "tls"))]
+    let cluster_src = None;
+    let src = metrics::Sources {
+        nat: nat.clone(),
+        workers: counters.clone(),
+        audit: sink.clone(),
+        fips: fips.active,
+        extra,
+        cluster: cluster_src,
+    };
     #[cfg(feature = "tls")]
     let mut tls = tls;
     let metrics = cfg.management.listen.map(|addr| {
@@ -316,6 +402,12 @@ pub fn run(cfg: Config) -> ExitCode {
         std::thread::sleep(Duration::from_millis(200));
     }
     tracing::info!("shutting down");
+    // Hand owned slices over (bounded by cluster.ha.shutdown_handover_ms)
+    // and join the cluster threads before the audit queue closes.
+    #[cfg(feature = "tls")]
+    if let Some(c) = cluster {
+        c.shutdown();
+    }
 
     for t in threads.into_iter().flatten() {
         let _ = t.join();
@@ -328,6 +420,7 @@ pub fn run(cfg: Config) -> ExitCode {
         c.notify();
     }
     // Drop every AuditSink clone so the logger drains and exits.
+    // With HA, owned slices were released (or handed over) above.
     // POAM: POAM-009 - live port blocks are not released (no `nat_port_block_release`
     // records) at shutdown; the release needs a plat-nat64 drain API. SIEM
     // correlation closes them at `service_stop`.
@@ -391,7 +484,7 @@ mod tests {
         let (dev, mut host) = mem::pair(64);
         let w = {
             let (nat, counters, stop) = (nat.clone(), counters.clone(), stop.clone());
-            std::thread::spawn(move || worker(dev, nat, counters, 0, stop))
+            std::thread::spawn(move || worker(dev, nat, counters, 0, None, stop))
         };
         let mut buf = vec![0u8; 70_000];
         let t = std::time::Instant::now();

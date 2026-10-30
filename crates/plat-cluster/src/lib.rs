@@ -11,9 +11,29 @@
 //! [`owner_of_subscriber`] gives a deterministic rendezvous-hash assignment
 //! for load balancers that can use it.
 //!
+//! With `cluster.partition = "slices"` (required for HA) the pool is split
+//! into fixed slices ([`SliceMap`]) owned by rendezvous rank over the live
+//! members of the current [`View`]; [`Membership`] is the sans-IO
+//! election/lease/ownership state machine and [`codec`] the peer wire
+//! format. The functions below are the legacy contiguous scheme, unchanged.
+//!
 //! COMPLIANCE MAPPING:
 //! - NIST 800-53: SC-5(2) (Capacity, Bandwidth, and Redundancy), CP-10
 //!   (node loss affects only that node's subscribers; survivors are unchanged)
+
+pub mod codec;
+pub mod digest;
+pub mod membership;
+pub mod slices;
+pub mod view;
+
+pub use codec::{CodecError, Hello, MAX_NAME_LEN, Msg, PROTO_VERSION, RejectReason, SnapRecord, WireBib, WireBlock};
+pub use digest::{DigestInput, DigestMember, PartitionScheme, config_digest};
+pub use membership::{
+    AcquireReason, Action, Membership, MembershipConfig, MembershipError, Persisted, ReleaseReason, Role,
+};
+pub use slices::{MAX_SLICES, MemberId, SliceError, SliceId, SliceMap, rank, rank_with_standby};
+pub use view::{MAX_MEMBERS, View, make_epoch, term_of, version_of};
 
 use plat_common::{Config, Ipv4Cidr};
 
@@ -81,7 +101,7 @@ pub fn cover(addrs: &[u32]) -> Vec<Ipv4Cidr> {
     out
 }
 
-fn mix(mut x: u64) -> u64 {
+pub(crate) fn mix(mut x: u64) -> u64 {
     // splitmix64 finalizer: stable across nodes and releases.
     x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);

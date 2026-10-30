@@ -37,12 +37,15 @@ use std::path::PathBuf;
 pub use fips::{FipsStatus, init_fips, require_fips};
 pub use identity::{AllowList, CertSummary, PeerIdentity, cert_summary, peer_identity};
 pub use load::{check_cache_dir, check_key_file, load_certs, load_key};
-pub use policy::{ClientSettings, ServerSettings, client_config, server_config};
+pub use policy::{
+    ClientSettings, PeerConfigs, PeerSettings, ServerSettings, client_config, peer_configs, peer_server_name,
+    server_config,
+};
 pub use revocation::{
     CacheStats, RefreshHook, RefreshRecord, RevocationChecker, RevocationHook, RevocationRecord, RevocationSettings,
     spawn_refresher,
 };
-pub use verify::{CaBundle, mgmt_client_verifier, syslog_server_verifier};
+pub use verify::{CaBundle, mgmt_client_verifier, peer_client_verifier, peer_server_verifier, syslog_server_verifier};
 
 /// Errors building TLS material. Messages name the file, never its contents.
 #[derive(Debug, thiserror::Error)]

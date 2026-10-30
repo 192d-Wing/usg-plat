@@ -273,6 +273,8 @@ impl MgmtReason {
 pub enum MgmtPath {
     Metrics,
     Healthz,
+    /// Read-only cluster view (schema 7).
+    Cluster,
     Other,
 }
 
@@ -281,6 +283,7 @@ impl MgmtPath {
         match self {
             Self::Metrics => "/metrics",
             Self::Healthz => "/healthz",
+            Self::Cluster => "/cluster",
             Self::Other => "other",
         }
     }
@@ -322,6 +325,10 @@ pub enum TlsRole {
     MgmtClient,
     /// Syslog collector chain (`tls.server.hash.sha256`).
     SyslogServer,
+    /// Chain of a cluster peer that connected to this node (schema 7).
+    PeerClient,
+    /// Chain of a cluster peer this node connected to (schema 7).
+    PeerServer,
 }
 
 impl TlsRole {
@@ -329,6 +336,8 @@ impl TlsRole {
         match self {
             Self::MgmtClient => "mgmt_client",
             Self::SyslogServer => "syslog_server",
+            Self::PeerClient => "cluster_peer_client",
+            Self::PeerServer => "cluster_peer_server",
         }
     }
 }
@@ -461,13 +470,367 @@ pub struct RevocationRefresh {
     pub reason: Option<&'static str>,
 }
 
+/// An IPv4 pool slice (`cluster.slice`), formatted as a CIDR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SliceCidr {
+    pub net: u32,
+    pub len: u8,
+}
+
+/// `cluster.reason` of a `cluster_view_change` record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewReason {
+    /// First view after start-up or after an election.
+    Election,
+    MemberJoined,
+    MemberLost,
+    /// The leader's lease ran out and a new leader was elected.
+    LeaderLost,
+    /// Operator action (manual takeover command).
+    Manual,
+}
+
+impl ViewReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Election => "election",
+            Self::MemberJoined => "member_joined",
+            Self::MemberLost => "member_lost",
+            Self::LeaderLost => "leader_lost",
+            Self::Manual => "manual",
+        }
+    }
+}
+
+/// A new cluster view took effect (majority-acked).
+///
+/// COMPLIANCE MAPPING:
+/// - NIST 800-53: AU-2, AU-3, CP-10
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterView {
+    pub epoch: u64,
+    pub leader: u16,
+    /// Live member ids, at most [`ClusterView::MEMBERS_MAX`] recorded.
+    pub members_live: Vec<u16>,
+    pub reason: ViewReason,
+}
+
+impl ClusterView {
+    /// Matches the config limit on `[[cluster.members]]` (SC-5).
+    pub const MEMBERS_MAX: usize = 64;
+}
+
+/// `cluster.peer.state` of a `cluster_member_state` record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberState {
+    Up,
+    Down,
+    Syncing,
+    InSync,
+}
+
+impl MemberState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Up => "up",
+            Self::Down => "down",
+            Self::Syncing => "syncing",
+            Self::InSync => "in_sync",
+        }
+    }
+}
+
+/// A peer's connection or replication state changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterMemberChange {
+    pub peer_id: u16,
+    /// Configured member name and identity (operator text, sanitized anyway).
+    pub name: AuditText,
+    pub identity: AuditText,
+    pub ip: IpAddr,
+    pub state: MemberState,
+    pub epoch: u64,
+}
+
+/// `cluster.reason` of a `cluster_slice_acquire` record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcquireReason {
+    Startup,
+    Takeover,
+    Handover,
+    Failback,
+    /// Operator takeover command (two-node clusters without a witness).
+    Manual,
+}
+
+impl AcquireReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::Takeover => "takeover",
+            Self::Handover => "handover",
+            Self::Failback => "failback",
+            Self::Manual => "manual",
+        }
+    }
+}
+
+/// This node became owner of a slice. Written, with every
+/// `nat_port_block_adopt` for it, before the slice is used (AU-10).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SliceAcquire {
+    pub slice: SliceCidr,
+    pub epoch: u64,
+    /// Previous owner, if any.
+    pub prev_owner: Option<u16>,
+    pub reason: AcquireReason,
+    pub blocks_adopted: u32,
+    pub bibs_adopted: u64,
+    pub blocks_quarantined: u32,
+    /// The replicated state was complete (in-sync backup).
+    pub in_sync: bool,
+}
+
+/// `cluster.reason` of a `cluster_slice_release` record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SliceReleaseReason {
+    Handover,
+    /// Fenced by a view this node is not part of.
+    Fenced,
+    Shutdown,
+    /// This node's lease expired (self-fence).
+    LeaseLost,
+}
+
+impl SliceReleaseReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Handover => "handover",
+            Self::Fenced => "fenced",
+            Self::Shutdown => "shutdown",
+            Self::LeaseLost => "lease_lost",
+        }
+    }
+}
+
+/// `plat.release_reason` of a `nat_port_block_release` (schema 7). Absent
+/// for ordinary releases (idle, subscriber removed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockReleaseReason {
+    /// Given to the new slice owner by a graceful handover.
+    Handover,
+}
+
+impl BlockReleaseReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Handover => "handover",
+        }
+    }
+}
+
+/// A port block taken over from a previous slice owner (RFC 7422 §2
+/// continuity). Same fields as `nat_port_block_allocate` plus the original
+/// allocation time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockAdopt {
+    pub sub: u128,
+    pub sub_len: u8,
+    pub v4: u32,
+    pub port_lo: u16,
+    pub port_hi: u16,
+    /// Original allocation time on the previous owner, UTC µs.
+    pub allocated_us: u64,
+    pub prev_owner: Option<u16>,
+    pub epoch: u64,
+}
+
+/// `cluster.reason` of a `cluster_peer_rejected` record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerRejectReason {
+    /// Source IP or certificate identity is not a configured member/witness.
+    NotAllowed,
+    /// Certificate identity does not belong to the claimed node id.
+    IdMismatch,
+    /// The id is already connected from another address or certificate.
+    DuplicateId,
+    DigestMismatch,
+    Version,
+    /// Owned pool overlaps this node's (legacy partition).
+    Overlap,
+    /// TLS handshake failed or timed out.
+    Handshake,
+    /// Malformed or out-of-sequence frame on an established connection.
+    Protocol,
+    /// Replication input outside the slice, pool or client prefixes, or
+    /// from a member that does not own the slice.
+    InvalidInput,
+    /// A connection or handshake limit was reached (SC-5).
+    Capacity,
+}
+
+impl PeerRejectReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotAllowed => "not_allowed",
+            Self::IdMismatch => "id_mismatch",
+            Self::DuplicateId => "duplicate_id",
+            Self::DigestMismatch => "digest_mismatch",
+            Self::Version => "version",
+            Self::Overlap => "overlap",
+            Self::Handshake => "handshake",
+            Self::Protocol => "protocol",
+            Self::InvalidInput => "invalid_input",
+            Self::Capacity => "capacity",
+        }
+    }
+}
+
+/// A peer connection was refused (IA-3, AC-3). Rate-limited by the emitter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerRejected {
+    pub ip: IpAddr,
+    pub port: u16,
+    /// Typed certificate identity presented, if any (peer text, sanitized).
+    pub identity: Option<AuditText>,
+    /// Node id claimed in the Hello, if one was received.
+    pub claimed_id: Option<u16>,
+    pub reason: PeerRejectReason,
+}
+
+/// `cluster.hook` of a `cluster_hook` record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookKind {
+    Announce,
+    Withdraw,
+}
+
+impl HookKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Announce => "announce",
+            Self::Withdraw => "withdraw",
+        }
+    }
+}
+
+/// One route hook run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookRun {
+    pub hook: HookKind,
+    pub slice: SliceCidr,
+    pub epoch: u64,
+    /// Exit code; `None` if killed (timeout) or not started.
+    pub exit_code: Option<i32>,
+    pub duration_us: u64,
+    pub success: bool,
+}
+
+/// `cluster.command` of a `cluster_operator_command` record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorCommandKind {
+    Status,
+    Takeover,
+    Restore,
+    /// A line that did not parse.
+    Invalid,
+}
+
+impl OperatorCommandKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Status => "status",
+            Self::Takeover => "takeover",
+            Self::Restore => "restore",
+            Self::Invalid => "invalid",
+        }
+    }
+}
+
+/// `cluster.reason` of a refused `cluster_operator_command`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorRefusal {
+    /// The peer uid is neither root nor the daemon user (AC-3).
+    NotAuthorized,
+    /// Peer credentials could not be read.
+    NoCredentials,
+    /// The command is only valid with `auto_failover = false`.
+    AutoFailover,
+    /// `takeover` of a member whose peer link is up, without `--force`.
+    MemberUp,
+    UnknownMember,
+    /// The line did not parse.
+    Invalid,
+    /// Membership refused it (or the control thread did not answer).
+    Rejected,
+}
+
+impl OperatorRefusal {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotAuthorized => "not_authorized",
+            Self::NoCredentials => "no_credentials",
+            Self::AutoFailover => "auto_failover",
+            Self::MemberUp => "member_up",
+            Self::UnknownMember => "unknown_member",
+            Self::Invalid => "invalid",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+/// An operator command on the cluster socket (`platd cluster ...`), logged
+/// before the command acts, and for every refusal (AC-3, AU-2, AU-12).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorCommand {
+    pub command: OperatorCommandKind,
+    pub member: Option<u16>,
+    pub force: bool,
+    /// Peer process credentials (`SO_PEERCRED` / `getpeereid`).
+    pub peer_uid: Option<u32>,
+    pub peer_pid: Option<i32>,
+    /// `None`: accepted (about to act).
+    pub refused: Option<OperatorRefusal>,
+}
+
+/// Cluster fields of `service_start` (schema 7; CM-2, CM-3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterStart {
+    pub node_id: u16,
+    /// `contiguous` | `slices` | `ha`.
+    pub mode: &'static str,
+    /// SHA-256 over the cluster-relevant configuration.
+    pub config_digest: [u8; 32],
+    /// Owned CIDRs at start (empty for HA: acquire records follow). At most
+    /// [`ClusterStart::SLICES_MAX`] are written; `cluster.slice_count`
+    /// always carries the full count.
+    pub slices: Vec<SliceCidr>,
+    pub member_count: u16,
+}
+
+impl ClusterStart {
+    /// Cap on CIDRs written per record (a contiguous share or an
+    /// `owned_pool` is covered by few CIDRs; SC-5).
+    pub const SLICES_MAX: usize = 256;
+}
+
 /// One audit record. Times are UTC microseconds since the Unix epoch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     /// A port block was assigned to a subscriber (RFC 7422 bulk allocation).
     PortBlockAlloc { ts_us: u64, sub: u128, sub_len: u8, v4: u32, port_lo: u16, port_hi: u16 },
-    /// A port block was returned to the pool.
-    PortBlockRelease { ts_us: u64, sub: u128, sub_len: u8, v4: u32, port_lo: u16, port_hi: u16, held_secs: u32 },
+    /// A port block was returned to the pool. `reason` is set for a
+    /// handover to another node (schema 7).
+    PortBlockRelease {
+        ts_us: u64,
+        sub: u128,
+        sub_len: u8,
+        v4: u32,
+        port_lo: u16,
+        port_hi: u16,
+        held_secs: u32,
+        reason: Option<BlockReleaseReason>,
+    },
     /// BIB entry created (session-mode logging).
     BibCreate { ts_us: u64, proto: u8, v6: u128, v6_port: u16, v4: u32, v4_port: u16 },
     /// BIB entry removed (session-mode logging).
@@ -479,6 +842,8 @@ pub enum Event {
         kind: LifecycleKind,
         /// FIPS module state; set on `Start` (schema 5).
         fips: Option<FipsMark>,
+        /// Cluster identity, digest and slices; set on `Start` (schema 7).
+        cluster: Option<Arc<ClusterStart>>,
     },
     /// Counter snapshot (drops etc.), emitted by the logger itself.
     Counter { ts_us: u64, name: &'static str, value: u64 },
@@ -532,6 +897,28 @@ pub enum Event {
     RevocationCheck { ts_us: u64, check: Arc<RevocationCheck> },
     /// Background refresher state change for a revocation source.
     RevocationRefresh { ts_us: u64, refresh: Arc<RevocationRefresh> },
+    /// A new cluster view took effect (schema 7).
+    ClusterViewChange { ts_us: u64, view: Arc<ClusterView> },
+    /// A peer changed connection or replication state (schema 7).
+    ClusterMemberState { ts_us: u64, member: Arc<ClusterMemberChange> },
+    /// This node acquired a slice (schema 7).
+    ClusterSliceAcquire { ts_us: u64, acquire: Arc<SliceAcquire> },
+    /// This node gave up a slice (schema 7).
+    ClusterSliceRelease { ts_us: u64, slice: SliceCidr, epoch: u64, new_owner: Option<u16>, reason: SliceReleaseReason },
+    /// A port block adopted from the previous slice owner (schema 7).
+    PortBlockAdopt { ts_us: u64, adopt: Arc<BlockAdopt> },
+    /// A peer connection was refused (schema 7).
+    ClusterPeerRejected { ts_us: u64, rejected: Arc<PeerRejected> },
+    /// Peer-rejected records suppressed over `window_secs` (schema 7).
+    ClusterPeerSuppressed { ts_us: u64, suppressed: u64, window_secs: u32 },
+    /// Replication records for a slice were lost; the slice resyncs
+    /// (rate-limited, one per slice per 10 s; schema 7).
+    ClusterReplicationGap { ts_us: u64, slice: SliceCidr, lost: u64 },
+    /// A route hook ran (schema 7).
+    ClusterHook { ts_us: u64, run: Arc<HookRun> },
+    /// An operator command was accepted (before it acts) or refused
+    /// (schema 7).
+    ClusterOperatorCommand { ts_us: u64, cmd: Arc<OperatorCommand> },
 }
 
 impl Event {
@@ -553,7 +940,17 @@ impl Event {
             | Event::ManagementConnection { ts_us, .. }
             | Event::ManagementSuppressed { ts_us, .. }
             | Event::RevocationCheck { ts_us, .. }
-            | Event::RevocationRefresh { ts_us, .. } => ts_us,
+            | Event::RevocationRefresh { ts_us, .. }
+            | Event::ClusterViewChange { ts_us, .. }
+            | Event::ClusterMemberState { ts_us, .. }
+            | Event::ClusterSliceAcquire { ts_us, .. }
+            | Event::ClusterSliceRelease { ts_us, .. }
+            | Event::PortBlockAdopt { ts_us, .. }
+            | Event::ClusterPeerRejected { ts_us, .. }
+            | Event::ClusterPeerSuppressed { ts_us, .. }
+            | Event::ClusterReplicationGap { ts_us, .. }
+            | Event::ClusterHook { ts_us, .. }
+            | Event::ClusterOperatorCommand { ts_us, .. } => ts_us,
         }
     }
 
@@ -578,6 +975,16 @@ impl Event {
             Event::ManagementSuppressed { .. } => "management_connection_suppressed",
             Event::RevocationCheck { .. } => "tls_revocation_check",
             Event::RevocationRefresh { .. } => "revocation_source_refresh",
+            Event::ClusterViewChange { .. } => "cluster_view_change",
+            Event::ClusterMemberState { .. } => "cluster_member_state",
+            Event::ClusterSliceAcquire { .. } => "cluster_slice_acquire",
+            Event::ClusterSliceRelease { .. } => "cluster_slice_release",
+            Event::PortBlockAdopt { .. } => "nat_port_block_adopt",
+            Event::ClusterPeerRejected { .. } => "cluster_peer_rejected",
+            Event::ClusterPeerSuppressed { .. } => "cluster_peer_suppressed",
+            Event::ClusterReplicationGap { .. } => "cluster_replication_gap",
+            Event::ClusterHook { .. } => "cluster_hook",
+            Event::ClusterOperatorCommand { .. } => "cluster_operator_command",
         }
     }
 
@@ -589,6 +996,23 @@ impl Event {
             Event::ManagementConnection { conn, .. } if conn.reason != MgmtReason::Accepted => 4,
             Event::RevocationCheck { check, .. } if check.status != RevocationStatus::Good || !check.allowed => 4,
             Event::RevocationRefresh { refresh, .. } if refresh.transition != RefreshTransition::Recovered => 4,
+            Event::ClusterMemberState { member, .. } if member.state == MemberState::Down => 4,
+            Event::ClusterSliceAcquire { acquire, .. } if !acquire.in_sync => 4,
+            Event::ClusterSliceRelease {
+                reason: SliceReleaseReason::Fenced | SliceReleaseReason::LeaseLost, ..
+            } => 4,
+            Event::ClusterHook { run, .. } if !run.success => 4,
+            // Every accepted command changes ownership or reads state; a
+            // takeover/restore is a warning-level operator action.
+            Event::ClusterOperatorCommand { cmd, .. }
+                if cmd.refused.is_some() || cmd.command != OperatorCommandKind::Status =>
+            {
+                4
+            }
+            Event::ClusterOperatorCommand { .. } => 5,
+            Event::ClusterPeerRejected { .. }
+            | Event::ClusterPeerSuppressed { .. }
+            | Event::ClusterReplicationGap { .. } => 4,
             Event::ManagementSuppressed { .. }
             | Event::Limit { .. }
             | Event::QueueOverflow { .. }
@@ -601,7 +1025,12 @@ impl Event {
             | Event::StorageThreshold { .. }
             | Event::RetentionPrune { .. }
             | Event::ManagementConnection { .. }
-            | Event::RevocationRefresh { .. } => 5,
+            | Event::RevocationRefresh { .. }
+            | Event::ClusterViewChange { .. }
+            | Event::ClusterMemberState { .. }
+            | Event::ClusterSliceAcquire { .. }
+            | Event::ClusterSliceRelease { .. }
+            | Event::ClusterHook { .. } => 5,
             _ => 6,
         }
     }
@@ -633,6 +1062,20 @@ impl Event {
                 Some(if refresh.transition == RefreshTransition::Recovered { "success" } else { "failure" })
             }
             Event::ManagementSuppressed { .. } => Some("failure"),
+            Event::ClusterViewChange { .. }
+            | Event::ClusterMemberState { .. }
+            | Event::ClusterSliceRelease { .. }
+            | Event::PortBlockAdopt { .. } => Some("success"),
+            // A takeover without complete state still succeeded, but
+            // attribution continuity is not guaranteed for it.
+            Event::ClusterSliceAcquire { acquire, .. } => Some(if acquire.in_sync { "success" } else { "unknown" }),
+            Event::ClusterHook { run, .. } => Some(if run.success { "success" } else { "failure" }),
+            Event::ClusterOperatorCommand { cmd, .. } => {
+                Some(if cmd.refused.is_none() { "success" } else { "failure" })
+            }
+            Event::ClusterPeerRejected { .. }
+            | Event::ClusterPeerSuppressed { .. }
+            | Event::ClusterReplicationGap { .. } => Some("failure"),
             Event::Counter { .. } => None,
         }
     }

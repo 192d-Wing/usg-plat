@@ -50,6 +50,10 @@ define_enum!(
         WrongNode => "wrong_node",
         SourceRoute => "source_route",
         SubscriberTableFull => "subscriber_table_full",
+        // Inbound for a slice this node does not hold a valid lease for.
+        ClusterFenced => "cluster_fenced",
+        // New subscriber homed on another node (`cluster.steering.mode = "drop"`).
+        Missteered => "missteered",
     }
 );
 
@@ -71,6 +75,13 @@ define_enum!(
         SessionCreated => "session_created",
         IoErrors => "io_errors",
         TxQueueFull => "tx_queue_full",
+        // New subscriber found homed on another node (any steering mode).
+        ClusterSteerMissteered => "cluster_steer_missteered",
+        // Block allocation skipped: no backup-acked reservation left.
+        ClusterReserveStarved => "cluster_reserve_starved",
+        // Strict paired pooling refused: the subscriber's address is full
+        // while other addresses have free blocks.
+        PoolPairedExhausted => "pool_paired_exhausted",
     }
 );
 
@@ -112,5 +123,27 @@ impl Counters {
 
     pub fn get(&self, c: Counter) -> u64 {
         self.events[c as usize].load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_are_unique_and_cluster_classes_exist() {
+        let mut d: Vec<_> = DropReason::ALL.iter().map(|r| r.as_str()).collect();
+        d.sort_unstable();
+        d.dedup();
+        assert_eq!(d.len(), DropReason::COUNT);
+        assert!(d.contains(&"cluster_fenced") && d.contains(&"missteered"));
+        let mut e: Vec<_> = Counter::ALL.iter().map(|c| c.as_str()).collect();
+        e.sort_unstable();
+        e.dedup();
+        assert_eq!(e.len(), Counter::COUNT);
+        let c = Counters::default();
+        c.record_drop(DropReason::Missteered);
+        c.inc(Counter::ClusterSteerMissteered);
+        assert_eq!((c.drops(DropReason::Missteered), c.get(Counter::ClusterSteerMissteered)), (1, 1));
     }
 }

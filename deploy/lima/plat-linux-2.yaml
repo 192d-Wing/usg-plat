@@ -1,0 +1,43 @@
+# Second translator node for the two-node cluster/HA test (plan §8.2).
+# Same image as the existing `plat-linux` instance (Ubuntu 24.04, aarch64, vz).
+#
+#   limactl create --name=plat-linux-2 deploy/lima/plat-linux-2.yaml
+#   limactl start plat-linux-2
+#
+# Network: Lima `user-v2` (gvisor-tap-vsock), which connects every instance
+# attached to it on one virtual switch with no host privileges (no
+# socket_vmnet, no sudoers entry). The test topology (plat-linux,
+# plat-linux-2, plat-edge) runs on a VXLAN overlay over user-v2 with static
+# addresses (192.168.205.0/24, fd00:205::/64), created by
+# deploy/tests/cluster/setup.sh, so failure injection (nft drops on 7946,
+# tc netem) never touches the Lima management NIC. The existing plat-linux
+# instance needs the same network once:
+#   limactl stop plat-linux && limactl edit plat-linux --network lima:user-v2 && limactl start plat-linux
+#
+# Test-only VM: no real-network addresses, keys or credentials are baked in;
+# the cluster PKI is generated at test setup time.
+vmType: vz
+arch: aarch64
+os: Linux
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/noble/release-20260926/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+    digest: "sha256:1d6bffe64b848468ac97f821d369a4846d983de1800ccf6b5ec8853e85cefc55"
+cpus: 4
+memory: 4GiB
+disk: 20GiB
+mounts: []
+networks:
+  - lima: user-v2
+provision:
+  - mode: system
+    script: |
+      #!/bin/sh
+      set -eu
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update -q
+      apt-get install -yq --no-install-recommends nftables iproute2 frr frr-pythontools \
+          iperf3 tcpdump python3 jq chrony openssl curl
+      # bgpd + bfdd for the slice announcements (hooks drive vtysh).
+      sed -i -e 's/^bgpd=no/bgpd=yes/' -e 's/^bfdd=no/bfdd=yes/' /etc/frr/daemons
+      systemctl enable --now chrony frr

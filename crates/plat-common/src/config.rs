@@ -124,12 +124,322 @@ pub struct ClusterConfig {
     /// Explicit override of the pool slice this node owns.
     #[serde(default)]
     pub owned_pool: Vec<Ipv4Cidr>,
+    /// `contiguous` (default, legacy) or `slices` (required for HA).
+    #[serde(default = "d_partition")]
+    pub partition: Partition,
+    /// Slice size for `partition = "slices"` (16..=32).
+    #[serde(default = "d_slice_len")]
+    pub slice_prefix_len: u8,
+    /// Full member list; required for HA. `node_count` must equal its length.
+    #[serde(default)]
+    pub members: Vec<ClusterMember>,
+    #[serde(default)]
+    pub ha: Option<HaConfig>,
+    #[serde(default)]
+    pub steering: SteeringConfig,
+}
+
+fn d_partition() -> Partition {
+    Partition::Contiguous
 }
 
 impl Default for ClusterConfig {
     fn default() -> Self {
-        Self { node_count: 1, owned_pool: Vec::new() }
+        Self {
+            node_count: 1,
+            owned_pool: Vec::new(),
+            partition: Partition::Contiguous,
+            slice_prefix_len: d_slice_len(),
+            members: Vec::new(),
+            ha: None,
+            steering: SteeringConfig::default(),
+        }
     }
+}
+
+impl ClusterConfig {
+    /// True if `[cluster.ha]` is present and `enabled = true`.
+    pub fn ha_enabled(&self) -> bool {
+        self.ha.as_ref().is_some_and(|h| h.enabled)
+    }
+
+    /// The HA settings when HA is enabled.
+    pub fn ha_active(&self) -> Option<&HaConfig> {
+        self.ha.as_ref().filter(|h| h.enabled)
+    }
+
+    /// Steering mode in effect: the configured one, else `drop` with HA and
+    /// `count` (legacy) without.
+    pub fn steering_mode(&self) -> SteeringMode {
+        self.steering.mode.unwrap_or(if self.ha_enabled() { SteeringMode::Drop } else { SteeringMode::Count })
+    }
+
+    /// Automatic failover in effect. Off without HA. With HA: the configured
+    /// value, else on when a quorum can be formed without the failed node
+    /// (three or more members, or two members plus a witness).
+    pub fn auto_failover(&self) -> bool {
+        match self.ha_active() {
+            None => false,
+            Some(h) => h.auto_failover.unwrap_or_else(|| self.quorum_tolerates_loss()),
+        }
+    }
+
+    /// True if a majority of voters (members plus witness) survives the loss
+    /// of one member.
+    pub fn quorum_tolerates_loss(&self) -> bool {
+        let witness = self.ha.as_ref().is_some_and(|h| h.witness.is_some());
+        let voters = self.members.len() + usize::from(witness);
+        voters >= 3
+    }
+
+    /// Number of slices `pool` splits into at `slice_prefix_len` (0 if a pool
+    /// entry is narrower than a slice).
+    pub fn slice_count(&self, pool: &[Ipv4Cidr]) -> u64 {
+        pool.iter()
+            .map(|p| {
+                if p.prefix_len() > self.slice_prefix_len {
+                    0
+                } else {
+                    1u64 << (self.slice_prefix_len - p.prefix_len())
+                }
+            })
+            .sum()
+    }
+}
+
+/// How `nat64.pool` is divided among the nodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Partition {
+    /// Legacy: each node owns one contiguous share (or `owned_pool`).
+    Contiguous,
+    /// Aligned slices of `slice_prefix_len`, assigned by rendezvous hashing
+    /// over the live members (required for HA).
+    Slices,
+}
+
+impl Partition {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Contiguous => "contiguous",
+            Self::Slices => "slices",
+        }
+    }
+}
+
+fn d_slice_len() -> u8 {
+    28
+}
+
+/// Largest accepted slice count (`nat64.pool` split at `slice_prefix_len`).
+pub const MAX_SLICES: u64 = 4096;
+/// Largest accepted `[[cluster.members]]` list.
+pub const MAX_CLUSTER_MEMBERS: usize = 64;
+
+/// One cluster member (all nodes carry the same list).
+///
+/// COMPLIANCE MAPPING:
+/// - NIST 800-53: IA-3 (Device Identification and Authentication) - the peer
+///   certificate must match `identity`, and the claimed `id` must match it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterMember {
+    /// Node id, `0 .. members.len()`; equals that node's `node.id`.
+    pub id: u16,
+    /// That node's `node.name`.
+    pub name: String,
+    /// Address the member's peer listener is reached at (source IP of its
+    /// connections is pinned to it).
+    pub peer_addr: SocketAddr,
+    /// Typed certificate identity (`cn:`, `dns:`, `uri:`, `sha256:`).
+    pub identity: String,
+    /// Rendezvous weight, 1..=100.
+    #[serde(default = "d_weight")]
+    pub weight: u16,
+    /// IPv6 address for mis-steer forwarding (`steering.mode = "forward"`,
+    /// phase 2; rejected until then).
+    #[serde(default)]
+    pub steer_addr: Option<std::net::Ipv6Addr>,
+}
+
+fn d_weight() -> u16 {
+    1
+}
+
+/// Tie-breaking voter for two-node clusters (`platd witness`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WitnessConfig {
+    pub addr: SocketAddr,
+    /// Typed certificate identity; distinct from every member identity.
+    pub identity: String,
+}
+
+/// Cluster high availability: replication, leases and failover. Absent or
+/// `enabled = false`: no replication and no peer listener.
+///
+/// COMPLIANCE MAPPING:
+/// - NIST 800-53: CP-7, CP-10 (alternate processing within the cluster)
+/// - NIST 800-53: SC-5 - rings, queues and frames are bounded
+/// - NIST 800-53: SC-24 - leases with a drift margin; minority self-fences
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HaConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Peer listener. Not a wildcard address unless `allow_wildcard`.
+    pub listen: SocketAddr,
+    #[serde(default)]
+    pub allow_wildcard: bool,
+    #[serde(default)]
+    pub witness: Option<WitnessConfig>,
+    /// Unset: on when a quorum survives one member loss (see
+    /// [`ClusterConfig::auto_failover`]). `true` is rejected without one.
+    #[serde(default)]
+    pub auto_failover: Option<bool>,
+    #[serde(default = "d_lease")]
+    pub lease_ms: u64,
+    #[serde(default = "d_heartbeat")]
+    pub heartbeat_ms: u64,
+    /// Clock-rate drift margin applied to leases (plus 200 ms).
+    #[serde(default = "d_drift")]
+    pub drift_margin_pct: u8,
+    /// TCP pickup window on adopted BIBs after takeover (0 disables).
+    #[serde(default = "d_tcp_adopt")]
+    pub tcp_adopt_secs: u32,
+    /// Hold-back for reserved-but-unlogged blocks after takeover.
+    #[serde(default = "d_quarantine")]
+    pub takeover_quarantine_secs: u32,
+    #[serde(default = "d_reserve")]
+    pub reserve_ahead_blocks: u16,
+    /// Automatic failback delay (0 = manual failback).
+    #[serde(default = "d_failback")]
+    pub failback_delay_secs: u32,
+    #[serde(default = "d_handovers")]
+    pub max_concurrent_handovers: u16,
+    /// Per-worker replication ring entries (power of two).
+    #[serde(default = "d_ring")]
+    pub repl_ring_entries: u32,
+    #[serde(default = "d_peer_queue")]
+    pub peer_queue_bytes: u64,
+    #[serde(default = "d_frame")]
+    pub max_frame_bytes: u32,
+    /// Persistent epoch/vote state (absolute; 0700, checked at start).
+    #[serde(default = "d_state_dir")]
+    pub state_dir: PathBuf,
+    #[serde(default = "d_hook_timeout")]
+    pub hook_timeout_ms: u64,
+    /// Bound on the coordinated handover at shutdown.
+    #[serde(default = "d_shutdown_handover")]
+    pub shutdown_handover_ms: u64,
+    #[serde(default)]
+    pub hooks: HooksConfig,
+    pub tls: ClusterTlsConfig,
+}
+
+fn d_lease() -> u64 {
+    3000
+}
+fn d_heartbeat() -> u64 {
+    500
+}
+fn d_drift() -> u8 {
+    10
+}
+fn d_tcp_adopt() -> u32 {
+    300
+}
+fn d_quarantine() -> u32 {
+    600
+}
+fn d_reserve() -> u16 {
+    8
+}
+fn d_failback() -> u32 {
+    60
+}
+fn d_handovers() -> u16 {
+    4
+}
+fn d_ring() -> u32 {
+    65_536
+}
+fn d_peer_queue() -> u64 {
+    64 << 20
+}
+fn d_frame() -> u32 {
+    1 << 20
+}
+fn d_state_dir() -> PathBuf {
+    PathBuf::from("/var/lib/plat/cluster")
+}
+fn d_hook_timeout() -> u64 {
+    5000
+}
+fn d_shutdown_handover() -> u64 {
+    10_000
+}
+
+/// Largest accepted `cluster.ha.repl_ring_entries`.
+pub const MAX_REPL_RING_ENTRIES: u32 = 1 << 20;
+/// Largest accepted `cluster.ha.peer_queue_bytes`.
+pub const MAX_PEER_QUEUE_BYTES: u64 = 1 << 30;
+/// Largest accepted `cluster.ha.max_frame_bytes`.
+pub const MAX_FRAME_BYTES: u32 = 16 << 20;
+
+/// Out-of-process route hooks, run as `<hook> <slice-cidr> <epoch> <reason>`.
+/// Ownership and mode are checked at start like key files.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HooksConfig {
+    pub announce: Option<PathBuf>,
+    pub withdraw: Option<PathBuf>,
+}
+
+/// Mutual TLS for the peer channel: one identity for the server and client
+/// roles, one CA, client certificate always required. FIPS policy from `[tls]`.
+///
+/// COMPLIANCE MAPPING:
+/// - NIST 800-53: SC-8, SC-8(1), SC-13, IA-3, IA-5(2)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterTlsConfig {
+    pub cert_file: PathBuf,
+    pub key_file: PathBuf,
+    pub ca_file: PathBuf,
+    /// Replaces `[tls.revocation]` for peer chains.
+    #[serde(default)]
+    pub revocation: Option<RevocationConfig>,
+}
+
+/// What to do with a new subscriber homed on another node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SteeringMode {
+    /// Count and allocate locally (legacy; subscriber becomes dual-homed).
+    Count,
+    /// Count and drop (`missteered`).
+    Drop,
+    /// Forward to the owner (phase 2; rejected by validation).
+    Forward,
+}
+
+impl SteeringMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Count => "count",
+            Self::Drop => "drop",
+            Self::Forward => "forward",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SteeringConfig {
+    /// Unset: `drop` with HA, `count` without.
+    #[serde(default)]
+    pub mode: Option<SteeringMode>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -232,6 +542,18 @@ pub struct Nat64Config {
     /// Lock shards per table; rounded up to a power of two.
     #[serde(default = "d_shards")]
     pub table_shards: u32,
+    /// Minimum time a released port block is held back before it can be
+    /// allocated again (120..=3600 s).
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - RFC 6888 REQ-12, RFC 7422 §2 - attribution windows never abut
+    ///   (POAM-010)
+    #[serde(default = "d_cooldown")]
+    pub block_cooldown_secs: u32,
+}
+
+fn d_cooldown() -> u32 {
+    120
 }
 
 fn d_port_min() -> u16 {
@@ -830,38 +1152,52 @@ impl RevocationConfig {
 
 /// Allow-list entry: printable ASCII or UTF-8 without control characters,
 /// no wildcard (matching is exact).
-fn check_allowed_client(e: &str) -> Result<(), ConfigError> {
+fn check_identity(at: &str, e: &str) -> Result<(), ConfigError> {
     if e.is_empty() || e.len() > MAX_ALLOWED_CLIENT_LEN {
-        return invalid(format!("management.tls.allowed_clients entries must be 1..={MAX_ALLOWED_CLIENT_LEN} bytes"));
+        return invalid(format!("{at} entries must be 1..={MAX_ALLOWED_CLIENT_LEN} bytes"));
     }
     if e.chars().any(char::is_control) || e.trim() != e {
-        return invalid(format!(
-            "management.tls.allowed_clients entry {e:?} has control characters or surrounding spaces"
-        ));
+        return invalid(format!("{at} entry {e:?} has control characters or surrounding spaces"));
     }
     if e.contains('*') {
-        return invalid(format!(
-            "management.tls.allowed_clients entry {e:?}: wildcards are not supported (exact match)"
-        ));
+        return invalid(format!("{at} entry {e:?}: wildcards are not supported (exact match)"));
     }
     // Typed entries only: a bare value could match a CN where a SAN was
     // meant (or the reverse).
     let Some((kind, value)) = e.split_once(':') else {
-        return invalid(format!(
-            "management.tls.allowed_clients entry {e:?} must be typed: cn:, dns:, uri: or sha256:"
-        ));
+        return invalid(format!("{at} entry {e:?} must be typed: cn:, dns:, uri: or sha256:"));
     };
     if value.is_empty() {
-        return invalid(format!("management.tls.allowed_clients entry {e:?} has an empty value"));
+        return invalid(format!("{at} entry {e:?} has an empty value"));
     }
     match kind {
         "cn" | "dns" | "uri" => Ok(()),
         "sha256" if value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()) => Ok(()),
-        "sha256" => invalid(format!(
-            "management.tls.allowed_clients entry {e:?}: sha256: needs 64 hex digits (certificate DER fingerprint)"
-        )),
-        _ => invalid(format!("management.tls.allowed_clients entry {e:?} must be typed: cn:, dns:, uri: or sha256:")),
+        "sha256" => invalid(format!("{at} entry {e:?}: sha256: needs 64 hex digits (certificate DER fingerprint)")),
+        _ => invalid(format!("{at} entry {e:?} must be typed: cn:, dns:, uri: or sha256:")),
     }
+}
+
+fn check_node_name(at: &str, name: &str) -> Result<(), ConfigError> {
+    if name.is_empty() || name.len() > 64 {
+        return invalid(format!("{at} must be 1..=64 characters"));
+    }
+    if !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)) {
+        return invalid(format!("{at} may only contain [A-Za-z0-9-_.]"));
+    }
+    Ok(())
+}
+
+/// A peer address: concrete IP and non-zero port.
+fn check_peer_addr(at: &str, a: SocketAddr) -> Result<(), ConfigError> {
+    if a.ip().is_unspecified() || a.ip().is_multicast() || a.port() == 0 {
+        return invalid(format!("{at} {a} must be a unicast address with a non-zero port"));
+    }
+    Ok(())
+}
+
+fn check_allowed_client(e: &str) -> Result<(), ConfigError> {
+    check_identity("management.tls.allowed_clients", e)
 }
 
 impl Config {
@@ -880,12 +1216,7 @@ impl Config {
         let t = &self.translation;
         let n = &self.nat64;
 
-        if self.node.name.is_empty() || self.node.name.len() > 64 {
-            return invalid("node.name must be 1..=64 characters");
-        }
-        if !self.node.name.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)) {
-            return invalid("node.name may only contain [A-Za-z0-9-_.]");
-        }
+        check_node_name("node.name", &self.node.name)?;
         if self.cluster.node_count == 0 || self.node.id >= self.cluster.node_count {
             return invalid("node.id must be < cluster.node_count");
         }
@@ -1112,14 +1443,201 @@ impl Config {
         if self.dataplane.sweep_interval_ms == 0 || self.dataplane.sweep_interval_ms > MAX_SWEEP_INTERVAL_MS {
             return invalid(format!("dataplane.sweep_interval_ms must be 1..={MAX_SWEEP_INTERVAL_MS}"));
         }
+        if !(120..=3600).contains(&n.block_cooldown_secs) {
+            return invalid("nat64.block_cooldown_secs must be 120..=3600 (RFC 6888 REQ-12)");
+        }
+        self.validate_cluster()
+    }
+
+    /// Partition, member list, HA and steering rules.
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: CM-6 - every cluster value range-checked; HA off unless
+    ///   configured
+    /// - NIST 800-53: SC-5 - slice count, rings, queues and frames bounded
+    /// - NIST 800-53: IA-3, AC-3 - typed, unique peer identities
+    /// - NIST 800-53: SC-24 - automatic failover only with a quorum that
+    ///   survives one member loss
+    fn validate_cluster(&self) -> Result<(), ConfigError> {
+        let c = &self.cluster;
+        let n = &self.nat64;
+
+        if c.partition == Partition::Slices {
+            if !(16..=32).contains(&c.slice_prefix_len) {
+                return invalid("cluster.slice_prefix_len must be 16..=32");
+            }
+            if let Some(p) = n.pool.iter().find(|p| p.prefix_len() > c.slice_prefix_len) {
+                return invalid(format!(
+                    "nat64.pool {p} is narrower than cluster.slice_prefix_len /{}",
+                    c.slice_prefix_len
+                ));
+            }
+            let slices = c.slice_count(&n.pool);
+            if slices > MAX_SLICES {
+                return invalid(format!(
+                    "nat64.pool splits into {slices} slices at /{}; maximum is {MAX_SLICES} \
+                     (use a shorter cluster.slice_prefix_len)",
+                    c.slice_prefix_len
+                ));
+            }
+            if !c.owned_pool.is_empty() {
+                return invalid("cluster.owned_pool cannot be combined with partition = \"slices\"");
+            }
+        }
+
+        if !c.members.is_empty() {
+            if c.members.len() > MAX_CLUSTER_MEMBERS {
+                return invalid(format!("cluster.members must list at most {MAX_CLUSTER_MEMBERS} members"));
+            }
+            if usize::from(c.node_count) != c.members.len() {
+                return invalid("cluster.node_count must equal the number of [[cluster.members]]");
+            }
+            let mut seen = vec![false; c.members.len()];
+            for (i, m) in c.members.iter().enumerate() {
+                let Some(slot) = seen.get_mut(usize::from(m.id)) else {
+                    return invalid(format!("cluster.members id {} must be < {}", m.id, c.members.len()));
+                };
+                if std::mem::replace(slot, true) {
+                    return invalid(format!("cluster.members id {} is listed twice", m.id));
+                }
+                check_node_name("cluster.members.name", &m.name)?;
+                check_identity("cluster.members.identity", &m.identity)?;
+                check_peer_addr("cluster.members.peer_addr", m.peer_addr)?;
+                if !(1..=100).contains(&m.weight) {
+                    return invalid("cluster.members.weight must be 1..=100");
+                }
+                if m.steer_addr.is_some() && c.steering_mode() != SteeringMode::Forward {
+                    return invalid(
+                        "cluster.members.steer_addr is only valid with cluster.steering.mode = \"forward\"",
+                    );
+                }
+                for o in &c.members[..i] {
+                    if o.name == m.name {
+                        return invalid(format!("cluster.members name {:?} is listed twice", m.name));
+                    }
+                    if o.identity == m.identity {
+                        return invalid(format!("cluster.members identity {:?} is listed twice", m.identity));
+                    }
+                    if o.peer_addr == m.peer_addr {
+                        return invalid(format!("cluster.members peer_addr {} is listed twice", m.peer_addr));
+                    }
+                }
+            }
+            match c.members.iter().find(|m| m.id == self.node.id) {
+                Some(me) if me.name == self.node.name => {}
+                _ => return invalid("cluster.members entry for node.id must carry node.name"),
+            }
+        }
+
+        if c.steering.mode == Some(SteeringMode::Forward) {
+            return invalid("cluster.steering.mode = \"forward\" is not supported yet (use \"drop\" or \"count\")");
+        }
+
+        let Some(h) = c.ha_active() else {
+            return Ok(());
+        };
+        if c.partition != Partition::Slices {
+            return invalid("[cluster.ha] requires cluster.partition = \"slices\"");
+        }
+        if c.members.len() < 2 {
+            return invalid("[cluster.ha] requires at least two [[cluster.members]]");
+        }
+        if h.listen.port() == 0 {
+            return invalid("cluster.ha.listen needs a non-zero port");
+        }
+        if h.listen.ip().is_unspecified() && !h.allow_wildcard {
+            return invalid("cluster.ha.listen must not be a wildcard address unless allow_wildcard = true");
+        }
+        if let Some(w) = &h.witness {
+            check_identity("cluster.ha.witness.identity", &w.identity)?;
+            check_peer_addr("cluster.ha.witness.addr", w.addr)?;
+            if c.members.iter().any(|m| m.identity == w.identity) {
+                return invalid("cluster.ha.witness.identity must differ from every member identity");
+            }
+            if c.members.iter().any(|m| m.peer_addr == w.addr) {
+                return invalid("cluster.ha.witness.addr must differ from every member peer_addr");
+            }
+        }
+        // SC-24: without a third voter a partition cannot be told apart from a
+        // peer failure, so both sides would take over.
+        if h.auto_failover == Some(true) && !c.quorum_tolerates_loss() {
+            return invalid(
+                "cluster.ha.auto_failover = true needs three or more members, or two members and a witness",
+            );
+        }
+        if !(1000..=30_000).contains(&h.lease_ms) {
+            return invalid("cluster.ha.lease_ms must be 1000..=30000");
+        }
+        if h.heartbeat_ms < 50 || h.heartbeat_ms > h.lease_ms / 4 {
+            return invalid("cluster.ha.heartbeat_ms must be 50..=lease_ms/4");
+        }
+        if !(1..=50).contains(&h.drift_margin_pct) {
+            return invalid("cluster.ha.drift_margin_pct must be 1..=50");
+        }
+        if h.tcp_adopt_secs > 3600 {
+            return invalid("cluster.ha.tcp_adopt_secs must be 0..=3600");
+        }
+        let to = &self.timeouts;
+        let longest = to.udp_secs.max(to.tcp_transitory_secs).max(to.icmp_secs);
+        if h.takeover_quarantine_secs < longest || h.takeover_quarantine_secs > MAX_TIMEOUT_SECS {
+            return invalid(format!(
+                "cluster.ha.takeover_quarantine_secs must be {longest}..={MAX_TIMEOUT_SECS} \
+                 (at least the longest udp/tcp_transitory/icmp timeout)"
+            ));
+        }
+        if !(1..=64).contains(&h.reserve_ahead_blocks) {
+            return invalid("cluster.ha.reserve_ahead_blocks must be 1..=64");
+        }
+        if h.failback_delay_secs > 86_400 {
+            return invalid("cluster.ha.failback_delay_secs must be 0..=86400");
+        }
+        if !(1..=64).contains(&h.max_concurrent_handovers) {
+            return invalid("cluster.ha.max_concurrent_handovers must be 1..=64");
+        }
+        if !h.repl_ring_entries.is_power_of_two() || !(1024..=MAX_REPL_RING_ENTRIES).contains(&h.repl_ring_entries) {
+            return invalid(format!(
+                "cluster.ha.repl_ring_entries must be a power of two in 1024..={MAX_REPL_RING_ENTRIES}"
+            ));
+        }
+        if !(1 << 20..=MAX_PEER_QUEUE_BYTES).contains(&h.peer_queue_bytes) {
+            return invalid(format!("cluster.ha.peer_queue_bytes must be 1048576..={MAX_PEER_QUEUE_BYTES}"));
+        }
+        if !(64 << 10..=MAX_FRAME_BYTES).contains(&h.max_frame_bytes) {
+            return invalid(format!("cluster.ha.max_frame_bytes must be 65536..={MAX_FRAME_BYTES}"));
+        }
+        // A snapshot keeps peer_queue_bytes / 4 in flight; a frame must fit.
+        if u64::from(h.max_frame_bytes) > h.peer_queue_bytes / 4 {
+            return invalid("cluster.ha.max_frame_bytes must be <= peer_queue_bytes / 4");
+        }
+        check_abs("cluster.ha.state_dir", &h.state_dir)?;
+        if !(100..=60_000).contains(&h.hook_timeout_ms) {
+            return invalid("cluster.ha.hook_timeout_ms must be 100..=60000");
+        }
+        if !(1000..=60_000).contains(&h.shutdown_handover_ms) {
+            return invalid("cluster.ha.shutdown_handover_ms must be 1000..=60000");
+        }
+        if let Some(p) = &h.hooks.announce {
+            check_abs("cluster.ha.hooks.announce", p)?;
+        }
+        if let Some(p) = &h.hooks.withdraw {
+            check_abs("cluster.ha.hooks.withdraw", p)?;
+        }
+        check_abs("cluster.ha.tls.cert_file", &h.tls.cert_file)?;
+        check_abs("cluster.ha.tls.key_file", &h.tls.key_file)?;
+        check_abs("cluster.ha.tls.ca_file", &h.tls.ca_file)?;
+        if let Some(r) = &h.tls.revocation {
+            r.validate("cluster.ha.tls.revocation")?;
+        }
         Ok(())
     }
 
-    /// True if any TLS endpoint is configured (syslog `transport = "tls"`
-    /// or `[management.tls]`). Builds without the `tls` feature refuse such
-    /// a config.
+    /// True if any TLS endpoint is configured (syslog `transport = "tls"`,
+    /// `[management.tls]`, or the cluster peer channel of `[cluster.ha]`).
+    /// Builds without the `tls` feature refuse such a config.
     pub fn uses_tls(&self) -> bool {
-        self.management.tls.is_some() || self.audit.syslog.iter().any(|s| s.transport == SyslogTransport::Tls)
+        self.management.tls.is_some()
+            || self.audit.syslog.iter().any(|s| s.transport == SyslogTransport::Tls)
+            || self.cluster.ha_enabled()
     }
 }
 

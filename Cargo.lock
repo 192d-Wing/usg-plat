@@ -1014,6 +1014,8 @@ version = "0.1.0"
 dependencies = [
  "plat-common",
  "proptest",
+ "sha2",
+ "thiserror",
 ]
 
 [[package]]
@@ -1032,6 +1034,7 @@ version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
  "libc",
+ "rustix",
 ]
 
 [[package]]
@@ -1044,6 +1047,7 @@ dependencies = [
  "crossbeam-utils",
  "parking_lot",
  "plat-audit",
+ "plat-cluster",
  "plat-common",
  "plat-packet",
  "plat-xlat",
@@ -1104,10 +1108,13 @@ dependencies = [
  "plat-tls",
  "plat-xlat",
  "rcgen",
+ "rustix",
  "rustls",
  "rustls-pki-types",
+ "serde",
  "sha2",
  "signal-hook",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]

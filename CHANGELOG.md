@@ -4,6 +4,64 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 
 ## [Unreleased]
 
+### Cluster high availability (branch `feat/cluster-ha`)
+
+HA is off unless `[cluster.ha] enabled = true`. The peer wire protocol is
+unreleased and unversioned across builds: **all members and the witness must
+run the same build.** Linux three-VM items L19–L23 are not fully re-run.
+
+#### Breaking
+
+- SIEM schema **6 → 7** (`plat_audit::LOG_SCHEMA_VERSION = 7`). SIEM parser
+  owners must update: new `cluster_*` records and `service_start` fields
+  `cluster.mode`, `cluster.config_digest`, owned slices. See
+  `docs/compliance/SIEM_LOGGING.md`.
+- Released port blocks now cool down for `nat64.block_cooldown_secs`
+  (default 120, range 120..=3600) before reuse (POAM-010 closed).
+
+#### Added
+
+- `plat-cluster`: `membership` (leases, quorum, leader election), `view`,
+  `slices` (fixed /28 slices, weighted rendezvous), `codec` (peer wire
+  format), `digest` (config digest); simulation tests `tests/sim.rs`.
+- `plat-nat64::repl` (export/import of blocks, BIBs, subscriber directory),
+  TCP pickup window for adopted BIBs; `plat-io::cred` (socket peer
+  credentials); `plat-tls` peer (mutual, serverAuth+clientAuth) configs;
+  `services/platd/src/cluster/` (control, replicator, peer channel).
+- Config: `[cluster] partition = "contiguous"|"slices"` and slice settings,
+  `[cluster.members]`, `[cluster.ha]` (lease, heartbeat, auto_failover,
+  failback, `tcp_adopt_secs`, ring sizes, `tls`), `[cluster.steering]`
+  (`mode = "drop"|"count"`; `forward` rejected), `nat64.block_cooldown_secs`.
+- Audit records: `cluster_view_change`, `cluster_member_state`,
+  `cluster_slice_acquire`, `cluster_slice_release` (incl. handover),
+  `nat_port_block_adopt`, `cluster_peer_server`, `cluster_peer_client`,
+  `cluster_peer_rejected`, `cluster_peer_suppressed`,
+  `cluster_replication_gap`, `cluster_hook`, `cluster_operator_command`.
+- Drop reasons `wrong_node`, `cluster_fenced`, `missteered`.
+- Metrics: `plat_cluster_{epoch,leader,lease_remaining_ms,slices,peer_up,
+  peer_rejected_total,handovers_total,takeovers_total,resync_total,
+  repl_events_total,repl_dropped_total,repl_lag_records,
+  repl_ack_timeouts_total,directory_entries,hook_failures_total,
+  state_persist_failures_total,steer_missteered_total}`,
+  `plat_pool_{blocks_free,blocks_total,releases_deferred_total,
+  paired_exhausted_total}`, `cluster_reserve_starved`; mgmt `/cluster`.
+- CLI: `platd witness`, `platd cluster status`, `platd cluster takeover
+  [--force]`, `platd cluster restore` (operator socket `state_dir/ctl.sock`,
+  root or daemon uid only).
+- Deploy: `deploy/hooks/frr-{announce,withdraw}.sh`,
+  `deploy/systemd/plat-v6-announce.sh` with
+  `platd.service.d.example/v6-announce.conf` and
+  `frr.service.d.example/plat-v6-announce.conf`; `PLAT_V6_MODE` /
+  `PLAT_V4_POOL` in `plat-tun-setup.sh`; Lima `deploy/lima/*.yaml`;
+  cluster test bed `deploy/tests/cluster/` (F1–F13, takeover trials).
+- Dependencies: `rustix` (workspace, `event`/`net`/`process`) and `libc`
+  (`plat-io`, peer credentials). Both MIT/Apache-2.0; `cargo deny` clean.
+
+#### Compliance
+
+- POAM-010 closed; POAM-007 Partial; POAM-017 split (a) open, (b) partial,
+  (c) closed with HA; new POAM-028 to POAM-033.
+
 ### Documentation: Linux TUN throughput (branch `perf/linux-throughput`)
 
 - README "Measured performance" and ARCHITECTURE.md: indicative Linux TUN

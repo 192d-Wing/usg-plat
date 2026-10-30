@@ -44,7 +44,7 @@ conversation acts as orchestrator and delegates to the subagents in
 | `crates/plat-audit` | Non-blocking SIEM logging: JSON/CEF, RFC 5424 syslog (UDP/TCP/TLS), SHA-256 chained file; `tls` feature |
 | `crates/plat-tls` | FIPS provider and start gate, TLS 1.3 policy, key/cert loading, mTLS identity allow-list, OCSP/CRL revocation |
 | `crates/plat-io` | `PacketQueue` trait, Linux multiqueue TUN, in-memory queue |
-| `crates/plat-cluster` | Deterministic pool partitioning, CIDR cover, rendezvous hashing |
+| `crates/plat-cluster` | Deterministic pool partitioning, CIDR cover, rendezvous hashing; HA (sans-IO): fixed slices with weighted rendezvous, lease-based membership/views, config digest, strict peer wire codec |
 | `services/platd` | Daemon: FIPS gate, workers, sweeper, clock, mTLS management/metrics, revocation refresher, `check-config`, `verify-log` |
 
 ## Development Commands
@@ -90,7 +90,7 @@ chain, 1 on a verification failure, an unverified tail (unless
    mapping, (b)(1) path/status validation, (b)(2) revocation cache). Never cite
    SC-17 on code: it is an organisational control.
 8. **Log schema is an interface.** Any change to SIEM field names bumps
-   `plat_audit::LOG_SCHEMA_VERSION` (currently 5) and
+   `plat_audit::LOG_SCHEMA_VERSION` (currently 7) and
    `docs/compliance/SIEM_LOGGING.md`. Audit fields carry no attacker-controlled
    text except certificate-derived strings, which must go through
    `plat_audit::AuditText` (sanitised, length-capped, escaped for JSON/CEF).
@@ -122,6 +122,10 @@ chain, 1 on a verification failure, an unverified tail (unless
 | SI-10 | `plat-packet` validation, strict OCSP/CRL/HTTP parsing in `plat-tls`, property tests that parsers never panic |
 | SC-8/SC-13/AC-17 | TLS 1.3 syslog (RFC 5425) and mTLS management via aws-lc-rs FIPS; FIPS start gate |
 | IA-3/IA-5(2)/AC-3 | mTLS client certs with typed allow-list (`cn:`/`dns:`/`uri:`/`sha256:`), full-chain OCSP then CRL revocation |
+| CP-10/SC-5(2) cluster HA | `plat-cluster` membership and slices, `plat-nat64` `repl.rs` rings/shadow and `State::adopt_slice`, `services/platd/src/cluster/`; off unless `[cluster.ha] enabled = true`; POAM-007 Partial (sessions not replicated, POAM-028 pickup; leader-crash takeover ~6.2 s vs 5 s target; L19–L23 not run), POAM-017 (a) open, (b) partial |
+| AU-2/AU-12/AU-5 cluster | schema 7 `cluster_*` records and `nat_port_block_adopt` queued before a slice is Active (retried under `refuse_new_bindings`); `cluster_operator_command` for every takeover/restore and refusal |
+| SC-8/IA-3/AC-3 cluster | peer channel mTLS 1.3 via `plat_tls::peer_configs`, identity bound to member id, accept-side IP pinning (dialer not pinned, POAM-031), replication only from the slice owner, one trust domain (POAM-032); operator socket admits uid 0 or the daemon uid via peer credentials (`plat_io::cred`) |
+| SC-24 cluster | lease self-fence, minority never takes over, unsynced takeover holds back unseen blocks |
 | CM-6/CM-7 | `deny_unknown_fields`, validated ranges, management is loopback-only plaintext or mTLS (never plaintext off-host) |
 | CM-3/SA-11/SR-3 | CI (fmt, clippy host + aarch64, tests on Linux, cargo-audit/deny) is a required check on `main`; actions pinned by SHA |
 | AC-6/SC-39 | systemd unit grants no capabilities and sandboxes the unprivileged `plat` user (not yet verified on Linux, `docs/compliance/LINUX_VERIFICATION.md`) |

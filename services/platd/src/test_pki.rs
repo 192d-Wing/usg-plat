@@ -59,6 +59,23 @@ impl Ca {
         Leaf { der: cert.der().clone(), pem: cert.pem(), key_pem: key.serialize_pem(), serial }
     }
 
+    /// A cluster peer leaf: `cn` as subject CN and DNS SAN, both
+    /// serverAuth and clientAuth (one identity dials and accepts).
+    pub fn peer_leaf(&self, cn: &str) -> Leaf {
+        let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut p = CertificateParams::new(Vec::<String>::new()).unwrap();
+        p.distinguished_name.push(DnType::CommonName, cn);
+        p.subject_alt_names = vec![SanType::DnsName(cn.try_into().unwrap())];
+        p.is_ca = IsCa::ExplicitNoCa;
+        p.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        p.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth, ExtendedKeyUsagePurpose::ClientAuth];
+        p.use_authority_key_identifier_extension = true;
+        let serial = SERIAL.fetch_add(1, Ordering::Relaxed);
+        p.serial_number = Some(SerialNumber::from(serial));
+        let cert = p.signed_by(&key, &self.issuer).unwrap();
+        Leaf { der: cert.der().clone(), pem: cert.pem(), key_pem: key.serialize_pem(), serial }
+    }
+
     /// A CRL (DER) revoking `serials`, valid until 2049.
     pub fn crl(&self, serials: &[u64]) -> Vec<u8> {
         let p = CertificateRevocationListParams {

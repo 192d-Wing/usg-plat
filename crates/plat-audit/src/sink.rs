@@ -240,7 +240,7 @@ mod tests {
     use crate::LifecycleKind;
 
     fn ev() -> Event {
-        Event::Lifecycle { ts_us: 0, kind: LifecycleKind::Start, fips: None }
+        Event::Lifecycle { ts_us: 0, kind: LifecycleKind::Start, fips: None, cluster: None }
     }
 
     /// SEC-302 / NIST-401: `try_emit` never counts; a full queue is

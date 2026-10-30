@@ -110,3 +110,108 @@ fn overflow_is_counted_and_reported() {
     assert!(!sink.emit(ev(3)));
     assert_eq!(sink.stats().lost.load(std::sync::atomic::Ordering::Relaxed), 1);
 }
+
+/// Schema 7: cluster records flow through the logger and `verify-log`
+/// accepts them (chain format unchanged); tampering is still detected.
+#[test]
+fn cluster_records_verify() {
+    use plat_audit::{
+        AcquireReason, AuditText, BlockAdopt, BlockReleaseReason, ClusterView, HookKind, HookRun, PeerRejectReason,
+        PeerRejected, SliceAcquire, SliceCidr, SliceReleaseReason, ViewReason,
+    };
+    use std::sync::Arc;
+    let ts = 1_793_196_960_000_000;
+    let slice = SliceCidr { net: 0xc000_0210, len: 28 };
+    let evs = vec![
+        Event::ClusterViewChange {
+            ts_us: ts,
+            view: Arc::new(ClusterView { epoch: 4, leader: 0, members_live: vec![0, 1], reason: ViewReason::Election }),
+        },
+        Event::ClusterSliceAcquire {
+            ts_us: ts,
+            acquire: Arc::new(SliceAcquire {
+                slice,
+                epoch: 4,
+                prev_owner: Some(1),
+                reason: AcquireReason::Takeover,
+                blocks_adopted: 1,
+                bibs_adopted: 3,
+                blocks_quarantined: 0,
+                in_sync: true,
+            }),
+        },
+        Event::PortBlockAdopt {
+            ts_us: ts,
+            adopt: Arc::new(BlockAdopt {
+                sub: 0x2001_0db8 << 96,
+                sub_len: 64,
+                v4: 0xc000_0211,
+                port_lo: 1024,
+                port_hi: 1535,
+                allocated_us: ts - 5_000_000,
+                prev_owner: Some(1),
+                epoch: 4,
+            }),
+        },
+        Event::PortBlockRelease {
+            ts_us: ts,
+            sub: 0x2001_0db8 << 96,
+            sub_len: 64,
+            v4: 0xc000_0211,
+            port_lo: 1024,
+            port_hi: 1535,
+            held_secs: 5,
+            reason: Some(BlockReleaseReason::Handover),
+        },
+        Event::ClusterSliceRelease {
+            ts_us: ts,
+            slice,
+            epoch: 5,
+            new_owner: Some(1),
+            reason: SliceReleaseReason::Handover,
+        },
+        Event::ClusterPeerRejected {
+            ts_us: ts,
+            rejected: Arc::new(PeerRejected {
+                ip: "198.51.100.99".parse().unwrap(),
+                port: 1,
+                identity: Some(AuditText::new("dns:x\"},\"event.sequence\":0", AuditText::SUBJECT_MAX)),
+                claimed_id: Some(1),
+                reason: PeerRejectReason::NotAllowed,
+            }),
+        },
+        Event::ClusterPeerSuppressed { ts_us: ts, suppressed: 3, window_secs: 60 },
+        Event::ClusterReplicationGap { ts_us: ts, slice, lost: 2 },
+        Event::ClusterHook {
+            ts_us: ts,
+            run: Arc::new(HookRun {
+                hook: HookKind::Withdraw,
+                slice,
+                epoch: 5,
+                exit_code: Some(1),
+                duration_us: 9,
+                success: false,
+            }),
+        },
+    ];
+    let n = evs.len() as u64;
+    let path = tmp("cluster7");
+    let (sink, rx) = AuditSink::bounded(1024);
+    let h = Logger::new(cfg(path.clone(), vec![]), node(), rx, sink.stats().clone()).spawn().unwrap();
+    for e in evs {
+        assert!(sink.emit(e));
+    }
+    drop(sink);
+    h.join();
+    let mut text = String::new();
+    std::fs::File::open(&path).unwrap().read_to_string(&mut text).unwrap();
+    let rep = verify(text.as_bytes()).unwrap();
+    assert!(rep.ok(), "{rep:?}\n{text}");
+    assert_eq!(rep.records, n);
+    for a in ["cluster_view_change", "nat_port_block_adopt", "cluster_peer_rejected", "cluster_hook"] {
+        assert!(text.contains(&format!("\"event.action\":\"{a}\"")), "{a}");
+    }
+    assert!(text.contains("\"plat.schema\":7"));
+    let edited = text.replacen("\"cluster.epoch\":4", "\"cluster.epoch\":3", 1);
+    assert!(!verify(edited.as_bytes()).unwrap().ok(), "edited epoch");
+}

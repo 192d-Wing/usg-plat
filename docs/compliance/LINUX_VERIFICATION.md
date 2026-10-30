@@ -50,7 +50,7 @@ each item.
 | L7 | platd survives the system-call filter, with CPU pinning | SC-39, AC-6 | — | PASS (run 2) |
 | L8 | Device policy and sandbox options leave `/dev/net/tun` usable | SC-39 | — | PASS (run 2) |
 | L9 | `MemoryMax` / `TasksMax` adequate for the production config | SC-5, SC-39, CP-10 | POAM-021 | PASS (run 2); formula ~14 % conservative |
-| L10 | Two-node cluster: each node routes only its own slice | SC-7, SC-5(2) | POAM-017 | PASS (emulated: two netns on one host, not a real two-node cluster; run 2) |
+| L10 | Two-node cluster: each node routes only its own slice | SC-7, SC-5(2) | POAM-017 | PASS (emulated: two netns on one host, not a real two-node cluster; run 2). Legacy `contiguous` mode only; the real multi-VM cluster test is L19–L23 (not yet run) |
 | L11 | No other forward drop policy overrides ours; no conntrack from our ruleset | SC-7, CM-7 | — | PASS with note (run 2) |
 | L12 | Audit lifecycle on ext4/xfs, `statvfs` under the sandbox, power cut, damaged start | AU-5, AU-5(1), AU-9, AU-11 | POAM-020, POAM-027 | PASS (run 4); by-design residual POAM-027 |
 | L13 | Log directory permissions and shipper access | AU-9, AC-6 | — | PASS (runs 3 and 4) |
@@ -59,7 +59,11 @@ each item.
 | L16 | Crash and restart behaviour; start limit | CP-10, SC-24, AU-9 | POAM-009 | PASS (run 3) |
 | L17 | TUN back-pressure is counted, not a stall | SC-5, SI-4 | — | PARTIAL (run 2): kernel drops exported; `tx_queue_full` path unexercised |
 | L18 | `.deb` and `.rpm` install, upgrade and removal | CM-2, CM-6, AC-6, AU-9 | — | NOT RUN |
-
+| L19 | Cluster HA failover: node crash, VM loss, hook failure (F1, F2, F11) | CP-10, SC-5(2), AU-12, SC-24 | POAM-007, POAM-028 | PASS (three-VM run, round 6 build, 2026-10-29; `target/agent-workflow/cluster-ha/three-vm-report.md` (round 6)). F1 `kill -9`: takeover 3830 ms, TCP 200/200, 10 acquire(takeover) + 8 adopt, 0 attribution violations over 219k packets; F2 VM loss: takeover 3433 ms, TCP 200/200, 231k packets 0 violations; F11 hook failure/timeout PASS. Leader crash: 5 round-6 trials poll median 3748 ms, max 3950 ms (27 trials over rounds 2-6, max 4508 ms, all <= 5 s). Crash route cleanup (`deploy/tests/cluster/route-check.sh`): after `kill -9` the dead node withdraws its IPv4 slices and the IPv6 prefix, and a restarted standby announces nothing until it owns a slice |
+| L20 | Cluster HA split brain: peer-link partition, isolation, witness down, clock step (F3, F4, F9, F10) | SC-24, CP-10, AU-10 | POAM-007 | PASS (three-VM run, round 6). F3 partition (one view, no dual-active slice, 176k packets 0 violations), F4 isolation (fenced 1959 ms, B active 1315 ms, 10 withdraw hooks, no packets from A after fence), F9 witness down after the F8 load (TCP 200/200, max gap 115 ms, no takeover without quorum), F10 clock step: all PASS |
+| L21 | Cluster HA rejoin, failback and growth (F5, F12) | CP-10, AU-12 | POAM-017(a), POAM-030 | PARTIAL (three-VM run, round 6). F5: A in sync after 833 ms, failback 63.2 s after rejoin, 8 release(handover) records, no `missteered` drops on the standby before failback, UDP max gap 50 ms; but 1/200 TCP flows lost and one flow gapped 26.8 s: the planned handover drops TCP state on the new owner (316 `tcp_no_state` on A in the minute after failback; sessions not replicated, POAM-007(1)/POAM-028). F12 grow: B serves 6/16 after 64.5 s, 6 handed over (6 in flight is the documented deviation POAM-017(a)), TCP 184/200 (92 %) for the same reason |
+| L22 | Cluster HA identity and config digest: duplicate id, digest mismatch (F6, F7) | IA-3, CM-6, AC-3 | POAM-017(c), POAM-032 | PASS (three-VM run, round 6). F6 impostor refused `duplicate_id` (witness), serves no slice; F7 digest mismatch refused and audited, no replication, `service_start` digests differ |
+| L23 | Cluster HA replication back-pressure and mis-steer (F8, F13) | SC-5, SI-4, SC-7 | POAM-017(b), POAM-029 | PASS (three-VM run, round 6). F8: worker rate within noise (3596 vs 3533 pps), no replication loss, B in sync. F13 fresh /64 (2001:db8:100:336b::/64): mis-steer counted and dropped (13), no block on the non-home node, in steady state and after a platd restart of that node |
 
 ## Procedures, pass criteria and results
 
@@ -384,3 +388,55 @@ path is still unexercised on Linux (covered only by
   (conffile / `%config(noreplace)`).
 - Remove the package: `platd` and the guard are stopped and disabled; the
   config and `/var/log/plat` remain.
+
+### L19–L23 — cluster HA on three VMs (PLANNED, not yet run)
+
+Branch `feat/cluster-ha` (uncommitted). Nothing below has been executed: the
+VM definitions and scripts are authored and pass `sh -n`, shellcheck and the
+stubbed `make test-deploy` checks only. These items must not be cited as
+evidence until they have a recorded result. (The plan called these L18–L22;
+L18 was already taken by the package check, so they are numbered L19–L23.)
+
+Topology (`deploy/lima/plat-linux-2.yaml`, `deploy/lima/plat-edge.yaml`; the
+existing `plat-linux` VM is moved to the same network):
+
+- VMs `plat-linux` (node A, member 0), `plat-linux-2` (node B, member 1) and
+  `plat-edge` (FRR router with BGP and BFD, netns `cli` and `inet`, `platd
+  witness`, traffic server and a UDP syslog sink), Ubuntu 24.04 arm64.
+- Lima `user-v2` network (no host prerequisite) with a VXLAN overlay `plha0`
+  (VNI 205, MTU 1450): 192.168.205.11/.12/.20, fd00:205::11/12/20.
+- Nodes peer with the edge over BGP (BFD); the shipped hooks
+  `deploy/hooks/frr-{announce,withdraw}.sh` announce slices; the edge has an
+  L3-hashed ECMP route for the NAT64 prefix to both nodes.
+- Throw-away test PKI generated on the edge (EC P-256, serverAuth and
+  clientAuth EKU); revocation `off` for the test CA.
+- Harness: `deploy/tests/cluster/setup.sh`, `run-all.sh`, one script per
+  case (`f01-kill-platd.sh` … `f13-missteer.sh`), traffic meter `flows.py`,
+  attribution checker `attrib-check.sh` (no `(v4, port range)` allocated or
+  adopted on two nodes with overlapping intervals; every adopt precedes the
+  first translated packet from that block on the edge capture).
+
+| Item | Case | Pass criteria |
+|------|------|---------------|
+| L19 | F1 `kill -9 platd` on A | B acquires A's slices within lease + margin + BFD (target ≤ 5 s); ≥ 95 % of TCP flows survive; acquire and adopt records present; zero attribution overlap |
+| L19 | F2 `limactl stop -f plat-linux` (VM loss) | as F1 |
+| L19 | F11 hook failure or timeout | `cluster_hook` outcome `failure`, counted; slice stays Active and is alerted |
+| L20 | F3 peer-link partition only (A↔B cut, both reach the witness) | exactly one view wins; no slice swap churn; no dual-active on the edge capture |
+| L20 | F4 full isolation of A (data plane up) | A fences within lease − margin and runs the withdraw hook; B takes over after lease + margin; the edge sees no slice packets from A after A's fence time |
+| L20 | F9 witness down | no view change and no disruption; with a subsequent A crash, no takeover (documented) |
+| L20 | F10 wall-clock step ±1 h on A | no lease effect (monotonic time only) |
+| L21 | F5 rejoin A | A syncs as backup and fails back after `failback_delay_secs` by handover, no flow loss beyond 1 s; release(`handover`) records |
+| L21 | F12 grow from 1 to 2 members | about half of the slices handed over; flows survive. Expected deviation: no leader-side batching, so all moved slices go in one view (POAM-017(a)) |
+| L22 | F6 duplicate `node.id` | refused `duplicate_id`, audited, `/healthz` degraded, no slice served by the impostor |
+| L22 | F7 config digest mismatch (different `port_block_size`) | `digest_mismatch`, no replication, `service_start` digests differ |
+| L23 | F8 slow or lossy peer link (netem delay 200 ms, loss 5 %, 1 Mbit) under a flow storm | worker throughput within noise; any loss counted (`plat_cluster_repl_dropped_total` on A or `{reason="gap"}` on B) and repaired by resync after the impairment is lifted, or, when the impairment causes no loss (the replication stream fits the link and the queue does not overflow), no drop, no gap, no resync and B in sync; no attribution violation |
+| L23 | F13 mis-steer (edge sends one subscriber to B while it is homed on A) | `missteered` counted and dropped in `drop` mode |
+
+Open timing item for L19: the in-process simulation
+(`crates/plat-cluster/tests/sim.rs`, lease 3 s, heartbeat 500 ms, 10 % drift)
+bounds a member crash at about 4.7 s but a **leader crash at about 6.2 s**,
+above the 5 s target of F1. F1 must be run with the leader as the crashed
+node as well; the result decides whether the target or `lease_ms` changes
+(POAM-007).
+
+Result: **NOT RUN.**

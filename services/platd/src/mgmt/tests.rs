@@ -92,6 +92,7 @@ fn sources() -> Sources {
         audit: sink,
         fips: true,
         extra: Vec::new(),
+        cluster: None,
     }
 }
 

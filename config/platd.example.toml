@@ -10,6 +10,39 @@ name = "plat-01"
 # Nodes sharing nat64.pool. Each node owns a disjoint contiguous slice of the
 # pool and announces it upstream; see ARCHITECTURE.md "Cluster scale-out".
 node_count = 1
+# High availability (off unless [cluster.ha] is present with enabled = true;
+# see ARCHITECTURE.md). HA needs partition = "slices", the full member list on
+# every node, and a witness for automatic failover in two-node clusters.
+# partition = "slices"          # "contiguous" (default) | "slices"
+# slice_prefix_len = 28         # 16..=32, >= every pool prefix; <= 4096 slices
+#
+# [[cluster.members]]           # ids 0..n, unique names/identities/addresses
+# id = 0
+# name = "plat-01"              # must equal that node's node.name
+# peer_addr = "198.51.100.11:7946"
+# identity = "dns:plat-01.cluster.example"   # typed, exact match
+# weight = 1                    # 1..=100
+#
+# [cluster.ha]
+# enabled = true
+# listen = "198.51.100.11:7946"  # no wildcard unless allow_wildcard = true
+# witness = { addr = "198.51.100.20:7946", identity = "dns:witness.cluster.example" }
+# lease_ms = 3000               # 1000..=30000; heartbeat_ms <= lease_ms / 4
+# heartbeat_ms = 500
+# tcp_adopt_secs = 300          # TCP pickup window after takeover, 0..=3600
+# takeover_quarantine_secs = 600
+# failback_delay_secs = 60      # 0 = manual failback
+# state_dir = "/var/lib/plat/cluster"
+# [cluster.ha.hooks]
+# announce = "/usr/libexec/plat/frr-announce.sh"
+# withdraw = "/usr/libexec/plat/frr-withdraw.sh"
+# [cluster.ha.tls]
+# cert_file = "/etc/plat/tls/peer.pem"
+# key_file = "/etc/plat/tls/peer.key"
+# ca_file = "/etc/plat/tls/cluster-ca.pem"
+#
+# [cluster.steering]
+# mode = "drop"                 # "count" | "drop"; default drop with HA, count without
 
 [translation]
 # RFC 6052 prefix. This example uses a /96 inside the RFC 8215 local-use
@@ -53,6 +86,9 @@ max_sessions = 4000000
 max_sessions_per_subscriber = 4000
 max_subscribers = 1000000
 table_shards = 1024
+# Released port blocks are held back this long before reuse (RFC 6888
+# REQ-12; 120..=3600).
+block_cooldown_secs = 120
 
 [timeouts]
 udp_secs = 300

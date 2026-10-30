@@ -247,6 +247,9 @@ fn full_teardown_removes_subscriber_and_new_flow_logs_new_block() {
     assert_eq!(fx.nat.state().bib4.len(), 0);
     fx.clock.advance(Duration::from_secs(61));
     assert_eq!(fx.nat.state().sweep().blocks_released, 1);
+    assert_eq!(fx.nat.state().pool.free_blocks(), total - 1, "cooling down (POAM-010)");
+    fx.clock.advance(Duration::from_secs(120));
+    fx.nat.state().sweep();
     assert_eq!(fx.nat.state().pool.free_blocks(), total);
     assert_eq!(fx.nat.state().session_count(), 0);
 
@@ -313,6 +316,10 @@ fn pool_exhaustion_is_reported_and_recovers() {
     fx.nat.state().sweep();
     fx.clock.advance(Duration::from_secs(61));
     assert_eq!(fx.nat.state().sweep().blocks_released, 8);
+    // POAM-010: released blocks are not reusable during the cool-down.
+    assert_eq!(run(&mut fx, &udp6(sub(8, 1), 1, SERVER, 53, b"x")).unwrap_err(), DropReason::PortExhausted);
+    fx.clock.advance(Duration::from_secs(120));
+    fx.nat.state().sweep();
     run(&mut fx, &udp6(sub(8, 1), 1, SERVER, 53, b"x")).unwrap();
 }
 
