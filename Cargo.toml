@@ -36,7 +36,7 @@ plat-tls = { path = "crates/plat-tls", version = "0.1.0" }
 ahash = "0.8"
 clap = { version = "4", features = ["derive"] }
 core_affinity = "0.8"
-criterion = { version = "0.5", default-features = false }
+criterion = { version = "0.8", default-features = false }
 crossbeam-channel = "0.5"
 crossbeam-utils = "0.8"
 hex = "0.4"
