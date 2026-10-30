@@ -50,7 +50,8 @@ pub fn check(cfg: &Config, path: &Path) -> Result<(), String> {
         )
     };
     let text = read_bounded(path).map_err(|e| fail(format!("cannot read {}: {e}", path.display())))?;
-    let tun = format!("oifname \"{}\"", cfg.dataplane.interface);
+    let tun_name = format!("\"{}\"", cfg.dataplane.interface);
+    let tun = format!("oifname {tun_name}");
     let mut guard_seen = false;
     for l in text.lines().map(str::trim) {
         if l.starts_with('#') || l.contains("hook ") {
@@ -59,8 +60,9 @@ pub fn check(cfg: &Config, path: &Path) -> Result<(), String> {
         let words: Vec<&str> = l.split_whitespace().collect();
         if !guard_seen && is_guard(l, &tun, &t.cluster_interfaces, &cfg.nat64.pool) {
             guard_seen = true;
-        } else if !guard_seen && words.contains(&"accept") && !words.contains(&"ip6") {
-            // An accept that can match IPv4 before the guard shadows it.
+        } else if !guard_seen && words.contains(&"accept") && !words.contains(&"ip6") && may_reach_tun(l, &tun_name) {
+            // An accept that can match IPv4 towards the TUN before the
+            // guard shadows it.
             return Err(fail(format!("{} accepts IPv4 before the pool-source guard: {l}", path.display())));
         }
     }
@@ -76,6 +78,27 @@ fn is_guard(l: &str, tun: &str, ifaces: &[String], pool: &[Ipv4Cidr]) -> bool {
         && l.contains(" drop ")
         && ifaces.iter().all(|i| l.contains(&format!("\"{i}\"")))
         && saddr_set(l).is_some_and(|set| pool.iter().all(|c| covered(c, &set)))
+}
+
+/// Whether a rule can match traffic forwarded to the TUN (`tun` is the
+/// quoted interface name), and so shadow the guard (which matches
+/// `oifname <tun>`): it names the TUN or a negation as output interface,
+/// or it has no output restriction and does not match only traffic
+/// arriving from the TUN (`iifname <tun> ... accept`, the outbound rule
+/// `plat-tun-setup.sh` writes, cannot).
+fn may_reach_tun(l: &str, tun: &str) -> bool {
+    let Some(rest) = l.split_once("oifname ").map(|x| x.1.trim_start()) else {
+        let from_tun = l.split_once("iifname ").is_some_and(|x| x.1.split_whitespace().next() == Some(tun));
+        return !from_tun;
+    };
+    if rest.starts_with("!=") {
+        return true;
+    }
+    let value = match rest.strip_prefix('{') {
+        Some(r) => r.split_once('}').map_or(r, |x| x.0),
+        None => rest.split_whitespace().next().unwrap_or(""),
+    };
+    value.split(',').any(|v| v.trim() == tun)
 }
 
 /// The `ip saddr { ... }` (or single-element) source set of a rule, as
@@ -222,6 +245,87 @@ mod tests {
         std::fs::remove_dir_all(&d).unwrap();
     }
 
+    /// Lines as `nft list table inet plat` printed them on Linux 6.8 /
+    /// nftables 1.0.9 (deploy/tests/nftguard/report.md): a /32 loses its
+    /// prefix length, a one-element interface set its braces, adjacent
+    /// prefixes merge into a range, and live tables carry counters.
+    const OUT_V4: &str = "iifname \"plat0\" ip saddr { 192.0.2.0/24, 203.0.113.7 } accept";
+
+    fn real(pool: &[&str], ifaces: &str, guard: &str) -> (Config, String) {
+        let mut c = cfg(true);
+        c.nat64.pool = pool.iter().map(|p| p.parse().unwrap()).collect();
+        c.translation.cluster_interfaces = ifaces.split(',').map(str::to_string).collect();
+        (c, guard.to_string())
+    }
+
+    #[test]
+    fn real_nft_rendering_passes() {
+        let d = dir("real");
+        for (c, guard) in [
+            real(
+                &["192.0.2.0/24", "203.0.113.7/32"],
+                "cl0",
+                "oifname \"plat0\" iifname != \"cl0\" ip saddr { 192.0.2.0/24, 203.0.113.7 } \
+                 counter packets 2 bytes 91 drop comment \"plat-pool-source-guard\" # handle 7",
+            ),
+            real(
+                &["192.0.2.0/24", "192.0.3.0/25"],
+                "cl0",
+                "oifname \"plat0\" iifname != \"cl0\" ip saddr { 192.0.2.0-192.0.3.127 } \
+                 counter packets 1 bytes 45 drop comment \"plat-pool-source-guard\"",
+            ),
+            real(
+                &["192.0.2.0/24", "203.0.113.7/32"],
+                "cl0,bond1.40",
+                "oifname \"plat0\" iifname != { \"cl0\", \"bond1.40\" } ip saddr { 192.0.2.0/24, 203.0.113.7 } \
+                 counter packets 0 bytes 0 drop comment \"plat-pool-source-guard\"",
+            ),
+        ] {
+            let p = snapshot(&d, &format!("{guard}\n\t\t{OUT_V4}\n\t\tcounter packets 0 bytes 0 drop"));
+            assert!(check(&c, &p).is_ok(), "{guard}");
+        }
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn missing_guard_is_reported_as_missing_not_shadowed() {
+        let (c, guard) = real(
+            &["192.0.2.0/24", "203.0.113.7/32"],
+            "cl0",
+            "oifname \"plat0\" iifname != \"cl0\" ip saddr { 192.0.2.0/24, 203.0.113.7 } \
+             counter packets 0 bytes 0 drop comment \"plat-pool-source-guard\"",
+        );
+        let d = dir("msg");
+        // The outbound accept from the TUN follows; it cannot shadow a rule
+        // for traffic towards the TUN, so a missing or mismatched guard is
+        // reported as such.
+        for bad in [
+            String::new(),
+            guard.replace("\"cl0\"", "\"ext0\""),
+            guard.replace("203.0.113.7", "198.51.100.1"),
+            "oifname \"plat0\" ip saddr { 192.0.2.0/24, 203.0.113.7 } counter packets 0 bytes 0 drop \
+             comment \"plat-pool-source-guard\""
+                .to_string(),
+        ] {
+            let e = check(&c, &snapshot(&d, &format!("{bad}\n\t\t{OUT_V4}"))).unwrap_err();
+            assert!(e.contains("has no matching pool-source guard rule"), "{bad}: {e}");
+        }
+        // Accepts that can reach the TUN still shadow it.
+        for shadow in [
+            "oifname \"plat0\" ip saddr 192.0.2.1 accept",
+            "oifname { \"eth9\", \"plat0\" } accept",
+            "oifname != \"eth0\" accept",
+            "iifname \"eth0\" accept",
+        ] {
+            let e = check(&c, &snapshot(&d, &format!("{shadow}\n\t\t{guard}"))).unwrap_err();
+            assert!(e.contains("accepts IPv4 before the pool-source guard"), "{shadow}: {e}");
+        }
+        // Accepts towards other interfaces do not.
+        let other = "oifname \"eth0\" ip saddr 192.0.2.1 accept";
+        assert!(check(&c, &snapshot(&d, &format!("{other}\n\t\t{OUT_V4}\n\t\t{guard}"))).is_ok());
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
     #[test]
     fn guard_must_precede_ipv4_accepts() {
         let c = cfg(true);
@@ -229,7 +333,7 @@ mod tests {
         let v6 = "oifname \"plat0\" ip6 saddr { 2001:db8::/32 } ip6 daddr 64:ff9b:1::/96 accept";
         let v4 = "iifname \"plat0\" ip saddr { 192.0.2.0/24 } accept";
         assert!(check(&c, &snapshot(&d, &format!("{v6}\n\t\t{GOOD}\n\t\t{v4}"))).is_ok());
-        for shadow in [v4, "ct state established,related accept", "oifname \"plat0\" accept"] {
+        for shadow in ["ct state established,related accept", "oifname \"plat0\" accept"] {
             let e = check(&c, &snapshot(&d, &format!("{shadow}\n\t\t{GOOD}"))).unwrap_err();
             assert!(e.contains("before the pool-source guard"), "{shadow}: {e}");
         }

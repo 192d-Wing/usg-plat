@@ -65,6 +65,7 @@ each item.
 | L22 | Cluster HA identity and config digest: duplicate id, digest mismatch (F6, F7) | IA-3, CM-6, AC-3 | POAM-017(c), POAM-032 | PASS (three-VM run, round 6). F6 impostor refused `duplicate_id` (witness), serves no slice; F7 digest mismatch refused and audited, no replication, `service_start` digests differ |
 | L23 | Cluster HA replication back-pressure and mis-steer (F8, F13) | SC-5, SI-4, SC-7 | POAM-017(b), POAM-029 | PASS (three-VM run, round 6). F8: worker rate within noise (3596 vs 3533 pps), no replication loss, B in sync. F13 fresh /64 (2001:db8:100:336b::/64): mis-steer counted and dropped (13), no block on the non-home node, in steady state and after a platd restart of that node |
 | L24 | Multiqueue TUN keeps every fragment of a datagram on one queue (Q2) | SC-5(2), SC-5 | POAM-035 | PASS (2026-10-29, performance review of `feat/protocol-completeness`): 0/64 IPv4 and 0/64 IPv6 datagrams split across 4 queues |
+| L25 | Pool-source guard rule and `cross_node_hairpin` start gate on real nftables | SC-7, SC-7(5), AC-4, CM-6 | POAM-024 | PASS (2026-10-29, kernel 6.8, nftables 1.0.9, three network namespaces): pool sources dropped from the external interface in both modes, accepted from the cluster interface only with the switch on; gate passes on real `nft list` output, refuses 4 broken snapshots |
 
 ## Procedures, pass criteria and results
 
@@ -460,3 +461,27 @@ The risk recorded in POAM-035 was not observed with default queue
 selection. Not covered: other queue-selection settings, other kernels and
 other I/O backends (AF_XDP, POAM-016); the harness used for the check is not
 in the repository.
+
+### L25 — pool-source guard on real nftables (POAM-024 residual (b))
+
+- Three network namespaces (translator with an external and a cluster
+  veth, TUN `plat0`; an external host; a cluster peer). `plat-tun-setup.sh`
+  loads the rules with the real `nft`; scapy probes with pool and non-pool
+  sources towards a pool address; a reader on the TUN and `tcpdump` record
+  what reaches it. Then `platd run` against the real `plat.nft.expected`
+  and broken copies of it.
+- Pass: pool-sourced IPv4 from the external interface never reaches the
+  TUN; from the cluster interface only with `cross_node_hairpin = true`;
+  non-pool sources always do; the start gate accepts every real rendering
+  (a /32 without prefix length, a one-element interface set without braces,
+  merged ranges, multi-interface sets, live counters) and refuses a missing
+  guard, a wrong interface, an uncovered pool and a hairpin-off guard.
+
+Result: **PASS** (2026-10-29, Lima VM `plat-linux`, kernel 6.8.0 aarch64,
+nftables 1.0.9). Report and scripts: `deploy/tests/nftguard/` (`report.md`;
+run with sudo in a disposable VM as described in its `README.md`). The
+refusal message in that run was the misleading "accepts IPv4 before the
+pool-source guard"; it now reads "has no matching pool-source guard rule"
+(`hairpin_guard.rs::missing_guard_is_reported_as_missing_not_shadowed`).
+Not covered: `plat-fwguard` live-table sync and a start under the systemd
+unit.
