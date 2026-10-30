@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use common::{Fx, config, fixture, l4_sum4, l4_sum6, run, run_all, sub, synth, udp4, udp6};
+use common::{Fx, config, fixture, fixture_q, l4_sum4, l4_sum6, run, run_all, sub, synth, udp4, udp6};
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use plat_audit::{AcquireReason, AuditSink};
 use plat_cluster::SliceMap;
@@ -341,7 +341,12 @@ fn timed_flows<K>(iters: u64, pkts: &[Vec<u8>], mut mk: impl FnMut() -> (Fx, K))
 /// Cluster engine over the fixture pool (four /32 slices, all Active, no
 /// backup reservation), with a replication ring on the worker.
 fn ha_fixture() -> (Fx, Arc<ReplHub>) {
-    let cfg = config(&[]);
+    ha_fixture_with(&[], 8)
+}
+
+/// `ha_fixture` with config edits and a reserve-ahead budget in blocks.
+fn ha_fixture_with(edits: &[(&str, &str)], reserve_ahead: u16) -> (Fx, Arc<ReplHub>) {
+    let cfg = config(edits);
     let setup = ClusterSetup {
         slices: SliceMap::new(&cfg.nat64.pool, 32).unwrap(),
         self_id: 0,
@@ -349,7 +354,7 @@ fn ha_fixture() -> (Fx, Arc<ReplHub>) {
         directory: Arc::new(Directory::new(cfg.nat64.table_shards, cfg.nat64.max_subscribers)),
         tcp_adopt_secs: 300,
         quarantine_secs: 600,
-        reserve_ahead: 8,
+        reserve_ahead,
     };
     let clock = Clock::new();
     let (sink, rx) = AuditSink::bounded(4096 * 4);
@@ -398,5 +403,81 @@ fn bench_flows(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, bench, bench_flows);
+/// Audit queue for the layout benches: well above the block records one
+/// chunk writes, so `try_send` never hits a full queue (PERF-003).
+const LAYOUT_QUEUE: usize = 1 << 16;
+
+/// New-flow churn for subscribers that grow past 512 ports: 2 subscribers
+/// x 2000 source ports, so each fills 4 blocks at 512 x 4 or 16 blocks at
+/// 128 x 16 (same 2048-port maximum), HA off and HA on (reserve-ahead 8 at
+/// 512, 32 at 128). The audit receiver is not drained, so record
+/// formatting and writing are excluded.
+///
+/// `block_spill_*` isolates the per-block cost: every subscriber uses
+/// `size` ports (1 block) or `size + 1` ports (2 blocks). The per-block
+/// cost is `(spill - fill)` per subscriber minus one flow.
+fn bench_block_layouts(c: &mut Criterion) {
+    let pkts: Vec<Vec<u8>> = (0..FLOW_CHUNK)
+        .map(|i| udp6(sub((i / 2000) as u16 + 1, 1), 1000 + (i % 2000) as u16, 0xc633_6407, 53, b"q"))
+        .collect();
+    let mut g = c.benchmark_group("nat64_block_layout");
+    g.throughput(Throughput::Elements(1));
+    for (name, size, max) in [("512x4", "512", "4"), ("128x16", "128", "16")] {
+        let edits = [
+            ("port_block_size = 512", &*format!("port_block_size = {size}")),
+            ("max_blocks_per_subscriber = 4", &*format!("max_blocks_per_subscriber = {max}")),
+        ];
+        let mut fx = fixture_q(&edits, LAYOUT_QUEUE);
+        for p in &pkts {
+            assert!(run(&mut fx, p).is_ok(), "{name}: every flow gets a port");
+        }
+        drop(fx);
+        g.bench_function(format!("flow_churn_{name}"), |b| {
+            b.iter_custom(|n| timed_flows(n, &pkts, || (fixture_q(&edits, LAYOUT_QUEUE), ())))
+        });
+    }
+    // HA on. `128x16_ra8` keeps the 512 x 4 reserve-ahead count, so block
+    // size and reserve-ahead budget can be told apart.
+    for (name, size, max, reserve) in
+        [("512x4", "512", "4", 8u16), ("128x16", "128", "16", 32), ("128x16_ra8", "128", "16", 8)]
+    {
+        let edits = [
+            ("port_block_size = 512", &*format!("port_block_size = {size}")),
+            ("max_blocks_per_subscriber = 4", &*format!("max_blocks_per_subscriber = {max}")),
+        ];
+        {
+            let (mut fx, hub) = ha_fixture_with(&edits, reserve);
+            for p in &pkts {
+                assert!(run(&mut fx, p).is_ok(), "ha {name}: every flow gets a port");
+            }
+            assert_eq!(hub.dropped_total(), 0, "ha {name}: ring sized for a chunk");
+        }
+        g.bench_function(format!("flow_churn_ha_{name}"), |b| {
+            b.iter_custom(|n| timed_flows(n, &pkts, || ha_fixture_with(&edits, reserve)))
+        });
+    }
+    for size in [512usize, 128] {
+        let edits = [
+            ("port_block_size = 512", &*format!("port_block_size = {size}")),
+            ("max_blocks_per_subscriber = 4", &*format!("max_blocks_per_subscriber = {}", 2048 / size)),
+        ];
+        for (kind, per_sub) in [("fill", size), ("spill", size + 1)] {
+            let subs = FLOW_CHUNK / per_sub;
+            let pkts: Vec<Vec<u8>> = (0..subs * per_sub)
+                .map(|i| udp6(sub((i / per_sub) as u16 + 1, 1), 1000 + (i % per_sub) as u16, 0xc633_6407, 53, b"q"))
+                .collect();
+            let mut fx = fixture_q(&edits, LAYOUT_QUEUE);
+            for p in &pkts {
+                assert!(run(&mut fx, p).is_ok(), "block_{kind}_{size}: every flow gets a port");
+            }
+            drop(fx);
+            g.bench_function(format!("block_{kind}_{size}"), |b| {
+                b.iter_custom(|n| timed_flows(n, &pkts, || (fixture_q(&edits, LAYOUT_QUEUE), ())))
+            });
+        }
+    }
+    g.finish();
+}
+
+criterion_group!(benches, bench, bench_flows, bench_block_layouts);
 criterion_main!(benches);

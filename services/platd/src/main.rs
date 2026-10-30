@@ -258,13 +258,72 @@ fn capacity_summary(cfg: &Config, owned_addrs: u64) -> String {
              get pool_exhausted; add pool addresses or lower nat64.max_subscribers\n",
             c.total_blocks, max_subs
         ));
+        o.push_str(&smaller_blocks_hint(cfg, owned_addrs));
     } else if c.subscribers_at_max_blocks < max_subs {
         o.push_str(&format!(
             "WARNING: only {} of {} subscribers can hold {} blocks each; heavy users may get pool_exhausted\n",
             c.subscribers_at_max_blocks, max_subs, n.max_blocks_per_subscriber
         ));
     }
+    if let Some(line) =
+        reserve_ahead_advisory(n.port_block_size, cfg.cluster.ha_active().map(|h| h.reserve_ahead_blocks))
+    {
+        o.push_str(&line);
+    }
     o
+}
+
+/// Smaller uniform blocks with the same maximum ports per subscriber
+/// (`port_block_size x max_blocks_per_subscriber`), for a pool that cannot
+/// give every subscriber one block. Advisory only; the config is unchanged.
+///
+/// COMPLIANCE MAPPING:
+/// - NIST 800-53: CM-6, SC-5 (planning support only, no enforcement) -
+///   capacity planning guidance
+/// - RFC 6888 REQ-4, RFC 7422 - port-block sizing; RFC 6056 / RFC 6888
+///   REQ-15 - smaller blocks give fewer bits of in-block port randomness
+fn smaller_blocks_hint(cfg: &Config, owned_addrs: u64) -> String {
+    let n = &cfg.nat64;
+    let max_ports = u32::from(n.port_block_size) * u32::from(n.max_blocks_per_subscriber);
+    let mut o = String::new();
+    for size in [256u16, 128] {
+        // Only layouts that keep the same maximum exactly.
+        if size >= n.port_block_size || max_ports % u32::from(size) != 0 {
+            continue;
+        }
+        let Ok(blocks) = u16::try_from(max_ports / u32::from(size)) else { continue };
+        let a = n.capacity_with(size, blocks, owned_addrs);
+        o.push_str(&format!(
+            "  hint: port_block_size = {size}, max_blocks_per_subscriber = {blocks} (same {max_ports} ports max) \
+             serves {} at 1 block ({}-bit in-block port randomness; more block records)\n",
+            a.subscribers_at_one_block,
+            size.trailing_zeros(),
+        ));
+    }
+    o
+}
+
+/// Ports one HA reservation covers by default (512-port blocks x 8).
+const DEFAULT_RESERVE_AHEAD_PORTS: u32 = 512 * 8;
+
+/// With HA on, a smaller `port_block_size` uses up the reserve-ahead budget
+/// (`cluster.ha.reserve_ahead_blocks`, counted in blocks) in fewer ports, so
+/// bursts make more Reserve round trips and `cluster_reserve_starved`
+/// records. Warning only (exit code unchanged).
+///
+/// COMPLIANCE MAPPING:
+/// - NIST 800-53: CP-10, CM-6, SC-5 (planning support only, no
+///   enforcement) - HA reservation sizing guidance
+fn reserve_ahead_advisory(block_size: u16, reserve_ahead: Option<u16>) -> Option<String> {
+    let r = reserve_ahead?;
+    let ports = u32::from(block_size) * u32::from(r);
+    (ports < DEFAULT_RESERVE_AHEAD_PORTS).then(|| {
+        let want = DEFAULT_RESERVE_AHEAD_PORTS.div_ceil(u32::from(block_size.max(1))).min(64);
+        format!(
+            "WARNING: cluster.ha.reserve_ahead_blocks = {r} x port_block_size = {block_size} reserves {ports} ports \
+             ahead (default layout {DEFAULT_RESERVE_AHEAD_PORTS}); consider reserve_ahead_blocks = {want}\n"
+        )
+    })
 }
 
 fn main() -> ExitCode {
@@ -514,6 +573,38 @@ mod tests {
             text = text.replace(a, b);
         }
         Config::from_toml(&text).unwrap()
+    }
+
+    /// Tight pool: the warning names smaller uniform layouts with the same
+    /// maximum ports per subscriber; an ample pool gets no hint.
+    #[test]
+    fn capacity_summary_suggests_smaller_blocks() {
+        let s = capacity_summary(&example(&[]), 256);
+        assert!(
+            s.contains("hint: port_block_size = 256, max_blocks_per_subscriber = 8 (same 2048 ports max) serves 64512 at 1 block (8-bit")
+                && s.contains("hint: port_block_size = 128, max_blocks_per_subscriber = 16 (same 2048 ports max) serves 129024 at 1 block (7-bit"),
+            "{s}"
+        );
+        assert!(
+            !capacity_summary(&example(&[("max_subscribers = 1000000", "max_subscribers = 8000")]), 256)
+                .contains("hint")
+        );
+        // Already at 128: nothing smaller is suggested.
+        let small = example(&[("port_block_size = 512", "port_block_size = 128")]);
+        assert!(!capacity_summary(&small, 256).contains("hint"));
+    }
+
+    #[test]
+    fn reserve_ahead_advisory_scales_with_block_size() {
+        assert_eq!(reserve_ahead_advisory(512, None), None);
+        assert_eq!(reserve_ahead_advisory(512, Some(8)), None);
+        assert_eq!(reserve_ahead_advisory(128, Some(32)), None);
+        let w = reserve_ahead_advisory(128, Some(8)).unwrap();
+        assert!(
+            w.starts_with("WARNING: cluster.ha.reserve_ahead_blocks = 8") && w.contains("reserve_ahead_blocks = 32"),
+            "{w}"
+        );
+        assert!(reserve_ahead_advisory(64, Some(1)).unwrap().contains("reserve_ahead_blocks = 64"));
     }
 
     /// POAM-021: check-config warns when the unit's MemoryMax is too low.
