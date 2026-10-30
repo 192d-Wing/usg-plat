@@ -18,7 +18,7 @@ mod common;
 
 use std::hint::black_box;
 
-use common::*;
+use common::{fixture, run, sub, udp4, udp6};
 use plat_xlat::HEADROOM;
 
 fn main() {
