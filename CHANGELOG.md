@@ -4,6 +4,15 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 
 ## [Unreleased]
 
+### Pool capacity report
+
+- `platd check-config` prints the port-block capacity of this node's share
+  of the pool (blocks per address, total blocks, subscribers served at 1
+  block and at `nat64.max_blocks_per_subscriber`) and a `WARNING` when it is
+  below `nat64.max_subscribers`. Exit codes are unchanged. The shipped
+  example config triggers the warning (a /24 serves 32 256 one-block
+  subscribers, `max_subscribers` is 1 000 000).
+
 ### Memory sizing checked against the config (branch `fix/poams-021-018-012`)
 
 Closes POAM-021. SIEM schema unchanged.
