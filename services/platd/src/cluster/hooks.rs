@@ -338,7 +338,9 @@ mod tests {
             Some(later.clone()),
             state.path().to_path_buf(),
             me(&d),
-            Duration::from_millis(300),
+            // Long enough for a loaded CI runner to write the pidfile
+            // before the kill; the script itself waits 30 s.
+            Duration::from_secs(2),
             16,
             sink,
         )
