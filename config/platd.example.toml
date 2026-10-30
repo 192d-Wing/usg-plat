@@ -57,7 +57,7 @@ ipv4_mtu = 1500
 # fragmented with IPv6 Fragment Headers.
 lowest_ipv6_mtu = 1280
 # Locally generated Packet Too Big / Fragmentation Needed, per worker per
-# second (0 disables).
+# second (0 disables; otherwise >= 4, a quarter is reserved for PMTU errors).
 icmp_errors_per_sec = 100
 copy_tos = true
 # RFC 6052 §3.1 deviation switch (WKP only): translate ICMPv4 errors from
@@ -72,6 +72,36 @@ wkp_non_global_icmp_errors = false
 # exempt, so subscribers hairpin even with this non-global example pool; the
 # Well-Known Prefix requires a global pool.
 allow_non_global_destinations = false
+# Locally generated ICMP errors (all share icmp_errors_per_sec). Never sent
+# about ICMP errors, non-first fragments or multicast/unspecified sources.
+send_time_exceeded = true
+send_unreachable = true
+# RFC 6146 §3.5.2.2 SHOULD, off by default (documented deviation): would
+# answer IPv4 scans of the pool with Host Unreachable / Admin Prohibited.
+send_inbound_unreachable = false
+send_param_problem = true
+# Off by default: source-routed IPv4 is dropped silently.
+send_source_route_failed = false
+# Source of locally generated ICMPv6 errors (RFC 4443 §2.2). Unset: the
+# synthesized destination of the offending packet. Must lie outside the
+# client prefixes and the NAT64 prefix.
+# icmp_source_v6 = "2001:db8:ffff::1"
+
+[translation.fragments]
+# Per worker, preallocated at start (SC-5). Defaults use about 1 MiB per
+# worker; `check-config` rejects more than 64 MiB per worker.
+max_entries = 4096
+# RFC 6146 FRAGMENT_MIN is 2 s; must stay below the UDP/ICMP timeouts.
+timeout_ms = 2000
+max_fragments_per_datagram = 64
+# Non-first fragments held until their first fragment arrives (0 = off).
+max_buffered_fragments = 64
+buffer_slot_bytes = 1536
+# Concurrent reassemblies for fragmented ICMP and zero-checksum UDP.
+reassembly_slots = 4
+max_reassembly_bytes = 65535
+# "reassemble" (RFC 7915 §4.5) or "drop".
+udp_zero_checksum = "reassemble"
 
 [nat64]
 pool = ["192.0.2.0/24"]

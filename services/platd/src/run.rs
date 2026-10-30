@@ -12,7 +12,7 @@ use plat_audit::FipsMark;
 use plat_audit::{AuditSink, Event, LifecycleKind, Logger, LoggerHandle, NodeIdent};
 use plat_common::{Clock, Config, Counter, Counters, DropReason};
 use plat_io::PacketQueue;
-use plat_nat64::{AdoptInput, AdoptMeta, ClusterSetup, Nat64, ReplHub, ReplProducer, Verdict, WorkerCtx};
+use plat_nat64::{AdoptInput, AdoptMeta, ClusterSetup, Nat64, ReplHub, ReplProducer, Verdict};
 use plat_xlat::HEADROOM;
 
 use crate::metrics;
@@ -49,14 +49,25 @@ pub fn worker<Q: PacketQueue>(
     stop: Arc<AtomicBool>,
 ) {
     let mut buf = vec![0u8; HEADROOM + MAX_PKT].into_boxed_slice();
-    let mut ctx = WorkerCtx::new(counters.clone(), id.wrapping_mul(0x9e37));
+    let mut ctx = nat.new_worker(counters.clone(), id.wrapping_mul(0x9e37));
+    let mut since_housekeep = 0u32;
     if let Some(r) = repl {
         ctx = ctx.with_repl(r);
     }
     while !stop.load(Ordering::Relaxed) {
+        // Fragment expiry and the fragment gauge, every 64 packets and when
+        // idle (no blocking, no allocation).
+        since_housekeep += 1;
+        if since_housekeep >= 64 {
+            since_housekeep = 0;
+            nat.housekeep(&mut ctx);
+        }
         let n = match q.recv(&mut buf[HEADROOM..]) {
             Ok(Some(n)) => n,
-            Ok(None) => continue,
+            Ok(None) => {
+                since_housekeep = 64;
+                continue;
+            }
             Err(e) => {
                 counters.inc(Counter::IoErrors);
                 tracing::warn!(worker = id, "recv: {e}");
@@ -74,7 +85,7 @@ pub fn worker<Q: PacketQueue>(
                     transmit(&mut q, f, &counters);
                 }
             }
-            Verdict::Drop(_) => {}
+            Verdict::Consumed | Verdict::Drop(_) => {}
         }
     }
 }

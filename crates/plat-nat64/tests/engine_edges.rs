@@ -177,7 +177,7 @@ fn tcp_non_syn_creates_no_binding() {
 
 #[test]
 fn subscriber_session_counter_returns_to_zero_after_expiry() {
-    let mut fx = fixture(&[("max_sessions_per_subscriber = 4000", "max_sessions_per_subscriber = 4")]);
+    let mut fx = fixture(&[("max_sessions_per_subscriber = 4000", "max_sessions_per_subscriber = 4"), NO_UNREACH]);
     let s = sub(1, 1);
     for d in 0..4u16 {
         run(&mut fx, &udp6(s, 1000, SERVER, 53 + d, b"x")).unwrap();
@@ -198,7 +198,7 @@ fn subscriber_session_counter_returns_to_zero_after_expiry() {
 
 #[test]
 fn global_session_limit_and_recovery() {
-    let mut fx = fixture(&[("max_sessions = 4000000", "max_sessions = 3")]);
+    let mut fx = fixture(&[("max_sessions = 4000000", "max_sessions = 3"), NO_UNREACH]);
     for i in 0..3u16 {
         run(&mut fx, &udp6(sub(i, 1), 1000, SERVER, 53, b"x")).unwrap();
     }
@@ -287,6 +287,7 @@ fn small_pool_fixture() -> Fx {
     fixture(&[
         ("port_block_size = 512", "port_block_size = 32256"),
         ("max_blocks_per_subscriber = 4", "max_blocks_per_subscriber = 1"),
+        NO_UNREACH,
     ])
 }
 
@@ -599,7 +600,8 @@ fn ipv6_first_fragment_translates_with_mf_and_valid_checksum() {
     let f = h.frag.expect("IPv4 fragment");
     assert!(f.more && f.offset == 0, "MF=1 offset 0");
     assert!(!h.df, "RFC 7915 §5.1.1: DF clear on translated fragments");
-    assert_eq!(h.id, 0x1234, "low 16 bits of the IPv6 Identification");
+    // RFC-004: a fresh IPv4 ID per datagram, shared by its fragments.
+    let id4 = h.id;
     assert_eq!(h.total_len, 20 + 56);
     assert_eq!(be16(&out, 22), 53);
     // Reassembled transport checksum (first fragment + untouched rest) is valid.
@@ -607,8 +609,13 @@ fn ipv6_first_fragment_translates_with_mf_and_valid_checksum() {
     l4.extend_from_slice(&f2[48..]);
     let s4 = ck::pseudo_v4(h.src, h.dst, proto::UDP, l4.len() as u16) + ck::sum(&l4);
     assert_eq!(ck::fold(s4), 0xffff, "UDP checksum over the reassembled datagram");
-    // Non-first fragment: documented drop (POAM-001).
-    assert_eq!(run(&mut fx, &f2).unwrap_err(), DropReason::Fragment);
+    // Non-first fragment: header-only translation with the first
+    // fragment's mapping (RFC 6146 §3.4, POAM-001).
+    let out2 = run(&mut fx, &f2).unwrap();
+    let h2 = v4_ok(&out2);
+    assert_eq!(h2.frag, Some(plat_packet::ip::Frag { id: u32::from(id4), offset: 7, more: false }));
+    assert_eq!((h2.src, h2.dst, h2.proto), (h.src, h.dst, proto::UDP));
+    assert_eq!(&out2[20..], &f2[48..], "payload untouched");
 }
 
 #[test]
@@ -635,17 +642,21 @@ fn ipv4_first_fragment_reply_gets_fragment_header() {
 }
 
 #[test]
-fn fragmented_icmpv6_echo_is_dropped() {
+fn fragmented_icmpv6_echo_waits_for_reassembly() {
     let mut fx = fixture(&[]);
     let s = sub(1, 1);
     let e = echo6(s, 1, SERVER);
-    let mut p = vec![0u8; 48 + 12];
-    write_v6_header(&mut p, 0, 20, proto::FRAGMENT, 64, s, synth(SERVER));
+    // A non-last fragment carries a multiple of 8 bytes.
+    let mut p = vec![0u8; 48 + 16];
+    write_v6_header(&mut p, 0, 24, proto::FRAGMENT, 64, s, synth(SERVER));
     p[40] = proto::ICMPV6;
     put16(&mut p, 42, 1);
     put32(&mut p, 44, 9);
-    p[48..].copy_from_slice(&e[40..]);
-    assert_eq!(run(&mut fx, &p).unwrap_err(), DropReason::Fragment, "POAM-001");
+    p[48..60].copy_from_slice(&e[40..]);
+    // Held in a reassembly slot (the ICMPv6 checksum needs the whole
+    // message); nothing is sent until the datagram completes.
+    assert_eq!(run_all(&mut fx, &p).unwrap(), Vec::<Vec<u8>>::new());
+    assert_eq!(fx.ctx.fragment_entries(), 1);
 }
 
 #[test]
@@ -653,13 +664,14 @@ fn dropped_after_mapping_leaves_no_state() {
     let mut fx = fixture(&[]);
     let s = sub(1, 1);
     let e = echo6(s, 1, SERVER);
-    let mut p = vec![0u8; 48 + 12];
-    write_v6_header(&mut p, 0, 20, proto::FRAGMENT, 64, s, synth(SERVER));
+    // A non-last fragment carries a multiple of 8 bytes.
+    let mut p = vec![0u8; 48 + 16];
+    write_v6_header(&mut p, 0, 24, proto::FRAGMENT, 64, s, synth(SERVER));
     p[40] = proto::ICMPV6;
     put16(&mut p, 42, 1);
     put32(&mut p, 44, 9);
-    p[48..].copy_from_slice(&e[40..]);
-    assert_eq!(run(&mut fx, &p).unwrap_err(), DropReason::Fragment);
+    p[48..60].copy_from_slice(&e[40..]);
+    assert!(run_all(&mut fx, &p).unwrap().is_empty());
     assert!(
         fx.nat.state().lookup6(Key6 { proto: proto::ICMP, addr: s, port: 1 }).is_none(),
         "BIB for a dropped packet"

@@ -35,6 +35,10 @@ pub fn synth(v4: u32) -> u128 {
     PREFIX | u128::from(v4)
 }
 
+/// Fixture edit: no ICMPv6 Destination Unreachable when a mapping cannot be
+/// created (limit tests that assert the drop itself).
+pub const NO_UNREACH: (&str, &str) = ("send_unreachable = true", "send_unreachable = false");
+
 /// Fixture edit: let servers in documentation ranges be reached.
 pub const ALLOW_NON_GLOBAL: (&str, &str) =
     ("allow_non_global_destinations = false", "allow_non_global_destinations = true");
@@ -85,7 +89,8 @@ pub fn fixture_cfg(cfg: &Config, q: usize) -> Fx {
     let p = cfg.nat64.pool[0];
     let owned = (0..p.size().min(4) as u32).map(|i| p.network() + i).collect();
     let nat = Nat64::new(cfg, owned, sink, clock.clone()).unwrap();
-    Fx { nat, clock, rx, ctx: WorkerCtx::new(Arc::new(Counters::default()), 1) }
+    let ctx = nat.new_worker(Arc::new(Counters::default()), 1);
+    Fx { nat, clock, rx, ctx }
 }
 
 pub fn l4_sum6(p: &mut [u8], src: u128, dst: u128, pr: u8, off: usize) {
@@ -176,7 +181,7 @@ pub fn icmp4_err(router: u32, ty: u8, code: u8, rest: u32, quoted: &[u8]) -> Vec
 /// Runs one packet through the engine; returns every output packet or the
 /// drop.
 pub fn run_all(fx: &mut Fx, pkt: &[u8]) -> Result<Vec<Vec<u8>>, plat_common::DropReason> {
-    let mut buf = vec![0u8; HEADROOM + 2048];
+    let mut buf = vec![0u8; HEADROOM + 65536];
     buf[HEADROOM..HEADROOM + pkt.len()].copy_from_slice(pkt);
     match fx.nat.process(&mut buf, HEADROOM, pkt.len(), &mut fx.ctx) {
         Verdict::Forward { start, len } => Ok(vec![buf[start..start + len].to_vec()]),
@@ -185,6 +190,7 @@ pub fn run_all(fx: &mut Fx, pkt: &[u8]) -> Result<Vec<Vec<u8>>, plat_common::Dro
             assert_eq!(v.len(), count);
             Ok(v)
         }
+        Verdict::Consumed => Ok(Vec::new()),
         Verdict::Drop(d) => Err(d),
     }
 }

@@ -498,3 +498,36 @@ fn block_cooldown_edges() {
     invalid(&[("block_cooldown_secs = 120", "block_cooldown_secs = 3601")]);
     assert_eq!(with(&[("block_cooldown_secs = 120\n", "")]).unwrap().nat64.block_cooldown_secs, 120);
 }
+
+#[test]
+fn fragment_timeout_versus_session_timeouts_and_ceiling() {
+    // Just below the shortest session timeout (icmp 60 s) is accepted; at it, refused.
+    invalid(&[("timeout_ms = 2000", "timeout_ms = 60000")]);
+    with(&[("timeout_ms = 2000", "timeout_ms = 59999")]).unwrap();
+    invalid(&[("timeout_ms = 2000", "timeout_ms = 0")]);
+    // Boundaries accepted.
+    for (a, b) in [
+        ("max_entries = 4096", "max_entries = 64"),
+        ("max_fragments_per_datagram = 64", "max_fragments_per_datagram = 2"),
+        ("max_fragments_per_datagram = 64", "max_fragments_per_datagram = 128"),
+        ("max_buffered_fragments = 64", "max_buffered_fragments = 1024"),
+        ("buffer_slot_bytes = 1536", "buffer_slot_bytes = 1280"),
+        ("buffer_slot_bytes = 1536", "buffer_slot_bytes = 9216"),
+        ("reassembly_slots = 4", "reassembly_slots = 64"),
+        ("max_reassembly_bytes = 65535", "max_reassembly_bytes = 1280"),
+    ] {
+        with(&[(a, b)]).unwrap();
+    }
+    // Non-power-of-two entries round up.
+    let c = with(&[("max_entries = 4096", "max_entries = 100")]).unwrap();
+    assert_eq!(c.translation.fragments.entries(), 128);
+    // Wrong types and unknown keys in the new tables.
+    invalid_parse(&[("max_entries = 4096", "max_entries = -1")]);
+    invalid_parse(&[("timeout_ms = 2000", "timeout_ms = \"2s\"")]);
+    invalid_parse(&[("send_time_exceeded = true", "send_time_exceeded = 1")]);
+    invalid_parse(&[("[translation.fragments]", "[translation.fragments]\nmax_entriez = 1")]);
+}
+
+fn invalid_parse(edits: &[(&str, &str)]) {
+    assert!(with(edits).is_err(), "{edits:?}");
+}

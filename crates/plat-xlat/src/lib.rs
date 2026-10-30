@@ -12,7 +12,7 @@ pub mod rfc6052;
 pub mod siit;
 
 pub use rfc6052::Prefix6052;
-pub use siit::{Frags, Map4, Map6, XlatError, v4_to_v6, v4_to_v6_fragments, v6_to_v4};
+pub use siit::{Frags, Map4, Map6, XlatError, v4_to_v6, v4_to_v6_fragments, v6_to_v4, v6_to_v4_fragments};
 
 /// Bytes reserved in front of every received packet.
 pub const HEADROOM: usize = 64;

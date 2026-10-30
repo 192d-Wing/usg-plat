@@ -4,6 +4,78 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 
 ## [Unreleased]
 
+### Protocol completeness (branch `feat/protocol-completeness`)
+
+Stacked on `feat/cluster-ha`. Closes POAM-001, POAM-002, POAM-011 and
+POAM-023; adds POAM-034 and POAM-035. SIEM schema unchanged (7): new drop
+reasons and counters only.
+
+#### Breaking
+
+- `translation.icmp_errors_per_sec` must be `0` or at least `4` (a quarter
+  of the per-worker bucket is reserved for Packet Too Big / Fragmentation
+  Needed). Configs with 1–3 fail validation.
+- `translation.send_source_route_failed` defaults to `false`: source-routed
+  IPv4 stays a silent `source_route` drop unless enabled.
+- Behaviour: TTL / Hop Limit ≤ 1 packets now get ICMP Time Exceeded; an
+  inbound TTL 1 packet that the inbound filter refuses is now counted
+  `no_binding` / `filtered` instead of `hop_limit`. Non-first fragments are
+  translated instead of dropped as `fragment`.
+
+#### Added
+
+- Fragment handling (RFC 6146 §3.4, RFC 7915): per-worker preallocated
+  fragment table (`crates/plat-nat64/src/frag.rs`), out-of-order hold
+  buffer, reassembly of fragmented ICMP echo, ICMP errors and zero-checksum
+  IPv4 UDP only; RFC 5722 overlap detection (also IPv4), RFC 7112 / RFC 1858
+  tiny-fragment checks, per-source caps, per-fragment slice checks; ICMP
+  errors quoting fragments we sent are translated.
+- Config `[translation.fragments]`: `max_entries`, `timeout_ms`,
+  `max_fragments_per_datagram`, `max_buffered_fragments`,
+  `buffer_slot_bytes`, `reassembly_slots`, `max_reassembly_bytes`,
+  `udp_zero_checksum` (`"reassemble"` default, or `"drop"`); `check-config`
+  prints the fragment memory per worker (ceiling 64 MiB).
+- Locally generated ICMP errors (RFC 7915 §4.4/§5.4, RFC 6146 §3.5): Time
+  Exceeded both directions, ICMPv6 Destination Unreachable when a limit
+  refuses a mapping, Parameter Problem for an active Routing header,
+  opt-in inbound Unreachable (3/1, 3/13) and Source Route Failed (3/5), IPv4
+  fragmentation of ≤ 1280-byte IPv6 packets above `ipv4_mtu`. Keys
+  `translation.send_time_exceeded`, `send_unreachable`, `send_param_problem`
+  (default `true`), `send_inbound_unreachable`, `send_source_route_failed`
+  (default `false`), and optional `translation.icmp_source_v6`.
+- IPv4 Identification per RFC 7739 §5.3 (`crates/plat-nat64/src/ident.rs`):
+  randomized per-worker counter table, one fresh ID per fragmented IPv6
+  datagram.
+- Drop reasons `fragment_timeout`, `fragment_overlap`, `fragment_tiny`,
+  `fragment_too_many`, `fragment_table_full`, `fragment_buffer_full`,
+  `reassembly_full`, `reassembly_too_big`, `fragment_unmatched`,
+  `icmp_quote_unmatched`; counters `fragments_in_v6`, `fragments_in_v4`,
+  `fragments_forwarded`, `fragments_buffered`, `datagrams_reassembled`,
+  `fragmented_v6_to_v4`, `icmp_time_exceeded_sent`,
+  `icmp_unreachable_sent`, `icmp_param_problem_sent`; gauge
+  `plat_fragment_entries`.
+- `make ir`: hot-path instructions per packet with cachegrind (Linux,
+  `crates/plat-nat64/examples/ir.rs`).
+
+#### Changed
+
+- Fragmentation Needed is decided before the inbound session update and
+  sent only when the read-only filter admits the packet (POAM-023); inbound
+  Time Exceeded and Source Route Failed are gated the same way.
+- Engine API: `Nat64::new_worker`, `Nat64::housekeep`, `Verdict::Consumed`
+  (held fragment); `platd` workers run housekeeping every 64 packets and on
+  an idle receive.
+
+#### Compliance
+
+- POAM-001, POAM-002 (with documented deviations), POAM-011 and POAM-023
+  closed; POAM-034 (stale fragment mapping within `timeout_ms`, AU-10/AU-12
+  attribution risk) and POAM-035 (per-worker fragment state; not observed on
+  Linux multiqueue TUN, LINUX_VERIFICATION L24) added. Deviations listed in
+  `docs/compliance/RFC_COMPLIANCE.md` "Protocol deviations".
+- Hot path (cachegrind, `plat-linux`): v6→v4 1107 → 1126 instructions per
+  packet (+1.7%), v4→v6 940 → 925 (−1.6%), measured after fix round 1.
+
 ### Cluster high availability (branch `feat/cluster-ha`)
 
 HA is off unless `[cluster.ha] enabled = true`. The peer wire protocol is

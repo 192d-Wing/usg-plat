@@ -2,7 +2,7 @@
 LINUX_TARGET ?= aarch64-unknown-linux-gnu
 ZENSICAL ?= uvx zensical@0.0.73
 
-.PHONY: all check fmt clippy check-linux check-notls test test-deploy bench security compliance-annotations release dist deb rpm packages docs docs-serve
+.PHONY: all check fmt clippy check-linux check-notls test test-deploy bench ir security compliance-annotations release dist deb rpm packages docs docs-serve
 
 all: check test
 
@@ -48,6 +48,16 @@ test-deploy:
 
 bench:
 	cargo bench -p plat-xlat -p plat-nat64 -p plat-audit --bench xlat --bench nat64 --bench audit
+
+# Hot-path instructions per packet (cachegrind, Linux): the difference of a
+# 200k and a 100k packet run, so setup cost cancels (PERF-002).
+ir:
+	cargo build --release -p plat-nat64 --example ir
+	@for d in v6 v4; do \
+	  a=$$(valgrind --tool=cachegrind --cache-sim=no --cachegrind-out-file=/dev/null target/release/examples/ir 100000 $$d 2>&1 | awk '/I *refs/ {gsub(",","",$$4); print $$4}'); \
+	  b=$$(valgrind --tool=cachegrind --cache-sim=no --cachegrind-out-file=/dev/null target/release/examples/ir 200000 $$d 2>&1 | awk '/I *refs/ {gsub(",","",$$4); print $$4}'); \
+	  echo "$$d: $$(( (b - a) / 100000 )) instructions/packet"; \
+	done
 
 security:
 	cargo audit

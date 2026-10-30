@@ -204,9 +204,11 @@ fn icmp6_error_outer_source() {
     }
 }
 
-/// RFC-103: an error quoting a non-first fragment has no ports to match.
+/// RFC-103: an error quoting a non-first fragment has no ports to match; it
+/// translates only through this worker's record of fragments it sent
+/// (POAM-001), so an untracked one is `icmp_quote_unmatched`.
 #[test]
-fn icmp_errors_quoting_non_first_fragments_are_dropped() {
+fn icmp_errors_quoting_untracked_non_first_fragments_are_unmatched() {
     let mut fx = fixture(&[]);
     let s = sub(1, 1);
     let (a, p) = udp_flow(&mut fx, s);
@@ -219,11 +221,11 @@ fn icmp_errors_quoting_non_first_fragments_are_dropped() {
     put16(&mut fq, 42, 160 << 3); // offset 1280 bytes, M=0
     put32(&mut fq, 44, 7);
     fq[48..].copy_from_slice(&q[40..]);
-    assert_eq!(run(&mut fx, &icmp6_err(s, synth(SERVER), 1, 4, 0, &fq)).unwrap_err(), DropReason::Fragment);
+    assert_eq!(run(&mut fx, &icmp6_err(s, synth(SERVER), 1, 4, 0, &fq)).unwrap_err(), DropReason::IcmpQuoteUnmatched);
     let mut q4 = udp4(a, p, SERVER, 53, b"xxxxxxxx");
     let l = q4.len() as u16;
     write_v4_header(&mut q4[..20], 0, l, 9, false, false, 185, 64, proto::UDP, a, SERVER);
-    assert_eq!(run(&mut fx, &icmp4_err(ROUTER4, 3, 3, 0, &q4)).unwrap_err(), DropReason::Fragment);
+    assert_eq!(run(&mut fx, &icmp4_err(ROUTER4, 3, 3, 0, &q4)).unwrap_err(), DropReason::IcmpQuoteUnmatched);
     // The same errors about first fragments / whole packets translate.
     assert!(run(&mut fx, &icmp6_err(s, synth(SERVER), 1, 4, 0, &q)).is_ok());
     assert!(run(&mut fx, &icmp4_err(ROUTER4, 3, 3, 0, &udp4(a, p, SERVER, 53, b"xxxxxxxx"))).is_ok());
@@ -319,24 +321,36 @@ fn too_big_v6_gets_ptb_and_no_state() {
     assert_eq!(&out[48..88], &pkt[..40]);
     assert!(fx.nat.state().lookup6(Key6 { proto: proto::UDP, addr: s, port: 5353 }).is_none());
     assert!(events(&fx).is_empty(), "no attribution record for a dropped packet");
-    // A packet within 1280 bytes that would need IPv4 fragmentation is
-    // dropped without a PTB (POAM-002).
+    // A packet within 1280 bytes that needs IPv4 fragmentation is
+    // fragmented with DF=0 (RFC 7915 §5.1, POAM-002), no PTB.
     let mut fx = fixture(&[("ipv4_mtu = 1500", "ipv4_mtu = 576")]);
-    assert_eq!(run(&mut fx, &udp6(s, 5353, SERVER, 53, &[1u8; 1000])).unwrap_err(), DropReason::TooBig);
+    let frags = run_all(&mut fx, &udp6(s, 5353, SERVER, 53, &[1u8; 1000])).unwrap();
+    assert_eq!(frags.len(), 2);
+    let (h1, h2) = (v4_ok(&frags[0]), v4_ok(&frags[1]));
+    assert!(frags.iter().all(|f| f.len() <= 576));
+    assert!(!h1.df && !h2.df && h1.id == h2.id);
+    assert_eq!((h1.frag.unwrap().more, h2.frag.unwrap().offset), (true, 552 / 8));
+    let mut l4 = frags[0][20..].to_vec();
+    l4.extend_from_slice(&frags[1][20..]);
+    assert_eq!(l4.len(), 1008);
+    let s4 = ck::pseudo_v4(h1.src, h1.dst, proto::UDP, l4.len() as u16) + ck::sum(&l4);
+    assert_eq!(ck::fold(s4), 0xffff);
+    assert_eq!(fx.ctx.counters.get(Counter::FragmentedV6ToV4), 1);
 }
 
 #[test]
 fn local_icmp_errors_are_rate_limited_per_worker() {
-    let mut fx = fixture(&[("icmp_errors_per_sec = 100", "icmp_errors_per_sec = 2")]);
+    let mut fx = fixture(&[("icmp_errors_per_sec = 100", "icmp_errors_per_sec = 4")]);
     let s = sub(1, 1);
     let (a, p) = udp_flow(&mut fx, s);
     let big = udp4(SERVER, 53, a, p, &[7u8; 1453]);
-    assert!(run(&mut fx, &big).is_ok());
-    assert!(run(&mut fx, &big).is_ok());
+    for _ in 0..4 {
+        assert!(run(&mut fx, &big).is_ok());
+    }
     assert_eq!(run(&mut fx, &big).unwrap_err(), DropReason::TooBig);
     assert_eq!(fx.ctx.counters.get(Counter::IcmpErrorsRateLimited), 1);
     fx.clock.advance(Duration::from_millis(600));
-    assert!(run(&mut fx, &big).is_ok(), "refilled at 2/s");
+    assert!(run(&mut fx, &big).is_ok(), "refilled at 4/s");
     let mut fx = fixture(&[("icmp_errors_per_sec = 100", "icmp_errors_per_sec = 0")]);
     let (a, p) = udp_flow(&mut fx, s);
     assert_eq!(run(&mut fx, &udp4(SERVER, 53, a, p, &[7u8; 1453])).unwrap_err(), DropReason::TooBig);
@@ -400,7 +414,7 @@ fn lowest_ipv6_mtu_raises_the_fragmentation_threshold() {
 
 #[test]
 fn unexpired_source_route_is_dropped() {
-    let mut fx = fixture(&[]);
+    let mut fx = fixture(&[("send_source_route_failed = false", "send_source_route_failed = true")]);
     let s = sub(1, 1);
     let (a, p) = udp_flow(&mut fx, s);
     for ty in [131u8, 137] {
@@ -414,15 +428,48 @@ fn unexpired_source_route_is_dropped() {
         put16(&mut pkt, 10, 0);
         let c = ck::finish(ck::sum(&pkt[..28]));
         put16(&mut pkt, 10, c);
-        assert_eq!(run(&mut fx, &pkt).unwrap_err(), DropReason::SourceRoute, "option {ty}");
+        // ICMPv4 Source Route Failed from the pool address (RFC 7915 §4.1,
+        // RFC 1812 §5.2.4.1, POAM-002); still counted as source_route.
+        let out = run(&mut fx, &pkt).unwrap();
+        let h = v4_ok(&out);
+        assert_eq!((h.src, h.dst, h.proto, out[20], out[21]), (a, SERVER, proto::ICMP, 3, 5), "option {ty}");
+        assert_eq!(&out[28..56], &pkt[..28], "quotes the offending header");
     }
+    assert_eq!(fx.ctx.counters.drops(DropReason::SourceRoute), 2);
+    // SEC-005: a remote the filter would refuse (no session with it) gets
+    // no answer, only the drop.
+    let base = udp4(SERVER + 1, 53, a, p, b"x");
+    let mut pkt = base[..20].to_vec();
+    pkt.extend_from_slice(&[131, 7, 4, 10, 0, 0, 1, 0]);
+    pkt.extend_from_slice(&base[20..]);
+    pkt[0] = 0x47;
+    let l = pkt.len() as u16;
+    put16(&mut pkt, 2, l);
+    put16(&mut pkt, 10, 0);
+    let c = ck::finish(ck::sum(&pkt[..28]));
+    put16(&mut pkt, 10, c);
+    assert_eq!(run(&mut fx, &pkt).unwrap_err(), DropReason::SourceRoute);
+    // Disabled (the default): the plain drop.
+    let mut fx = fixture(&[]);
+    let (a, p) = udp_flow(&mut fx, s);
+    let base = udp4(SERVER, 53, a, p, b"x");
+    let mut pkt = base[..20].to_vec();
+    pkt.extend_from_slice(&[131, 7, 4, 10, 0, 0, 1, 0]);
+    pkt.extend_from_slice(&base[20..]);
+    pkt[0] = 0x47;
+    let l = pkt.len() as u16;
+    put16(&mut pkt, 2, l);
+    put16(&mut pkt, 10, 0);
+    let c = ck::finish(ck::sum(&pkt[..28]));
+    put16(&mut pkt, 10, c);
+    assert_eq!(run(&mut fx, &pkt).unwrap_err(), DropReason::SourceRoute);
 }
 
 // ------------------------------------------------- U1-D: subscriber table
 
 #[test]
 fn subscriber_table_is_bounded() {
-    let mut fx = fixture(&[("max_subscribers = 1000000", "max_subscribers = 2")]);
+    let mut fx = fixture(&[("max_subscribers = 1000000", "max_subscribers = 2"), NO_UNREACH]);
     run(&mut fx, &udp6(sub(1, 1), 1, SERVER, 53, b"x")).unwrap();
     run(&mut fx, &udp6(sub(2, 1), 1, SERVER, 53, b"x")).unwrap();
     assert_eq!(run(&mut fx, &udp6(sub(3, 1), 1, SERVER, 53, b"x")).unwrap_err(), DropReason::SubscriberTableFull);
@@ -446,6 +493,7 @@ fn failed_allocation_leaves_no_subscriber_entry() {
     let mut fx = fixture(&[
         ("port_block_size = 512", "port_block_size = 32256"),
         ("max_blocks_per_subscriber = 4", "max_blocks_per_subscriber = 1"),
+        NO_UNREACH,
     ]);
     for i in 0..8u16 {
         run(&mut fx, &udp6(sub(i, 1), 1, SERVER, 53, b"x")).unwrap();
