@@ -2,9 +2,10 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use plat_packet::{checksum as ck, parse_v4, parse_v6, put16};
 use plat_xlat::{HEADROOM, Map4, Map6, v4_to_v6, v6_to_v4};
+use std::hint::black_box;
 
 fn udp6(payload: usize) -> Vec<u8> {
     let l4 = 8 + payload;

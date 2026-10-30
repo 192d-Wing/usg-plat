@@ -4,12 +4,13 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use plat_audit::format;
 use plat_audit::{AuditSink, Event, Logger, NodeIdent};
 use plat_common::config::{
     AuditConfig, AuditFileConfig, AuditMode, LogFormat, OverflowPolicy, SyslogConfig, SyslogTransport,
 };
+use std::hint::black_box;
 
 /// A data-plane record, built the way `plat-nat64` builds it (by value,
 /// per record). `Event` is no longer `Copy` (TLS variants hold an `Arc`),
