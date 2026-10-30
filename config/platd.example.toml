@@ -122,6 +122,12 @@ filtering = "address_dependent"
 max_sessions = 4000000
 max_sessions_per_subscriber = 4000
 max_subscribers = 1000000
+# At most max_subscribers_per_aggregate subscribers inside one
+# aggregate_prefix_len prefix (SC-5): a client holding a /48 cannot fill the
+# subscriber table. aggregate_prefix_len is 32..=subscriber_prefix_len (equal
+# turns the limit off); a /56 holds exactly 256 /64 subscribers.
+aggregate_prefix_len = 56
+max_subscribers_per_aggregate = 256
 table_shards = 1024
 # Released port blocks are held back this long before reuse (RFC 6888
 # REQ-12; 120..=3600).

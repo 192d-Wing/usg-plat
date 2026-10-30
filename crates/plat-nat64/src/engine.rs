@@ -739,7 +739,10 @@ impl Nat64 {
     ) -> R {
         let exhausted = match e {
             DropReason::PortExhausted => !M::SLICED,
-            DropReason::SubscriberLimit | DropReason::SubscriberTableFull | DropReason::SessionLimit => true,
+            DropReason::SubscriberLimit
+            | DropReason::SubscriberTableFull
+            | DropReason::AggregateSubscriberLimit
+            | DropReason::SessionLimit => true,
             _ => false,
         };
         if !self.icmp_gen.unreachable || !exhausted {

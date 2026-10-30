@@ -698,6 +698,21 @@ pub struct Nat64Config {
     /// Upper bound on distinct subscribers (subscriber-table entries).
     #[serde(default = "d_max_subs")]
     pub max_subscribers: u32,
+    /// IPv6 prefix length that groups subscribers into one aggregate
+    /// (e.g. one customer's delegated /48 or /56). 32..=`subscriber_prefix_len`;
+    /// equal to `subscriber_prefix_len` makes every aggregate one subscriber
+    /// (limit off).
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: SC-5 - one short client prefix cannot fill the
+    ///   subscriber table (POAM-013)
+    /// - RFC 6888 REQ-4 - per-subscriber (aggregate) limits
+    #[serde(default = "d_agg_len")]
+    pub aggregate_prefix_len: u8,
+    /// Upper bound on subscribers inside one aggregate (1..=2^24; a value
+    /// above `max_subscribers` leaves only the global bound).
+    #[serde(default = "d_max_per_agg")]
+    pub max_subscribers_per_aggregate: u32,
     /// Lock shards per table; rounded up to a power of two.
     #[serde(default = "d_shards")]
     pub table_shards: u32,
@@ -744,6 +759,15 @@ fn d_max_sessions_sub() -> u32 {
 }
 fn d_max_subs() -> u32 {
     1_000_000
+}
+/// A /56 is the usual residential delegation: with /64 subscribers it
+/// holds exactly 256, so the default never limits a /56 customer and caps a
+/// /48 (65 536 possible subscribers) at 256.
+fn d_agg_len() -> u8 {
+    56
+}
+fn d_max_per_agg() -> u32 {
+    256
 }
 /// Upper bound accepted for `nat64.max_subscribers`.
 pub const MAX_SUBSCRIBERS: u32 = 1 << 24;
@@ -1528,6 +1552,12 @@ impl Config {
         if n.max_subscribers == 0 || n.max_subscribers > MAX_SUBSCRIBERS {
             return invalid(format!("nat64.max_subscribers must be 1..={MAX_SUBSCRIBERS}"));
         }
+        if !(32..=n.subscriber_prefix_len).contains(&n.aggregate_prefix_len) {
+            return invalid("nat64.aggregate_prefix_len must be 32..=subscriber_prefix_len");
+        }
+        if n.max_subscribers_per_aggregate == 0 || n.max_subscribers_per_aggregate > MAX_SUBSCRIBERS {
+            return invalid(format!("nat64.max_subscribers_per_aggregate must be 1..={MAX_SUBSCRIBERS}"));
+        }
         if n.table_shards == 0 || n.table_shards > 1 << 16 {
             return invalid("nat64.table_shards must be 1..=65536");
         }
@@ -1947,6 +1977,38 @@ mod tests {
     fn rejects_short_udp_timeout() {
         let bad = EXAMPLE.replace("udp_secs = 300", "udp_secs = 30");
         assert!(matches!(Config::from_toml(&bad), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn aggregate_limit_is_validated() {
+        let c = Config::from_toml(EXAMPLE).unwrap();
+        assert_eq!((c.nat64.aggregate_prefix_len, c.nat64.max_subscribers_per_aggregate), (56, 256));
+        // Defaults when omitted.
+        let bare =
+            EXAMPLE.replace("aggregate_prefix_len = 56\n", "").replace("max_subscribers_per_aggregate = 256\n", "");
+        let d = Config::from_toml(&bare).unwrap();
+        assert_eq!((d.nat64.aggregate_prefix_len, d.nat64.max_subscribers_per_aggregate), (56, 256));
+        for (a, b) in [
+            ("aggregate_prefix_len = 56", "aggregate_prefix_len = 31"),
+            ("aggregate_prefix_len = 56", "aggregate_prefix_len = 65"),
+            ("max_subscribers_per_aggregate = 256", "max_subscribers_per_aggregate = 0"),
+            ("max_subscribers_per_aggregate = 256", "max_subscribers_per_aggregate = 16777217"),
+        ] {
+            assert!(EXAMPLE.contains(a), "{a}");
+            assert!(Config::from_toml(&EXAMPLE.replace(a, b)).is_err(), "{b}");
+        }
+        for (a, b) in [
+            ("aggregate_prefix_len = 56", "aggregate_prefix_len = 32"),
+            ("aggregate_prefix_len = 56", "aggregate_prefix_len = 64"),
+            ("max_subscribers_per_aggregate = 256", "max_subscribers_per_aggregate = 1"),
+            ("max_subscribers_per_aggregate = 256", "max_subscribers_per_aggregate = 16777216"),
+        ] {
+            assert!(Config::from_toml(&EXAMPLE.replace(a, b)).is_ok(), "{b}");
+        }
+        // Must not be longer than the subscriber prefix.
+        let short = EXAMPLE.replace("subscriber_prefix_len = 64", "subscriber_prefix_len = 48");
+        assert!(Config::from_toml(&short).is_err());
+        assert!(Config::from_toml(&short.replace("aggregate_prefix_len = 56", "aggregate_prefix_len = 48")).is_ok());
     }
 
     #[test]

@@ -12,6 +12,7 @@ mod common;
 use std::time::Duration;
 
 use common::*;
+use plat_audit::{Event, LimitKind};
 use plat_common::{Counter, DropReason};
 use plat_nat64::state::Key6;
 use plat_packet::{be16, be32, checksum as ck, parse_v4, parse_v6, proto, put16, put32};
@@ -485,6 +486,43 @@ fn subscriber_table_is_bounded() {
     fx.nat.state().sweep();
     assert_eq!(fx.nat.state().subscriber_count(), 0);
     run(&mut fx, &udp6(sub(3, 1), 1, SERVER, 53, b"x")).unwrap();
+}
+
+/// POAM-013: one aggregate (/56 by default) holds at most
+/// `max_subscribers_per_aggregate` subscribers; the refusal creates no
+/// entry or block, is counted and audited, and expiry frees the capacity.
+#[test]
+fn aggregate_subscriber_limit() {
+    let mut fx = fixture(&[("max_subscribers_per_aggregate = 256", "max_subscribers_per_aggregate = 2"), NO_UNREACH]);
+    // sub(n, _) varies bits 64..80: n 0..=255 share one /56.
+    run(&mut fx, &udp6(sub(1, 1), 1, SERVER, 53, b"x")).unwrap();
+    run(&mut fx, &udp6(sub(2, 1), 1, SERVER, 53, b"x")).unwrap();
+    let blocks = fx.nat.state().pool.free_blocks();
+    assert_eq!(run(&mut fx, &udp6(sub(3, 1), 1, SERVER, 53, b"x")).unwrap_err(), DropReason::AggregateSubscriberLimit);
+    assert_eq!(fx.nat.state().subscriber_count(), 2);
+    assert_eq!(fx.nat.state().pool.free_blocks(), blocks, "no block for a refused subscriber");
+    assert_eq!(fx.nat.state().aggregate_count(sub(3, 1)), 2);
+    assert_eq!(fx.ctx.counters.drops(DropReason::AggregateSubscriberLimit), 1);
+    let agg = sub(0, 0);
+    assert!(events(&fx).iter().any(|e| matches!(
+        e,
+        Event::Limit { kind: LimitKind::AggregateSubscribers, sub, sub_len: 56, .. } if *sub == agg
+    )));
+    // Existing subscribers and other aggregates are unaffected.
+    run(&mut fx, &udp6(sub(1, 2), 9, SERVER, 53, b"x")).unwrap();
+    run(&mut fx, &udp6(sub(256, 1), 1, SERVER, 53, b"x")).unwrap();
+    assert_eq!(fx.nat.state().aggregate_count(sub(256, 1)), 1);
+    // Sweeper expiry frees the aggregate.
+    fx.clock.advance(Duration::from_secs(301));
+    fx.nat.state().sweep();
+    fx.clock.advance(Duration::from_secs(3));
+    fx.nat.state().sweep();
+    fx.clock.advance(Duration::from_secs(61));
+    fx.nat.state().sweep();
+    assert_eq!(fx.nat.state().subscriber_count(), 0);
+    assert_eq!(fx.nat.state().aggregate_count(sub(3, 1)), 0);
+    run(&mut fx, &udp6(sub(3, 1), 1, SERVER, 53, b"x")).unwrap();
+    assert_eq!(fx.nat.state().aggregate_count(sub(3, 1)), 1);
 }
 
 /// SEC-005: a failed allocation leaves no empty subscriber entry behind.

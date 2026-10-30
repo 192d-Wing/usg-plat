@@ -46,6 +46,22 @@ Narrows POAM-024. SIEM schema unchanged.
 - `check-config --format env`: `PLAT_CROSS_NODE_HAIRPIN`,
   `PLAT_CLUSTER_IFACES`.
 
+### Per-aggregate subscriber limit (branch `fix/poam-013`)
+
+Closes POAM-013. SIEM schema unchanged (7): no field changes; new
+`event.reason` value and drop reason only.
+
+- Added `nat64.aggregate_prefix_len` (32..=`subscriber_prefix_len`, default
+  56) and `nat64.max_subscribers_per_aggregate` (1..=2^24,
+  default 256). A new subscriber whose aggregate is full is refused before
+  any subscriber entry or port block is created: drop reason
+  `aggregate_subscriber_limit`, `nat_resource_limit` record with
+  `event.reason = "aggregate_subscriber_limit"` and the aggregate prefix as
+  `plat.subscriber.prefix`, ICMPv6 Unreachable 1/3 like the other mapping
+  limits. Counts follow the sweeper, adoption and handover release.
+- Breaking: a config with `subscriber_prefix_len` below 56 fails validation
+  until `aggregate_prefix_len` is set.
+
 ### Protocol completeness (branch `feat/protocol-completeness`)
 
 Stacked on `feat/cluster-ha`. Closes POAM-001, POAM-002, POAM-011 and

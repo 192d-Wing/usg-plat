@@ -151,6 +151,13 @@ Configuration changes to note when upgrading from an earlier build:
   prefix. A network-specific-prefix deployment that must reach such space
   sets it to `true`. The Well-Known Prefix cannot be combined with a
   non-global pool.
+- `nat64.aggregate_prefix_len` (default 56) and
+  `nat64.max_subscribers_per_aggregate` (default 256) cap the subscribers
+  inside one aggregate prefix (a /48 holder gets at most 256 /64
+  subscribers; refusals count `aggregate_subscriber_limit` and log a
+  `nat_resource_limit` record). `aggregate_prefix_len` must not exceed
+  `subscriber_prefix_len`: a config with `subscriber_prefix_len` below 56
+  must set it (equal turns the limit off).
 - `audit.on_overflow = "refuse_new_bindings"` (the default) requires
   `[audit.file]`; a syslog-only config must set `on_overflow =
   "drop_and_alert"`.

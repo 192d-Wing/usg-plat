@@ -126,6 +126,7 @@ I/O backend (POAM-016), not lock changes (POAM-015).
 | `bib6` | (proto, v6 src, sport) | v4 transport address | shard |
 | `bib4` | (proto, pool addr, pool port) | BIB + sessions `(remote addr, port) → expiry, TCP state` | shard |
 | `subs` | v6 prefix (`subscriber_prefix_len`) | port blocks + per-protocol bitmaps | shard |
+| `aggs` | v6 prefix (`aggregate_prefix_len`) | subscriber count (entries only while > 0) | shard (leaf, under `subs`) |
 | `pool` | address index | FIFO free list of blocks; round-robin queue of addresses with free blocks | per-address mutex; one padded `avail` mutex taken only on block allocate/release |
 
 - **Endpoint-independent mapping** (RFC 4787 REQ-1), **address-dependent
@@ -133,7 +134,10 @@ I/O backend (POAM-016), not lock changes (POAM-015).
   index kept only under ADF), **paired pooling** (REQ-2).
 - **Bounded subscribers.** `nat64.max_subscribers` (default 1 000 000); a new
   subscriber is refused before any entry is created when the pool has no
-  free block or the table is full.
+  free block or the table is full. At most
+  `nat64.max_subscribers_per_aggregate` (default 256) subscribers share one
+  `nat64.aggregate_prefix_len` (default 56) prefix (POAM-013 closed); the
+  count changes only on subscriber create and removal.
 - **Bulk port allocation** (RFC 7422 style): a subscriber receives blocks of
   `port_block_size` ports on one IPv4 address, up to
   `max_blocks_per_subscriber`. Ports inside a block are chosen randomly
@@ -145,6 +149,8 @@ I/O backend (POAM-016), not lock changes (POAM-015).
 
 Lock order: `bib6 → subs` (released) `→ bib4`; sweeper `bib6 → bib4`
 (released) then `subs`. Nothing acquires `bib6` or `subs` while holding `bib4`.
+`aggs` is a leaf: taken briefly only while a `subs` shard is held (or alone),
+and holds no other lock.
 
 ## SIEM logging
 

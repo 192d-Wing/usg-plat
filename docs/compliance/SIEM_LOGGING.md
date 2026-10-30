@@ -149,7 +149,11 @@ attribution).
 
 `event.reason` ∈ `pool_exhausted`, `subscriber_block_limit`,
 `subscriber_session_limit`, `global_session_limit`,
-`subscriber_table_limit`. Rate-limited to one record per second per reason.
+`subscriber_table_limit`, `aggregate_subscriber_limit` (schema 7, additive:
+`nat64.max_subscribers_per_aggregate` reached; `source.ip` and
+`plat.subscriber.prefix` carry the aggregate prefix and
+`nat64.aggregate_prefix_len`, e.g. `2001:db8:100::/56`). Rate-limited to one
+record per second per reason.
 
 ```json
 {"@timestamp":"2026-10-28T14:16:01.000000Z","plat.schema":7,"event.sequence":9,"event.kind":"event","event.category":"network","event.action":"nat_resource_limit","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","event.reason":"subscriber_block_limit","source.ip":"2001:db8:100:1::","plat.subscriber.prefix":"2001:db8:100:1::/64"}
@@ -809,7 +813,8 @@ for `nat_port_block_release` (same address and range), `service_stop`,
   `port_exhausted`, `subscriber_limit`, `session_limit`,
   `audit_unavailable`, `fragment`, `too_big`, `hop_limit`,
   `icmp_untranslatable`, `wrong_node`, `source_route`,
-  `subscriber_table_full`, `cluster_fenced` (slice fenced or adopting on
+  `subscriber_table_full`, `aggregate_subscriber_limit` (new subscriber's
+  aggregate prefix full), `cluster_fenced` (slice fenced or adopting on
   this node), `missteered` (HA `steering.mode = "drop"`: new subscriber
   homed on another member); fragments: `fragment_timeout` (incomplete
   datagram expired), `fragment_overlap` (overlap or duplicate, RFC 5722;
