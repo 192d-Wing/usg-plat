@@ -898,3 +898,29 @@ fn own_slice_refused(cfg: &[(&str, &str)], cross_node: bool) {
     let hp = run(&mut fx, &udp6(a, 7000, b4, bp, b"hp")).unwrap();
     assert_eq!((v6_ok(&hp).dst, be16(&hp, 42)), (b, 6000));
 }
+
+/// RFC deviation 11 (RFC 4787 REQ-9, RFC 6146 §3.8): a cross-node hairpin
+/// (another node's pool slice as the wire source) is refused silently with
+/// `translation.cross_node_hairpin` off (default) and accepted with it on.
+#[test]
+fn cross_node_hairpin_refused_off_accepted_on() {
+    let peer = 0xc000_0264; // 192.0.2.100, another node's slice
+    for on in [false, true] {
+        let mut cfg = vec![CLUSTER_24, EIF];
+        if on {
+            cfg.push(CROSS_NODE_HAIRPIN);
+        }
+        let mut fx = fixture_strict(&cfg);
+        let a = sub(1, 1);
+        let oa = run(&mut fx, &udp6(a, 5353, GLOBAL, 53, b"q")).unwrap();
+        let (a4, ap) = (be32(&oa, 12), be16(&oa, 20));
+        let r = run(&mut fx, &udp4(peer, 4444, a4, ap, b"hairpin"));
+        if on {
+            let out = r.unwrap();
+            assert_eq!((v6_ok(&out).src, v6_ok(&out).dst), (synth(peer), a));
+        } else {
+            // Silent drop: no ICMP error is generated (deviation 12).
+            assert_eq!(r.unwrap_err(), DropReason::SrcNotAllowed);
+        }
+    }
+}

@@ -258,7 +258,10 @@ platd check-config -c /etc/plat/platd.toml   # prints the slice table and this n
   TLS), so each node and witness certificate needs **both the `serverAuth`
   and `clientAuth` extended key usages**, and a SAN matching its
   `identity` (e.g. `dns:plat-1.cluster.example`). Every member must have the
-  same `[cluster]` and pool settings: a different configuration digest is
+  same `[cluster]` and pool settings, `translation.cross_node_hairpin`,
+  `nat64.aggregate_prefix_len` and `nat64.max_subscribers_per_aggregate`
+  (`cluster_interfaces` is node-local and may differ): a different
+  configuration digest is
   refused (`digest_mismatch`), and so is a second node with the same id
   (`duplicate_id`: a second connection for a live id, a peer claiming the
   receiver's own id, or a claim of a connected member's id with another

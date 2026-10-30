@@ -7,7 +7,11 @@
 //! `CAP_NET_ADMIN`, so it reads the snapshot of the live table the script
 //! writes (`plat.nft.expected`; `plat-fwguard` keeps the live table equal to
 //! it) and refuses to start when the guard is missing or names other
-//! interfaces.
+//! interfaces, does not cover every `nat64.pool` CIDR, or comes after a
+//! rule that accepts IPv4 (and would shadow it).
+//!
+//! Residual (POAM-024): this checks the snapshot, not the live table; the
+//! two are kept equal by `plat-fwguard`, and changing either needs root.
 //!
 //! Fail closed rather than warn: the switch is opt-in, a warning in the
 //! journal leaves the spoofing path open silently, and the script installs
@@ -20,9 +24,10 @@
 //!   against the configuration at start
 
 use std::io::Read;
+use std::net::Ipv4Addr;
 use std::path::Path;
 
-use plat_common::Config;
+use plat_common::{Config, Ipv4Cidr};
 
 /// Snapshot of the installed forward policy written by `plat-tun-setup.sh`.
 pub const SNAPSHOT: &str = "/etc/nftables.d/plat.nft.expected";
@@ -46,15 +51,70 @@ pub fn check(cfg: &Config, path: &Path) -> Result<(), String> {
     };
     let text = read_bounded(path).map_err(|e| fail(format!("cannot read {}: {e}", path.display())))?;
     let tun = format!("oifname \"{}\"", cfg.dataplane.interface);
-    let ok = text.lines().any(|l| {
-        l.contains(&format!("comment \"{GUARD_COMMENT}\""))
-            && l.contains(&tun)
-            && l.contains("iifname != ")
-            && l.contains("ip saddr ")
-            && l.contains(" drop ")
-            && t.cluster_interfaces.iter().all(|i| l.contains(&format!("\"{i}\"")))
-    });
-    if ok { Ok(()) } else { Err(fail(format!("{} has no matching pool-source guard rule", path.display()))) }
+    let mut guard_seen = false;
+    for l in text.lines().map(str::trim) {
+        if l.starts_with('#') || l.contains("hook ") {
+            continue;
+        }
+        let words: Vec<&str> = l.split_whitespace().collect();
+        if !guard_seen && is_guard(l, &tun, &t.cluster_interfaces, &cfg.nat64.pool) {
+            guard_seen = true;
+        } else if !guard_seen && words.contains(&"accept") && !words.contains(&"ip6") {
+            // An accept that can match IPv4 before the guard shadows it.
+            return Err(fail(format!("{} accepts IPv4 before the pool-source guard: {l}", path.display())));
+        }
+    }
+    if guard_seen { Ok(()) } else { Err(fail(format!("{} has no matching pool-source guard rule", path.display()))) }
+}
+
+/// The guard rule: our comment, towards the TUN, from anywhere but every
+/// cluster interface, dropping a source set that covers all of `nat64.pool`.
+fn is_guard(l: &str, tun: &str, ifaces: &[String], pool: &[Ipv4Cidr]) -> bool {
+    l.contains(&format!("comment \"{GUARD_COMMENT}\""))
+        && l.contains(tun)
+        && l.contains("iifname != ")
+        && l.contains(" drop ")
+        && ifaces.iter().all(|i| l.contains(&format!("\"{i}\"")))
+        && saddr_set(l).is_some_and(|set| pool.iter().all(|c| covered(c, &set)))
+}
+
+/// The `ip saddr { ... }` (or single-element) source set of a rule, as
+/// inclusive address ranges. nft renders prefixes as `a/n`, host routes as
+/// `a`, and may merge adjacent prefixes into ranges `a-b`.
+fn saddr_set(l: &str) -> Option<Vec<(u32, u32)>> {
+    let rest = l.split_once("ip saddr ")?.1.trim_start();
+    let body = match rest.strip_prefix('{') {
+        Some(r) => r.split_once('}')?.0,
+        None => rest.split_whitespace().next()?,
+    };
+    body.split(',').map(|e| element(e.trim())).collect()
+}
+
+fn element(e: &str) -> Option<(u32, u32)> {
+    if let Some((a, b)) = e.split_once('-') {
+        let (a, b) = (u32::from(a.trim().parse::<Ipv4Addr>().ok()?), u32::from(b.trim().parse::<Ipv4Addr>().ok()?));
+        return (a <= b).then_some((a, b));
+    }
+    let c: Ipv4Cidr = if e.contains('/') { e.parse().ok()? } else { format!("{e}/32").parse().ok()? };
+    let host = u32::MAX.checked_shr(u32::from(c.prefix_len())).unwrap_or(0);
+    Some((c.network(), c.network() | host))
+}
+
+/// `c` lies inside the union of `set`.
+fn covered(c: &Ipv4Cidr, set: &[(u32, u32)]) -> bool {
+    let host = u32::MAX.checked_shr(u32::from(c.prefix_len())).unwrap_or(0);
+    let (mut next, end) = (u64::from(c.network()), u64::from(c.network() | host));
+    // Each pass extends the covered prefix by one range; at most |set| passes.
+    for _ in 0..=set.len() {
+        if next > end {
+            return true;
+        }
+        match set.iter().find(|&&(a, b)| u64::from(a) <= next && next <= u64::from(b)) {
+            Some(&(_, b)) => next = u64::from(b) + 1,
+            None => return false,
+        }
+    }
+    next > end
 }
 
 fn read_bounded(path: &Path) -> std::io::Result<String> {
@@ -125,9 +185,54 @@ mod tests {
             GOOD.replace(" drop ", " accept "),
             "oifname \"plat0\" ip saddr { 192.0.2.0/24 } accept".to_string(),
         ] {
-            assert!(check(&c, &snapshot(&d, &bad)).unwrap_err().contains("no matching"), "{bad}");
+            let e = check(&c, &snapshot(&d, &bad)).unwrap_err();
+            assert!(e.contains("no matching") || e.contains("before the pool-source guard"), "{bad}: {e}");
         }
         assert!(check(&c, &d).is_err(), "a directory is not a snapshot");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    fn two_pools() -> Config {
+        let mut c = cfg(true);
+        c.nat64.pool = vec!["192.0.2.0/24".parse().unwrap(), "198.51.100.0/25".parse().unwrap()];
+        c
+    }
+
+    #[test]
+    fn guard_must_cover_the_whole_pool() {
+        let c = two_pools();
+        let d = dir("pool");
+        let rule = |set: &str| GOOD.replace("{ 192.0.2.0/24 }", set);
+        for ok in [
+            "{ 192.0.2.0/24, 198.51.100.0/25 }",
+            // nft may merge adjacent prefixes or render a wider set.
+            "{ 192.0.2.0/25, 192.0.2.128-192.0.2.255, 198.51.100.0/24 }",
+        ] {
+            assert!(check(&c, &snapshot(&d, &rule(ok))).is_ok(), "{ok}");
+        }
+        for bad in [
+            // Stale (only the old pool) and partial sets.
+            "{ 192.0.2.0/24 }",
+            "{ 192.0.2.0/24, 198.51.100.0/26 }",
+            "{ 192.0.2.0/25, 198.51.100.0/25 }",
+            "{ 192.0.2.0/24, garbage }",
+        ] {
+            assert!(check(&c, &snapshot(&d, &rule(bad))).unwrap_err().contains("no matching"), "{bad}");
+        }
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn guard_must_precede_ipv4_accepts() {
+        let c = cfg(true);
+        let d = dir("order");
+        let v6 = "oifname \"plat0\" ip6 saddr { 2001:db8::/32 } ip6 daddr 64:ff9b:1::/96 accept";
+        let v4 = "iifname \"plat0\" ip saddr { 192.0.2.0/24 } accept";
+        assert!(check(&c, &snapshot(&d, &format!("{v6}\n\t\t{GOOD}\n\t\t{v4}"))).is_ok());
+        for shadow in [v4, "ct state established,related accept", "oifname \"plat0\" accept"] {
+            let e = check(&c, &snapshot(&d, &format!("{shadow}\n\t\t{GOOD}"))).unwrap_err();
+            assert!(e.contains("before the pool-source guard"), "{shadow}: {e}");
+        }
         std::fs::remove_dir_all(&d).unwrap();
     }
 }

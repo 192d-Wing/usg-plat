@@ -81,8 +81,8 @@ chain, 1 on a verification failure, an unverified tail (unless
    before its audit record is queued, unless `on_overflow = "drop_and_alert"`.
    A block returns to the pool only after its release record is queued.
    Records the caller retries use `AuditSink::try_emit` (not counted as lost).
-5. **Lock order.** `bib6 → subs (released) → bib4`; sweeper `bib6 → bib4`, then
-   `subs`. Never take `bib6` or `subs` while holding `bib4`.
+5. **Lock order.** `bib6 → subs (→ aggs, leaf) (released) → bib4`; sweeper
+   `bib6 → bib4`, then `subs (→ aggs)`. Never take `bib6` or `subs` while holding `bib4`.
 6. **`unsafe` only in `plat-io`**, each block with a `// SAFETY:` comment.
 7. **Annotate controls and RFC sections** with `// COMPLIANCE MAPPING:`; mark
    known gaps `// POAM:` and list them in `docs/compliance/POAM.md`. Cite
@@ -111,11 +111,11 @@ chain, 1 on a verification failure, an unverified tail (unless
 
 | Family | Where |
 |--------|-------|
-| SC-5 DoS protection | limits in `Nat64Config` (incl. `max_subscribers`), `State::admit_session`, `State::bib_for`, per-worker ICMP error token bucket (a quarter reserved for PTB / Frag Needed; rate 0 or ≥ 4), keyed hashing in `shard.rs`; preallocated per-worker fragment table, hold buffer and reassembly slots bounded by `[translation.fragments]` with per-source caps (`frag.rs`) |
-| SC-7 boundary protection | client prefix allow-list, RFC 6052 §3.1 checks, non-global IPv4 denied by default (`allow_non_global_destinations`), ICMP error validation, ADF filtering, host nftables forward policy (`deploy/systemd/plat-tun-setup.sh`) |
+| SC-5 DoS protection | limits in `Nat64Config` (incl. `max_subscribers` and the per-aggregate `max_subscribers_per_aggregate`), `State::admit_session`, `State::bib_for`, per-worker ICMP error token bucket (a quarter reserved for PTB / Frag Needed; rate 0 or ≥ 4), keyed hashing in `shard.rs`; preallocated per-worker fragment table, hold buffer and reassembly slots bounded by `[translation.fragments]` with per-source caps (`frag.rs`) |
+| SC-7 boundary protection | client prefix allow-list, RFC 6052 §3.1 checks, non-global IPv4 denied by default (`allow_non_global_destinations`), pool-sourced wire IPv4 refused unless `cross_node_hairpin` with its start-gated nft guard (`services/platd/src/hairpin_guard.rs`), ICMP error validation, ADF filtering, host nftables forward policy (`deploy/systemd/plat-tun-setup.sh`) |
 | SC-10 network disconnect | idle timers (RFC 6146 minimums enforced in config) + `State::sweep` |
 | AU-2/3/8/12 | `plat-audit` events, UTC µs timestamps, sequence numbers, node identity |
-| AU-4/AU-5/AU-5(1) | bounded queue, `on_overflow` policy, degraded state on file failure or low free space (`min_free_bytes`), `/healthz`, `audit_queue_overflow` / `audit_output_failure` / `audit_storage_threshold` records |
+| AU-4/AU-5/AU-5(1) | bounded queue, `on_overflow` policy, degraded state on file failure or low free space (`min_free_bytes`, mandatory, default max(2 × `max_bytes`, 1 GiB)), `/healthz`, `audit_queue_overflow` / `audit_output_failure` / `audit_storage_threshold` records |
 | AU-6(3)/(4) | ECS/CEF correlation fields, RFC 5424 syslog export |
 | AU-9/AU-11 | SHA-256 chain v2 across files (unkeyed, POAM-003), `platd verify-log`, 0640 file mode, `max_files` retention with `audit_retention_prune` records |
 | SI-4 | per-worker counters, Prometheus `/metrics`, periodic counter records |

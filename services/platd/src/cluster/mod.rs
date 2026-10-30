@@ -61,7 +61,7 @@ fn scheme(p: Partition) -> PartitionScheme {
 
 /// The inputs of the cluster configuration digest (WU1 mapping): pool and
 /// block layout, partition, members, witness identity and lease timing (0
-/// without HA).
+/// without HA), cross-node hairpinning and the aggregate subscriber limit.
 pub fn digest_input(cfg: &Config) -> DigestInput {
     let ha = cfg.cluster.ha_active();
     DigestInput {
@@ -83,6 +83,10 @@ pub fn digest_input(cfg: &Config) -> DigestInput {
         lease_ms: ha.map_or(0, |h| u32::try_from(h.lease_ms).unwrap_or(u32::MAX)),
         heartbeat_ms: ha.map_or(0, |h| u32::try_from(h.heartbeat_ms).unwrap_or(u32::MAX)),
         drift_margin_pct: ha.map_or(0, |h| h.drift_margin_pct),
+        // cluster_interfaces is node-local (names differ per host): not hashed.
+        cross_node_hairpin: cfg.translation.cross_node_hairpin,
+        aggregate_prefix_len: cfg.nat64.aggregate_prefix_len,
+        max_subscribers_per_aggregate: cfg.nat64.max_subscribers_per_aggregate,
     }
 }
 
@@ -105,6 +109,9 @@ pub fn voting_digest(members: &[DigestMember], witness: &str, lease_ms: u64, hea
         lease_ms: u32::try_from(lease_ms).unwrap_or(u32::MAX),
         heartbeat_ms: u32::try_from(heartbeat_ms).unwrap_or(u32::MAX),
         drift_margin_pct: drift,
+        cross_node_hairpin: false,
+        aggregate_prefix_len: 0,
+        max_subscribers_per_aggregate: 0,
     })
 }
 

@@ -68,6 +68,15 @@ pub struct DigestInput {
     pub lease_ms: u32,
     pub heartbeat_ms: u32,
     pub drift_margin_pct: u8,
+    /// `translation.cross_node_hairpin`: every member must agree, or a
+    /// hairpin between two nodes is accepted in one direction only.
+    /// `translation.cluster_interfaces` is deliberately not hashed: interface
+    /// names are node-local and may differ between members.
+    pub cross_node_hairpin: bool,
+    /// `nat64.aggregate_prefix_len` (POAM-013).
+    pub aggregate_prefix_len: u8,
+    /// `nat64.max_subscribers_per_aggregate` (POAM-013).
+    pub max_subscribers_per_aggregate: u32,
 }
 
 const DOMAIN: &[u8] = b"usg-plat cluster config digest v1\0";
@@ -113,6 +122,8 @@ pub fn config_digest(cfg: &DigestInput) -> [u8; 32] {
     h.update(cfg.lease_ms.to_le_bytes());
     h.update(cfg.heartbeat_ms.to_le_bytes());
     h.update([cfg.drift_margin_pct]);
+    h.update([u8::from(cfg.cross_node_hairpin), cfg.aggregate_prefix_len]);
+    h.update(cfg.max_subscribers_per_aggregate.to_le_bytes());
     h.finalize().into()
 }
 
@@ -138,6 +149,9 @@ mod tests {
             lease_ms: 3000,
             heartbeat_ms: 500,
             drift_margin_pct: 10,
+            cross_node_hairpin: false,
+            aggregate_prefix_len: 48,
+            max_subscribers_per_aggregate: 256,
         }
     }
 
@@ -172,6 +186,9 @@ mod tests {
             Box::new(|c| c.lease_ms = 4000),
             Box::new(|c| c.heartbeat_ms = 400),
             Box::new(|c| c.drift_margin_pct = 11),
+            Box::new(|c| c.cross_node_hairpin = true),
+            Box::new(|c| c.aggregate_prefix_len = 56),
+            Box::new(|c| c.max_subscribers_per_aggregate = 255),
         ];
         let mut seen = std::collections::HashSet::new();
         for (i, e) in edits.iter().enumerate() {

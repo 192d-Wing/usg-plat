@@ -147,8 +147,8 @@ I/O backend (POAM-016), not lock changes (POAM-015).
   shard (no cursor or time budget, POAM-012), expires sessions, removes BIBs
   that have been empty for ≥ 2 s, and releases lingering blocks.
 
-Lock order: `bib6 → subs` (released) `→ bib4`; sweeper `bib6 → bib4`
-(released) then `subs`. Nothing acquires `bib6` or `subs` while holding `bib4`.
+Lock order: `bib6 → subs (→ aggs)` (released) `→ bib4`; sweeper `bib6 → bib4`
+(released) then `subs (→ aggs)`. Nothing acquires `bib6` or `subs` while holding `bib4`.
 `aggs` is a leaf: taken briefly only while a `subs` shard is held (or alone),
 and holds no other lock.
 

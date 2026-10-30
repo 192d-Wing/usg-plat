@@ -4,6 +4,20 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 
 ## [Unreleased]
 
+### Review fixes for POAM-020/024/013 (branch `fix/poams-020-024-013`)
+
+- The cluster configuration digest now also covers
+  `translation.cross_node_hairpin`, `nat64.aggregate_prefix_len` and
+  `nat64.max_subscribers_per_aggregate` (`cluster_interfaces` is node-local
+  and not hashed). **The digest value changes**: a mixed-version cluster
+  reports `digest_mismatch` until every member runs this version.
+- The cross-node hairpin start gate is stricter: the
+  `plat-pool-source-guard` rule must cover every `nat64.pool` CIDR and come
+  before any rule that accepts IPv4.
+- Cross-node hairpin off by default is documented as RFC deviation 11
+  (RFC 4787 REQ-9, RFC 6146 §3.8); pool-source refusal is a silent BCP 38
+  drop (deviation 12).
+
 ### Audit free-space threshold on by default (branch `fix/poam-020`)
 
 Closes POAM-020. SIEM schema unchanged.
