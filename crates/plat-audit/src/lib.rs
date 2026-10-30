@@ -23,7 +23,8 @@
 //! - NIST 800-53: AU-6(3), AU-6(4) (correlation fields, central export)
 //! - NIST 800-53: AU-8 (UTC microsecond time stamps)
 //! - NIST 800-53: AU-9 (hash-chained local log, unkeyed; see `logger`)
-//! - RFC 6888 REQ-12, RFC 7422 - port-block logging for attribution
+//! - RFC 6888 §4, REQ-14, RFC 7422 - port-block logging for attribution
+//! - RFC 6888 REQ-12 - no destination addresses or ports are logged
 
 pub mod event;
 pub mod format;

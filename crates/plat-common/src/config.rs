@@ -720,7 +720,7 @@ pub struct Nat64Config {
     /// allocated again (120..=3600 s).
     ///
     /// COMPLIANCE MAPPING:
-    /// - RFC 6888 REQ-12, RFC 7422 §2 - attribution windows never abut
+    /// - RFC 6888 REQ-8 - no reallocation for at least 120 s; attribution windows never abut
     ///   (POAM-010)
     #[serde(default = "d_cooldown")]
     pub block_cooldown_secs: u32,
@@ -1738,7 +1738,7 @@ impl Config {
             return invalid(format!("dataplane.sweep_interval_ms must be 1..={MAX_SWEEP_INTERVAL_MS}"));
         }
         if !(120..=3600).contains(&n.block_cooldown_secs) {
-            return invalid("nat64.block_cooldown_secs must be 120..=3600 (RFC 6888 REQ-12)");
+            return invalid("nat64.block_cooldown_secs must be 120..=3600 (RFC 6888 REQ-8)");
         }
         self.validate_cluster()
     }

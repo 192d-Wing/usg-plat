@@ -8,7 +8,7 @@ Source: `crates/plat-audit`.
 An IPv4 abuse report or law-enforcement request names an IPv4 address, a
 port, and a time. Behind a NAT64 many subscribers share that address, so the
 PLAT must log enough to answer "which subscriber held 192.0.2.10:40123 at
-14:16:00Z?" (RFC 6888 REQ-12, RFC 7422), and do it fast enough that logging
+14:16:00Z?" (RFC 6888 §4, RFC 7422), and do it fast enough that logging
 never limits forwarding.
 
 ## Schema history
