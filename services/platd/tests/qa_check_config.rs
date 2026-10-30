@@ -145,6 +145,29 @@ fn mgmt_tls_good_and_bad_material() {
 }
 
 #[test]
+fn pool_capacity_is_reported_and_undersized_pool_warns() {
+    let d = Dir::new("capacity");
+    // Example: a /24 serves 32 256 one-block subscribers, below max_subscribers.
+    let ex = d.write("ex.toml", EXAMPLE, 0o644);
+    let o = check(&ex, false);
+    assert_eq!(code(&o), 0, "{}", String::from_utf8_lossy(&o.stderr));
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(out.contains("port blocks: 126 per address x 256 addresses = 32256 (512 ports each)"), "{out}");
+    assert!(out.contains("8064 at 4 blocks") && out.contains("WARNING: the pool has 32256 blocks"), "{out}");
+    // Room for one block each but not four: the softer warning.
+    let mid = d.write("mid.toml", &EXAMPLE.replace("max_subscribers = 1000000", "max_subscribers = 10000"), 0o644);
+    let out = String::from_utf8_lossy(&check(&mid, false).stdout).into_owned();
+    assert!(out.contains("WARNING: only 8064 of 10000 subscribers can hold 4 blocks"), "{out}");
+    // Sized to fit: no capacity warning.
+    let fit = d.write("fit.toml", &EXAMPLE.replace("max_subscribers = 1000000", "max_subscribers = 8000"), 0o644);
+    let out = String::from_utf8_lossy(&check(&fit, false).stdout).into_owned();
+    assert!(
+        out.contains("port blocks:") && !out.contains("WARNING: the pool") && !out.contains("WARNING: only"),
+        "{out}"
+    );
+}
+
+#[test]
 fn expiring_cert_warns_but_passes() {
     let d = Dir::new("expiry");
     let cfg = mgmt_cfg(&d, 0o600, 10);

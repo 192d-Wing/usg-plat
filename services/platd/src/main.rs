@@ -234,6 +234,39 @@ fn tls_summary(cfg: &Config) -> Result<String, String> {
     Ok(o)
 }
 
+/// The `check-config` port-block capacity lines, with a warning when this
+/// node's share of the pool cannot serve `nat64.max_subscribers` (SC-5, CM-6).
+fn capacity_summary(cfg: &Config, owned_addrs: u64) -> String {
+    let n = &cfg.nat64;
+    let c = n.capacity(owned_addrs);
+    let max_subs = u64::from(n.max_subscribers);
+    let mut o = format!(
+        "port blocks: {} per address x {} addresses = {} ({} ports each)\n\
+         \x20 subscribers served: {} at 1 block, {} at {} blocks (max_subscribers = {})\n",
+        c.blocks_per_addr,
+        owned_addrs,
+        c.total_blocks,
+        n.port_block_size,
+        c.subscribers_at_one_block,
+        c.subscribers_at_max_blocks,
+        n.max_blocks_per_subscriber,
+        max_subs,
+    );
+    if c.subscribers_at_one_block < max_subs {
+        o.push_str(&format!(
+            "WARNING: the pool has {} blocks for up to {} subscribers: subscribers beyond that \
+             get pool_exhausted; add pool addresses or lower nat64.max_subscribers\n",
+            c.total_blocks, max_subs
+        ));
+    } else if c.subscribers_at_max_blocks < max_subs {
+        o.push_str(&format!(
+            "WARNING: only {} of {} subscribers can hold {} blocks each; heavy users may get pool_exhausted\n",
+            c.subscribers_at_max_blocks, max_subs, n.max_blocks_per_subscriber
+        ));
+    }
+    o
+}
+
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
@@ -278,6 +311,7 @@ fn main() -> ExitCode {
                 if let (Some(a), Some(b)) = (owned.first(), owned.last()) {
                     println!("  range {} - {}", Ipv4Addr::from(*a), Ipv4Addr::from(*b));
                 }
+                print!("{}", capacity_summary(&cfg, owned.len() as u64));
                 println!("fragment memory per worker: {} bytes (SC-5)", cfg.translation.fragments.memory_per_worker());
                 print!("{}", memory_summary(&cfg, unit.as_deref()));
                 if let Some(f) = cfg.audit.file.as_ref() {
