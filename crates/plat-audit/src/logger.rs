@@ -1159,6 +1159,36 @@ impl FileDest {
     }
 }
 
+/// Datagrams per `sendmmsg` call (Linux UDP syslog).
+#[cfg(target_os = "linux")]
+const UDP_CHUNK: usize = 64;
+
+/// Drives a multi-message send of `len` datagrams to completion. `send(off)`
+/// sends datagrams `off..len` and returns how many left (in order), as
+/// `sendmmsg` does. A partial send resumes at the first unsent datagram; an
+/// error (or zero progress) means that datagram was refused, so it is
+/// counted lost and the rest are retried, the same accounting as one `send`
+/// per record. Returns the number lost.
+///
+/// COMPLIANCE MAPPING:
+/// - NIST 800-53: AU-5 - every undelivered record is counted
+/// - RFC 5426 §3.1 - order preserved, one message per datagram
+#[cfg(any(target_os = "linux", test))]
+fn send_resuming(len: usize, mut send: impl FnMut(usize) -> std::io::Result<usize>) -> u64 {
+    let mut off = 0;
+    let mut lost = 0;
+    while off < len {
+        match send(off) {
+            Ok(k) if k > 0 => off += k.min(len - off),
+            _ => {
+                lost += 1;
+                off += 1;
+            }
+        }
+    }
+    lost
+}
+
 /// Wire connection of one syslog destination.
 enum SyslogConn {
     Udp(UdpSocket),
@@ -1311,6 +1341,71 @@ impl SyslogOut {
         }
     }
 
+    /// Non-Linux UDP: one `send` per record; returns the records lost.
+    #[cfg(not(target_os = "linux"))]
+    fn send_udp(
+        &self,
+        s: &UdpSocket,
+        batch: &[(u64, Event)],
+        node: &NodeIdent,
+        msg: &mut Vec<u8>,
+        _buf: &mut Vec<u8>,
+    ) -> u64 {
+        let mut lost = 0;
+        for (seq, ev) in batch {
+            self.format(*seq, node, ev, msg);
+            if s.send(msg).is_err() {
+                lost += 1;
+            }
+        }
+        lost
+    }
+
+    /// Linux UDP: formats up to [`UDP_CHUNK`] records into `buf` and sends
+    /// them with `sendmmsg`, one datagram per record, resuming after a
+    /// partial send; returns the records lost.
+    #[cfg(target_os = "linux")]
+    fn send_udp(
+        &self,
+        s: &UdpSocket,
+        batch: &[(u64, Event)],
+        node: &NodeIdent,
+        msg: &mut Vec<u8>,
+        buf: &mut Vec<u8>,
+    ) -> u64 {
+        use rustix::net::{MMsgHdr, SendAncillaryBuffer, SendFlags, sendmmsg};
+        use std::io::IoSlice;
+        let mut lost = 0;
+        for chunk in batch.chunks(UDP_CHUNK) {
+            buf.clear();
+            let mut ends = [0usize; UDP_CHUNK];
+            for ((seq, ev), end) in chunk.iter().zip(ends.iter_mut()) {
+                self.format(*seq, node, ev, msg);
+                buf.extend_from_slice(msg);
+                *end = buf.len();
+            }
+            let mut start = 0;
+            let iovs: [IoSlice<'_>; UDP_CHUNK] = std::array::from_fn(|i| {
+                let end = if i < chunk.len() { ends[i] } else { start };
+                let iov = IoSlice::new(buf.get(start..end).unwrap_or_default());
+                start = end;
+                iov
+            });
+            let mut ctls: [SendAncillaryBuffer<'_, '_, '_>; UDP_CHUNK] =
+                std::array::from_fn(|_| SendAncillaryBuffer::default());
+            let mut i = 0;
+            let mut hdrs = ctls.each_mut().map(|c| {
+                let h = MMsgHdr::new(std::slice::from_ref(&iovs[i]), c);
+                i += 1;
+                h
+            });
+            let hdrs = &mut hdrs[..chunk.len()];
+            lost +=
+                send_resuming(hdrs.len(), |off| sendmmsg(s, &mut hdrs[off..], SendFlags::empty()).map_err(Into::into));
+        }
+        lost
+    }
+
     /// RFC 6587 §3.4.1 / RFC 5425 §4.3 octet counting: `MSG-LEN SP MSG`.
     fn frame(&self, batch: &[(u64, Event)], node: &NodeIdent, msg: &mut Vec<u8>, buf: &mut Vec<u8>) {
         buf.clear();
@@ -1325,10 +1420,11 @@ impl SyslogOut {
     /// the number of failed operations; the cause of a loss is noted in
     /// `stats` for the next `audit_remote_loss` record.
     ///
-    /// UDP is one datagram (one `send` syscall) per record: RFC 5426 allows
-    /// one message per datagram, and batching with `sendmmsg` would need
-    /// `unsafe` FFI outside `plat-io`. The cost stays on this thread, off the
-    /// file path. TCP and TLS (octet counting) are one write per batch; on
+    /// UDP is one datagram per record (RFC 5426 §3.1). On Linux the batch
+    /// goes out in `sendmmsg` calls of up to [`UDP_CHUNK`] datagrams (safe
+    /// `rustix` wrapper); elsewhere one `send` per record. Loss counting is
+    /// the same on both paths: each record whose datagram is refused is one
+    /// lost record. The cost stays on this thread, off the file path. TCP and TLS (octet counting) are one write per batch; on
     /// failure the whole batch is counted as lost (some frames may have
     /// arrived), and records during the reconnect back-off are lost.
     fn send_batch(
@@ -1341,15 +1437,10 @@ impl SyslogOut {
         let n = batch.len() as u64;
         match self.conn {
             SyslogConn::Udp(ref s) => {
-                // POAM: POAM-018 one datagram (one syscall) per record; no
-                // sendmmsg / UDP GSO batching yet.
-                let mut lost = 0;
-                for (seq, ev) in batch {
-                    self.format(*seq, node, ev, msg);
-                    if s.send(msg).is_err() {
-                        lost += 1;
-                    }
-                }
+                // COMPLIANCE MAPPING:
+                // - NIST 800-53: AU-9(2) (records to a separate system), AU-5 (loss counted)
+                // - RFC 5426 §3.1 - one syslog message per datagram, in order
+                let lost = self.send_udp(s, batch, node, msg, buf);
                 if lost > 0 {
                     self.stats.note_loss(RemoteLossReason::Io);
                 }
@@ -2758,5 +2849,74 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text.matches("\"plat.reason\":\"seq_lease_failed\"").count(), 1, "{text}");
         assert!(read_lease(&path).0 > verify(text.as_bytes()).unwrap().last_seq);
+    }
+
+    /// POAM-018: a UDP batch larger than one `sendmmsg` chunk arrives
+    /// complete, one record per datagram, in sequence order, with no loss.
+    #[test]
+    fn udp_batch_sends_every_record_in_order() {
+        let collector = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        collector.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let cfg = SyslogConfig {
+            address: collector.local_addr().unwrap(),
+            transport: SyslogTransport::Udp,
+            format: LogFormat::Json,
+            app_name: "platd".into(),
+            tls: None,
+        };
+        let mut out = SyslogOut::new(cfg, None).unwrap();
+        let batch: Vec<(u64, Event)> = (0..150u16).map(|i| (u64::from(i) + 1, ev(i))).collect();
+        let (mut msg, mut buf) = (Vec::new(), Vec::new());
+        assert_eq!(out.send_batch(&batch, &node(), &mut msg, &mut buf), (0, 0));
+        let mut b = [0u8; 4096];
+        for seq in 1..=150u64 {
+            let n = collector.recv(&mut b).unwrap();
+            let s = String::from_utf8_lossy(&b[..n]);
+            assert!(s.starts_with('<'), "one syslog message per datagram: {s}");
+            assert_eq!(s.matches("\"event.sequence\":").count(), 1, "{s}");
+            assert!(s.contains(&format!("\"event.sequence\":{seq},")), "order: want {seq}, got {s}");
+        }
+    }
+
+    /// `send_resuming` with full sends: one call, nothing lost.
+    #[test]
+    fn send_resuming_full_batch() {
+        let mut calls = Vec::new();
+        let lost = send_resuming(64, |off| {
+            calls.push(off);
+            Ok(64 - off)
+        });
+        assert_eq!((lost, calls), (0, vec![0]));
+    }
+
+    /// A partial send resumes at the first unsent datagram.
+    #[test]
+    fn send_resuming_partial_resumes() {
+        let mut calls = Vec::new();
+        let lost = send_resuming(10, |off| {
+            calls.push(off);
+            Ok((10 - off).min(3))
+        });
+        assert_eq!((lost, calls), (0, vec![0, 3, 6, 9]));
+    }
+
+    /// An error (e.g. an oversize datagram, `EMSGSIZE`, or a refused
+    /// destination) loses exactly the refused datagram; the rest are still
+    /// sent, as with one `send` per record. A zero return never spins.
+    #[test]
+    fn send_resuming_counts_each_refused_datagram() {
+        let mut calls = Vec::new();
+        let lost = send_resuming(8, |off| {
+            calls.push(off);
+            match off {
+                0 => Ok(2),
+                2 => Err(std::io::Error::from_raw_os_error(90)),
+                3 => Ok(0),
+                _ => Ok(8 - off),
+            }
+        });
+        assert_eq!((lost, calls), (2, vec![0, 2, 3, 4]));
+        assert_eq!(send_resuming(5, |_| Err(std::io::ErrorKind::ConnectionRefused.into())), 5);
+        assert_eq!(send_resuming(0, |_| unreachable!()), 0);
     }
 }

@@ -30,6 +30,10 @@ tracing.workspace = true
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", default-features = false, features = ["fs", "std"] }
 
+# AU-9(2) / POAM-018: UDP syslog batches with the safe `sendmmsg` wrapper.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1", default-features = false, features = ["fs", "net", "std"] }
+
 [dev-dependencies]
 criterion.workspace = true
 proptest.workspace = true

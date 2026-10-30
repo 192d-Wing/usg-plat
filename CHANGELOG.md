@@ -17,6 +17,15 @@ Closes POAM-021. SIEM schema unchanged.
   requirement exceeds its cgroup v2 `memory.max` or 90 % of RAM, or when RAM
   cannot be determined. Raise `MemoryMax` or lower the limits.
 
+### UDP syslog batching (POAM-018, branch `fix/poam-018`)
+
+- On Linux, UDP syslog sends each sender-thread batch with `sendmmsg`
+  (up to 64 datagrams per call) instead of one `send` per record. Still one
+  record per datagram (RFC 5426) and in order; partial sends resume; loss
+  counting and audit records are unchanged. Measured on Linux loopback:
+  about 580 k records/s per destination, from about 310–360 k. New bench
+  `audit_logger/udp_e2e_100k`. POAM-018 closed.
+
 ### Review fixes for POAM-020/024/013 (branch `fix/poams-020-024-013`)
 
 - The cluster configuration digest now also covers

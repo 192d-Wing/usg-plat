@@ -412,8 +412,9 @@ Silicon development host (8 performance + 4 efficiency cores).
 
 In these engine-only benches, shared-table scaling at high thread counts is
 limited by per-packet shard locks (POAM-015); with TUN I/O this cost is
-negligible (see below). UDP syslog sends one datagram per record, about
-310 k records/s per destination (POAM-018).
+negligible (see below). UDP syslog sends one datagram per record, batched
+with `sendmmsg` on Linux: about 580 k records/s per destination on Linux
+loopback (`audit_logger/udp_e2e_100k`; 310–360 k before POAM-018).
 
 These are engine numbers without kernel I/O.
 

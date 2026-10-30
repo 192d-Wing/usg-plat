@@ -1,12 +1,15 @@
 //! Logger-side cost per record, data-plane enqueue cost, and end-to-end
-//! logger throughput to the hash-chained file.
+//! logger throughput to the hash-chained file and to a UDP syslog collector
+//! (POAM-018: `sendmmsg` batching on Linux).
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use plat_audit::format;
 use plat_audit::{AuditSink, Event, Logger, NodeIdent};
-use plat_common::config::{AuditConfig, AuditFileConfig, AuditMode, OverflowPolicy};
+use plat_common::config::{
+    AuditConfig, AuditFileConfig, AuditMode, LogFormat, OverflowPolicy, SyslogConfig, SyslogTransport,
+};
 
 /// A data-plane record, built the way `plat-nat64` builds it (by value,
 /// per record). `Event` is no longer `Copy` (TLS variants hold an `Arc`),
@@ -80,6 +83,42 @@ fn bench(c: &mut Criterion) {
     });
     g.finish();
     let _ = std::fs::remove_dir_all(&dir);
+
+    // UDP syslog only (no file): 100 000 records through the logger thread
+    // and the destination's sender thread to a local socket drained by
+    // another thread. Records/s here is the sender's datagram rate.
+    let collector = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let addr = collector.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let mut b = [0u8; 4096];
+        while collector.recv(&mut b).is_ok() {}
+    });
+    let udp = AuditConfig {
+        file: None,
+        syslog: vec![SyslogConfig {
+            address: addr,
+            transport: SyslogTransport::Udp,
+            format: LogFormat::Json,
+            app_name: "platd".into(),
+            tls: None,
+        }],
+        ..cfg.clone()
+    };
+    let mut g = c.benchmark_group("audit_logger");
+    g.throughput(Throughput::Elements(N));
+    g.sample_size(10);
+    g.bench_function("udp_e2e_100k", |b| {
+        b.iter(|| {
+            let (sink, rx) = AuditSink::bounded(1 << 17);
+            let h = Logger::new(udp.clone(), node.clone(), rx, sink.stats().clone()).spawn().unwrap();
+            for i in 0..N {
+                sink.emit(bib(black_box(1_793_196_960_000_000 + i)));
+            }
+            drop(sink);
+            h.join();
+        })
+    });
+    g.finish();
 }
 
 criterion_group!(benches, bench);
