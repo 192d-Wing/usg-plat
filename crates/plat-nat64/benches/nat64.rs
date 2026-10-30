@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use common::*;
+use common::{Fx, config, fixture, l4_sum4, l4_sum6, run, run_all, sub, synth, udp4, udp6};
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use plat_audit::{AcquireReason, AuditSink};
 use plat_cluster::SliceMap;
