@@ -96,47 +96,61 @@ fn main() {
     let filled = st.session_count();
 
     for (label, advance) in [("nothing due", 0u64), ("all due", 301)] {
-        if advance > 0 {
-            clock.advance(Duration::from_secs(advance));
-        }
-        let stop = Arc::new(AtomicBool::new(false));
-        let h = {
-            let (nat, keys, stop) = (nat.clone(), keys.clone(), stop.clone());
-            std::thread::spawn(move || worker(nat, keys, stop))
-        };
-        std::thread::sleep(Duration::from_millis(100));
-        let mut passes = Vec::new();
-        let mut last = None;
-        let n = if advance > 0 { 1 } else { 10 };
-        for _ in 0..n {
-            let t = Instant::now();
-            let s = st.sweep();
-            passes.push(t.elapsed());
-            last = Some(s);
-        }
-        std::thread::sleep(Duration::from_millis(50));
-        stop.store(true, Ordering::Relaxed);
-        let (max, p9999, _) = h.join().unwrap();
-        passes.sort();
-        if let Some(s) = last {
-            println!("  last pass: {s:?}");
-            // "all due": the refreshing worker starts 100 ms before the pass
-            // and runs over its (at most 2^20) sessions: one it reaches before the
-            // sweeper is re-armed and stays, one it reaches after is
-            // re-created on its BIB. Every other session expires.
-            if advance > 0 {
-                let left = st.session_count();
-                assert!(s.sessions_expired + left >= filled, "every session expired or was refreshed");
-                assert!(left <= keys.len() as u64, "only worker-refreshed sessions remain");
-                println!("  expired {} of {filled}; {left} refreshed or re-created by the worker", s.sessions_expired);
-            }
-        }
-        println!(
-            "{label}: pass median {:.3} ms max {:.3} ms; worker refresh max {:.1} us p99.99 {:.1} us",
-            passes[passes.len() / 2].as_secs_f64() * 1e3,
-            passes[passes.len() - 1].as_secs_f64() * 1e3,
-            max as f64 / 1e3,
-            p9999 as f64 / 1e3
-        );
+        run_case(&nat, &keys, &clock, filled, label, advance);
     }
+}
+
+/// One measured case: optionally advance the clock past every timeout, run
+/// sweeper passes while a worker refreshes sessions, and print the results.
+fn run_case(
+    nat: &Arc<Nat64>,
+    keys: &Arc<Vec<(Key4, (u32, u16))>>,
+    clock: &Clock,
+    filled: u64,
+    label: &str,
+    advance: u64,
+) {
+    let st = nat.state();
+    if advance > 0 {
+        clock.advance(Duration::from_secs(advance));
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let h = {
+        let (nat, keys, stop) = (nat.clone(), keys.clone(), stop.clone());
+        std::thread::spawn(move || worker(nat, keys, stop))
+    };
+    std::thread::sleep(Duration::from_millis(100));
+    let mut passes = Vec::new();
+    let mut last = None;
+    let n = if advance > 0 { 1 } else { 10 };
+    for _ in 0..n {
+        let t = Instant::now();
+        let s = st.sweep();
+        passes.push(t.elapsed());
+        last = Some(s);
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    stop.store(true, Ordering::Relaxed);
+    let (max, p9999, _) = h.join().unwrap();
+    passes.sort();
+    if let Some(s) = last {
+        println!("  last pass: {s:?}");
+        // "all due": the refreshing worker starts 100 ms before the pass
+        // and runs over its (at most 2^20) sessions: one it reaches before the
+        // sweeper is re-armed and stays, one it reaches after is
+        // re-created on its BIB. Every other session expires.
+        if advance > 0 {
+            let left = st.session_count();
+            assert!(s.sessions_expired + left >= filled, "every session expired or was refreshed");
+            assert!(left <= keys.len() as u64, "only worker-refreshed sessions remain");
+            println!("  expired {} of {filled}; {left} refreshed or re-created by the worker", s.sessions_expired);
+        }
+    }
+    println!(
+        "{label}: pass median {:.3} ms max {:.3} ms; worker refresh max {:.1} us p99.99 {:.1} us",
+        passes[passes.len() / 2].as_secs_f64() * 1e3,
+        passes[passes.len() - 1].as_secs_f64() * 1e3,
+        max as f64 / 1e3,
+        p9999 as f64 / 1e3
+    );
 }
