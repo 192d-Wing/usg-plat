@@ -348,7 +348,7 @@ fn write_lease(path: &Path, reserved: u64) -> std::io::Result<()> {
 
 /// Rotated files `<path>.<µs>`, oldest first.
 fn rotated_files(path: &Path) -> Vec<(u64, PathBuf)> {
-    let Some(name) = path.file_name().and_then(|n| n.to_str()) else { return Vec::new() };
+    let Some(name) = path.file_name().and_then(std::ffi::OsStr::to_str) else { return Vec::new() };
     let Ok(rd) = std::fs::read_dir(dir_of(path)) else { return Vec::new() };
     let mut v: Vec<(u64, PathBuf)> = rd
         .filter_map(Result::ok)

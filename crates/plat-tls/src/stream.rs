@@ -100,7 +100,7 @@ impl std::error::Error for TlsIoError {}
 fn io_err(e: io::Error) -> TlsIoError {
     match e.kind() {
         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => TlsIoError::Timeout,
-        _ => match e.get_ref().and_then(|i| i.downcast_ref::<rustls::Error>()) {
+        _ => match e.get_ref().and_then(<dyn std::error::Error + Send + Sync>::downcast_ref::<rustls::Error>) {
             Some(t) => TlsIoError::Tls(t.clone()),
             None => TlsIoError::Io(e),
         },

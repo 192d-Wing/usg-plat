@@ -919,7 +919,7 @@ impl Net {
             }
         }
         pending.done();
-        tracing::info!(peer = pid, %peer, "cluster peer connected");
+        tracing::info!(peer = pid, addr = %peer, "cluster peer connected");
         if let Some(h) = self.inbound.get() {
             h.link(pid, true);
         }
