@@ -16,6 +16,9 @@ pub enum LimitKind {
     GlobalSessions,
     /// `nat64.max_subscribers` reached (SC-5).
     SubscriberTable,
+    /// `nat64.max_subscribers_per_aggregate` reached for one
+    /// `nat64.aggregate_prefix_len` aggregate (SC-5, POAM-013).
+    AggregateSubscribers,
 }
 
 impl LimitKind {
@@ -26,6 +29,7 @@ impl LimitKind {
             Self::SubscriberSessions => "subscriber_session_limit",
             Self::GlobalSessions => "global_session_limit",
             Self::SubscriberTable => "subscriber_table_limit",
+            Self::AggregateSubscribers => "aggregate_subscriber_limit",
         }
     }
 }
@@ -1132,6 +1136,7 @@ mod tests {
     #[test]
     fn limit_reasons() {
         assert_eq!(LimitKind::SubscriberTable.as_str(), "subscriber_table_limit");
+        assert_eq!(LimitKind::AggregateSubscribers.as_str(), "aggregate_subscriber_limit");
         assert_eq!(LimitKind::PoolExhausted.as_str(), "pool_exhausted");
     }
 }

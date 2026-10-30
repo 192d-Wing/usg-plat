@@ -86,6 +86,13 @@ send_source_route_failed = false
 # synthesized destination of the offending packet. Must lie outside the
 # client prefixes and the NAT64 prefix.
 # icmp_source_v6 = "2001:db8:ffff::1"
+# Cross-node hairpinning (RFC 6146 §3.8 across cluster nodes). Off by
+# default: a wire IPv4 packet sourced from any nat64.pool address is spoofed
+# and dropped (src_not_allowed). On: pool sources are accepted only via the
+# cluster-internal interfaces below; plat-tun-setup.sh drops them on every
+# other interface and platd refuses to start without that guard (POAM-024).
+cross_node_hairpin = false
+# cluster_interfaces = ["eth1"]
 
 [translation.fragments]
 # Per worker, preallocated at start (SC-5). Defaults use about 1 MiB per
@@ -115,6 +122,12 @@ filtering = "address_dependent"
 max_sessions = 4000000
 max_sessions_per_subscriber = 4000
 max_subscribers = 1000000
+# At most max_subscribers_per_aggregate subscribers inside one
+# aggregate_prefix_len prefix (SC-5): a client holding a /48 cannot fill the
+# subscriber table. aggregate_prefix_len is 32..=subscriber_prefix_len (equal
+# turns the limit off); a /56 holds exactly 256 /64 subscribers.
+aggregate_prefix_len = 56
+max_subscribers_per_aggregate = 256
 table_shards = 1024
 # Released port blocks are held back this long before reuse (RFC 6888
 # REQ-12; 120..=3600).
@@ -155,8 +168,10 @@ max_bytes = 1073741824
 max_files = 0
 # AU-5(1): when the log volume has less free space than this, write an
 # audit_storage_threshold record, report /healthz 503 and refuse new
-# bindings (existing ones keep being logged). 0 disables. Keep it above
-# max_bytes plus a few minutes of peak record volume.
+# bindings (existing ones keep being logged). Must be >= 1048576; 0 is
+# refused (the warning cannot be disabled). When omitted it defaults to
+# max(2 x max_bytes, 1 GiB). Keep it above max_bytes plus a few minutes of
+# peak record volume.
 min_free_bytes = 2147483648
 
 [[audit.syslog]]

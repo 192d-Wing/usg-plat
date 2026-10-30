@@ -285,6 +285,48 @@ PLAT_CLUSTER_HA=yes
 PLAT_POOL_ALL=192.0.2.0/24"
 if run_setup "$WORK/fake-platd" >/dev/null 2>&1; then fail "malformed PLAT_CLUSTER_HA accepted"; else pass "malformed PLAT_CLUSTER_HA rejected"; fi
 
+# --- 3c. pool-source guard (POAM-024) ----------------------------------------
+if echo "$env_out" | grep -qx 'PLAT_CROSS_NODE_HAIRPIN=0' && echo "$env_out" | grep -qx 'PLAT_CLUSTER_IFACES='; then
+    pass "check-config env output has PLAT_CROSS_NODE_HAIRPIN=0 and empty PLAT_CLUSTER_IFACES"
+else
+    fail "check-config env output lacks PLAT_CROSS_NODE_HAIRPIN / PLAT_CLUSTER_IFACES"
+fi
+guard_default='oifname "plat0" ip saddr { 192.0.2.0/24 } counter drop comment "plat-pool-source-guard"'
+fake "$env_out"
+if run_setup "$WORK/fake-platd" >"$WORK/out" 2>&1 && grep -Fq "$guard_default" "$RULES" &&
+    [ "$(grep -n 'plat-pool-source-guard' "$RULES" | cut -d: -f1)" -lt "$(grep -n 'iifname "plat0" ip saddr' "$RULES" | cut -d: -f1)" ]; then
+    pass "default: every pool source towards the TUN is dropped before the pool accepts"
+else
+    fail "default pool-source guard: $(cat "$WORK/out")"
+fi
+xbase=$(echo "$env_out" | grep -Ev '^PLAT_(OWNED_POOL|CLUSTER_HA|POOL_ALL|CROSS_NODE_HAIRPIN|CLUSTER_IFACES)=')
+fake "$xbase
+PLAT_OWNED_POOL=192.0.2.0/25
+PLAT_CLUSTER_HA=0
+PLAT_POOL_ALL=192.0.2.0/24
+PLAT_CROSS_NODE_HAIRPIN=1
+PLAT_CLUSTER_IFACES=eth1 bond0.20"
+guard_x='oifname "plat0" iifname != { "eth1", "bond0.20" } ip saddr { 192.0.2.0/24 } counter drop comment "plat-pool-source-guard"'
+if run_setup "$WORK/fake-platd" >"$WORK/out" 2>&1 && grep -Fq "$guard_x" "$RULES" &&
+    grep -F 'plat-pool-source-guard' "$RULES.expected" | grep -Fq ' drop comment'; then
+    pass "cross-node hairpin: whole-pool sources admitted only from the cluster interfaces"
+else
+    fail "cross-node pool-source guard: $(cat "$WORK/out")"
+fi
+for bad in "PLAT_CROSS_NODE_HAIRPIN=1
+PLAT_CLUSTER_IFACES=" "PLAT_CROSS_NODE_HAIRPIN=1
+PLAT_CLUSTER_IFACES=eth1;reboot" "PLAT_CROSS_NODE_HAIRPIN=1
+PLAT_CLUSTER_IFACES=eth1\" }" "PLAT_CROSS_NODE_HAIRPIN=0
+PLAT_CLUSTER_IFACES=eth1" "PLAT_CROSS_NODE_HAIRPIN=yes
+PLAT_CLUSTER_IFACES="; do
+    fake "$xbase
+PLAT_OWNED_POOL=192.0.2.0/25
+PLAT_CLUSTER_HA=0
+PLAT_POOL_ALL=192.0.2.0/24
+$bad"
+    if run_setup "$WORK/fake-platd" >/dev/null 2>&1; then fail "guard input accepted: $bad"; else pass "guard input rejected: $(echo "$bad" | tr '\n' ' ')"; fi
+done
+
 # --- 3b. test hooks are ignored outside test mode ----------------------------
 # Only where the real path is absent, so the run stops before touching the
 # host (it dies at the missing /usr/bin/platd).

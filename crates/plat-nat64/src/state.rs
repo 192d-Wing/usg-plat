@@ -319,6 +319,15 @@ pub struct State {
     /// read-mostly fields every packet uses (`bib6`, `sub_mask`, ...).
     sub_count: CachePadded<AtomicU64>,
     max_subs: u64,
+    /// Subscribers per aggregate prefix (POAM-013). A leaf lock: taken
+    /// only while a `subs` shard is held, never with `bib4`, and never
+    /// holds another lock. Entries exist only for aggregates with at least
+    /// one subscriber, so it is bounded by `max_subscribers`; keyed with a
+    /// random `ahash` (`Sharded`).
+    aggs: Sharded<u128, u32>,
+    agg_mask: u128,
+    agg_len: u8,
+    max_per_agg: u32,
     max_sessions: u64,
     max_sessions_per_sub: u32,
     max_blocks: u16,
@@ -388,6 +397,10 @@ impl State {
             sessions: CachePadded::new(AtomicU64::new(0)),
             sub_count: CachePadded::new(AtomicU64::new(0)),
             max_subs: u64::from(n.max_subscribers),
+            aggs: Sharded::new(shards),
+            agg_mask: Ipv6Cidr::mask_of(n.aggregate_prefix_len),
+            agg_len: n.aggregate_prefix_len,
+            max_per_agg: n.max_subscribers_per_aggregate,
             max_sessions: n.max_sessions,
             max_sessions_per_sub: n.max_sessions_per_subscriber,
             max_blocks: n.max_blocks_per_subscriber,
@@ -434,12 +447,59 @@ impl State {
         &self.audit
     }
 
+    /// Subscribers counted against the aggregate holding `sub`.
+    pub fn aggregate_count(&self, sub: u128) -> u32 {
+        let a = sub & self.agg_mask;
+        self.aggs.lock(&a).get(&a).copied().unwrap_or(0)
+    }
+
+    /// Counts one new subscriber against its aggregate; `false` (nothing
+    /// changed) when the aggregate is full. Called with the subscriber's
+    /// `subs` shard held (lock order `subs → aggs`).
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: SC-5 - per-aggregate subscriber bound (POAM-013)
+    /// - RFC 6888 REQ-4 - limits per subscriber aggregate
+    fn agg_acquire(&self, sub: u128) -> bool {
+        let a = sub & self.agg_mask;
+        let mut g = self.aggs.lock(&a);
+        let n = g.entry(a).or_insert(0);
+        if *n >= self.max_per_agg {
+            if *n == 0 {
+                g.remove(&a);
+            }
+            return false;
+        }
+        *n += 1;
+        true
+    }
+
+    /// Undoes one [`State::agg_acquire`]; drops the entry at zero so the
+    /// table holds only live aggregates.
+    fn agg_release(&self, sub: u128) {
+        let a = sub & self.agg_mask;
+        let mut g = self.aggs.lock(&a);
+        if let Some(n) = g.get_mut(&a) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                g.remove(&a);
+            }
+        }
+    }
+
     /// Emits a resource-limit record at most once per second per kind.
     /// Cold and out of line so the session fast path stays compact
     /// (PERF-001).
     #[cold]
     #[inline(never)]
     fn limit(&self, kind: LimitKind, sub: u128) {
+        self.limit_len(kind, sub, self.sub_len);
+    }
+
+    /// [`State::limit`] for a prefix of length `len` (the aggregate).
+    #[cold]
+    #[inline(never)]
+    fn limit_len(&self, kind: LimitKind, sub: u128, len: u8) {
         // Slots hold `now + 1`; 0 means "never emitted".
         let stamp = self.clock.now_ms() + 1;
         let Some(slot) = self.limit_last.get(kind as usize) else { return };
@@ -447,7 +507,7 @@ impl State {
         if (last == 0 || stamp.saturating_sub(last) >= 1000)
             && slot.compare_exchange(last, stamp, Ordering::Relaxed, Ordering::Relaxed).is_ok()
         {
-            self.audit.emit(Event::Limit { ts_us: Clock::wall_us(), kind, sub, sub_len: self.sub_len });
+            self.audit.emit(Event::Limit { ts_us: Clock::wall_us(), kind, sub, sub_len: len });
         }
     }
 
@@ -629,8 +689,6 @@ impl State {
                 self.check_home(c, sub, counters)?;
             }
             if is_new {
-                // POAM: POAM-013 no aggregate-prefix limit: one short client
-                // prefix can fill the subscriber table up to max_subscribers.
                 // COMPLIANCE MAPPING:
                 // - NIST 800-53: SC-5 - bounded subscriber table; both
                 //   rejections are read-only (PERF-101), so a flood of new
@@ -655,6 +713,15 @@ impl State {
                     self.limit(LimitKind::SubscriberTable, sub);
                     return Err(DropReason::SubscriberTableFull);
                 }
+                // COMPLIANCE MAPPING:
+                // - NIST 800-53: SC-5 - per-aggregate bound, checked before
+                //   any subscriber entry or port block exists (POAM-013)
+                // - RFC 6888 REQ-4 - aggregate subscriber limit
+                if !self.agg_acquire(sub) {
+                    self.sub_count.fetch_sub(1, Ordering::Relaxed);
+                    self.limit_len(LimitKind::AggregateSubscribers, sub & self.agg_mask, self.agg_len);
+                    return Err(DropReason::AggregateSubscriberLimit);
+                }
             }
             let s = gs.entry(sub).or_insert_with(|| Subscriber {
                 blocks: Vec::new(),
@@ -673,6 +740,7 @@ impl State {
                     if is_new {
                         gs.remove(&sub);
                         self.sub_count.fetch_sub(1, Ordering::Relaxed);
+                        self.agg_release(sub);
                     }
                     return Err(e);
                 }
@@ -1105,6 +1173,7 @@ impl State {
                 let keep = !s.blocks.is_empty() || s.sessions.load(Ordering::Relaxed) > 0;
                 if !keep {
                     self.sub_count.fetch_sub(1, Ordering::Relaxed);
+                    self.agg_release(*sub);
                     self.repl(repl, ReplRecord::SubGone { sub: *sub });
                 }
                 keep
@@ -1413,6 +1482,7 @@ impl State {
                 let keep = !sx.blocks.is_empty() || sx.sessions.load(Ordering::Relaxed) > 0;
                 if !keep {
                     self.sub_count.fetch_sub(1, Ordering::Relaxed);
+                    self.agg_release(*sub);
                     st.subscribers_removed += 1;
                 }
                 keep
@@ -1477,17 +1547,28 @@ impl State {
             }
         }
         let mut new_subs = 0u64;
+        // New subscribers planned per aggregate (POAM-013); bounded by the
+        // input like `per_sub`.
+        let mut new_per_agg: Map<u128, u32> = Map::with_hasher(self.hasher.clone());
         for (sub, blocks) in per_sub.iter_mut() {
             let (have, exists) = {
                 let g = self.subs.lock(sub);
                 g.get(sub).map_or((0, false), |x| (x.blocks.len(), true))
             };
-            let room = if exists || self.sub_count.load(Ordering::Relaxed) + new_subs < self.max_subs {
+            let agg = *sub & self.agg_mask;
+            let agg_room = || {
+                let planned = new_per_agg.get(&agg).copied().unwrap_or(0);
+                self.aggregate_count(*sub).saturating_add(planned) < self.max_per_agg
+            };
+            let room = if exists || (self.sub_count.load(Ordering::Relaxed) + new_subs < self.max_subs && agg_room()) {
                 usize::from(self.max_blocks).saturating_sub(have)
             } else {
                 0
             };
-            new_subs += u64::from(!exists && room > 0);
+            if !exists && room > 0 {
+                new_subs += 1;
+                *new_per_agg.entry(agg).or_insert(0) += 1;
+            }
             for r in blocks.drain(room.min(blocks.len())..) {
                 owner.remove(&r);
                 held.push((hold_until, r));
@@ -1625,6 +1706,12 @@ impl State {
                     if self.sub_count.fetch_add(1, Ordering::Relaxed) >= self.max_subs {
                         // Raced with new subscribers: the record is queued
                         // but the block cannot be served here; hold it back.
+                        self.sub_count.fetch_sub(1, Ordering::Relaxed);
+                        held.push((hold_until, r));
+                        continue;
+                    }
+                    if !self.agg_acquire(sub) {
+                        // Same race against the aggregate limit (POAM-013).
                         self.sub_count.fetch_sub(1, Ordering::Relaxed);
                         held.push((hold_until, r));
                         continue;

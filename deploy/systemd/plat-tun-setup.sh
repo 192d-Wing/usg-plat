@@ -76,6 +76,8 @@ CLIENTS=
 POOL=
 HA=0
 POOL_ALL=
+XHAIRPIN=0
+CLUSTER_IFACES=
 while IFS= read -r line; do
     [ -n "$line" ] || continue
     printf '%s\n' "$line" | grep -Eq '^PLAT_[A-Z0-9_]+=' ||
@@ -89,6 +91,8 @@ while IFS= read -r line; do
         PLAT_OWNED_POOL) POOL=$value ;;
         PLAT_CLUSTER_HA) HA=$value ;;
         PLAT_POOL_ALL) POOL_ALL=$value ;;
+        PLAT_CROSS_NODE_HAIRPIN) XHAIRPIN=$value ;;
+        PLAT_CLUSTER_IFACES) CLUSTER_IFACES=$value ;;
         *) ;;
     esac
 done <<EOF
@@ -115,10 +119,27 @@ check owned_pool "$POOL" "$V4( $V4)*"
 # COMPLIANCE MAPPING:
 # - NIST 800-53: SC-7 (Boundary Protection), CP-10 (System Recovery)
 check cluster_ha "$HA" '[01]'
+[ -n "$POOL_ALL" ] || die "check-config returned no PLAT_POOL_ALL"
+check pool_all "$POOL_ALL" "$V4( $V4)*"
 if [ "$HA" = 1 ]; then
-    [ -n "$POOL_ALL" ] || die "PLAT_CLUSTER_HA=1 without PLAT_POOL_ALL"
-    check pool_all "$POOL_ALL" "$V4( $V4)*"
     POOL=$POOL_ALL
+fi
+
+# Pool-source guard (POAM-024): a forwarded IPv4 packet towards the TUN
+# whose source is a pool address is spoofed, except a cross-node hairpin
+# from a peer node, which may arrive only on the cluster-internal interfaces
+# (translation.cluster_interfaces). platd refuses to start with
+# cross_node_hairpin on unless this rule is in the installed table.
+# COMPLIANCE MAPPING:
+# - NIST 800-53: SC-7, SC-7(5) (BCP 38 ingress filtering), AC-4
+check cross_node_hairpin "$XHAIRPIN" '[01]'
+if [ "$XHAIRPIN" = 1 ]; then
+    check cluster_interfaces "$CLUSTER_IFACES" '[A-Za-z0-9_.-]{1,15}( [A-Za-z0-9_.-]{1,15})*'
+    ifaces_set=$(printf '%s' "$CLUSTER_IFACES" | sed -e 's/^/"/' -e 's/ /", "/g' -e 's/$/"/')
+    guard_match="iifname != { $ifaces_set } "
+else
+    [ -z "$CLUSTER_IFACES" ] || die "PLAT_CLUSTER_IFACES set without PLAT_CROSS_NODE_HAIRPIN=1"
+    guard_match=
 fi
 
 # Audit log directory (AU-9, AC-6): plat:plat-log 2750 - the dedicated
@@ -171,6 +192,7 @@ fi
 # policy and the copy the nftables service restores are the same file.
 clients_set=$(printf '%s' "$CLIENTS" | sed 's/ /, /g')
 pool_set=$(printf '%s' "$POOL" | sed 's/ /, /g')
+pool_all_set=$(printf '%s' "$POOL_ALL" | sed 's/ /, /g')
 mkdir -p "$(dirname "$NFT_RULES")"
 tmp_rules="$NFT_RULES.tmp.$$"
 trap 'rm -f "$tmp_rules"' EXIT
@@ -189,6 +211,8 @@ table inet plat {
         # ICMPv6 errors from IPv6-side routers about translated flows
         # (platd validates them against live sessions).
         oifname "$IF" ip6 daddr $PREFIX icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem } accept
+        # Spoofed pool sources towards the translator (POAM-024).
+        oifname "$IF" ${guard_match}ip saddr { $pool_all_set } counter drop comment "plat-pool-source-guard"
         # Translated IPv4 from this node's pool slice, and traffic to it.
         iifname "$IF" ip saddr { $pool_set } accept
         oifname "$IF" ip daddr { $pool_set } accept

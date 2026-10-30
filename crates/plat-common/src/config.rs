@@ -522,6 +522,24 @@ pub struct TranslationConfig {
     /// - RFC 4443 §2.2 - errors sourced from an address of the translator
     #[serde(default)]
     pub icmp_source_v6: Option<std::net::Ipv6Addr>,
+    /// Accept wire IPv4 packets whose source is inside another cluster
+    /// node's pool slice (cross-node hairpinning, RFC 6146 §3.8). Default
+    /// `false`: any source inside `nat64.pool` arriving on the wire is
+    /// spoofed (own-node hairpins never touch the wire) and refused as
+    /// `src_not_allowed`. When `true`, `cluster_interfaces` must name the
+    /// cluster-internal interfaces; `plat-tun-setup.sh` then drops pool
+    /// sources arriving on any other interface, and platd refuses to start
+    /// unless that guard is in the installed forward policy.
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: SC-7, SC-7(5), AC-4 - pool sources accepted only from
+    ///   the cluster-internal network (POAM-024)
+    #[serde(default)]
+    pub cross_node_hairpin: bool,
+    /// Interfaces on which pool-sourced IPv4 from peer nodes may arrive
+    /// (required, at most 16, when `cross_node_hairpin` is on).
+    #[serde(default)]
+    pub cluster_interfaces: Vec<String>,
     #[serde(default)]
     pub fragments: FragmentsConfig,
 }
@@ -680,6 +698,21 @@ pub struct Nat64Config {
     /// Upper bound on distinct subscribers (subscriber-table entries).
     #[serde(default = "d_max_subs")]
     pub max_subscribers: u32,
+    /// IPv6 prefix length that groups subscribers into one aggregate
+    /// (e.g. one customer's delegated /48 or /56). 32..=`subscriber_prefix_len`;
+    /// equal to `subscriber_prefix_len` makes every aggregate one subscriber
+    /// (limit off).
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: SC-5 - one short client prefix cannot fill the
+    ///   subscriber table (POAM-013)
+    /// - RFC 6888 REQ-4 - per-subscriber (aggregate) limits
+    #[serde(default = "d_agg_len")]
+    pub aggregate_prefix_len: u8,
+    /// Upper bound on subscribers inside one aggregate (1..=2^24; a value
+    /// above `max_subscribers` leaves only the global bound).
+    #[serde(default = "d_max_per_agg")]
+    pub max_subscribers_per_aggregate: u32,
     /// Lock shards per table; rounded up to a power of two.
     #[serde(default = "d_shards")]
     pub table_shards: u32,
@@ -726,6 +759,15 @@ fn d_max_sessions_sub() -> u32 {
 }
 fn d_max_subs() -> u32 {
     1_000_000
+}
+/// A /56 is the usual residential delegation: with /64 subscribers it
+/// holds exactly 256, so the default never limits a /56 customer and caps a
+/// /48 (65 536 possible subscribers) at 256.
+fn d_agg_len() -> u8 {
+    56
+}
+fn d_max_per_agg() -> u32 {
+    256
 }
 /// Upper bound accepted for `nat64.max_subscribers`.
 pub const MAX_SUBSCRIBERS: u32 = 1 << 24;
@@ -841,35 +883,62 @@ fn d_summary() -> u64 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "RawAuditFileConfig")]
 pub struct AuditFileConfig {
     pub path: PathBuf,
-    #[serde(default = "d_max_bytes")]
     pub max_bytes: u64,
     /// Rotated files kept next to the live file (`<path>.<µs>`); the oldest
     /// are deleted beyond this. 0 keeps every file (archive externally).
     ///
     /// COMPLIANCE MAPPING:
     /// - NIST 800-53: AU-4 (Audit Log Storage Capacity), AU-11 (Retention)
-    #[serde(default)]
     pub max_files: u32,
     /// Free space (bytes) the log volume must keep. Below it the pipeline
     /// is degraded (new bindings refused under `refuse_new_bindings`,
     /// `/healthz` 503) and an `audit_storage_threshold` record is written,
-    /// while records keep being written. 0 disables the check. If free
-    /// space cannot be determined (`statvfs` fails), the check fails closed
-    /// the same way (state `unknown`).
+    /// while records keep being written. If free space cannot be determined
+    /// (`statvfs` fails), the check fails closed the same way (state
+    /// `unknown`). When omitted it defaults to
+    /// [`default_min_free_bytes`]; an explicit 0 is refused by validation
+    /// (the warning cannot be switched off).
     ///
     /// COMPLIANCE MAPPING:
-    /// - NIST 800-53: AU-5(1) (Storage Capacity Warning), AU-4
-    // POAM: POAM-020 defaults to 0 (storage-capacity warning off); the SSP
-    // must require a non-zero value.
-    #[serde(default)]
+    /// - NIST 800-53: AU-5(1) (Storage Capacity Warning), AU-4, CM-6
     pub min_free_bytes: u64,
+}
+
+/// On-disk form of [`AuditFileConfig`]: `min_free_bytes` stays optional so
+/// its default can depend on `max_bytes`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAuditFileConfig {
+    path: PathBuf,
+    #[serde(default = "d_max_bytes")]
+    max_bytes: u64,
+    #[serde(default)]
+    max_files: u32,
+    #[serde(default)]
+    min_free_bytes: Option<u64>,
+}
+
+impl From<RawAuditFileConfig> for AuditFileConfig {
+    fn from(r: RawAuditFileConfig) -> Self {
+        let min_free_bytes = r.min_free_bytes.unwrap_or_else(|| default_min_free_bytes(r.max_bytes));
+        Self { path: r.path, max_bytes: r.max_bytes, max_files: r.max_files, min_free_bytes }
+    }
 }
 
 fn d_max_bytes() -> u64 {
     1 << 30
+}
+
+/// Default `audit.file.min_free_bytes`: max(2 × `max_bytes`, 1 GiB), so one
+/// full rotation still fits after the warning fires (saturating).
+///
+/// COMPLIANCE MAPPING:
+/// - NIST 800-53: AU-5(1) (Storage Capacity Warning) - on by default
+pub fn default_min_free_bytes(max_bytes: u64) -> u64 {
+    max_bytes.saturating_mul(2).max(1 << 30)
 }
 
 /// Largest accepted `audit.file.max_files`.
@@ -1417,6 +1486,23 @@ impl Config {
             }
         }
 
+        // COMPLIANCE MAPPING:
+        // - NIST 800-53: SC-7(5), AC-4 - cross-node hairpin needs a named
+        //   cluster-internal ingress for the host pool-source guard (POAM-024)
+        if t.cross_node_hairpin && t.cluster_interfaces.is_empty() {
+            return invalid("translation.cross_node_hairpin requires translation.cluster_interfaces");
+        }
+        if !t.cross_node_hairpin && !t.cluster_interfaces.is_empty() {
+            return invalid("translation.cluster_interfaces is only valid with cross_node_hairpin = true");
+        }
+        if t.cluster_interfaces.len() > 16 {
+            return invalid("translation.cluster_interfaces must list at most 16 interfaces");
+        }
+        for i in &t.cluster_interfaces {
+            if i.is_empty() || i.len() > 15 || !i.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b)) {
+                return invalid(format!("translation.cluster_interfaces entry {i:?} is not a valid interface name"));
+            }
+        }
         if n.pool.is_empty() {
             return invalid("nat64.pool must not be empty");
         }
@@ -1466,6 +1552,12 @@ impl Config {
         if n.max_subscribers == 0 || n.max_subscribers > MAX_SUBSCRIBERS {
             return invalid(format!("nat64.max_subscribers must be 1..={MAX_SUBSCRIBERS}"));
         }
+        if !(32..=n.subscriber_prefix_len).contains(&n.aggregate_prefix_len) {
+            return invalid("nat64.aggregate_prefix_len must be 32..=subscriber_prefix_len");
+        }
+        if n.max_subscribers_per_aggregate == 0 || n.max_subscribers_per_aggregate > MAX_SUBSCRIBERS {
+            return invalid(format!("nat64.max_subscribers_per_aggregate must be 1..={MAX_SUBSCRIBERS}"));
+        }
         if n.table_shards == 0 || n.table_shards > 1 << 16 {
             return invalid("nat64.table_shards must be 1..=65536");
         }
@@ -1512,8 +1604,9 @@ impl Config {
         if a.file.as_ref().is_some_and(|f| f.max_files > MAX_AUDIT_FILES) {
             return invalid(format!("audit.file.max_files must be 0 (keep all) or 1..={MAX_AUDIT_FILES}"));
         }
-        if a.file.as_ref().is_some_and(|f| f.min_free_bytes != 0 && f.min_free_bytes < MIN_FILE_BYTES) {
-            return invalid("audit.file.min_free_bytes must be 0 (disabled) or >= 1048576");
+        if a.file.as_ref().is_some_and(|f| f.min_free_bytes < MIN_FILE_BYTES) {
+            // AU-5(1): the storage-capacity warning cannot be disabled.
+            return invalid("audit.file.min_free_bytes must be >= 1048576 (0 is refused; omit it for the default)");
         }
         // RFC 5424 §6.2.5 APP-NAME: 1*48PRINTUSASCII.
         for sl in &a.syslog {
@@ -1856,6 +1949,24 @@ mod tests {
     pub const EXAMPLE: &str = include_str!("../../../config/platd.example.toml");
 
     #[test]
+    fn cross_node_hairpin_needs_cluster_interfaces() {
+        let on = base().replace("cross_node_hairpin = false", "cross_node_hairpin = true");
+        assert!(invalid_msg(&on).contains("requires translation.cluster_interfaces"));
+        let iface =
+            |list: &str| on.replace("# cluster_interfaces = [\"eth1\"]", &format!("cluster_interfaces = [{list}]"));
+        let c = Config::from_toml(&iface("\"eth1\", \"bond0.20\"")).unwrap();
+        assert!(c.translation.cross_node_hairpin);
+        assert_eq!(c.translation.cluster_interfaces, ["eth1", "bond0.20"]);
+        assert!(invalid_msg(&iface("\"eth1; drop\"")).contains("not a valid interface name"));
+        assert!(invalid_msg(&iface("\"\"")).contains("not a valid interface name"));
+        let many = (0..17).map(|i| format!("\"e{i}\"")).collect::<Vec<_>>().join(",");
+        assert!(invalid_msg(&iface(&many)).contains("at most 16"));
+        let off = base().replace("# cluster_interfaces = [\"eth1\"]", "cluster_interfaces = [\"eth1\"]");
+        assert!(invalid_msg(&off).contains("only valid with cross_node_hairpin"));
+        assert!(!Config::from_toml(&base()).unwrap().translation.cross_node_hairpin);
+    }
+
+    #[test]
     fn example_config_validates() {
         let c = Config::from_toml(EXAMPLE).unwrap();
         assert_eq!(c.nat64.filtering, Filtering::AddressDependent);
@@ -1866,6 +1977,38 @@ mod tests {
     fn rejects_short_udp_timeout() {
         let bad = EXAMPLE.replace("udp_secs = 300", "udp_secs = 30");
         assert!(matches!(Config::from_toml(&bad), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn aggregate_limit_is_validated() {
+        let c = Config::from_toml(EXAMPLE).unwrap();
+        assert_eq!((c.nat64.aggregate_prefix_len, c.nat64.max_subscribers_per_aggregate), (56, 256));
+        // Defaults when omitted.
+        let bare =
+            EXAMPLE.replace("aggregate_prefix_len = 56\n", "").replace("max_subscribers_per_aggregate = 256\n", "");
+        let d = Config::from_toml(&bare).unwrap();
+        assert_eq!((d.nat64.aggregate_prefix_len, d.nat64.max_subscribers_per_aggregate), (56, 256));
+        for (a, b) in [
+            ("aggregate_prefix_len = 56", "aggregate_prefix_len = 31"),
+            ("aggregate_prefix_len = 56", "aggregate_prefix_len = 65"),
+            ("max_subscribers_per_aggregate = 256", "max_subscribers_per_aggregate = 0"),
+            ("max_subscribers_per_aggregate = 256", "max_subscribers_per_aggregate = 16777217"),
+        ] {
+            assert!(EXAMPLE.contains(a), "{a}");
+            assert!(Config::from_toml(&EXAMPLE.replace(a, b)).is_err(), "{b}");
+        }
+        for (a, b) in [
+            ("aggregate_prefix_len = 56", "aggregate_prefix_len = 32"),
+            ("aggregate_prefix_len = 56", "aggregate_prefix_len = 64"),
+            ("max_subscribers_per_aggregate = 256", "max_subscribers_per_aggregate = 1"),
+            ("max_subscribers_per_aggregate = 256", "max_subscribers_per_aggregate = 16777216"),
+        ] {
+            assert!(Config::from_toml(&EXAMPLE.replace(a, b)).is_ok(), "{b}");
+        }
+        // Must not be longer than the subscriber prefix.
+        let short = EXAMPLE.replace("subscriber_prefix_len = 64", "subscriber_prefix_len = 48");
+        assert!(Config::from_toml(&short).is_err());
+        assert!(Config::from_toml(&short.replace("aggregate_prefix_len = 56", "aggregate_prefix_len = 48")).is_ok());
     }
 
     #[test]

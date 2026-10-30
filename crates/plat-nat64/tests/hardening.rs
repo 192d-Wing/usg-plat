@@ -12,6 +12,7 @@ mod common;
 use std::time::Duration;
 
 use common::*;
+use plat_audit::{Event, LimitKind};
 use plat_common::{Counter, DropReason};
 use plat_nat64::state::Key6;
 use plat_packet::{be16, be32, checksum as ck, parse_v4, parse_v6, proto, put16, put32};
@@ -487,6 +488,43 @@ fn subscriber_table_is_bounded() {
     run(&mut fx, &udp6(sub(3, 1), 1, SERVER, 53, b"x")).unwrap();
 }
 
+/// POAM-013: one aggregate (/56 by default) holds at most
+/// `max_subscribers_per_aggregate` subscribers; the refusal creates no
+/// entry or block, is counted and audited, and expiry frees the capacity.
+#[test]
+fn aggregate_subscriber_limit() {
+    let mut fx = fixture(&[("max_subscribers_per_aggregate = 256", "max_subscribers_per_aggregate = 2"), NO_UNREACH]);
+    // sub(n, _) varies bits 64..80: n 0..=255 share one /56.
+    run(&mut fx, &udp6(sub(1, 1), 1, SERVER, 53, b"x")).unwrap();
+    run(&mut fx, &udp6(sub(2, 1), 1, SERVER, 53, b"x")).unwrap();
+    let blocks = fx.nat.state().pool.free_blocks();
+    assert_eq!(run(&mut fx, &udp6(sub(3, 1), 1, SERVER, 53, b"x")).unwrap_err(), DropReason::AggregateSubscriberLimit);
+    assert_eq!(fx.nat.state().subscriber_count(), 2);
+    assert_eq!(fx.nat.state().pool.free_blocks(), blocks, "no block for a refused subscriber");
+    assert_eq!(fx.nat.state().aggregate_count(sub(3, 1)), 2);
+    assert_eq!(fx.ctx.counters.drops(DropReason::AggregateSubscriberLimit), 1);
+    let agg = sub(0, 0);
+    assert!(events(&fx).iter().any(|e| matches!(
+        e,
+        Event::Limit { kind: LimitKind::AggregateSubscribers, sub, sub_len: 56, .. } if *sub == agg
+    )));
+    // Existing subscribers and other aggregates are unaffected.
+    run(&mut fx, &udp6(sub(1, 2), 9, SERVER, 53, b"x")).unwrap();
+    run(&mut fx, &udp6(sub(256, 1), 1, SERVER, 53, b"x")).unwrap();
+    assert_eq!(fx.nat.state().aggregate_count(sub(256, 1)), 1);
+    // Sweeper expiry frees the aggregate.
+    fx.clock.advance(Duration::from_secs(301));
+    fx.nat.state().sweep();
+    fx.clock.advance(Duration::from_secs(3));
+    fx.nat.state().sweep();
+    fx.clock.advance(Duration::from_secs(61));
+    fx.nat.state().sweep();
+    assert_eq!(fx.nat.state().subscriber_count(), 0);
+    assert_eq!(fx.nat.state().aggregate_count(sub(3, 1)), 0);
+    run(&mut fx, &udp6(sub(3, 1), 1, SERVER, 53, b"x")).unwrap();
+    assert_eq!(fx.nat.state().aggregate_count(sub(3, 1)), 1);
+}
+
 /// SEC-005: a failed allocation leaves no empty subscriber entry behind.
 #[test]
 fn failed_allocation_leaves_no_subscriber_entry() {
@@ -819,10 +857,23 @@ const CLUSTER_24: (&str, &str) = ("192.0.2.0/30", "192.0.2.0/24");
 /// SEC-301 (SC-7(5), BCP 38): under EIF, a wire packet whose source is in
 /// this node's own pool slice (e.g. subscriber B's live mapping) is spoofed,
 /// because own-node hairpins are looped back in-process. It is refused;
-/// the own-node hairpin and sources in other nodes' slices still work.
+/// the own-node hairpin still works. POAM-024: by default another node's
+/// slice is refused too.
 #[test]
 fn wire_source_in_own_pool_slice_is_refused() {
-    let mut fx = fixture_strict(&[CLUSTER_24, EIF]);
+    own_slice_refused(&[CLUSTER_24, EIF], false);
+    own_slice_refused(&[CLUSTER_24, EIF, CROSS_NODE_HAIRPIN], true);
+}
+
+/// `translation.cross_node_hairpin = true` (guarded by the host forward
+/// policy): another node's slice is a valid hairpin source.
+const CROSS_NODE_HAIRPIN: (&str, &str) = (
+    "cross_node_hairpin = false\n# cluster_interfaces = [\"eth1\"]",
+    "cross_node_hairpin = true\ncluster_interfaces = [\"eth1\"]",
+);
+
+fn own_slice_refused(cfg: &[(&str, &str)], cross_node: bool) {
+    let mut fx = fixture_strict(cfg);
     let (a, b) = (sub(1, 1), sub(2, 1));
     let oa = run(&mut fx, &udp6(a, 5353, GLOBAL, 53, b"q")).unwrap();
     let (a4, ap) = (be32(&oa, 12), be16(&oa, 20));
@@ -833,11 +884,43 @@ fn wire_source_in_own_pool_slice_is_refused() {
         let r = run(&mut fx, &udp4(src, sp, a4, ap, b"spoof"));
         assert_eq!(r.unwrap_err(), DropReason::SrcNotAllowed, "{src:08x}:{sp}");
     }
-    // Another node's slice (cross-node hairpin) is still accepted.
+    // Another node's slice: a cross-node hairpin only with the switch on.
     let other = 0xc000_0264; // 192.0.2.100
-    let r = run(&mut fx, &udp4(other, 4444, a4, ap, b"peer")).unwrap();
-    assert_eq!(v6_ok(&r).src, synth(other));
+    let r = run(&mut fx, &udp4(other, 4444, a4, ap, b"peer"));
+    if cross_node {
+        assert_eq!(v6_ok(&r.unwrap()).src, synth(other));
+    } else {
+        assert_eq!(r.unwrap_err(), DropReason::SrcNotAllowed);
+    }
+    // A source outside the pool is unaffected.
+    assert!(run(&mut fx, &udp4(GLOBAL, 4444, a4, ap, b"ext")).is_ok());
     // The own-node hairpin A -> B's mapping is still forwarded.
     let hp = run(&mut fx, &udp6(a, 7000, b4, bp, b"hp")).unwrap();
     assert_eq!((v6_ok(&hp).dst, be16(&hp, 42)), (b, 6000));
+}
+
+/// RFC deviation 11 (RFC 4787 REQ-9, RFC 6146 §3.8): a cross-node hairpin
+/// (another node's pool slice as the wire source) is refused silently with
+/// `translation.cross_node_hairpin` off (default) and accepted with it on.
+#[test]
+fn cross_node_hairpin_refused_off_accepted_on() {
+    let peer = 0xc000_0264; // 192.0.2.100, another node's slice
+    for on in [false, true] {
+        let mut cfg = vec![CLUSTER_24, EIF];
+        if on {
+            cfg.push(CROSS_NODE_HAIRPIN);
+        }
+        let mut fx = fixture_strict(&cfg);
+        let a = sub(1, 1);
+        let oa = run(&mut fx, &udp6(a, 5353, GLOBAL, 53, b"q")).unwrap();
+        let (a4, ap) = (be32(&oa, 12), be16(&oa, 20));
+        let r = run(&mut fx, &udp4(peer, 4444, a4, ap, b"hairpin"));
+        if on {
+            let out = r.unwrap();
+            assert_eq!((v6_ok(&out).src, v6_ok(&out).dst), (synth(peer), a));
+        } else {
+            // Silent drop: no ICMP error is generated (deviation 12).
+            assert_eq!(r.unwrap_err(), DropReason::SrcNotAllowed);
+        }
+    }
 }

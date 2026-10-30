@@ -1,6 +1,7 @@
 //! `platd` — multithreaded 464XLAT PLAT (RFC 6877) / stateful NAT64 (RFC 6146).
 
 mod cluster;
+mod hairpin_guard;
 mod metrics;
 #[cfg(feature = "tls")]
 mod mgmt;
@@ -158,6 +159,9 @@ fn render_env(cfg: &Config, owned: &[u32], fips: bool) -> Result<String, String>
         "PLAT_POOL_ALL={}",
         join(plat_cluster::cover(&plat_cluster::pool_addrs(&cfg.nat64.pool)).iter().map(ToString::to_string).collect())
     );
+    // POAM-024: pool-sourced IPv4 is admitted only on these interfaces.
+    let _ = writeln!(o, "PLAT_CROSS_NODE_HAIRPIN={}", u8::from(cfg.translation.cross_node_hairpin));
+    let _ = writeln!(o, "PLAT_CLUSTER_IFACES={}", cfg.translation.cluster_interfaces.join(" "));
     Ok(o)
 }
 
@@ -236,6 +240,9 @@ fn main() -> ExitCode {
                     println!("  range {} - {}", Ipv4Addr::from(*a), Ipv4Addr::from(*b));
                 }
                 println!("fragment memory per worker: {} bytes (SC-5)", cfg.translation.fragments.memory_per_worker());
+                if let Some(f) = cfg.audit.file.as_ref() {
+                    println!("audit file min_free_bytes: {} (AU-5(1))", f.min_free_bytes);
+                }
                 print!("{}", cluster::summary(&cfg));
                 match tls_summary(&cfg) {
                     Ok(t) => {
@@ -445,13 +452,17 @@ mod tests {
             s,
             "PLAT_IF=plat0\nPLAT_NODE_ID=0\nPLAT_NAT64_PREFIX=64:ff9b:1::/96\n\
              PLAT_CLIENT_PREFIXES=2001:db8:100::/40\nPLAT_OWNED_POOL=192.0.2.0/24\nPLAT_FIPS=1\nPLAT_MGMT_TLS=0\n\
-             PLAT_CLUSTER_HA=0\nPLAT_POOL_ALL=192.0.2.0/24\n"
+             PLAT_CLUSTER_HA=0\nPLAT_POOL_ALL=192.0.2.0/24\n\
+             PLAT_CROSS_NODE_HAIRPIN=0\nPLAT_CLUSTER_IFACES=\n"
         );
         // Two nodes: node 1 gets only its half of the pool.
         let cfg = example(&[("id = 0", "id = 1"), ("node_count = 1", "node_count = 2")]);
         let s = render_env(&cfg, &plat_cluster::owned(&cfg), false).unwrap();
         assert!(s.contains("PLAT_OWNED_POOL=192.0.2.128/25\n"), "{s}");
-        assert!(s.ends_with("PLAT_FIPS=0\nPLAT_MGMT_TLS=0\nPLAT_CLUSTER_HA=0\nPLAT_POOL_ALL=192.0.2.0/24\n"), "{s}");
+        assert!(
+            s.ends_with("PLAT_FIPS=0\nPLAT_MGMT_TLS=0\nPLAT_CLUSTER_HA=0\nPLAT_POOL_ALL=192.0.2.0/24\nPLAT_CROSS_NODE_HAIRPIN=0\nPLAT_CLUSTER_IFACES=\n"),
+            "{s}"
+        );
         // Nothing shell-special reaches the script.
         for bad in ["plat0;reboot", "plat 0", "plat$(x)", "averyveryverylongname"] {
             let cfg = example(&[("interface = \"plat0\"", &format!("interface = \"{bad}\""))]);

@@ -151,6 +151,13 @@ Configuration changes to note when upgrading from an earlier build:
   prefix. A network-specific-prefix deployment that must reach such space
   sets it to `true`. The Well-Known Prefix cannot be combined with a
   non-global pool.
+- `nat64.aggregate_prefix_len` (default 56) and
+  `nat64.max_subscribers_per_aggregate` (default 256) cap the subscribers
+  inside one aggregate prefix (a /48 holder gets at most 256 /64
+  subscribers; refusals count `aggregate_subscriber_limit` and log a
+  `nat_resource_limit` record). `aggregate_prefix_len` must not exceed
+  `subscriber_prefix_len`: a config with `subscriber_prefix_len` below 56
+  must set it (equal turns the limit off).
 - `audit.on_overflow = "refuse_new_bindings"` (the default) requires
   `[audit.file]`; a syslog-only config must set `on_overflow =
   "drop_and_alert"`.
@@ -194,6 +201,12 @@ Configuration changes to note when upgrading from an earlier build:
   certificates may be 0644.
 - TLS syslog collectors must support TLS 1.3 (RFC 5425 TLS 1.2 is not
   offered).
+- **Breaking (POAM-020):** `audit.file.min_free_bytes = 0` (and any value
+  below 1048576) is refused; the storage-capacity warning (AU-5(1)) can no
+  longer be disabled. Remove the key to get the default, max(2 ×
+  `max_bytes`, 1 GiB), or set a value ≥ 1 MiB. Configs that omitted it now
+  get that default: the volume needs that much free space or new bindings
+  are refused. `check-config` prints the effective value.
 - Fragments and ICMP generation (branch `feat/protocol-completeness`,
   unreleased):
   - **Breaking:** `translation.icmp_errors_per_sec` must be 0 or at least 4
@@ -245,12 +258,24 @@ platd check-config -c /etc/plat/platd.toml   # prints the slice table and this n
   TLS), so each node and witness certificate needs **both the `serverAuth`
   and `clientAuth` extended key usages**, and a SAN matching its
   `identity` (e.g. `dns:plat-1.cluster.example`). Every member must have the
-  same `[cluster]` and pool settings: a different configuration digest is
+  same `[cluster]` and pool settings, `translation.cross_node_hairpin`,
+  `nat64.aggregate_prefix_len` and `nat64.max_subscribers_per_aggregate`
+  (`cluster_interfaces` is node-local and may differ): a different
+  configuration digest is
   refused (`digest_mismatch`), and so is a second node with the same id
   (`duplicate_id`: a second connection for a live id, a peer claiming the
   receiver's own id, or a claim of a connected member's id with another
   member's certificate or from another address; `/healthz` reports degraded
   for 60 s on the node that refused it).
+- **Cross-node hairpin**: a subscriber reaching another subscriber's
+  mapping in a slice owned by another node arrives from the wire with a pool
+  source. That is refused by default (`src_not_allowed`), because an
+  external attacker can forge the same source. To allow it, set
+  `translation.cross_node_hairpin = true` and list the cluster-internal
+  interfaces in `translation.cluster_interfaces`; `plat-tun-setup.sh` then
+  drops pool sources on every other interface, and platd refuses to start
+  if that rule is missing (POAM-024). Those interfaces must carry only peer
+  traffic.
 - **Witness**: a two-node cluster needs a third voter for automatic failover.
   Run `platd witness` (same binary, own mTLS certificate, votes only, holds no
   state) on a small third host and set `cluster.ha.witness`. Its file needs an
