@@ -257,6 +257,15 @@ platd check-config -c /etc/plat/platd.toml   # prints the slice table and this n
   receiver's own id, or a claim of a connected member's id with another
   member's certificate or from another address; `/healthz` reports degraded
   for 60 s on the node that refused it).
+- **Cross-node hairpin**: a subscriber reaching another subscriber's
+  mapping in a slice owned by another node arrives from the wire with a pool
+  source. That is refused by default (`src_not_allowed`), because an
+  external attacker can forge the same source. To allow it, set
+  `translation.cross_node_hairpin = true` and list the cluster-internal
+  interfaces in `translation.cluster_interfaces`; `plat-tun-setup.sh` then
+  drops pool sources on every other interface, and platd refuses to start
+  if that rule is missing (POAM-024). Those interfaces must carry only peer
+  traffic.
 - **Witness**: a two-node cluster needs a third voter for automatic failover.
   Run `platd witness` (same binary, own mTLS certificate, votes only, holds no
   state) on a small third host and set `cluster.ha.witness`. Its file needs an

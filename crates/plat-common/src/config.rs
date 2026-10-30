@@ -522,6 +522,24 @@ pub struct TranslationConfig {
     /// - RFC 4443 §2.2 - errors sourced from an address of the translator
     #[serde(default)]
     pub icmp_source_v6: Option<std::net::Ipv6Addr>,
+    /// Accept wire IPv4 packets whose source is inside another cluster
+    /// node's pool slice (cross-node hairpinning, RFC 6146 §3.8). Default
+    /// `false`: any source inside `nat64.pool` arriving on the wire is
+    /// spoofed (own-node hairpins never touch the wire) and refused as
+    /// `src_not_allowed`. When `true`, `cluster_interfaces` must name the
+    /// cluster-internal interfaces; `plat-tun-setup.sh` then drops pool
+    /// sources arriving on any other interface, and platd refuses to start
+    /// unless that guard is in the installed forward policy.
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: SC-7, SC-7(5), AC-4 - pool sources accepted only from
+    ///   the cluster-internal network (POAM-024)
+    #[serde(default)]
+    pub cross_node_hairpin: bool,
+    /// Interfaces on which pool-sourced IPv4 from peer nodes may arrive
+    /// (required, at most 16, when `cross_node_hairpin` is on).
+    #[serde(default)]
+    pub cluster_interfaces: Vec<String>,
     #[serde(default)]
     pub fragments: FragmentsConfig,
 }
@@ -1444,6 +1462,23 @@ impl Config {
             }
         }
 
+        // COMPLIANCE MAPPING:
+        // - NIST 800-53: SC-7(5), AC-4 - cross-node hairpin needs a named
+        //   cluster-internal ingress for the host pool-source guard (POAM-024)
+        if t.cross_node_hairpin && t.cluster_interfaces.is_empty() {
+            return invalid("translation.cross_node_hairpin requires translation.cluster_interfaces");
+        }
+        if !t.cross_node_hairpin && !t.cluster_interfaces.is_empty() {
+            return invalid("translation.cluster_interfaces is only valid with cross_node_hairpin = true");
+        }
+        if t.cluster_interfaces.len() > 16 {
+            return invalid("translation.cluster_interfaces must list at most 16 interfaces");
+        }
+        for i in &t.cluster_interfaces {
+            if i.is_empty() || i.len() > 15 || !i.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b)) {
+                return invalid(format!("translation.cluster_interfaces entry {i:?} is not a valid interface name"));
+            }
+        }
         if n.pool.is_empty() {
             return invalid("nat64.pool must not be empty");
         }
@@ -1882,6 +1917,24 @@ mod tests {
     use super::*;
 
     pub const EXAMPLE: &str = include_str!("../../../config/platd.example.toml");
+
+    #[test]
+    fn cross_node_hairpin_needs_cluster_interfaces() {
+        let on = base().replace("cross_node_hairpin = false", "cross_node_hairpin = true");
+        assert!(invalid_msg(&on).contains("requires translation.cluster_interfaces"));
+        let iface =
+            |list: &str| on.replace("# cluster_interfaces = [\"eth1\"]", &format!("cluster_interfaces = [{list}]"));
+        let c = Config::from_toml(&iface("\"eth1\", \"bond0.20\"")).unwrap();
+        assert!(c.translation.cross_node_hairpin);
+        assert_eq!(c.translation.cluster_interfaces, ["eth1", "bond0.20"]);
+        assert!(invalid_msg(&iface("\"eth1; drop\"")).contains("not a valid interface name"));
+        assert!(invalid_msg(&iface("\"\"")).contains("not a valid interface name"));
+        let many = (0..17).map(|i| format!("\"e{i}\"")).collect::<Vec<_>>().join(",");
+        assert!(invalid_msg(&iface(&many)).contains("at most 16"));
+        let off = base().replace("# cluster_interfaces = [\"eth1\"]", "cluster_interfaces = [\"eth1\"]");
+        assert!(invalid_msg(&off).contains("only valid with cross_node_hairpin"));
+        assert!(!Config::from_toml(&base()).unwrap().translation.cross_node_hairpin);
+    }
 
     #[test]
     fn example_config_validates() {

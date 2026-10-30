@@ -24,6 +24,28 @@ Closes POAM-020. SIEM schema unchanged.
   caveat removed. Tests: `config_edges.rs::audit_edges`,
   `qa_check_config.rs::exit_codes_basic`.
 
+### Spoofed pool sources (branch `fix/poam-024`)
+
+Narrows POAM-024. SIEM schema unchanged.
+
+#### Breaking
+
+- Wire IPv4 packets whose source is inside `nat64.pool` (any node's slice)
+  are now refused (`src_not_allowed`) by default, and the host forward
+  policy drops them (`plat-pool-source-guard`). Clusters that rely on
+  cross-node hairpinning must set `translation.cross_node_hairpin = true`
+  and `translation.cluster_interfaces`.
+
+#### Added
+
+- `translation.cross_node_hairpin` (default `false`) and
+  `translation.cluster_interfaces` (required with it, at most 16). With the
+  switch on, `plat-tun-setup.sh` drops pool sources arriving on any other
+  interface, and platd refuses to start unless that rule is in the
+  installed-table snapshot (`/etc/nftables.d/plat.nft.expected`).
+- `check-config --format env`: `PLAT_CROSS_NODE_HAIRPIN`,
+  `PLAT_CLUSTER_IFACES`.
+
 ### Protocol completeness (branch `feat/protocol-completeness`)
 
 Stacked on `feat/cluster-ha`. Closes POAM-001, POAM-002, POAM-011 and

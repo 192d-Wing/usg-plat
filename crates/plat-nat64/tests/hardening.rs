@@ -819,10 +819,23 @@ const CLUSTER_24: (&str, &str) = ("192.0.2.0/30", "192.0.2.0/24");
 /// SEC-301 (SC-7(5), BCP 38): under EIF, a wire packet whose source is in
 /// this node's own pool slice (e.g. subscriber B's live mapping) is spoofed,
 /// because own-node hairpins are looped back in-process. It is refused;
-/// the own-node hairpin and sources in other nodes' slices still work.
+/// the own-node hairpin still works. POAM-024: by default another node's
+/// slice is refused too.
 #[test]
 fn wire_source_in_own_pool_slice_is_refused() {
-    let mut fx = fixture_strict(&[CLUSTER_24, EIF]);
+    own_slice_refused(&[CLUSTER_24, EIF], false);
+    own_slice_refused(&[CLUSTER_24, EIF, CROSS_NODE_HAIRPIN], true);
+}
+
+/// `translation.cross_node_hairpin = true` (guarded by the host forward
+/// policy): another node's slice is a valid hairpin source.
+const CROSS_NODE_HAIRPIN: (&str, &str) = (
+    "cross_node_hairpin = false\n# cluster_interfaces = [\"eth1\"]",
+    "cross_node_hairpin = true\ncluster_interfaces = [\"eth1\"]",
+);
+
+fn own_slice_refused(cfg: &[(&str, &str)], cross_node: bool) {
+    let mut fx = fixture_strict(cfg);
     let (a, b) = (sub(1, 1), sub(2, 1));
     let oa = run(&mut fx, &udp6(a, 5353, GLOBAL, 53, b"q")).unwrap();
     let (a4, ap) = (be32(&oa, 12), be16(&oa, 20));
@@ -833,10 +846,16 @@ fn wire_source_in_own_pool_slice_is_refused() {
         let r = run(&mut fx, &udp4(src, sp, a4, ap, b"spoof"));
         assert_eq!(r.unwrap_err(), DropReason::SrcNotAllowed, "{src:08x}:{sp}");
     }
-    // Another node's slice (cross-node hairpin) is still accepted.
+    // Another node's slice: a cross-node hairpin only with the switch on.
     let other = 0xc000_0264; // 192.0.2.100
-    let r = run(&mut fx, &udp4(other, 4444, a4, ap, b"peer")).unwrap();
-    assert_eq!(v6_ok(&r).src, synth(other));
+    let r = run(&mut fx, &udp4(other, 4444, a4, ap, b"peer"));
+    if cross_node {
+        assert_eq!(v6_ok(&r.unwrap()).src, synth(other));
+    } else {
+        assert_eq!(r.unwrap_err(), DropReason::SrcNotAllowed);
+    }
+    // A source outside the pool is unaffected.
+    assert!(run(&mut fx, &udp4(GLOBAL, 4444, a4, ap, b"ext")).is_ok());
     // The own-node hairpin A -> B's mapping is still forwarded.
     let hp = run(&mut fx, &udp6(a, 7000, b4, bp, b"hp")).unwrap();
     assert_eq!((v6_ok(&hp).dst, be16(&hp, 42)), (b, 6000));

@@ -86,6 +86,13 @@ send_source_route_failed = false
 # synthesized destination of the offending packet. Must lie outside the
 # client prefixes and the NAT64 prefix.
 # icmp_source_v6 = "2001:db8:ffff::1"
+# Cross-node hairpinning (RFC 6146 §3.8 across cluster nodes). Off by
+# default: a wire IPv4 packet sourced from any nat64.pool address is spoofed
+# and dropped (src_not_allowed). On: pool sources are accepted only via the
+# cluster-internal interfaces below; plat-tun-setup.sh drops them on every
+# other interface and platd refuses to start without that guard (POAM-024).
+cross_node_hairpin = false
+# cluster_interfaces = ["eth1"]
 
 [translation.fragments]
 # Per worker, preallocated at start (SC-5). Defaults use about 1 MiB per

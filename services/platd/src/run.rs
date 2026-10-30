@@ -220,6 +220,12 @@ pub fn run(cfg: Config) -> ExitCode {
         }
     };
     tracing::info!(fips = fips.active, provider = fips.provider, "FIPS status");
+    // SC-7(5), AC-4 (POAM-024): cross-node hairpin only behind the host
+    // pool-source guard; fail closed before anything is started.
+    if let Err(e) = crate::hairpin_guard::check(&cfg, std::path::Path::new(crate::hairpin_guard::SNAPSHOT)) {
+        tracing::error!("{e}");
+        return ExitCode::FAILURE;
+    }
 
     // The queue exists before the TLS material is loaded, so revocation
     // records produced from here on wait in it until the logger is up.
