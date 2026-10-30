@@ -5,7 +5,7 @@
 mod common;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use common::*;
@@ -229,9 +229,10 @@ fn churn_cannot_starve_a_shard_tail() {
     assert_eq!(st.session_count(), 1000);
     let largest = (0..st.bib4.shard_count()).map(|i| st.bib4.lock_index(i).len()).max().unwrap();
     let stop = Arc::new(AtomicBool::new(false));
+    let started = Arc::new(AtomicU64::new(0));
     let churn: Vec<_> = (0..3u64)
         .map(|t| {
-            let (nat, stop) = (nat.clone(), stop.clone());
+            let (nat, stop, started) = (nat.clone(), stop.clone(), started.clone());
             std::thread::spawn(move || {
                 let st = nat.state();
                 let mut x = 0x9e37_79b9_u64 + t;
@@ -249,12 +250,20 @@ fn churn_cannot_starve_a_shard_tail() {
                         st.bib4.note_removal_index(i);
                         g.insert(k, v);
                     }
+                    if steps == 0 {
+                        started.fetch_add(1, Ordering::Relaxed);
+                    }
                     steps += 1;
                 }
                 steps
             })
         })
         .collect();
+    // Sweep only once every churn thread is running, or a fast runner can
+    // finish the whole sweep before any churn happens.
+    while started.load(Ordering::Relaxed) < 3 {
+        std::thread::yield_now();
+    }
     fx.clock.advance(Duration::from_secs(UDP_S + 1));
     let mut cycles = 0;
     while st.session_count() > 0 && cycles <= largest {
