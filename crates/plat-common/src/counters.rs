@@ -50,6 +50,10 @@ define_enum!(
         WrongNode => "wrong_node",
         SourceRoute => "source_route",
         SubscriberTableFull => "subscriber_table_full",
+        // New subscriber refused: its aggregate prefix
+        // (nat64.aggregate_prefix_len) already holds
+        // nat64.max_subscribers_per_aggregate subscribers (POAM-013).
+        AggregateSubscriberLimit => "aggregate_subscriber_limit",
         // Inbound for a slice this node does not hold a valid lease for.
         ClusterFenced => "cluster_fenced",
         // New subscriber homed on another node (`cluster.steering.mode = "drop"`).

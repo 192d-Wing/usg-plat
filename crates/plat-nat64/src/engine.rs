@@ -294,6 +294,10 @@ pub struct Nat64 {
     ident_key: IdentKey,
     frag_cfg: FragmentsConfig,
     udp_zero_reassemble: bool,
+    /// `translation.cross_node_hairpin`: other nodes' pool slices are
+    /// accepted as wire sources (the host guard limits them to the
+    /// cluster-internal interfaces).
+    cross_node_hairpin: bool,
     /// Source of locally generated ICMPv6 errors (`None`: the packet's
     /// synthesized destination).
     icmp_src6: Option<u128>,
@@ -324,6 +328,7 @@ impl Nat64 {
             state,
             clients: t.client_prefixes.clone(),
             cluster_pool: cfg.nat64.pool.clone(),
+            cross_node_hairpin: t.cross_node_hairpin,
             sub_mask: Ipv6Cidr::mask_of(cfg.nat64.subscriber_prefix_len),
             filtering: cfg.nat64.filtering,
             mtu4: t.ipv4_mtu,
@@ -421,6 +426,22 @@ impl Nat64 {
     #[inline]
     fn dst_forbidden(&self, a: u32) -> bool {
         is_never_translatable_v4(a) || (self.deny_non_global_dst && self.non_global_foreign(a))
+    }
+
+    /// A wire IPv4 source that only a spoofer can send: this node's own
+    /// slice always (own-node hairpins are looped back in-process), and any
+    /// pool address unless cross-node hairpinning is enabled.
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: SC-7, SC-7(5), AC-4 - BCP 38 / RFC 2827 ingress
+    ///   filtering of the translator's own address space (SEC-301, POAM-024)
+    #[inline]
+    fn spoofed_pool_src<M: Mode>(&self, a: u32) -> bool {
+        if self.cross_node_hairpin {
+            self.state.pool.local_in(M::SLICED, a).is_some()
+        } else {
+            self.cluster_pool.iter().any(|c| c.contains(a))
+        }
     }
 
     /// Non-global IPv4 address (RFC 6890) outside the cluster pool. The pool
@@ -718,7 +739,10 @@ impl Nat64 {
     ) -> R {
         let exhausted = match e {
             DropReason::PortExhausted => !M::SLICED,
-            DropReason::SubscriberLimit | DropReason::SubscriberTableFull | DropReason::SessionLimit => true,
+            DropReason::SubscriberLimit
+            | DropReason::SubscriberTableFull
+            | DropReason::AggregateSubscriberLimit
+            | DropReason::SessionLimit => true,
             _ => false,
         };
         if !self.icmp_gen.unreachable || !exhausted {
@@ -870,9 +894,10 @@ impl Nat64 {
         //   hairpins never touch the wire (`outbound_v6` loops them back
         //   in-process), so a wire packet claiming this node's own pool slice
         //   as its source is spoofed and refused (SEC-301). Other nodes'
-        //   slices stay accepted for cross-node hairpinning; the cluster edge
-        //   must filter the pool prefix as a source on external ingress.
-        if !hairpin && self.state.pool.local_in(M::SLICED, h.src).is_some() {
+        //   slices are refused too unless `translation.cross_node_hairpin`
+        //   is on, which requires the host guard limiting pool sources to the
+        //   cluster-internal interfaces (POAM-024).
+        if !hairpin && self.spoofed_pool_src::<M>(h.src) {
             return Err(DropReason::SrcNotAllowed);
         }
         if h.ttl <= 1 {
@@ -1384,7 +1409,7 @@ impl Nat64 {
         if f.offset == 1 && h.proto == proto::TCP {
             return Err(DropReason::FragmentTiny);
         }
-        if is_never_translatable_v4(h.src) || (!hairpin && self.state.pool.local_in(M::SLICED, h.src).is_some()) {
+        if is_never_translatable_v4(h.src) || (!hairpin && self.spoofed_pool_src::<M>(h.src)) {
             return Err(DropReason::SrcNotAllowed);
         }
         if h.ttl <= 1 {

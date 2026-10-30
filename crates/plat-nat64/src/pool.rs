@@ -910,6 +910,25 @@ impl Pool {
         (base + g.wanted.len()).min((2 * s.reserve_ahead).saturating_sub(have))
     }
 
+    /// Blocks of Active slices that are not allocated: ready (free or
+    /// reserved), sent to the backup as `Reserve` and not yet acknowledged,
+    /// cooling down or held back after a takeover. Each slice is read under
+    /// its lock, so a top-up (free -> pending -> reserved) or a hold-back
+    /// expiry in flight does not change the sum; only an allocation or
+    /// release does (0 in legacy mode). Off path (diagnostics, tests).
+    pub fn unallocated_blocks(&self) -> u64 {
+        let Some(s) = &self.sliced else { return 0 };
+        s.slices
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| Self::is_active(s, *i))
+            .map(|(_, m)| {
+                let g = m.lock();
+                g.ready() + (g.pending.len() + g.cooling.len() + g.held.len()) as u64
+            })
+            .sum()
+    }
+
     /// Moves up to the reservation deficit of free blocks of slice `id` to
     /// the pending set, for the replicator to send as `Reserve`. Off path.
     pub fn reserve_take(&self, id: SliceId) -> Vec<BlockRef> {
@@ -1115,9 +1134,13 @@ mod tests {
         let r = p.reserve_take(0);
         assert_eq!(r.len(), 2);
         assert_eq!(p.reserve_deficit(0), 0);
+        let unalloc = p.unallocated_blocks();
+        assert_eq!(unalloc, p.free_blocks() + 2, "pending blocks are not allocated");
         assert!(p.alloc(None, false).is_none(), "pending is not usable");
         assert_eq!(p.reserve_confirm(0, &r[..1]), 1);
+        assert_eq!(p.unallocated_blocks(), unalloc, "a top-up does not change the unallocated count");
         assert_eq!(p.alloc(None, false), Some(r[0]));
+        assert_eq!(p.unallocated_blocks(), unalloc - 1);
         assert_eq!(p.alloc_block(Some(r[0].addr_idx), true), Err(AllocFail::Starved));
         p.reserve_reset(0);
         assert_eq!(p.reserve_deficit(0), 2);

@@ -21,7 +21,7 @@ never limits forwarding.
 | 4 | `audit_retention_prune` gains `plat.audit.state` (`scheduled` with outcome `unknown`, then `deleted` / `failed`; CEF `act=`). `audit_storage_threshold` gains state `unknown` (free space undeterminable; no `plat.audit.available_bytes`). |
 | 5 | TLS (branch `feat/fips-tls`). `service_start` gains `plat.fips` / `plat.fips_provider` (CEF `cn2`/`cs1`). `audit_remote_loss` gains optional `plat.reason` (`io`, `tls_handshake`, `tls_verify`, `tls_revocation`; CEF `reason`); TCP losses now carry `io`. New records `management_connection`, `management_connection_suppressed`, `tls_revocation_check`, `revocation_source_refresh`. First records that carry peer-supplied text (certificate subject, SANs, issuer DN, serial, URLs), sanitised and capped (see Injection safety). |
 | 6 | Branch `fix/linux-validation` (unreleased). New record `audit_recovery` (`plat.reason` `empty_file`/`missing_header`/`truncated_tail`, `plat.audit.last_checkpoint_seq`, `plat.audit.max_seq`, `plat.audit.lease_state` `ok`/`absent`/`corrupt`/`inflated`/`high`; CEF `reason`, `cn3` `lastCheckpointSeq`, `cn2` `maxSeq`, `cs4` `leaseState`). `audit_output_failure` may carry `plat.reason` (`truncate_failed`, `seq_lease_failed`, `seq_exhausted`; CEF `reason`). New lease file `.<name>.seq`. `verify-log` exit 3 and `--allow-recovery`. |
-| 7 | Branch `feat/cluster-ha` (unreleased). Cluster high availability. New records `cluster_view_change`, `cluster_member_state`, `cluster_slice_acquire`, `cluster_slice_release`, `nat_port_block_adopt`, `cluster_peer_rejected`, `cluster_peer_suppressed`, `cluster_replication_gap`, `cluster_hook`, `cluster_operator_command`. `nat_port_block_release` may carry `plat.release_reason` (`handover`; CEF `reason`). `service_start` may carry `cluster.node_id`, `cluster.mode`, `cluster.config_digest`, `cluster.slices`, `cluster.slice_count`, `cluster.member_count` (CEF `cs2`/`cs3`/`cs4`/`cn3`). `tls_revocation_check` gains roles `cluster_peer_client` / `cluster_peer_server`. Chain format unchanged. |
+| 7 | Branch `feat/cluster-ha` (unreleased). Cluster high availability. New records `cluster_view_change`, `cluster_member_state`, `cluster_slice_acquire`, `cluster_slice_release`, `nat_port_block_adopt`, `cluster_peer_rejected`, `cluster_peer_suppressed`, `cluster_replication_gap`, `cluster_hook`, `cluster_operator_command`. `nat_port_block_release` may carry `plat.release_reason` (`handover`; CEF `reason`). `service_start` may carry `cluster.node_id`, `cluster.mode`, `cluster.config_digest`, `cluster.slices`, `cluster.slice_count`, `cluster.member_count` (CEF `cs2`/`cs3`/`cs4`/`cn3`). `tls_revocation_check` gains roles `cluster_peer_client` / `cluster_peer_server`. Additive within schema 7 (branch `fix/poams-020-024-013`): `nat_resource_limit` `event.reason` value `aggregate_subscriber_limit` (POAM-013); `cluster.config_digest` now also covers `cross_node_hairpin`, `aggregate_prefix_len` and `max_subscribers_per_aggregate` (value changes, field unchanged). Chain format unchanged. |
 
 Branch `feat/protocol-completeness` (unreleased) adds drop reasons, counters
 and one gauge but changes no record type or field name, so the schema stays
@@ -38,9 +38,9 @@ Files written under schemas 2–7 use the same chain v2 and verify.
 |---------|----------------|----------|
 | AU-2, AU-12 | Port-block allocate/release, binding create/delete (session mode), resource limits, queue overflow, service start/stop, periodic drop counters, audit output failure, remote loss, storage threshold, retention prune. An allocation record is queued before the block is used; a block returns to the pool only after its release record is queued. | `event.rs`; `plat-nat64/tests/engine.rs::udp_mapping_reply_and_block_log`, `session_mode_logs_bindings`; `hardening.rs::block_is_not_reused_before_its_release_record_is_queued` |
 | AU-3 | Who (`source.ip`, `plat.subscriber.prefix`), what (`event.action`), when (`@timestamp`), where (`observer.name`, `plat.node_id`), outcome (`event.outcome`; CEF `outcome`), NAT address and ports, sequence. | `format.rs::json_port_block_record`, `cef_and_syslog`, `storage_and_retention_records` |
-| AU-4 | Bounded queue `audit.queue_capacity`; rotation at `audit.file.max_bytes`; retention `audit.file.max_files` (0 = keep all, the default); free-space threshold `audit.file.min_free_bytes`. | `config.rs`; `config_edges.rs::audit_edges` |
+| AU-4 | Bounded queue `audit.queue_capacity`; rotation at `audit.file.max_bytes`; retention `audit.file.max_files` (0 = keep all, the default); free-space threshold `audit.file.min_free_bytes` (default max(2 × `max_bytes`, 1 GiB), 0 refused). | `config.rs`; `config_edges.rs::audit_edges` |
 | AU-5 | `on_overflow`: `refuse_new_bindings` (default; requires `[audit.file]`) or `drop_and_alert`. A full queue, a failed local file or low free space makes `has_room()` false, so new bindings are refused; `/healthz` returns 503. Records: `audit_queue_overflow`, `audit_output_failure`. Recovery is declared only after a checkpoint in the new file is synced. | `health.rs::file_failure_degrades_fails_closed_and_recovers`; `outputs.rs::queue_overflow_produces_an_audit_record`; `pipeline.rs::overflow_is_counted_and_reported`; `logger.rs::tests::full_volume_never_rotates_prunes_or_flaps` |
-| AU-5(1) | `min_free_bytes` threshold (default 0 = off; the example sets 2 GiB); `audit_storage_threshold` records; fail closed when free space cannot be determined. | `logger.rs::tests::free_space_threshold_degrades_and_recovers`, `undeterminable_free_space_fails_closed_once` |
+| AU-5(1) | `min_free_bytes` threshold (default max(2 × `max_bytes`, 1 GiB) when `[audit.file]` omits it; 0 and values below 1 MiB refused, POAM-020 closed); `audit_storage_threshold` records; fail closed when free space cannot be determined. | `logger.rs::tests::free_space_threshold_degrades_and_recovers`, `undeterminable_free_space_fails_closed_once` |
 | AU-6(3), AU-6(4) | ECS-style field names, CEF, RFC 5424 syslog to central collectors. | `format.rs`; `pipeline.rs::file_and_syslog_records_with_valid_chain` |
 | AU-8 | JSON and syslog header: RFC 3339 UTC with microseconds from the system clock. CEF `rt`: milliseconds. The platform must run NTP/PTP. | `format.rs::timestamps` |
 | AU-9 (Partial) | File mode 0640 in a `plat:plat-log` 2750 directory; SHA-256 chain v2 across batches and files; per-checkpoint `fdatasync`; a failed batch is cut back to the last checkpoint; sequence numbers continue across restarts and files and are never reused (durable lease `.<name>.seq`, `audit_recovery` after a damaged start); atomic rotation; `platd verify-log` (exit 3 for a recovery gap). The chain is unkeyed (POAM-003); a deleted tail plus restart looks like a crash (POAM-027). Linux: L12, L13, L16 PASS (LINUX_VERIFICATION.md). | `health.rs::restart_continues_chain_and_sequence`, `header_and_checkpoint_metadata_are_bound_into_the_chain`, `missing_live_file_resumes_from_newest_rotated_file`; `pipeline.rs::tampering_is_detected` |
@@ -149,7 +149,11 @@ attribution).
 
 `event.reason` ∈ `pool_exhausted`, `subscriber_block_limit`,
 `subscriber_session_limit`, `global_session_limit`,
-`subscriber_table_limit`. Rate-limited to one record per second per reason.
+`subscriber_table_limit`, `aggregate_subscriber_limit` (schema 7, additive:
+`nat64.max_subscribers_per_aggregate` reached; `source.ip` and
+`plat.subscriber.prefix` carry the aggregate prefix and
+`nat64.aggregate_prefix_len`, e.g. `2001:db8:100::/56`). Rate-limited to one
+record per second per reason.
 
 ```json
 {"@timestamp":"2026-10-28T14:16:01.000000Z","plat.schema":7,"event.sequence":9,"event.kind":"event","event.category":"network","event.action":"nat_resource_limit","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","event.reason":"subscriber_block_limit","source.ip":"2001:db8:100:1::","plat.subscriber.prefix":"2001:db8:100:1::/64"}
@@ -401,8 +405,9 @@ counted as delivered. Every lost batch is counted once; the sum of
 
 ### `audit_storage_threshold`
 
-Free space on the log volume, checked at most once per second when
-`min_free_bytes > 0`.
+Free space on the log volume, checked at most once per second whenever
+`[audit.file]` is configured (`min_free_bytes` is always ≥ 1 MiB; default
+max(2 × `max_bytes`, 1 GiB)).
 
 - `below_threshold`: free space < `min_free_bytes`; the pipeline is degraded
   (new bindings refused, `/healthz` 503) while records keep being written.
@@ -808,7 +813,8 @@ for `nat_port_block_release` (same address and range), `service_stop`,
   `port_exhausted`, `subscriber_limit`, `session_limit`,
   `audit_unavailable`, `fragment`, `too_big`, `hop_limit`,
   `icmp_untranslatable`, `wrong_node`, `source_route`,
-  `subscriber_table_full`, `cluster_fenced` (slice fenced or adopting on
+  `subscriber_table_full`, `aggregate_subscriber_limit` (new subscriber's
+  aggregate prefix full), `cluster_fenced` (slice fenced or adopting on
   this node), `missteered` (HA `steering.mode = "drop"`: new subscriber
   homed on another member); fragments: `fragment_timeout` (incomplete
   datagram expired), `fragment_overlap` (overlap or duplicate, RFC 5722;

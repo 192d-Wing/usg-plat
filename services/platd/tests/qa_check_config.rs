@@ -97,7 +97,19 @@ fn exit_codes_basic() {
     assert_eq!(code(&o), 0, "{}", String::from_utf8_lossy(&o.stderr));
     let out = String::from_utf8_lossy(&o.stdout);
     assert!(out.contains("TLS:") && out.contains("management: plain-loopback"), "{out}");
+    assert!(out.contains("audit file min_free_bytes: 2147483648 (AU-5(1))"), "{out}");
     assert_eq!(code(&check(&ok, true)), 0);
+    // POAM-020: an omitted threshold is shown with its computed default;
+    // an explicit 0 is refused (exit 2) in both formats.
+    let dflt = d.write("dflt.toml", &EXAMPLE.replace("min_free_bytes = 2147483648\n", ""), 0o644);
+    let o = check(&dflt, false);
+    assert_eq!(code(&o), 0, "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("audit file min_free_bytes: 2147483648 (AU-5(1))"));
+    let zero = d.write("zero.toml", &EXAMPLE.replace("min_free_bytes = 2147483648", "min_free_bytes = 0"), 0o644);
+    let o = check(&zero, false);
+    assert_eq!(code(&o), 2);
+    assert!(String::from_utf8_lossy(&o.stderr).contains("min_free_bytes"));
+    assert_eq!(code(&check(&zero, true)), 2);
     // Missing file, parse error, validation error.
     assert_eq!(code(&check(&d.0.join("missing.toml"), false)), 2);
     assert_eq!(code(&check(&d.0.join("missing.toml"), true)), 2);

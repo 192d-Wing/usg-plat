@@ -126,6 +126,7 @@ I/O backend (POAM-016), not lock changes (POAM-015).
 | `bib6` | (proto, v6 src, sport) | v4 transport address | shard |
 | `bib4` | (proto, pool addr, pool port) | BIB + sessions `(remote addr, port) → expiry, TCP state` | shard |
 | `subs` | v6 prefix (`subscriber_prefix_len`) | port blocks + per-protocol bitmaps | shard |
+| `aggs` | v6 prefix (`aggregate_prefix_len`) | subscriber count (entries only while > 0) | shard (leaf, under `subs`) |
 | `pool` | address index | FIFO free list of blocks; round-robin queue of addresses with free blocks | per-address mutex; one padded `avail` mutex taken only on block allocate/release |
 
 - **Endpoint-independent mapping** (RFC 4787 REQ-1), **address-dependent
@@ -133,7 +134,10 @@ I/O backend (POAM-016), not lock changes (POAM-015).
   index kept only under ADF), **paired pooling** (REQ-2).
 - **Bounded subscribers.** `nat64.max_subscribers` (default 1 000 000); a new
   subscriber is refused before any entry is created when the pool has no
-  free block or the table is full.
+  free block or the table is full. At most
+  `nat64.max_subscribers_per_aggregate` (default 256) subscribers share one
+  `nat64.aggregate_prefix_len` (default 56) prefix (POAM-013 closed); the
+  count changes only on subscriber create and removal.
 - **Bulk port allocation** (RFC 7422 style): a subscriber receives blocks of
   `port_block_size` ports on one IPv4 address, up to
   `max_blocks_per_subscriber`. Ports inside a block are chosen randomly
@@ -143,8 +147,10 @@ I/O backend (POAM-016), not lock changes (POAM-015).
   shard (no cursor or time budget, POAM-012), expires sessions, removes BIBs
   that have been empty for ≥ 2 s, and releases lingering blocks.
 
-Lock order: `bib6 → subs` (released) `→ bib4`; sweeper `bib6 → bib4`
-(released) then `subs`. Nothing acquires `bib6` or `subs` while holding `bib4`.
+Lock order: `bib6 → subs (→ aggs)` (released) `→ bib4`; sweeper `bib6 → bib4`
+(released) then `subs (→ aggs)`. Nothing acquires `bib6` or `subs` while holding `bib4`.
+`aggs` is a leaf: taken briefly only while a `subs` shard is held (or alone),
+and holds no other lock.
 
 ## SIEM logging
 
@@ -345,7 +351,7 @@ flowchart LR
 |----------|---------|
 | IPv6 access → PLAT | client prefix allow-list, ext-header bound, routing-header rejection, ICMPv6 error validation (live session, subscriber scope, sources inside the NAT64 prefix dropped); client source authenticity relies on access-edge SAVI/uRPF (POAM-014) |
 | PLAT → IPv4 Internet | never-translatable destinations always denied; RFC 6890 non-global destinations denied by default under every prefix (`translation.allow_non_global_destinations`; the cluster pool is exempt) |
-| IPv4 Internet → PLAT | pool ownership check, filtering, never-translatable and (by default) non-global data sources refused, unexpired source routes dropped |
+| IPv4 Internet → PLAT | pool ownership check, filtering, never-translatable and (by default) non-global data sources refused, unexpired source routes dropped; pool-sourced packets refused (own slice always, other slices unless `translation.cross_node_hairpin`, which needs the host `plat-pool-source-guard` rule limiting them to `translation.cluster_interfaces`; POAM-024) |
 | Host forwarding | nftables `inet plat` forward chain, default drop, installed by `plat-tun-setup.sh` before forwarding is enabled, persisted in `/etc/nftables.d/plat.nft` (glob include), and guarded by `plat-fwguard` (forwarding off if the table is missing or modified; residual window for direct `nft` changes, POAM-019). Verified on Linux (LINUX_VERIFICATION.md L5, L15) |
 | Cluster peers (HA) | mutual TLS 1.3 with a dedicated peer CA, typed identity bound to the claimed member id, source address pinned on the accepting side, config digest cross-check, duplicate-id refusal, replication accepted only from the slice owner; one trust domain (POAM-032); operator socket limited to uid 0 or the daemon uid |
 | Management | read-only metrics and health; plaintext only on loopback, otherwise mutual TLS 1.3 with client certificate, full-chain revocation and typed allow-list, per-IP and global connection caps; every mTLS connection audited |

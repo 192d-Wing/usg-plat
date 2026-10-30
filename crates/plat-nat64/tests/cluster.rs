@@ -710,3 +710,67 @@ fn paired_subscribers_under_connection_load_get_reserved_blocks() {
     let limit = u32::from(cfg.nat64.max_blocks_per_subscriber) * 64;
     assert!(ok.iter().all(|n| *n == limit), "paired subscribers starved for good: {ok:?}");
 }
+
+/// POAM-013: per-aggregate subscriber counts stay consistent across
+/// adoption (limit applied, over-limit blocks held back) and handover
+/// release (slots freed).
+#[test]
+fn aggregate_counts_survive_adoption_and_handover() {
+    const AGG3: (&str, &str) = ("max_subscribers_per_aggregate = 256", "max_subscribers_per_aggregate = 3");
+    const AGG2: (&str, &str) = ("max_subscribers_per_aggregate = 256", "max_subscribers_per_aggregate = 2");
+    let mut a = node(&[AGG3, NO_UNREACH]);
+    start_all(&a);
+    let _ = drain(&a);
+    // sub(1..=3) share one /56.
+    make_flows(&mut a, &[(1, 1000, proto::UDP), (2, 1000, proto::UDP), (3, 1000, proto::UDP)]);
+    assert_eq!(a.fx.nat.state().aggregate_count(sub(1, 1)), 3);
+    assert_eq!(
+        run(&mut a.fx, &udp6(sub(4, 1), 1000, SERVER, 53, b"q")).unwrap_err(),
+        DropReason::AggregateSubscriberLimit
+    );
+
+    // Takeover by a node with the same limit: counts carried over, still full.
+    let records = drain(&a);
+    let mut b = node(&[AGG3, NO_UNREACH]);
+    let shadow = shadow_for(&b);
+    for r in &records {
+        shadow.apply(r, 0).unwrap();
+    }
+    for s in 0..4 {
+        shadow.snapshot_end(s).unwrap();
+    }
+    adopt_from(&b, &shadow);
+    assert_eq!(b.fx.nat.state().subscriber_count(), 3);
+    assert_eq!(b.fx.nat.state().aggregate_count(sub(1, 1)), 3);
+    assert_eq!(
+        run(&mut b.fx, &udp6(sub(4, 1), 1000, SERVER, 53, b"q")).unwrap_err(),
+        DropReason::AggregateSubscriberLimit
+    );
+
+    // Takeover by a node with a lower limit: only two subscribers adopted.
+    let c = node(&[AGG2, NO_UNREACH]);
+    let shadow = shadow_for(&c);
+    for r in &records {
+        shadow.apply(r, 0).unwrap();
+    }
+    for s in 0..4 {
+        shadow.snapshot_end(s).unwrap();
+    }
+    adopt_from(&c, &shadow);
+    assert_eq!(c.fx.nat.state().subscriber_count(), 2);
+    assert_eq!(c.fx.nat.state().aggregate_count(sub(1, 1)), 2);
+
+    // Handover release of every slice frees the aggregate on the old owner.
+    for s in 0..4 {
+        a.fx.nat.state().release_slice(s, Some(BlockReleaseReason::Handover));
+    }
+    assert_eq!(a.fx.nat.state().subscriber_count(), 0);
+    assert_eq!(a.fx.nat.state().aggregate_count(sub(1, 1)), 0);
+    // The freed aggregate admits new subscribers once the slices are back.
+    for s in 0..4 {
+        a.fx.nat.state().set_slice_state(s, SliceState::Inactive);
+        a.fx.nat.state().adopt_slice(s, &AdoptInput::default(), meta(AcquireReason::Failback)).unwrap();
+    }
+    run(&mut a.fx, &udp6(sub(4, 1), 1000, SERVER, 53, b"q")).unwrap();
+    assert_eq!(a.fx.nat.state().aggregate_count(sub(1, 1)), 1);
+}

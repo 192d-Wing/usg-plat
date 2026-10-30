@@ -182,12 +182,34 @@ fn audit_edges() {
     // Default when omitted: keep every file.
     let c = with(&[("max_files = 0\n", "")]).unwrap();
     assert_eq!(c.audit.file.unwrap().max_files, 0);
-    // AU-5(1) free-space threshold: 0 (off) or at least 1 MiB.
-    valid(&[("min_free_bytes = 2147483648", "min_free_bytes = 0")]);
-    valid(&[("min_free_bytes = 2147483648", "min_free_bytes = 1048576")]);
+    // AU-5(1) free-space threshold (POAM-020): at least 1 MiB, 0 refused.
+    invalid(&[("min_free_bytes = 2147483648", "min_free_bytes = 0")]);
+    invalid(&[("min_free_bytes = 2147483648", "min_free_bytes = 1")]);
     invalid(&[("min_free_bytes = 2147483648", "min_free_bytes = 1048575")]);
+    valid(&[("min_free_bytes = 2147483648", "min_free_bytes = 1048576")]);
+    valid(&[("min_free_bytes = 2147483648", &format!("min_free_bytes = {}", i64::MAX))]);
+    assert!(with(&[("min_free_bytes = 2147483648", "min_free_bytes = -1")]).is_err(), "negative");
+    // An explicit value is kept as written.
+    let c = with(&[("min_free_bytes = 2147483648", "min_free_bytes = 5242880")]).unwrap();
+    assert_eq!(c.audit.file.unwrap().min_free_bytes, 5 << 20, "explicit value kept");
+    // Omitted: max(2 × max_bytes, 1 GiB).
     let c = with(&[("min_free_bytes = 2147483648\n", "")]).unwrap();
-    assert_eq!(c.audit.file.unwrap().min_free_bytes, 0, "disabled when omitted");
+    assert_eq!(c.audit.file.unwrap().min_free_bytes, 2 << 30, "default with max_bytes = 1 GiB");
+    let c = with(&[("min_free_bytes = 2147483648\n", ""), ("max_bytes = 1073741824", "max_bytes = 1048576")]).unwrap();
+    assert_eq!(c.audit.file.unwrap().min_free_bytes, 1 << 30, "1 GiB floor for small max_bytes");
+    let c =
+        with(&[("min_free_bytes = 2147483648\n", ""), ("max_bytes = 1073741824", "max_bytes = 536870913")]).unwrap();
+    assert_eq!(c.audit.file.unwrap().min_free_bytes, 1073741826, "just above the floor");
+    let c =
+        with(&[("min_free_bytes = 2147483648\n", ""), ("max_bytes = 1073741824", "max_bytes = 4294967296")]).unwrap();
+    assert_eq!(c.audit.file.unwrap().min_free_bytes, 8 << 30, "2 × max_bytes");
+    let c = with(&[
+        ("min_free_bytes = 2147483648\n", ""),
+        ("max_bytes = 1073741824", &format!("max_bytes = {}", i64::MAX)),
+    ])
+    .unwrap();
+    assert_eq!(c.audit.file.unwrap().min_free_bytes, u64::MAX - 1, "no overflow");
+    assert_eq!(plat_common::config::default_min_free_bytes(u64::MAX), u64::MAX, "saturates");
     valid(&[("app_name = \"platd\"", &format!("app_name = \"{}\"", "a".repeat(48)))]);
     for bad in ["", "plat d", "\\u00e9t", &"a".repeat(49)] {
         invalid(&[("app_name = \"platd\"", &format!("app_name = \"{bad}\""))]);

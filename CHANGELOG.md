@@ -4,6 +4,78 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 
 ## [Unreleased]
 
+### Review fixes for POAM-020/024/013 (branch `fix/poams-020-024-013`)
+
+- The cluster configuration digest now also covers
+  `translation.cross_node_hairpin`, `nat64.aggregate_prefix_len` and
+  `nat64.max_subscribers_per_aggregate` (`cluster_interfaces` is node-local
+  and not hashed). **The digest value changes**: a mixed-version cluster
+  reports `digest_mismatch` until every member runs this version.
+- The cross-node hairpin start gate is stricter: the
+  `plat-pool-source-guard` rule must cover every `nat64.pool` CIDR and come
+  before any rule that accepts IPv4.
+- Cross-node hairpin off by default is documented as RFC deviation 11
+  (RFC 4787 REQ-9, RFC 6146 §3.8); pool-source refusal is a silent BCP 38
+  drop (deviation 12).
+
+### Audit free-space threshold on by default (branch `fix/poam-020`)
+
+Closes POAM-020. SIEM schema unchanged.
+
+#### Breaking
+
+- `audit.file.min_free_bytes` must be at least 1048576; an explicit `0`
+  (formerly "disabled") fails validation. When `[audit.file]` omits it, it
+  defaults to max(2 × `max_bytes`, 1 GiB) instead of 0.
+
+#### Changed
+
+- `check-config` (text) prints `audit file min_free_bytes: <n> (AU-5(1))`.
+
+#### Compliance
+
+- AU-5(1) and the FAU_STG.4 row are Implemented; CM-6 secure default
+  caveat removed. Tests: `config_edges.rs::audit_edges`,
+  `qa_check_config.rs::exit_codes_basic`.
+
+### Spoofed pool sources (branch `fix/poam-024`)
+
+Narrows POAM-024. SIEM schema unchanged.
+
+#### Breaking
+
+- Wire IPv4 packets whose source is inside `nat64.pool` (any node's slice)
+  are now refused (`src_not_allowed`) by default, and the host forward
+  policy drops them (`plat-pool-source-guard`). Clusters that rely on
+  cross-node hairpinning must set `translation.cross_node_hairpin = true`
+  and `translation.cluster_interfaces`.
+
+#### Added
+
+- `translation.cross_node_hairpin` (default `false`) and
+  `translation.cluster_interfaces` (required with it, at most 16). With the
+  switch on, `plat-tun-setup.sh` drops pool sources arriving on any other
+  interface, and platd refuses to start unless that rule is in the
+  installed-table snapshot (`/etc/nftables.d/plat.nft.expected`).
+- `check-config --format env`: `PLAT_CROSS_NODE_HAIRPIN`,
+  `PLAT_CLUSTER_IFACES`.
+
+### Per-aggregate subscriber limit (branch `fix/poam-013`)
+
+Closes POAM-013. SIEM schema unchanged (7): no field changes; new
+`event.reason` value and drop reason only.
+
+- Added `nat64.aggregate_prefix_len` (32..=`subscriber_prefix_len`, default
+  56) and `nat64.max_subscribers_per_aggregate` (1..=2^24,
+  default 256). A new subscriber whose aggregate is full is refused before
+  any subscriber entry or port block is created: drop reason
+  `aggregate_subscriber_limit`, `nat_resource_limit` record with
+  `event.reason = "aggregate_subscriber_limit"` and the aggregate prefix as
+  `plat.subscriber.prefix`, ICMPv6 Unreachable 1/3 like the other mapping
+  limits. Counts follow the sweeper, adoption and handover release.
+- Breaking: a config with `subscriber_prefix_len` below 56 fails validation
+  until `aggregate_prefix_len` is set.
+
 ### Protocol completeness (branch `feat/protocol-completeness`)
 
 Stacked on `feat/cluster-ha`. Closes POAM-001, POAM-002, POAM-011 and

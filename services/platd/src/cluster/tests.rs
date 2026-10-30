@@ -388,7 +388,12 @@ fn join_replicate_takeover_rejoin_failback() {
     ));
 
     // Crash A: B takes every slice within the lease bound.
+    // Only acquires after the crash count: under load B can miss a view
+    // while the cluster forms, and slices adopted across that gap are
+    // (conservatively) recorded as takeovers too.
     let a_slices = a.active();
+    let mark = b.events.lock().len();
+    let counted = b.h().shared.takeovers("takeover");
     a.kill();
     let took = wait("takeover by B", Duration::from_secs(6), || b.active() == 16);
     let bound = Duration::from_millis(LEASE_MS * 11 / 10 + 200 + 5 * 100 + 1000);
@@ -397,19 +402,21 @@ fn join_replicate_takeover_rejoin_failback() {
         .events
         .lock()
         .iter()
+        .skip(mark)
         .filter(|e| matches!(e, Event::ClusterSliceAcquire { acquire, .. } if acquire.reason == AuditAcquire::Takeover))
         .count();
     let rs: Vec<_> = b
         .events
         .lock()
         .iter()
+        .skip(mark)
         .filter_map(|e| match e {
             Event::ClusterSliceAcquire { acquire, .. } => Some((acquire.reason, acquire.prev_owner, acquire.in_sync)),
             _ => None,
         })
         .collect();
     assert_eq!(takeovers, a_slices, "{rs:?}");
-    assert_eq!(b.h().shared.takeovers("takeover"), a_slices as u64);
+    assert_eq!(b.h().shared.takeovers("takeover") - counted, a_slices as u64);
     assert!(
         b.has(|e| matches!(e, Event::PortBlockAdopt { adopt, .. } if adopt.v4 == v4 && adopt.prev_owner == Some(0)))
     );
@@ -1027,11 +1034,14 @@ fn restarted_member_relearns_homes_and_refuses_missteered() {
     wait("B learns the subscriber's home", Duration::from_secs(5), || dir_b.home_of(sub).is_some_and(|h| h.node == 0));
 
     // Mis-steered to B: counted and dropped, nothing allocated on B.
-    let before = b.nat.state().pool.free_blocks();
+    // Not `free_blocks`: that moves with the background reservation
+    // top-up (free -> pending until A acknowledges) and hold-back expiry.
+    let unallocated = |n: &Node| n.nat.state().pool.unallocated_blocks();
+    let before = unallocated(&b);
     assert_eq!(b.send(client, 40001), None);
     assert_eq!(b.ctx.counters.get(Counter::ClusterSteerMissteered), 1);
     assert_eq!(b.ctx.counters.drops(DropReason::Missteered), 1);
-    assert_eq!(b.nat.state().pool.free_blocks(), before);
+    assert_eq!(unallocated(&b), before);
     assert!(!b.has(|e| matches!(e, Event::PortBlockAlloc { sub: s, .. } if *s == sub)));
     drop(b);
     drop(a);
