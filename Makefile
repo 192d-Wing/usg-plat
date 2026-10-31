@@ -82,13 +82,22 @@ endif
 	@true
 
 # Build: plat-xdp-core for bpfel (a library: proves it is no_std/BPF-clean, no
-# linker needed); plat-xdp with the xdp feature, whose build script builds and
-# links the plat-xdp-ebpf object (bpf-linker), then the object checks.
+# linker needed); the plat-xdp-ebpf object (build-object.sh: bpf-linker, the
+# aya-build flags, path-independent) into $(XDP_OBJ), then the object checks
+# (licence, helper allow-list, no loops); plat-xdp with the xdp feature, whose
+# build script builds and links the object again, then the same checks.
+XDP_OBJ := target/xdp/plat-xdp-ebpf
 xdp: xdp-env
 ifneq ($(XDP_CORE),)
 	RUSTC_BOOTSTRAP=1 cargo build -p plat-xdp-core $(BPF_STD) --release
 else
 	@echo "xdp: skipped bpfel build (no crates/plat-xdp-core yet; WU1)"
+endif
+ifneq ($(XDP_EBPF),)
+	deploy/tests/xdp/build-object.sh target/xdp
+	python3 -I deploy/tests/xdp/check-object.py $(XDP_OBJ)
+else
+	@echo "xdp: skipped eBPF object build (no crates/plat-xdp-ebpf yet; WU2)"
 endif
 ifneq ($(XDP_USER),)
 	cargo build -p plat-xdp --features xdp --release
@@ -100,7 +109,8 @@ else
 endif
 
 # Lint: the deploy/tests/xdp scripts (shellcheck required when CI=true), the
-# object checker's self-test, clippy for bpfel, clippy with the xdp feature.
+# self-tests of the object checker and of the stack/instruction gate's
+# evaluation, clippy for bpfel, clippy with the xdp feature.
 check-xdp: xdp-env
 	for f in $(XDP_SH); do sh -n $$f || exit 1; done
 	@if command -v shellcheck >/dev/null 2>&1; then shellcheck -x $(XDP_SH); \
@@ -108,6 +118,7 @@ check-xdp: xdp-env
 	else echo "WARNING: shellcheck not installed; skipped" >&2; fi
 	for f in $(XDP_PY); do python3 -I -c 'import ast, sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])' $$f || exit 1; done
 	python3 -I deploy/tests/xdp/check-object.py --self-test
+	python3 -I deploy/tests/xdp/obj-gate.py --self-test
 ifneq ($(strip $(XDP_BPF_PKGS)),)
 	RUSTC_BOOTSTRAP=1 cargo clippy $(XDP_BPF_PKGS) $(BPF_STD) -- -D warnings
 else
@@ -122,16 +133,19 @@ endif
 
 # Levels 2-4 in virtme-ng VMs (Linux only; plan §11): fetch each matrix kernel
 # through the signed Debian chain, boot it, run deploy/tests/xdp/guest.sh.
-# WU3 adds the level-2 test_run binary as the guest's second argument.
+# With plat-xdp-ebpf, builds the object first (make xdp) and the guest runs
+# the stack/instruction gate and the level-2 smoke vectors on it
+# (obj-gate.py). WU3 adds the level-2 test_run binary as the guest's second
+# argument.
 # Prerequisites: virtme-ng, QEMU, gpgv and the Debian archive keyring
 # (`apt-get install debian-archive-keyring`, as the xdp-vm CI job does), or
 # XDP_DEBIAN_KEYRING=/path/to/debian-archive-keyring.gpg; without it
 # fetch-kernel.sh fails closed ("keyring not found").
-test-xdp: xdp-env
+test-xdp: xdp-env $(if $(XDP_EBPF),xdp)
 	@[ "$$(uname -s)" = Linux ] || { echo "ERROR: test-xdp needs Linux with virtme-ng and QEMU (plan §11)" >&2; exit 1; }
 	@for k in $(XDP_KERNELS); do \
 	  kimg=$$(deploy/tests/xdp/fetch-kernel.sh $$k) || exit 1; \
-	  deploy/tests/xdp/vng-run.sh $(XDP_VNG_FLAGS) "$$kimg" || exit 1; \
+	  deploy/tests/xdp/vng-run.sh $(XDP_VNG_FLAGS) $(if $(XDP_EBPF),-o $(CURDIR)/$(XDP_OBJ)) "$$kimg" || exit 1; \
 	done
 
 bench-xdp: xdp-env

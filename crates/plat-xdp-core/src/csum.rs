@@ -29,14 +29,20 @@ pub fn sum<const M: usize>(b: &[u8; M]) -> u64 {
 
 /// [`sum`] of the `len` bytes of `b` at `off` (`len` even at every call
 /// site), read in place instead of copied out. Bytes past the end of `b`
-/// read as zero.
+/// read as zero. `off` and `len` are constants at every call site, so the
+/// word loop has a constant trip count and is fully unrolled in the eBPF
+/// object (PERF-009: no back-edge).
 #[inline(always)]
 pub fn sum_at<const N: usize>(b: &[u8; N], off: usize, len: usize) -> u64 {
+    let s = b.get(off..).unwrap_or(&[]);
+    let s = s.get(..len).unwrap_or(s);
+    let (pairs, rest) = s.as_chunks::<2>();
     let mut acc: u64 = 0;
-    let mut it = b.iter().skip(off).take(len);
-    while let Some(hi) = it.next() {
-        let lo = it.next().copied().unwrap_or(0);
-        acc += u64::from(u16::from_be_bytes([*hi, lo]));
+    for p in pairs {
+        acc += u64::from(u16::from_be_bytes(*p));
+    }
+    if let [last] = rest {
+        acc += u64::from(*last) << 8;
     }
     acc
 }

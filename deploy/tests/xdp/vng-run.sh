@@ -8,8 +8,10 @@
 # --disable-kvm), on x86_64 with --disable-microvm (microvm wants KVM).
 # Expect about 15 s per kernel under TCG (spike: 6.1.176, 15.5 s).
 #
-# Usage: vng-run.sh [-m] [-c CPUS] [-M MEMORY] KERNEL_IMAGE [-- GUEST_CMD [ARG...]]
+# Usage: vng-run.sh [-m] [-c CPUS] [-M MEMORY] [-o OBJECT] KERNEL_IMAGE [-- GUEST_CMD [ARG...]]
 #   KERNEL_IMAGE  .../boot/vmlinuz-KVER as printed by fetch-kernel.sh
+#   -o            the plat-xdp-ebpf object (absolute path, not under /tmp):
+#                 the default guest command becomes guest.sh -o OBJECT KVER
 #   -m            install the image's lib/modules/KVER into /lib/modules when
 #                 absent (root or sudo; CI runners only). The guest sees the
 #                 host's /lib/modules when vng cannot read the version from a
@@ -26,14 +28,16 @@ here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/../../.." && pwd)
 
 die() { echo "vng-run: $1" >&2; exit "${2:-1}"; }
-usage() { die "usage: vng-run.sh [-m] [-c CPUS] [-M MEMORY] KERNEL_IMAGE [-- GUEST_CMD [ARG...]]" 2; }
+usage() { die "usage: vng-run.sh [-m] [-c CPUS] [-M MEMORY] [-o OBJECT] KERNEL_IMAGE [-- GUEST_CMD [ARG...]]" 2; }
 
 install_mods=no
 cpus=4
 mem=2G
-while getopts mc:M: opt; do
+object=
+while getopts mc:M:o: opt; do
     case "$opt" in
         m) install_mods=yes ;;
+        o) object=$OPTARG ;;
         c) cpus=$OPTARG ;;
         M) mem=$OPTARG ;;
         *) usage ;;
@@ -68,7 +72,18 @@ if [ "$install_mods" = yes ] && [ ! -d "/lib/modules/$kver" ]; then
     echo "vng-run: installed modules for $kver into /lib/modules" >&2
 fi
 
-[ $# -gt 0 ] || set -- "$here/guest.sh" "$kver"
+if [ -n "$object" ]; then
+    case "$object" in /*) ;; *) die "-o needs an absolute path: $object" 2 ;; esac
+    case "$object" in /tmp/*) die "object under /tmp is hidden from the guest" 2 ;; *) ;; esac
+    [ -f "$object" ] || die "no object $object (make xdp)" 2
+fi
+if [ $# -eq 0 ]; then
+    if [ -n "$object" ]; then
+        set -- "$here/guest.sh" -o "$object" "$kver"
+    else
+        set -- "$here/guest.sh" "$kver"
+    fi
+fi
 for a do
     case "$a" in
         *[!A-Za-z0-9_./:=,+@%-]* | '') die "guest argument outside [A-Za-z0-9_./:=,+@%-]: '$a'" 2 ;;
