@@ -75,7 +75,7 @@ pub const HDR4: usize = ETH + IP4 + UDP;
 /// out-of-range constant offset and folds away otherwise.
 #[inline(always)]
 pub(crate) fn take<const N: usize, const M: usize>(src: &[u8; N], off: usize) -> [u8; M] {
-    if let Some(a) = src.get(off..).and_then(|s| s.first_chunk::<M>()) {
+    if let Some(a) = src.get(off..).and_then(<[u8]>::first_chunk::<M>) {
         return *a;
     }
     let mut a = [0u8; M];
@@ -90,7 +90,7 @@ pub(crate) fn take<const N: usize, const M: usize>(src: &[u8; N], off: usize) ->
 /// panicking. As in [`take`], the in-range case is one fixed-size copy.
 #[inline(always)]
 pub(crate) fn put<const N: usize, const M: usize>(dst: &mut [u8; N], off: usize, src: &[u8; M]) {
-    if let Some(d) = dst.get_mut(off..).and_then(|d| d.first_chunk_mut::<M>()) {
+    if let Some(d) = dst.get_mut(off..).and_then(<[u8]>::first_chunk_mut::<M>) {
         *d = *src;
         return;
     }

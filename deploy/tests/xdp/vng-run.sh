@@ -93,6 +93,7 @@ fi
 for a do
     case "$a" in
         *[!A-Za-z0-9_./:=,+@%-]* | '') die "guest argument outside [A-Za-z0-9_./:=,+@%-]: '$a'" 2 ;;
+        *) ;;
     esac
 done
 cmd=$*
@@ -106,6 +107,7 @@ else
     case "$(uname -m)" in
         aarch64 | arm64) set -- "$@" --qemu "$here/qemu-tcg.sh" ;;
         x86_64 | amd64) set -- "$@" --disable-microvm ;;
+        *) ;;
     esac
 fi
 
