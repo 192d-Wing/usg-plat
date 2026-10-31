@@ -1,6 +1,10 @@
 # NIST 800-53: CM-2 (Baseline Configuration), SA-15 (Development Tools) - pinned toolchain.
+# rust-src: `-Z build-std=core` for the bpfel-unknown-none eBPF build (XDP fast
+# path, POAM-016). The channel stays stable 1.99.1 (LLVM 23); no nightly. The
+# eBPF build alone runs with RUSTC_BOOTSTRAP=1, set per command (Makefile) or by
+# plat-xdp's build script, never for the workspace build.
 [toolchain]
 channel = "1.99.1"
-components = ["rustfmt", "clippy"]
+components = ["rustfmt", "clippy", "rust-src"]
 targets = ["aarch64-unknown-linux-gnu"]
 profile = "minimal"

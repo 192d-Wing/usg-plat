@@ -49,6 +49,92 @@ test-deploy:
 bench:
 	cargo bench -p plat-xlat -p plat-nat64 -p plat-audit --bench xlat --bench nat64 --bench audit
 
+# XDP fast path (POAM-016 Phase 1, plan §15). Not part of check/test: those need
+# no bpf-linker and no Linux VM. The crates arrive in later work units, so each
+# target runs only what is in the tree and says what it skipped.
+# RUSTC_BOOTSTRAP=1 is set on the one bpfel-unknown-none command it is needed for
+# (-Z build-std=core on stable 1.99.1), never exported or set for the workspace.
+# COMPLIANCE MAPPING:
+# - NIST 800-53: SA-15 (Development Tools), CM-2 (Baseline Configuration), SA-11
+#   (Developer Testing)
+XDP_CORE := $(wildcard crates/plat-xdp-core/Cargo.toml)
+XDP_EBPF := $(wildcard crates/plat-xdp-ebpf/Cargo.toml)
+XDP_USER := $(wildcard crates/plat-xdp/Cargo.toml)
+XDP_LOADER := $(wildcard services/plat-xdp-loader/Cargo.toml)
+XDP_BPF_PKGS := $(if $(XDP_CORE),-p plat-xdp-core) $(if $(XDP_EBPF),-p plat-xdp-ebpf)
+XDP_SH := $(wildcard deploy/tests/xdp/*.sh)
+XDP_PY := $(wildcard deploy/tests/xdp/*.py)
+BPF_TARGET := bpfel-unknown-none
+BPF_STD := --target $(BPF_TARGET) -Z build-std=core
+# Kernel matrix for test-xdp (deploy/tests/xdp/kernels.conf); XDP_VNG_FLAGS=-m on
+# CI runners installs the kernel modules into /lib/modules.
+XDP_KERNELS ?= 6.1 6.6 6.12 latest
+XDP_VNG_FLAGS ?=
+
+.PHONY: xdp check-xdp test-xdp bench-xdp xdp-env
+
+xdp-env:
+ifneq ($(origin RUSTC_BOOTSTRAP),undefined)
+	$(error RUSTC_BOOTSTRAP is set ($(origin RUSTC_BOOTSTRAP)); the workspace build must stay plain stable (plan §15))
+endif
+	@true
+
+# Build: plat-xdp-core for bpfel (a library: proves it is no_std/BPF-clean, no
+# linker needed); plat-xdp with the xdp feature, whose build script builds and
+# links the plat-xdp-ebpf object (bpf-linker), then the object checks.
+xdp: xdp-env
+ifneq ($(XDP_CORE),)
+	RUSTC_BOOTSTRAP=1 cargo build -p plat-xdp-core $(BPF_STD) --release
+else
+	@echo "xdp: skipped bpfel build (no crates/plat-xdp-core yet; WU1)"
+endif
+ifneq ($(XDP_USER),)
+	cargo build -p plat-xdp --features xdp --release
+	@objs=$$(find target/release/build -path '*/out/plat-xdp-ebpf' -type f 2>/dev/null); \
+	[ -n "$$objs" ] || { echo "ERROR: plat-xdp built but no plat-xdp-ebpf object under target/release/build" >&2; exit 1; }; \
+	for o in $$objs; do python3 -I deploy/tests/xdp/check-object.py "$$o" || exit 1; done
+else
+	@echo "xdp: skipped plat-xdp object build (no crates/plat-xdp yet; WU3)"
+endif
+
+# Lint: the deploy/tests/xdp scripts (shellcheck required when CI=true), the
+# object checker's self-test, clippy for bpfel, clippy with the xdp feature.
+check-xdp: xdp-env
+	for f in $(XDP_SH); do sh -n $$f || exit 1; done
+	@if command -v shellcheck >/dev/null 2>&1; then shellcheck -x $(XDP_SH); \
+	elif [ "$$CI" = true ]; then echo "ERROR: shellcheck is required in CI" >&2; exit 1; \
+	else echo "WARNING: shellcheck not installed; skipped" >&2; fi
+	for f in $(XDP_PY); do python3 -I -c 'import ast, sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])' $$f || exit 1; done
+	python3 -I deploy/tests/xdp/check-object.py --self-test
+ifneq ($(strip $(XDP_BPF_PKGS)),)
+	RUSTC_BOOTSTRAP=1 cargo clippy $(XDP_BPF_PKGS) $(BPF_STD) -- -D warnings
+else
+	@echo "check-xdp: skipped bpfel clippy (no plat-xdp-core / plat-xdp-ebpf yet; WU1/WU2)"
+endif
+ifneq ($(XDP_USER),)
+	cargo clippy -p plat-xdp --features xdp --all-targets -- -D warnings
+endif
+ifneq ($(XDP_LOADER),)
+	cargo clippy -p plat-xdp-loader --features xdp --all-targets -- -D warnings
+endif
+
+# Levels 2-4 in virtme-ng VMs (Linux only; plan §11): fetch each matrix kernel
+# through the signed Debian chain, boot it, run deploy/tests/xdp/guest.sh.
+# WU3 adds the level-2 test_run binary as the guest's second argument.
+test-xdp: xdp-env
+	@[ "$$(uname -s)" = Linux ] || { echo "ERROR: test-xdp needs Linux with virtme-ng and QEMU (plan §11)" >&2; exit 1; }
+	@for k in $(XDP_KERNELS); do \
+	  kimg=$$(deploy/tests/xdp/fetch-kernel.sh $$k) || exit 1; \
+	  deploy/tests/xdp/vng-run.sh $(XDP_VNG_FLAGS) "$$kimg" || exit 1; \
+	done
+
+bench-xdp: xdp-env
+ifneq ($(XDP_CORE),)
+	cargo bench -p plat-xdp-core
+else
+	@echo "bench-xdp: skipped (no plat-xdp-core yet; WU1)"
+endif
+
 # Hot-path instructions per packet (cachegrind, Linux): the difference of a
 # 200k and a 100k packet run, so setup cost cancels (PERF-002).
 ir:

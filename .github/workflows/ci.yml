@@ -77,3 +77,107 @@ jobs:
         with:
           tool: cargo-audit@0.22.2,cargo-deny@0.20.2
       - run: make security
+
+  # XDP fast path (POAM-016 Phase 1, plan §15). NIST 800-53: SA-15, CM-2, SA-11.
+  # Pinned bpf-linker (sha256), LLVM-major match with rustc, bpfel build and
+  # object checks on both architectures. Steps for crates that are not in the
+  # tree yet skip with a message (Makefile). Reports on every push; it becomes
+  # a required check on main when WU2/WU3 add the eBPF object.
+  xdp-build:
+    name: xdp build (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: The workspace build environment has no RUSTC_BOOTSTRAP
+        run: |
+          if [ -n "${RUSTC_BOOTSTRAP+set}" ]; then
+            echo "::error::RUSTC_BOOTSTRAP is set for the workspace build (plan §15)"
+            exit 1
+          fi
+      - name: Install pinned toolchain from rust-toolchain.toml (incl. rust-src)
+        run: rustup toolchain install && rustup show
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install tools (zstd, shellcheck) and AWS-LC FIPS build deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends zstd shellcheck cmake golang-go clang
+      - name: Install bpf-linker 0.12.0 (release tarball, sha256-pinned)
+        run: |
+          deploy/tests/xdp/install-bpf-linker.sh "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: rustc and bpf-linker share one LLVM major
+        run: deploy/tests/xdp/check-llvm-major.sh "$HOME/.local/bin/bpf-linker"
+      - name: make check-xdp (scripts, bpfel clippy, xdp-feature clippy)
+        run: make check-xdp
+      - name: make xdp (bpfel build, eBPF object, licence and helper checks, sha256)
+        run: make xdp
+
+  # Kernel matrix (plan §11 level 3, decision Q1). Kernels are Debian packages
+  # verified through the signed InRelease (deploy/tests/xdp/fetch-kernel.sh),
+  # booted with virtme-ng: KVM on x86_64, TCG through qemu-tcg.sh on arm64.
+  # Today: boot, kernel smoke test (XDP load + BPF_PROG_TEST_RUN), netns and
+  # e2e topologies; level 2 and 4 skip until WU3/WU5. Becomes a required check
+  # on main before [xdp] is documented as supported.
+  xdp-vm:
+    name: xdp vm (${{ matrix.kernel }}, ${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel: ["6.1", "6.6", "6.12", "latest"]
+        arch: [x86_64, aarch64]
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            qemu: qemu-system-x86
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            qemu: qemu-system-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      XDP_KERNELS: ${{ matrix.kernel }}
+      XDP_VNG_FLAGS: -m
+      QEMU_PKG: ${{ matrix.qemu }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install virtme-ng, QEMU, gpgv and the Debian archive keyring
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends virtme-ng "$QEMU_PKG" busybox-static file kmod \
+            gpgv debian-archive-keyring xz-utils iproute2 iputils-ping
+      - name: Allow the runner user to open /dev/kvm (when the host offers it)
+        run: |
+          if [ -e /dev/kvm ]; then
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+            sudo udevadm control --reload-rules
+            sudo udevadm trigger --name-match=kvm
+          else
+            echo "no /dev/kvm: TCG"
+          fi
+      - name: make test-xdp (fetch, verify, boot, guest checks)
+        run: make test-xdp
+      - name: Record the kernel package and verification
+        if: always()
+        run: cat target/xdp-kernels/*/kernel.env >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: xdp-vm-${{ matrix.kernel }}-${{ matrix.arch }}
+          path: |
+            target/xdp-vm/*.log
+            target/xdp-kernels/*/kernel.env
+          if-no-files-found: ignore
+          retention-days: 14
