@@ -13,7 +13,7 @@ pub mod ip;
 
 pub use ip::{
     Frag, Ipv4Hdr, Ipv6Hdr, L4, ParseError, parse_l4, parse_l4_inner, parse_v4, parse_v4_ignore_source_route,
-    parse_v4_inner, parse_v6, parse_v6_ignore_routing, parse_v6_inner,
+    parse_v4_inner, parse_v6, parse_v6_ignore_routing, parse_v6_inner, tcp_seq,
 };
 
 /// IP protocol numbers used by the translator.

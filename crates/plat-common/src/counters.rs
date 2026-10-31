@@ -76,6 +76,11 @@ define_enum!(
         FragmentUnmatched => "fragment_unmatched",
         // ICMP error quoting a non-first fragment this worker cannot map.
         IcmpQuoteUnmatched => "icmp_quote_unmatched",
+        // Unsolicited inbound SYN on a bound port not held for simultaneous
+        // open: the BIB's held-SYN slots (nat64.max_held_syns_per_bib) or
+        // the node-wide cap (nat64.max_held_syns) are full (RFC 6146
+        // §3.5.2.2, SC-5).
+        HeldSynLimit => "held_syn_limit",
     }
 );
 
@@ -115,6 +120,13 @@ define_enum!(
         IcmpTimeExceededSent => "icmp_time_exceeded_sent",
         IcmpUnreachableSent => "icmp_unreachable_sent",
         IcmpParamProblemSent => "icmp_param_problem_sent",
+        // Unsolicited inbound SYN held for simultaneous open (RFC 6146
+        // §3.5.2.2); consumed, not forwarded.
+        TcpSynHeld => "tcp_syn_held",
+        // Retransmitted SYN for a remote already held (deadline unchanged).
+        TcpSynHeldDup => "tcp_syn_held_dup",
+        // A subscriber SYN matched a held SYN: session opened ESTABLISHED.
+        TcpSynHeldMatched => "tcp_syn_held_matched",
     }
 );
 

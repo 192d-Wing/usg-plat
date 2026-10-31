@@ -302,3 +302,83 @@ fn smaller_block_hint_boundaries_end_to_end() {
     assert_eq!(code(&o), 0, "{out}");
     assert!(out.contains("WARNING: the pool") && !out.contains("hint:"), "{out}");
 }
+
+/// QA (POAM-008, SC-5/CM-6): held-SYN keys as an operator sees them from
+/// `check-config`: the worst-case memory line, the EIF warning, the off
+/// line, the env listing, and exit 2 for every invalid value.
+#[test]
+fn held_syn_check_config_end_to_end() {
+    let d = Dir::new("heldsyn");
+    let text = |cfg: &Path, env: bool| {
+        let o = check(cfg, env);
+        assert_eq!(code(&o), 0, "{}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    };
+    let ok = d.write("ok.toml", EXAMPLE, 0o644);
+    let out = text(&ok, false);
+    assert!(
+        out.contains("held SYN memory (worst case): 4456448 bytes (16384 SYNs, 4 per BIB, 6 s, expiry ICMP off; SC-5)"),
+        "{out}"
+    );
+    assert!(!out.contains("WARNING: nat64.tcp_simultaneous_open"), "{out}");
+
+    let icmp =
+        d.write("icmp.toml", &EXAMPLE.replace("held_syn_unreachable = false", "held_syn_unreachable = true"), 0o644);
+    let out = text(&icmp, false);
+    assert!(
+        out.contains(&format!("{} bytes", 16_384 * (8 * 32 + 16) + 4096 * 24)) && out.contains("expiry ICMP on"),
+        "{out}"
+    );
+
+    let eif = d.write(
+        "eif.toml",
+        &EXAMPLE.replace("filtering = \"address_dependent\"", "filtering = \"endpoint_independent\""),
+        0o644,
+    );
+    let out = text(&eif, false);
+    assert!(out.contains("WARNING: nat64.tcp_simultaneous_open has no effect"), "{out}");
+    assert!(!out.contains("held SYN memory"), "{out}");
+
+    let off =
+        d.write("off.toml", &EXAMPLE.replace("tcp_simultaneous_open = true", "tcp_simultaneous_open = false"), 0o644);
+    assert!(text(&off, false).contains("held SYNs: off"));
+    let zero = d.write("zero.toml", &EXAMPLE.replace("max_held_syns = 16384", "max_held_syns = 0"), 0o644);
+    assert!(text(&zero, false).contains("held SYNs: off"));
+
+    // The env format (tun-setup input) carries no held-SYN keys; the
+    // worst case is folded into PLAT_MEMORY_REQUIRED_BYTES.
+    let mem = |cfg: &Path| -> u64 {
+        let env = text(cfg, true);
+        let line = env.lines().find(|l| l.starts_with("PLAT_MEMORY_REQUIRED_BYTES=")).unwrap();
+        line.split('=').nth(1).unwrap().parse().unwrap()
+    };
+    assert_eq!(mem(&ok) - mem(&off), 16_384 * (8 * 32 + 16));
+    assert_eq!(mem(&icmp) - mem(&off), 16_384 * (8 * 32 + 16) + 4096 * 24);
+
+    for (i, (from, to)) in [
+        ("held_syn_secs = 6", "held_syn_secs = 5"),
+        ("held_syn_secs = 6", "held_syn_secs = 61"),
+        ("max_held_syns_per_bib = 4", "max_held_syns_per_bib = 0"),
+        ("max_held_syns_per_bib = 4", "max_held_syns_per_bib = 9"),
+        ("max_held_syns = 16384", "max_held_syns = 1048577"),
+        ("max_held_syns = 16384", "max_held_syns = -1"),
+        ("held_syn_secs = 6", "held_syn_secs = \"6\""),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let bad = d.write(&format!("bad{i}.toml"), &EXAMPLE.replace(from, to), 0o644);
+        assert_eq!(code(&check(&bad, false)), 2, "{to}");
+        assert_eq!(code(&check(&bad, true)), 2, "{to} (env)");
+    }
+    let dep = d.write(
+        "dep.toml",
+        &EXAMPLE
+            .replace("tcp_simultaneous_open = true", "tcp_simultaneous_open = false")
+            .replace("held_syn_unreachable = false", "held_syn_unreachable = true"),
+        0o644,
+    );
+    let o = check(&dep, false);
+    assert_eq!(code(&o), 2);
+    assert!(String::from_utf8_lossy(&o.stderr).contains("requires nat64.tcp_simultaneous_open"));
+}

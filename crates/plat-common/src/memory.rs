@@ -53,6 +53,7 @@ pub fn worker_count(cfg: &Config) -> usize {
 /// `max_sessions × 800 + queue_capacity × 64
 ///  + workers × fragment memory per worker
 ///  + (workers + 1) × repl_ring_entries × 64 (HA only)
+///  + held-SYN worst case (`Nat64Config::held_syn_memory`)
 ///  + shard headers + 256 MiB`,
 ///
 /// where the shard headers are 128 B × (4 × `table_shards` for `bib6`,
@@ -72,6 +73,7 @@ pub fn required_bytes(cfg: &Config, workers: usize) -> u64 {
         .saturating_add((cfg.audit.queue_capacity as u64).saturating_mul(AUDIT_SLOT_BYTES))
         .saturating_add(w.saturating_mul(cfg.translation.fragments.memory_per_worker()))
         .saturating_add(ring)
+        .saturating_add(cfg.nat64.held_syn_memory())
         .saturating_add(shard_header_bytes(cfg.nat64.table_shards))
         .saturating_add(HEADROOM_BYTES)
 }
@@ -250,7 +252,10 @@ mod tests {
         let hdr = shard_header_bytes(c.nat64.table_shards);
         assert_eq!(shard_header_bytes(1024), (4 * 1024 + 16 * 1024) * 128);
         assert_eq!(shard_header_bytes(65536), (4 * 65536 + 65536) * 128);
-        let base = 4_000_000 * 800 + 1_048_576 * 64 + hdr + (256 << 20);
+        // Held SYNs (defaults, ICMP off): 16384 x (8 x 32 + 16).
+        let held = 16_384 * (8 * 32 + 16);
+        assert_eq!(c.nat64.held_syn_memory(), held);
+        let base = 4_000_000 * 800 + 1_048_576 * 64 + held + hdr + (256 << 20);
         assert_eq!(required_bytes(&c, 4), base + 4 * frag);
         assert_eq!(required_bytes(&c, 1), base + frag);
         c.nat64.max_sessions = u64::MAX;

@@ -14,11 +14,11 @@ plat-xlat.workspace = true
 plat-audit.workspace = true
 plat-cluster.workspace = true
 ahash.workspace = true
+crossbeam-channel.workspace = true
 crossbeam-utils.workspace = true
 parking_lot.workspace = true
 
 [dev-dependencies]
-crossbeam-channel.workspace = true
 criterion.workspace = true
 proptest.workspace = true
 

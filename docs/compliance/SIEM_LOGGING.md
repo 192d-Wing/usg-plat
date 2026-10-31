@@ -290,6 +290,16 @@ TTL ≤ 1 packets that the inbound filter refuses are counted `no_binding` or
 `filtered`, not `hop_limit` (Time Exceeded is filter-gated); a too-big DF
 IPv4 packet the filter refuses is counted the same way, not `too_big`.
 
+Held-SYN drop reason (`fix/poam-008-simultaneous-open`, schema stays 7: a
+new value of the existing `plat.counter.name` field, no field change):
+`held_syn_limit` (an inbound SYN eligible for simultaneous open refused
+because the BIB's slots or the node-wide `max_held_syns` are full). The
+other held-SYN counters (`tcp_syn_held`, `tcp_syn_held_dup`,
+`tcp_syn_held_matched`, `plat_held_syns`, `plat_tcp_syn_held_expired_total`,
+`plat_held_syn_icmp_lost_total`) are not drop reasons and are only in
+`/metrics`. A sustained `held_syn_limit` indicates a SYN flood against
+bound ports filling the held-SYN cap (SC-5); alert on it.
+
 ```json
 {"@timestamp":"2026-10-29T14:17:00.000000Z","plat.schema":7,"event.sequence":41,"event.kind":"event","event.category":"network","event.action":"dataplane_counter","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"plat.counter.name":"fragment_overlap","plat.counter.value":3}
 ```
@@ -817,7 +827,8 @@ for `nat_port_block_release` (same address and range), `service_stop`,
   `port_exhausted`, `subscriber_limit`, `session_limit`,
   `audit_unavailable`, `fragment`, `too_big`, `hop_limit`,
   `icmp_untranslatable`, `wrong_node`, `source_route`,
-  `subscriber_table_full`, `aggregate_subscriber_limit` (new subscriber's
+  `subscriber_table_full`, `held_syn_limit` (held-SYN cap full),
+  `aggregate_subscriber_limit` (new subscriber's
   aggregate prefix full), `cluster_fenced` (slice fenced or adopting on
   this node), `missteered` (HA `steering.mode = "drop"`: new subscriber
   homed on another member); fragments: `fragment_timeout` (incomplete
@@ -850,6 +861,12 @@ for `nat_port_block_release` (same address and range), `service_stop`,
 - Counter `plat_pool_releases_deferred_total`: port-block releases the
   sweeper deferred because the `nat_port_block_release` record could not
   yet be queued (the block stays out of the pool until it is).
+- Held SYNs (RFC 6146 §3.5.2.2): `plat_tcp_syn_held_total`,
+  `plat_tcp_syn_held_dup_total` (retransmit consumed),
+  `plat_tcp_syn_held_matched_total` (promoted by the subscriber's SYN),
+  gauge `plat_held_syns`, `plat_tcp_syn_held_expired_total` (slots that
+  reached their lifetime), `plat_held_syn_icmp_lost_total` (expiry ICMPs
+  dropped on a full ring). Prometheus only, not SIEM records.
 - Counter `plat_sweep_resumed_total`: sweeper passes that reached their
   budget (half of `dataplane.sweep_interval_ms`) before the end of their
   cycle; the next pass resumes there (POAM-012). A steadily rising value

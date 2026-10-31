@@ -111,7 +111,7 @@ chain, 1 on a verification failure, an unverified tail (unless
 
 | Family | Where |
 |--------|-------|
-| SC-5 DoS protection | limits in `Nat64Config` (incl. `max_subscribers` and the per-aggregate `max_subscribers_per_aggregate`), `State::admit_session`, `State::bib_for`, per-worker ICMP error token bucket (a quarter reserved for PTB / Frag Needed; rate 0 or ≥ 4), keyed hashing in `shard.rs`; preallocated per-worker fragment table, hold buffer and reassembly slots bounded by `[translation.fragments]` with per-source caps (`frag.rs`) |
+| SC-5 DoS protection | limits in `Nat64Config` (incl. `max_subscribers` and the per-aggregate `max_subscribers_per_aggregate`), `State::admit_session`, `State::bib_for`, per-worker ICMP error token bucket (a quarter reserved for PTB / Frag Needed; rate 0 or ≥ 4), keyed hashing in `shard.rs`; preallocated per-worker fragment table, hold buffer and reassembly slots bounded by `[translation.fragments]` with per-source caps (`frag.rs`); held simultaneous-open SYNs (`held.rs`): per-BIB slots under the `bib4` shard lock, one per remote address, node cap `nat64.max_held_syns`, bounded expiry ring, arrays freed outside the guard when empty |
 | SC-7 boundary protection | client prefix allow-list, RFC 6052 §3.1 checks, non-global IPv4 denied by default (`allow_non_global_destinations`), pool-sourced wire IPv4 refused unless `cross_node_hairpin` with its start-gated nft guard (`services/platd/src/hairpin_guard.rs`), ICMP error validation, ADF filtering, host nftables forward policy (`deploy/systemd/plat-tun-setup.sh`) |
 | SC-10 network disconnect | idle timers (RFC 6146 minimums enforced in config) + `State::sweep` |
 | AU-2/3/8/12 | `plat-audit` events, UTC µs timestamps, sequence numbers, node identity |

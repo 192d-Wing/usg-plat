@@ -16,6 +16,7 @@ use plat_common::config::{AuditMode, Config, Filtering, OverflowPolicy, Steering
 use plat_common::{Clock, Counter, Counters, DropReason, Ipv6Cidr};
 use plat_packet::proto;
 
+use crate::held::{HeldBox, HeldCtx, HeldSlot, HeldSlots, HeldSynExpiry, SLOTS, SynMeta, expiry_of};
 use crate::pool::{AllocFail, BlockRef, Pool, SliceState};
 use crate::repl::{AdoptInput, Directory, ReplProducer, ReplRecord};
 use crate::shard::{Map, Sharded, lower_due};
@@ -76,7 +77,16 @@ pub struct Bib {
     /// filtering is one hash lookup instead of a scan of `sessions`.
     /// Present only under address-dependent filtering (PERF-102).
     remotes: Option<Box<Map<u32, u32>>>,
+    /// Held inbound SYNs (RFC 6146 §3.5.2.2 V4 INIT, see [`crate::held`]).
+    /// Not sessions: never forwarded, never matched by filtering, never
+    /// keep the BIB alive.
+    held: HeldSlots,
 }
+
+// PERF-002: a BIB exists per binding (up to `nat64.max_bibs`); any growth
+// must be deliberate and reflected in `plat_common::memory`. The held-SYN
+// field is one thin pointer.
+const _: () = assert!(size_of::<Bib>() == 176);
 
 impl Bib {
     fn insert_session(&mut self, remote: (u32, u16), s: Session) {
@@ -284,6 +294,8 @@ struct SweepCursor {
     subs: Vec<u128>,
     gone: Vec<u128>,
     dead: Vec<(Key4, Key6)>,
+    /// Held-SYN arrays emptied under a `bib4` guard, freed after it.
+    spill: Vec<HeldBox>,
     /// Per-shard table position the next walk starts at (`bib4` shards,
     /// then `subs` shards; sized on first use): where an interrupted walk
     /// stopped, so churn cannot starve a shard's tail (PERF-2).
@@ -429,6 +441,9 @@ pub struct State {
     sweep_resumed: AtomicU64,
     /// Sliced-pool (HA) settings; `None` in legacy mode.
     cluster: Option<Box<ClusterCtx>>,
+    /// Held-SYN settings, gauge and expiry ring; `None` while holding is
+    /// off (POAM-008 closed).
+    held: Option<Box<HeldCtx>>,
 }
 
 /// One bounded sweeper lock hold (POAM-012): full after `chunk` work
@@ -639,6 +654,7 @@ impl State {
             sweep_chunk: AtomicUsize::new(SWEEP_CHUNK),
             sweep_resumed: AtomicU64::new(0),
             cluster,
+            held: HeldCtx::from_config(n),
         }
     }
 
@@ -987,6 +1003,7 @@ impl State {
                 sessions: Map::with_hasher(self.hasher.clone()),
                 remotes: (self.filtering == Filtering::AddressDependent)
                     .then(|| Box::new(Map::with_hasher(self.hasher.clone()))),
+                held: None,
             },
         );
         // A new BIB has no session yet: the sweeper must see it (POAM-012).
@@ -1113,6 +1130,9 @@ impl State {
     /// BIB vanished concurrently; the caller retries once.
     pub fn outbound(&self, k4: Key4, remote: (u32, u16), flags: u8, counters: &Counters) -> Result<(), DropReason> {
         let now = self.clock.now_ms();
+        // Declared before the guard so an emptied held-SYN array is freed
+        // after `bib4` is released (PERF-006).
+        let mut spill: HeldSlots = None;
         let (mut g, due) = self.bib4.lock_due(&k4);
         let bib = g.get_mut(&k4).ok_or(DropReason::NoBinding)?;
         match bib.sessions.get_mut(&remote) {
@@ -1125,6 +1145,13 @@ impl State {
         }
         let (tcp, life) = if k4.proto == proto::TCP {
             match tcp::initial(Side::V6, flags) {
+                // COMPLIANCE MAPPING:
+                // - RFC 6146 §3.5.2.2 - V4 INIT + V6 SYN: ESTABLISHED, lifetime
+                //   at least TCP_EST; the stored V4 SYN is discarded
+                Some(_) if bib.held.is_some() && self.take_held(bib, remote, now, counters, &mut spill) => {
+                    let (est, _) = tcp::step(TcpState::V4Init, Side::V6, flags);
+                    (Some(est), self.timeout(k4.proto, Some(est)))
+                }
                 Some(t) => (Some(t), self.timeout(k4.proto, Some(t))),
                 // A picked-up session starts on the transitory timer.
                 None => (Some(Self::pickup(bib, flags, now)?), self.to.tcp_trans),
@@ -1167,13 +1194,29 @@ impl State {
     /// Inbound (v4→v6) lookup with filtering (RFC 6146 §3.5.1.2, RFC 4787 §5).
     /// Returns the IPv6 transport address.
     pub fn inbound(&self, k4: Key4, remote: (u32, u16), flags: u8, counters: &Counters) -> Result<Key6, DropReason> {
+        self.inbound_or_hold(k4, remote, flags, None, counters)?.ok_or(DropReason::Filtered)
+    }
+
+    /// [`State::inbound`] that may hold a refused SYN: with `syn` (an
+    /// unfragmented TCP SYN without ACK/RST) a packet the filter refuses
+    /// on a bound port is held for simultaneous open and `Ok(None)` is
+    /// returned (consumed, not forwarded). One `bib4` shard lock either way.
+    #[inline]
+    pub fn inbound_or_hold(
+        &self,
+        k4: Key4,
+        remote: (u32, u16),
+        flags: u8,
+        syn: Option<SynMeta>,
+        counters: &Counters,
+    ) -> Result<Option<Key6>, DropReason> {
         let now = self.clock.now_ms();
         let (mut g, due) = self.bib4.lock_due(&k4);
         let bib = g.get_mut(&k4).ok_or(DropReason::NoBinding)?;
         match bib.sessions.get_mut(&remote) {
             Some(s) if s.expires_ms > now => {
                 self.refresh(k4.proto, s, Side::V4, flags, now, due);
-                return Ok(bib.k6);
+                return Ok(Some(bib.k6));
             }
             // RFC-102: an expired, not yet swept session neither passes the
             // filter nor is revived.
@@ -1189,9 +1232,13 @@ impl State {
             Filtering::AddressPortDependent => false,
         };
         if !allowed {
-            // POAM: POAM-008 an unsolicited inbound TCP SYN is dropped, not
-            // held 6 s for simultaneous open (RFC 6146 §3.5.2.2).
-            return Err(DropReason::Filtered);
+            // RFC 6146 §3.5.2.2: a refused SYN on a bound port is stored
+            // for simultaneous open (POAM-008 closed); anything else, and a
+            // SYN over the caps, stays a silent drop.
+            return match syn {
+                Some(m) => self.hold_syn(k4, bib, remote, m, due, counters).map(|()| None),
+                None => Err(DropReason::Filtered),
+            };
         }
         let tcp = if k4.proto == proto::TCP {
             Some(tcp::initial(Side::V4, flags).ok_or(DropReason::TcpNoState)?)
@@ -1203,7 +1250,198 @@ impl State {
         bib.insert_session(remote, Session { expires_ms: expires, tcp });
         lower_due(due, expires);
         counters.inc(Counter::SessionCreated);
-        Ok(bib.k6)
+        Ok(Some(bib.k6))
+    }
+
+    /// Holds a refused inbound SYN in `bib` (cold: only unsolicited SYNs
+    /// to bound ports under ADF/APDF get here). A retransmission for a
+    /// remote already held is consumed without extending its deadline.
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - RFC 6146 §3.5.2.2 - V4 SYN stored for TCP_INCOMING_SYN; no BIB,
+    ///   port, session or audit record is created
+    /// - NIST 800-53: SC-5 - per-BIB slots and the node-wide cap bound the
+    ///   state; over a cap the SYN is dropped (`held_syn_limit`), as before
+    /// - NIST 800-53: SC-7(5) - the SYN is not forwarded and does not open
+    ///   the filter for its source
+    #[cold]
+    #[inline(never)]
+    fn hold_syn(
+        &self,
+        k4: Key4,
+        bib: &mut Bib,
+        remote: (u32, u16),
+        m: SynMeta,
+        due: &AtomicU64,
+        counters: &Counters,
+    ) -> Result<(), DropReason> {
+        let Some(h) = self.held.as_deref() else { return Err(DropReason::Filtered) };
+        let now = self.clock.now_ms();
+        let slot = HeldSlot {
+            remote: remote.0,
+            rport: remote.1,
+            ttl: m.ttl,
+            tos: m.tos,
+            seq: m.seq,
+            ident: m.ident,
+            len: m.len,
+            df: m.df,
+            expires_ms: now + h.life_ms,
+        };
+        // COMPLIANCE MAPPING:
+        // - NIST 800-53: SC-5 - at most one slot per remote IPv4 address per
+        //   BIB (SEC-001), so one remote cannot fill a BIB from many ports
+        let Bib { held, sessions, .. } = bib;
+        if let Some(slots) = held.as_deref_mut() {
+            let used = &mut slots[..h.per_bib];
+            if let Some(s) = used.iter_mut().find(|s| s.used() && s.remote == remote.0) {
+                if s.expires_ms > now {
+                    // A retransmission is consumed; another port is refused.
+                    if s.rport == remote.1 {
+                        counters.inc(Counter::TcpSynHeldDup);
+                        return Ok(());
+                    }
+                    return Err(DropReason::HeldSynLimit);
+                }
+                // NIST-005: an expired, unswept slot of this remote is
+                // reused in place (already counted against the cap). The
+                // old SYN ended unmatched: RFC-005, its expiry ICMP is
+                // queued now, as the sweeper would have.
+                if h.icmp_enabled() && !sessions.contains_key(&(s.remote, s.rport)) {
+                    h.push_expiry(expiry_of(k4, s));
+                }
+                *s = slot;
+                h.expired.fetch_add(1, Ordering::Relaxed);
+                lower_due(due, slot.expires_ms);
+                counters.inc(Counter::TcpSynHeld);
+                return Ok(());
+            }
+            if !used.iter().any(|s| !s.used()) {
+                return Err(DropReason::HeldSynLimit);
+            }
+        }
+        if !h.acquire() {
+            return Err(DropReason::HeldSynLimit);
+        }
+        // Allocated on the BIB's first live hold (cold, only after the cap
+        // admitted the slot) and freed outside the guard when its last slot
+        // clears, so arrays never outnumber held slots.
+        let slots = held.get_or_insert_with(|| {
+            h.arrays.fetch_add(1, Ordering::Relaxed);
+            Box::new([HeldSlot::default(); SLOTS])
+        });
+        if let Some(free) = slots[..h.per_bib].iter_mut().find(|s| !s.used()) {
+            *free = slot;
+        }
+        lower_due(due, slot.expires_ms);
+        counters.inc(Counter::TcpSynHeld);
+        Ok(())
+    }
+
+    /// Clears the live held SYN from `remote`, if any (the subscriber's own
+    /// SYN arrived in time). An expired, unswept slot never matches.
+    #[cold]
+    #[inline(never)]
+    fn take_held(
+        &self,
+        bib: &mut Bib,
+        remote: (u32, u16),
+        now: u64,
+        counters: &Counters,
+        spill: &mut HeldSlots,
+    ) -> bool {
+        let Some(h) = self.held.as_deref() else { return false };
+        let Some(slots) = bib.held.as_deref_mut() else { return false };
+        let Some(s) = slots.iter_mut().find(|s| s.expires_ms > now && s.remote == remote.0 && s.rport == remote.1)
+        else {
+            return false;
+        };
+        *s = HeldSlot::default();
+        if slots.iter().all(|s| !s.used()) {
+            *spill = h.take_array(&mut bib.held);
+        }
+        h.release(1);
+        counters.inc(Counter::TcpSynHeldMatched);
+        true
+    }
+
+    /// Clears `bib`'s held slots that expired by `now` (and, with `all`,
+    /// the live ones too, silently). Only an expired slot queues an expiry
+    /// ICMP (when enabled, `icmp`, and the remote has no session) and
+    /// counts as expired (RFC-001). Returns the earliest remaining
+    /// deadline. An emptied slot array is moved into `spill` for the
+    /// caller to drop after the shard guard (PERF-006).
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - RFC 6146 §3.5.2.2 - V4 INIT lifetime expiry: the STE is deleted and
+    ///   (with `nat64.held_syn_unreachable`) ICMP Port Unreachable is sent
+    ///   for the stored SYN
+    /// - RFC 5382 REQ-4 - no ICMP for a SYN held less than 6 s
+    /// - NIST 800-53: SC-10 - held state ends with its lifetime
+    fn expire_held(&self, k4: Key4, bib: &mut Bib, now: u64, all: bool, icmp: bool, spill: &mut HeldSlots) -> u64 {
+        let Some(h) = self.held.as_deref() else { return u64::MAX };
+        let Bib { held, sessions, .. } = bib;
+        let Some(slots) = held.as_deref_mut() else { return u64::MAX };
+        let mut next = u64::MAX;
+        let mut gone = 0;
+        let mut expired = 0;
+        for s in slots.iter_mut().filter(|s| s.used()) {
+            if s.expires_ms > now {
+                if all {
+                    *s = HeldSlot::default();
+                    gone += 1;
+                } else {
+                    next = next.min(s.expires_ms);
+                }
+                continue;
+            }
+            if icmp && h.icmp_enabled() && !sessions.contains_key(&(s.remote, s.rport)) {
+                h.push_expiry(expiry_of(k4, s));
+            }
+            *s = HeldSlot::default();
+            gone += 1;
+            expired += 1;
+        }
+        if next == u64::MAX {
+            *spill = h.take_array(held);
+        }
+        h.release(gone);
+        if expired > 0 {
+            h.expired.fetch_add(expired, Ordering::Relaxed);
+        }
+        next
+    }
+
+    /// Live held SYNs on this node (gauge `plat_held_syns`).
+    pub fn held_syn_count(&self) -> u64 {
+        self.held.as_deref().map_or(0, |h| h.count.load(Ordering::Relaxed))
+    }
+
+    /// Allocated held-SYN slot arrays (never above `nat64.max_held_syns`).
+    pub fn held_syn_arrays(&self) -> u64 {
+        self.held.as_deref().map_or(0, |h| h.arrays.load(Ordering::Relaxed))
+    }
+
+    /// Held SYNs cleared without a match (cumulative).
+    pub fn held_syn_expired_total(&self) -> u64 {
+        self.held.as_deref().map_or(0, |h| h.expired.load(Ordering::Relaxed))
+    }
+
+    /// Expiry ICMPs dropped on a full ring (cumulative).
+    pub fn held_syn_icmp_lost_total(&self) -> u64 {
+        self.held.as_deref().map_or(0, |h| h.icmp_lost.load(Ordering::Relaxed))
+    }
+
+    /// Takes up to `out.len()` expired held SYNs to answer with ICMP Port
+    /// Unreachable (only with `nat64.held_syn_unreachable`). Never blocks.
+    pub fn drain_held_expiry(&self, out: &mut [HeldSynExpiry]) -> usize {
+        self.held.as_deref().map_or(0, |h| h.drain(out))
+    }
+
+    /// The expiry ICMP is configured (workers drain the ring).
+    #[inline]
+    pub fn held_icmp_enabled(&self) -> bool {
+        self.held.as_deref().is_some_and(HeldCtx::icmp_enabled)
     }
 
     /// Read-only form of the [`State::inbound`] filter decision: would a
@@ -1388,7 +1626,7 @@ impl State {
         }
         st.shards_visited += 1;
         let n4 = self.bib4.shard_count();
-        let SweepCursor { keys4, dead, start: starts, .. } = cur;
+        let SweepCursor { keys4, dead, start: starts, spill, .. } = cur;
         starts.resize(n4 + self.subs.shard_count(), 0);
         keys4.clear();
         let rest = {
@@ -1406,12 +1644,14 @@ impl State {
                 }
                 n += 1;
                 h.add(SWEEP_ENTRY_COST + bib.sessions.len());
-                next = next.min(self.sweep_bib(*k4, bib, now, st, dead));
+                next = next.min(self.sweep_bib(*k4, bib, now, st, dead, spill));
             }
             lower_due(due, next);
             let removals = self.bib4.removals_index(i).unwrap_or(0);
             let rest = (more || start > 0).then(|| Resume::after(&g, removals, start, n));
             st.note_hold(h.t);
+            drop(g);
+            spill.clear();
             rest
         };
         if let Some(from) = rest {
@@ -1430,10 +1670,12 @@ impl State {
                     pos += 1;
                     let Some(bib) = g.get_mut(k4) else { continue };
                     h.add(SWEEP_ENTRY_COST + bib.sessions.len());
-                    next = next.min(self.sweep_bib(*k4, bib, now, st, dead));
+                    next = next.min(self.sweep_bib(*k4, bib, now, st, dead, spill));
                 }
                 lower_due(due, next);
                 st.note_hold(h.t);
+                drop(g);
+                spill.clear();
             }
         }
         self.remove_dead(dead, st, repl);
@@ -1442,7 +1684,38 @@ impl State {
     /// Expires `bib`'s sessions and marks it empty or dead. Returns the
     /// next time it needs the sweeper (`u64::MAX`: never, or queued in
     /// `dead`).
-    fn sweep_bib(&self, k4: Key4, bib: &mut Bib, now: u64, st: &mut SweepStats, dead: &mut Vec<(Key4, Key6)>) -> u64 {
+    /// An emptied held-SYN array is pushed to `spill` (dropped by the
+    /// caller after the shard guard; the Vec keeps its capacity).
+    fn sweep_bib(
+        &self,
+        k4: Key4,
+        bib: &mut Bib,
+        now: u64,
+        st: &mut SweepStats,
+        dead: &mut Vec<(Key4, Key6)>,
+        spill: &mut Vec<HeldBox>,
+    ) -> u64 {
+        let held_next = if bib.held.is_some() {
+            let mut one = None;
+            let next = self.expire_held(k4, bib, now, false, true, &mut one);
+            spill.extend(one);
+            next
+        } else {
+            u64::MAX
+        };
+        self.sweep_bib_sessions(k4, bib, now, st, dead).min(held_next)
+    }
+
+    /// The session part of [`State::sweep_bib`]. Held SYNs do not keep a
+    /// BIB alive (no port-block pinning by unsolicited SYNs).
+    fn sweep_bib_sessions(
+        &self,
+        k4: Key4,
+        bib: &mut Bib,
+        now: u64,
+        st: &mut SweepStats,
+        dead: &mut Vec<(Key4, Key6)>,
+    ) -> u64 {
         let before = bib.sessions.len();
         let mut next = u64::MAX;
         let Bib { sessions, remotes, .. } = bib;
@@ -1494,7 +1767,13 @@ impl State {
                     None
                 }
             };
-            if let Some(bib) = removed {
+            if let Some(mut bib) = removed {
+                // Held SYNs end with their BIB (outside the shard locks):
+                // ICMP, if enabled, only for those past their lifetime.
+                if bib.held.is_some() {
+                    let mut spill = None;
+                    self.expire_held(k4, &mut bib, self.clock.now_ms(), true, true, &mut spill);
+                }
                 if self.audit_mode == AuditMode::Session {
                     let wall = Clock::wall_us();
                     self.audit.emit(Event::BibDelete {
@@ -1946,7 +2225,12 @@ impl State {
                 self.bib4.note_removal(&k4);
                 g4.remove(&k4)
             };
-            let Some(bib) = removed else { continue };
+            let Some(mut bib) = removed else { continue };
+            // The slice is no longer ours: held SYNs are dropped silently.
+            if bib.held.is_some() {
+                let mut spill = None;
+                self.expire_held(k4, &mut bib, self.clock.now_ms(), true, false, &mut spill);
+            }
             let n = bib.sessions.len() as u64;
             self.sessions.fetch_sub(n, Ordering::Relaxed);
             bib.sub_sessions.fetch_sub(n as u32, Ordering::Relaxed);
@@ -2264,6 +2548,7 @@ impl State {
                             sessions: Map::with_hasher(self.hasher.clone()),
                             remotes: (self.filtering == Filtering::AddressDependent)
                                 .then(|| Box::new(Map::with_hasher(self.hasher.clone()))),
+                            held: None,
                         },
                     );
                     g6.insert(k6, Mapped { k4, idx });

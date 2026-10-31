@@ -59,6 +59,16 @@ pub fn render(s: &Sources) -> String {
         let _ = writeln!(o, "plat_worker_rx_packets_total{{worker=\"{i}\"}} {}", w.get(Counter::RxPackets));
     }
     let st = s.nat.state();
+    // RFC 6146 §3.5.2.2 held SYNs (SC-5 bound visible, SI-4).
+    let _ = write!(
+        o,
+        "# TYPE plat_held_syns gauge\nplat_held_syns {}\n\
+         # TYPE plat_tcp_syn_held_expired_total counter\nplat_tcp_syn_held_expired_total {}\n\
+         # TYPE plat_held_syn_icmp_lost_total counter\nplat_held_syn_icmp_lost_total {}\n",
+        st.held_syn_count(),
+        st.held_syn_expired_total(),
+        st.held_syn_icmp_lost_total()
+    );
     let a = s.audit.stats();
     let _ = write!(
         o,

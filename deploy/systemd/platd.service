@@ -62,6 +62,7 @@ SystemCallErrorNumber=EPERM
 #   nat64.max_sessions x 800 B + audit.queue_capacity x 64 B
 #   + workers x fragment memory per worker
 #   + (workers + 1) x cluster.ha.repl_ring_entries x 64 B (HA only)
+#   + held-SYN worst case (nat64.max_held_syns x 272 B + ring; ~4.5 MB default)
 #   + 128 B x (4 + min(16, 65536 / table_shards)) x table_shards + 256 MiB
 # (measured on aarch64: ~780 B/session, 3.05 GB at 3.91 M sessions with a
 # 1 Mi-record queue). `platd check-config` prints it (PLAT_MEMORY_REQUIRED_BYTES

@@ -163,6 +163,17 @@ I/O backend (POAM-016), not lock changes (POAM-015).
     cycle;
   - `bib4` has 16 × `table_shards` shards (at most 65 536), so a shard of a
     4 M-BIB table fits about one hold.
+- **Held SYNs** (RFC 6146 §3.5.2.2 simultaneous open, POAM-008 closed): a
+  refused inbound SYN on a port with a BIB is stored in the BIB inside its
+  `bib4` shard (`Option<Box<[HeldSlot; 8]>>`, 32 B slots, allocated on the
+  first hold and freed when the last slot clears), under the lock the
+  inbound path already holds. Caps: `max_held_syns_per_bib` (one slot per
+  remote address) and the node-wide atomic `max_held_syns`. The sweeper
+  expires slots after `held_syn_secs`; with `held_syn_unreachable` it
+  pushes an expiry entry onto a bounded MPSC ring, and worker housekeeping
+  drains up to 8 per call into ICMPv4 3/3 under the per-worker token
+  bucket. A subscriber SYN to the held remote promotes the session to
+  ESTABLISHED. Held SYNs never keep a BIB alive.
 
 Lock order: `bib6 → subs (→ aggs)` (released) `→ bib4`; sweeper `bib6 → bib4`
 (released) then `subs (→ aggs)`. Nothing acquires `bib6` or `subs` while holding `bib4`.

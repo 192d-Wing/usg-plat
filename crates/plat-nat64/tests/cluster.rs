@@ -828,3 +828,76 @@ fn chunked_budgeted_sweep_of_adopted_state() {
     let evs = events(&b.fx);
     assert_eq!(evs.iter().filter(|e| matches!(e, Event::PortBlockRelease { .. })).count(), 3);
 }
+
+/// RFC 6146 §3.5.2.2 held SYN (POAM-008): a slice fenced while the SYN is
+/// held sends no Port Unreachable at expiry (SC-24). The Active case is in
+/// `simopen.rs::expiry_port_unreachable_quotes_the_stored_syn`.
+#[test]
+fn held_syn_expiry_icmp_only_from_an_active_slice() {
+    const OTHER: u32 = 0xc633_6409;
+    let mut a = node(&[("held_syn_unreachable = false", "held_syn_unreachable = true")]);
+    start_all(&a);
+    let mut keys = Vec::new();
+    for port in 0..2u16 {
+        let out = run(&mut a.fx, &tcp6(sub(1, 1), 40000 + port, SERVER, 443, SYN)).unwrap();
+        keys.push(tuple4(&out));
+    }
+    for (v4, p4) in &keys {
+        assert!(run_all(&mut a.fx, &tcp4(OTHER, 5000, *v4, *p4, SYN)).unwrap().is_empty());
+    }
+    assert_eq!(a.fx.nat.state().held_syn_count(), 2);
+    let slice = (keys[0].0 & 3) as u16;
+    assert_eq!(a.fx.nat.state().fence_slice(slice), Some(SliceState::Active));
+    a.fx.clock.advance(Duration::from_millis(6_001));
+    a.fx.nat.state().sweep();
+    let n = a.fx.nat.housekeep(&mut a.fx.ctx);
+    let fenced = a.fx.ctx.counters.drops(DropReason::ClusterFenced);
+    // Both mappings share the subscriber's (paired) address, so both
+    // expiries are for the fenced slice.
+    assert_eq!(keys[0].0, keys[1].0);
+    assert_eq!((n, fenced), (0, 2));
+    assert_eq!(a.fx.ctx.counters.get(plat_common::Counter::IcmpUnreachableSent), 0);
+}
+
+/// QA (POAM-008, SC-24): an inbound SYN for a fenced slice is never held
+/// (no attacker state on a slice this node does not own).
+#[test]
+fn qa_fenced_slice_never_holds_a_syn() {
+    const OTHER: u32 = 0xc633_6409;
+    let mut a = node(&[]);
+    start_all(&a);
+    let out = run(&mut a.fx, &tcp6(sub(1, 1), 40000, SERVER, 443, SYN)).unwrap();
+    let (v4, p4) = tuple4(&out);
+    a.fx.nat.state().fence_slice((v4 & 3) as u16);
+    assert!(run_all(&mut a.fx, &tcp4(OTHER, 5000, v4, p4, SYN)).is_err());
+    assert_eq!(a.fx.nat.state().held_syn_count(), 0);
+    assert_eq!(a.fx.ctx.counters.get(Counter::TcpSynHeld), 0);
+}
+
+/// QA (POAM-008, CP-10): after takeover, an inbound SYN to an adopted BIB
+/// is held on the new owner and the subscriber's SYN promotes it.
+#[test]
+fn qa_held_syn_on_adopted_bib_after_takeover() {
+    const OTHER: u32 = 0xc633_6409;
+    let mut a = node(&[]);
+    start_all(&a);
+    let s = sub(1, 1);
+    let made = make_flows(&mut a, &[(1, 4000, proto::TCP)]);
+    let shadow = shadow_for(&a);
+    for r in drain(&a) {
+        shadow.apply(&r, 0).unwrap();
+    }
+    for x in 0..4 {
+        shadow.snapshot_end(x).unwrap();
+    }
+    let mut b = node_with(&[], 1024, SteeringMode::Drop, 1, 4096);
+    adopt_from(&b, &shadow);
+    let (v4, p4) = made[0].1;
+    assert!(run_all(&mut b.fx, &tcp4(OTHER, 5000, v4, p4, SYN)).unwrap().is_empty());
+    assert_eq!(b.fx.nat.state().held_syn_count(), 1);
+    let o = run(&mut b.fx, &tcp6(s, 4000, OTHER, 5000, SYN)).unwrap();
+    assert_eq!(tuple4(&o), (v4, p4), "same mapping (EIM) on the new owner");
+    assert_eq!(b.fx.nat.state().held_syn_count(), 0);
+    assert_eq!(b.fx.ctx.counters.get(Counter::TcpSynHeldMatched), 1);
+    assert!(run(&mut b.fx, &tcp4(OTHER, 5000, v4, p4, SYN | ACK)).is_ok());
+}

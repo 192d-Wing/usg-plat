@@ -386,6 +386,13 @@ pub fn parse_l4(pkt: &[u8], off: usize, avail: usize, proto_num: u8) -> Result<L
     })
 }
 
+/// TCP sequence number of the segment at `pkt[off..]`, or `None` when
+/// fewer than 8 bytes are available within `avail`.
+pub fn tcp_seq(pkt: &[u8], off: usize, avail: usize) -> Option<u32> {
+    let b = pkt.get(..avail.min(pkt.len()))?.get(off.checked_add(4)?..off.checked_add(8)?)?;
+    Some(u32::from_be_bytes([*b.first()?, *b.get(1)?, *b.get(2)?, *b.get(3)?]))
+}
+
 /// Lenient transport read for quoted packets: only the first 8 bytes are
 /// guaranteed (RFC 792), so TCP flags are reported as 0 when absent.
 pub fn parse_l4_inner(pkt: &[u8], off: usize, proto_num: u8) -> Result<L4, ParseError> {
@@ -404,6 +411,22 @@ pub fn parse_l4_inner(pkt: &[u8], off: usize, proto_num: u8) -> Result<L4, Parse
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn tcp_seq_is_bounds_checked() {
+        let p = [0u8, 1, 0, 2, 0xde, 0xad, 0xbe, 0xef, 9];
+        assert_eq!(tcp_seq(&p, 0, p.len()), Some(0xdead_beef));
+        assert_eq!(tcp_seq(&p, 0, 7), None);
+        assert_eq!(tcp_seq(&p, 2, 100), None);
+        assert_eq!(tcp_seq(&p, usize::MAX - 2, 100), None);
+    }
+
+    proptest! {
+        #[test]
+        fn tcp_seq_never_panics(p in proptest::collection::vec(any::<u8>(), 0..64), off in 0usize..80, avail in 0usize..80) {
+            let _ = tcp_seq(&p, off, avail);
+        }
+    }
 
     fn v4_udp() -> Vec<u8> {
         let mut p = vec![
