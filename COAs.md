@@ -17,6 +17,13 @@ then Phase 1 (established UDP fast path with a differential test harness),
 each phase gated on fast-path/slow-path equivalence. COA 2 (FPGA) is not
 pursued.
 
+**Licensing** (2026-10-30): the eBPF crate is `MIT OR GPL-2.0-only` and
+its object declares `"Dual MIT/GPL"`, because the fast path calls
+`bpf_fib_lookup`, a GPL-only kernel helper. Every other crate stays
+`MIT OR Apache-2.0`; `deny.toml` gets an exception scoped to the eBPF
+crate. Keeping `bpf_fib_lookup` preserves routing parity with the slow
+path and fail-closed behaviour when forwarding is disabled.
+
 ## COA 1: XDP hybrid (fast path in eBPF, slow path in platd)
 
 ### Concept
