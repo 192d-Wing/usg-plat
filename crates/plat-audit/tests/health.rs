@@ -507,23 +507,36 @@ fn stalled_collector_never_stalls_the_local_file() {
         app_name: "platd".into(),
         tls: None,
     };
-    let dir = tmpdir("stalled");
-    let path = dir.join("audit.jsonl");
-    let (sink, rx) = AuditSink::bounded(1 << 14);
-    let stats = sink.stats().clone();
+    // Writes 8000 records and returns how long the file took to hold them.
     // Every checkpoint is synced (L12): use realistic batches so the
     // timing measures the collector hand-off, not 1000 fsyncs.
-    let mut c = cfg(&path, 1 << 30, 0, vec![syslog]);
-    c.batch_max = 256;
-    let h = Logger::new(c, node(), rx, stats.clone()).spawn().unwrap();
-    let t = Instant::now();
-    for i in 0..8000u16 {
-        assert!(sink.emit(ev(i)));
-    }
-    wait("file keeps up", || written(&stats) >= 8000);
-    assert!(t.elapsed() < Duration::from_millis(1900), "file waited on the collector: {:?}", t.elapsed());
-    drop(sink);
-    h.join();
+    let run = |tag: &str, syslog: Vec<SyslogConfig>| {
+        let dir = tmpdir(tag);
+        let path = dir.join("audit.jsonl");
+        let (sink, rx) = AuditSink::bounded(1 << 14);
+        let stats = sink.stats().clone();
+        let mut c = cfg(&path, 1 << 30, 0, syslog);
+        c.batch_max = 256;
+        let h = Logger::new(c, node(), rx, stats.clone()).spawn().unwrap();
+        let t = Instant::now();
+        for i in 0..8000u16 {
+            assert!(sink.emit(ev(i)));
+        }
+        wait("file keeps up", || written(&stats) >= 8000);
+        let took = t.elapsed();
+        drop(sink);
+        h.join();
+        assert!(!stats.degraded());
+        took
+    };
+    // The same load with no collector is the baseline for this host's disk.
+    // Waiting on the stalled collector would add at least one stream
+    // timeout (2 s); a slow runner only scales both runs.
+    let baseline = run("stalled-baseline", vec![]);
+    let stalled = run("stalled", vec![syslog]);
     drop(listener);
-    assert!(!stats.degraded());
+    assert!(
+        stalled < baseline + Duration::from_secs(1),
+        "file waited on the collector: {stalled:?} (baseline {baseline:?})"
+    );
 }
