@@ -9,10 +9,13 @@
 //!   a `.text` `memset` with a loop: a bpf-to-bpf call, an extra stack
 //!   frame and a back-edge (PERF-009). The generic lowering expands them
 //!   to stores.
-//! - `--disable-memory-builtins`: do not export `memcpy` / `memset` /
-//!   `memmove` / `memcmp` / `bcmp` (each a loop in `.text`). Any call LLVM
-//!   still emits is then an unresolved symbol that fails the link, instead
-//!   of a loop in the object.
+//! - `--disable-memory-builtins`: asks bpf-linker not to export its
+//!   `memcpy` / `memset` / `memmove` / `memcmp` / `bcmp`. compiler_builtins
+//!   still puts unreferenced copies (each a loop) in `.text`; they are never
+//!   loaded. The guard is not this flag but `check-object.py`'s loop check,
+//!   which fails on any cycle in code reachable from the program, so a
+//!   call LLVM emits into one of them fails `make xdp` (PERF-006 /
+//!   NIST-007).
 
 fn main() {
     println!("cargo::rerun-if-changed=build.rs");

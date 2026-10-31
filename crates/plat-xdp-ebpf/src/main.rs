@@ -23,8 +23,8 @@
 //! COMPLIANCE MAPPING:
 //! - NIST 800-53: SC-7 (Boundary Protection), SC-24 (Fail in Known State),
 //!   SC-5 (Denial-of-Service Protection), SI-10 (Information Input
-//!   Validation) - enforcement point of the `plat-xdp-core` decision; see
-//!   `ctx.rs` and `maps.rs`
+//!   Validation) - enforcement point of the `plat-xdp-core` decision (Phase
+//!   1, not attached until WU3/WU4; POAM-016); see `ctx.rs` and `maps.rs`
 //! - NIST 800-53: CM-10 (Software Usage Restrictions) - licence section
 //!   "Dual MIT/GPL" (decision Q2, Option A)
 

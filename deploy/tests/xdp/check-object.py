@@ -36,7 +36,7 @@ LICENSE = b"Dual MIT/GPL\x00"
 # include/uapi/linux/bpf.h __BPF_FUNC_MAPPER order (identical in v6.1 and later).
 # No bpf_map_update_elem (2) or bpf_map_delete_elem (3): the program creates
 # and removes no per-packet map state; it writes only through lookup pointers
-# (SLOT.seen_ns, IDENT, STATS). NIST 800-53 SC-5.
+# (SLOT.seen_ns, IDENT, SCRATCH, STATS, FWD). NIST 800-53 SC-5.
 ALLOWED_HELPERS = {
     1: "bpf_map_lookup_elem",
     5: "bpf_ktime_get_ns",

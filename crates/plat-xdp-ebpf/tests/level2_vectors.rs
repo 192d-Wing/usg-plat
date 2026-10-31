@@ -275,6 +275,8 @@ enum Ovr {
     SlotState(u8),
     /// EGRESS[DEV] role mask (allowed stays 1).
     EgressRole(u32, u8),
+    /// CONFIG.mtu4 (RFC-001: an IPv6 packet whose translation exceeds it).
+    Mtu4(u16),
 }
 
 impl Ovr {
@@ -290,6 +292,7 @@ impl Ovr {
                 env.slice.generation = generation;
             }
             Self::SlotState(st) => env.rec.state = st,
+            Self::Mtu4(m) => env.config.mtu4 = m,
             Self::EgressRole(dev, role) => {
                 for e in env.egress.iter_mut().filter(|e| e.ifindex == dev) {
                     e.role = role;
@@ -307,6 +310,7 @@ impl Ovr {
             Self::Slice { .. } => format!("with {frame} map SLICE {} {}", le(0), hex(&env.slice.to_bytes())),
             Self::SlotState(_) => format!("with {frame} map SLOT {} {}", le(SLOT), hex(&env.rec.to_bytes())),
             Self::EgressRole(dev, role) => format!("with {frame} egress {} {role}", ifname(dev)),
+            Self::Mtu4(_) => format!("with {frame} map CONFIG {} {}", le(0), hex(&env.config.to_bytes())),
         }
     }
 }
@@ -317,6 +321,63 @@ fn ifname(i: u32) -> &'static str {
         UP => "up0",
         _ => panic!("ifindex {i}"),
     }
+}
+
+/// RFC-002: redirect vectors and the plat-xdp-core `hex` vector whose
+/// expected output (an independent from-scratch reference with full
+/// checksums) the generated frame must equal, so `PLAT_XDP_BLESS` cannot
+/// bless a wrong core.
+const INDEPENDENT: [(&str, bool, &str); 6] = [
+    ("v6_spike_5b_payload_df0", true, "spike_5b_payload"),
+    ("v6_spike_1300b_df", true, "spike_1300b_df"),
+    ("v6_spike_3b_odd_length_df0", true, "spike_3b_odd_length"),
+    ("v4_in_5b_payload", false, "in_5b_payload"),
+    ("v4_in_3b_odd_length_df0", false, "in_3b_odd_length_df0"),
+    ("v4_in_ethernet_padding_60", false, "in_ethernet_padding_60"),
+];
+
+/// The expected output of a `hex` vector in a plat-xdp-core vector file.
+fn core_expected(file: &str, name: &str) -> Vec<u8> {
+    let line = file
+        .lines()
+        .find(|l| l.split_whitespace().nth(1) == Some(name) && l.starts_with("hex "))
+        .unwrap_or_else(|| panic!("no core vector {name}"));
+    unhex(line.split_whitespace().nth(3).unwrap_or_else(|| panic!("{name}: no expected output")))
+}
+
+/// RFC 1071 header checksum of the IPv4 header at `p[14..34]`.
+fn fix_v4_csum(p: &mut [u8]) {
+    p[24] = 0;
+    p[25] = 0;
+    let mut sum: u32 = p[14..34].chunks(2).map(|w| u32::from(u16::from_be_bytes([w[0], w[1]]))).sum();
+    while sum > 0xffff {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    p[24..26].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+}
+
+/// Compares a generated redirect with the core file's independent expected
+/// output as `diff_engine.rs` does: the IPv4 Identification is substituted
+/// (random by design, ID 0 required with DF) and the header checksum
+/// recomputed. The Ethernet addresses differ by design (the core vectors use
+/// one FIB MAC pair, the namespace one per egress), so they are checked
+/// against the namespace's FIB result instead (plan §2.4).
+fn assert_independent(name: &str, got: &[u8]) {
+    let Some((_, v6, core)) = INDEPENDENT.iter().find(|(n, _, _)| *n == name) else {
+        panic!("{name}: redirect without an independent expected output");
+    };
+    let mut want = core_expected(if *v6 { CORE_V6 } else { CORE_V4 }, core);
+    let (smac, dmac) = if *v6 { (UP0_MAC, UP0_NH) } else { (ACC0_MAC, ACC0_NH) };
+    assert_eq!(got[..6], dmac, "{name}: destination MAC");
+    assert_eq!(got[6..12], smac, "{name}: source MAC");
+    if *v6 {
+        if got[20] & 0x40 != 0 {
+            assert_eq!(got[18..20], [0, 0], "{name}: DF set with a non-zero ID");
+        }
+        want[18..20].copy_from_slice(&got[18..20]);
+        fix_v4_csum(&mut want);
+    }
+    assert_eq!(hex(&got[12..]), hex(&want[12..]), "{name}: differs from the independent reference");
 }
 
 fn generate() -> String {
@@ -331,6 +392,27 @@ fn generate() -> String {
     let mut arp = vec![0xff; 6];
     arp.extend_from_slice(&[0x02, 0, 0, 0, 0x02, 0xfe, 0x08, 0x06]);
     arp.resize(42, 0);
+
+    // RFC-001: slow-path hand-offs of RFC 7915 / RFC 6146 the fast path
+    // must decline (IPv4 header checksum recomputed after each edit).
+    let v4_edit = |base: &[u8], f: &dyn Fn(&mut Vec<u8>)| {
+        let mut v = base.to_vec();
+        f(&mut v);
+        fix_v4_csum(&mut v);
+        v
+    };
+    let v4_mf = v4_edit(&in5, &|v| v[20] = 0x20);
+    let v4_offset = v4_edit(&in5, &|v| {
+        v[20] = 0x40;
+        v[21] = 0x01;
+    });
+    let v4_udp0 = v4_edit(&in5, &|v| {
+        v[40] = 0;
+        v[41] = 0;
+    });
+    let v4_df0_above_frag6 = v4_edit(&core_input(CORE_V4, "in_1300b_df"), &|v| v[20] = 0);
+    let v4_ttl2 = v4_edit(&in5, &|v| v[22] = 2);
+    let v4_ttl1 = v4_edit(&in5, &|v| v[22] = 1);
 
     let mut not_for_us = spike5.clone();
     not_for_us[..6].copy_from_slice(&[0x33, 0x33, 0, 0, 0, 1]);
@@ -394,7 +476,20 @@ fn generate() -> String {
             Ovr::EgressRole(ACC, ROLE_UPSTREAM),
         ),
     ];
+    let rfc_declines: Vec<(&str, u32, Vec<u8>, Want, Ovr)> = vec![(
+        "v6_above_mtu4",
+        ACC,
+        core_input(CORE_V6, "spike_1300b_df"),
+        Want::Pass(PassReason::TooBig),
+        Ovr::Mtu4(1280),
+    )];
     let frames: Vec<(&str, u32, Vec<u8>, Want)> = vec![
+        ("v4_fragment_mf", UP, v4_mf, Want::Pass(PassReason::Fragment)),
+        ("v4_fragment_offset", UP, v4_offset, Want::Pass(PassReason::Fragment)),
+        ("v4_udp_zero_csum", UP, v4_udp0, Want::Pass(PassReason::UdpZeroCsum)),
+        ("v4_df0_above_frag6", UP, v4_df0_above_frag6, Want::Pass(PassReason::TooBig)),
+        ("v4_ttl_2", UP, v4_ttl2, Want::Pass(PassReason::HopLimit)),
+        ("v4_ttl_1", UP, v4_ttl1, Want::Pass(PassReason::HopLimit)),
         ("v6_spike_5b_payload_df0", ACC, spike5.clone(), Want::Redirect),
         ("v6_spike_1300b_df", ACC, core_input(CORE_V6, "spike_1300b_df"), Want::Redirect),
         ("v6_spike_3b_odd_length_df0", ACC, core_input(CORE_V6, "spike_3b_odd_length"), Want::Redirect),
@@ -412,7 +507,7 @@ fn generate() -> String {
     let frames = frames
         .into_iter()
         .map(|(n, i, f, w)| (n, i, f, w, None))
-        .chain(declines.into_iter().map(|(n, i, f, w, o)| (n, i, f, w, Some(o))));
+        .chain(declines.into_iter().chain(rfc_declines).map(|(n, i, f, w, o)| (n, i, f, w, Some(o))));
 
     let mut idents = BTreeSet::new();
     let mut lines = String::new();
@@ -428,6 +523,7 @@ fn generate() -> String {
         match (want, action.pass_reason()) {
             (Want::Redirect, None) => {
                 let (eg, o) = apply(frame, &out, &action).unwrap_or_else(|| panic!("{name}: no redirect"));
+                assert_independent(name, &o);
                 writeln!(
                     lines,
                     "frame {name} {} redirect {} {SLOT} {} {}",
@@ -527,6 +623,23 @@ fn vectors_cover_both_directions_and_declines() {
     // harness can reach, and every frame with a `with` line exists.
     for r in ["disabled", "deadline", "slice_inactive", "slot_dead", "too_big", "egress_not_allowed", "not_for_us"] {
         assert!(v.lines().any(|l| l.starts_with("frame ") && l.contains(&format!(" pass {r} "))), "no {r} vector");
+    }
+    // RFC-001: the RFC 7915 / RFC 6146 slow-path hand-offs.
+    for (f, r) in [
+        ("v4_fragment_mf", "fragment"),
+        ("v4_fragment_offset", "fragment"),
+        ("v4_udp_zero_csum", "udp_zero_csum"),
+        ("v4_df0_above_frag6", "too_big"),
+        ("v6_above_mtu4", "too_big"),
+        ("v4_ttl_2", "hop_limit"),
+        ("v4_ttl_1", "hop_limit"),
+    ] {
+        assert!(v.lines().any(|l| l.starts_with(&format!("frame {f} ")) && l.contains(&format!(" pass {r} "))), "{f}");
+    }
+    // RFC-002: every redirect is checked against an independent output.
+    for l in v.lines().filter(|l| l.starts_with("frame ") && l.contains(" redirect ")) {
+        let name = l.split_whitespace().nth(1).unwrap_or_default();
+        assert!(INDEPENDENT.iter().any(|(n, _, _)| *n == name), "{name}: no independent expected output");
     }
     for w in v.lines().filter(|l| l.starts_with("with ")) {
         let f = w.split_whitespace().nth(1).unwrap_or_default();

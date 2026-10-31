@@ -122,6 +122,8 @@ jobs:
         run: make check-xdp
       - name: make xdp (bpfel build, eBPF object, licence, helper and loop checks, sha256)
         run: make xdp
+      - name: The object is reproducible from another directory and has no host paths (SEC-001)
+        run: deploy/tests/xdp/check-repro.sh target/xdp/plat-xdp-ebpf "$RUNNER_TEMP/xdp-repro"
 
   # Level-1 differential harness at the plan §11 case count (advisory, like
   # xdp-build; NIST 800-53: SA-11(1), advisory until WU8). Release build: the 1M cases take

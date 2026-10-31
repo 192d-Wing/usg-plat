@@ -10,7 +10,7 @@
 //! never inserts or deletes elements (no `bpf_map_update_elem` /
 //! `bpf_map_delete_elem`; `check-object.py` rejects them). It writes only
 //! through lookup pointers: `SLOT.seen_ns`, this CPU's `IDENT` entry,
-//! this CPU's `SCRATCH` block and this CPU's `STATS` counters.
+//! this CPU's `SCRATCH` block and this CPU's `STATS` / `FWD` counters.
 //!
 //! COMPLIANCE MAPPING:
 //! - NIST 800-53: SC-5 (Denial-of-Service Protection) - every map has a
@@ -19,15 +19,17 @@
 //!   forwarding; `CONFIG` and `IDENT_KEY` are read-only to the program
 //!   (`BPF_F_RDONLY_PROG`)
 //! - CLAUDE.md rule 3 - the kernel keys every BPF hash map with a random
-//!   seed (`htab->hashrnd`; the loader never sets `BPF_F_ZERO_SEED`)
+//!   seed (`htab->hashrnd`) unless `BPF_F_ZERO_SEED` is set. Requirement on
+//!   the loader (WU3, not written yet; POAM-016): never set
+//!   `BPF_F_ZERO_SEED` on `OUT6` / `IN4`
 
 use aya_ebpf::bindings::{BPF_F_MMAPABLE, BPF_F_RDONLY_PROG};
 use aya_ebpf::macros::map;
 use aya_ebpf::maps::{Array, DevMapHash, HashMap, PerCpuArray};
 use plat_xdp_core::HDR6;
 use plat_xdp_core::abi::{
-    ConfigRec, Control, EgressEnt, IFACE_SLOTS, IdentEnt, IfaceEnt, Key4, Key6, MAX_SLICES, STATS_LEN, SliceEnt,
-    SlotRec,
+    ConfigRec, Control, EgressEnt, FWD_DIRS, FwdCounters, IFACE_SLOTS, IdentEnt, IfaceEnt, Key4, Key6, MAX_SLICES,
+    STATS_LEN, SliceEnt, SlotRec,
 };
 use plat_xdp_core::ident::{IdentKey, TABLE};
 
@@ -83,6 +85,11 @@ pub(crate) static TX: DevMapHash = DevMapHash::with_max_entries(IFACE_SLOTS, 0);
 /// Per-CPU counters (`StatIdx`, then `PassReason::stat_idx`).
 #[map(name = "STATS")]
 pub(crate) static STATS: PerCpuArray<u64> = PerCpuArray::with_max_entries(STATS_LEN, 0);
+
+/// Per-CPU forwarded packets and bytes, one entry per `FwdDir` (PERF-001:
+/// one lookup per forwarded packet).
+#[map(name = "FWD")]
+pub(crate) static FWD: PerCpuArray<FwdCounters> = PerCpuArray::with_max_entries(FWD_DIRS, 0);
 
 /// This CPU's output header block (Ethernet + IPv6 + UDP, the larger
 /// direction). It lives in a map rather than on the stack to keep 64 B of

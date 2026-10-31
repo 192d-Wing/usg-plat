@@ -119,6 +119,17 @@ check-xdp: xdp-env
 	for f in $(XDP_PY); do python3 -I -c 'import ast, sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])' $$f || exit 1; done
 	python3 -I deploy/tests/xdp/check-object.py --self-test
 	python3 -I deploy/tests/xdp/obj-gate.py --self-test
+	@# SEC-002: RUSTC_BOOTSTRAP only on the bpfel command lines, never exported
+	@# or assigned for make, and never in a cargo config.
+	@if grep -nE '^(export[[:space:]]+)?RUSTC_BOOTSTRAP[[:space:]]*[:?+!]?=|^[[:space:]]*export[[:space:]]+RUSTC_BOOTSTRAP' Makefile; then \
+	  echo "ERROR: RUSTC_BOOTSTRAP exported or assigned in the Makefile (plan §15)" >&2; exit 1; fi
+	@if grep -nE '^	RUSTC_BOOTSTRAP=' Makefile | grep -vF '$$(BPF_STD)'; then \
+	  echo "ERROR: RUSTC_BOOTSTRAP on a recipe line without the bpfel target (plan §15)" >&2; exit 1; fi
+	@if ls .cargo/config* >/dev/null 2>&1 && grep -n RUSTC_BOOTSTRAP .cargo/config*; then \
+	  echo "ERROR: RUSTC_BOOTSTRAP in .cargo/config (plan §15)" >&2; exit 1; fi
+	@# NIST-003: ctx.rs is the only module of the eBPF crate allowed unsafe code.
+	@if grep -rn 'allow(unsafe_code)' crates/plat-xdp-ebpf | grep -v '^crates/plat-xdp-ebpf/src/ctx.rs:'; then \
+	  echo "ERROR: allow(unsafe_code) outside crates/plat-xdp-ebpf/src/ctx.rs (rule 6)" >&2; exit 1; fi
 ifneq ($(strip $(XDP_BPF_PKGS)),)
 	RUSTC_BOOTSTRAP=1 cargo clippy $(XDP_BPF_PKGS) $(BPF_STD) -- -D warnings
 else

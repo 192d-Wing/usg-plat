@@ -28,7 +28,8 @@
 //!   (`XDP_ABORTED`, counted `aborted`) instead of passing a half-rewritten
 //!   one; a `TX` miss after the rewrite is aborted the same way
 //! - NIST 800-53: SI-4 (System Monitoring) - per-CPU counters for every
-//!   pass reason, forwarded packets and bytes, and aborts
+//!   pass reason and aborts (`STATS`), forwarded packets and bytes per
+//!   direction (`FWD`)
 //! - RFC 6146 §3.5.1 - UDP session lifetime refresh (`SLOT.seen_ns`)
 
 #![allow(unsafe_code)]
@@ -42,14 +43,14 @@ use aya_ebpf::helpers::generated::{bpf_fib_lookup, bpf_ktime_get_coarse_ns, bpf_
 use aya_ebpf::macros::xdp;
 use aya_ebpf::programs::XdpContext;
 use plat_xdp_core::abi::{
-    Control, EgressEnt, FibParams, IdentEnt, IfaceEnt, Key4, Key6, PassReason, SliceEnt, SlotRec, StatIdx, XlatConfig,
-    iface_slot,
+    Control, EgressEnt, FibParams, FwdDir, IdentEnt, IfaceEnt, Key4, Key6, PassReason, SliceEnt, SlotRec, StatIdx,
+    XlatConfig, iface_slot,
 };
 use plat_xdp_core::classify::{ETHERTYPE_IPV4, ETHERTYPE_IPV6};
 use plat_xdp_core::ident::IdentKey;
 use plat_xdp_core::{ETH, Env, HDR4, HDR6, Verdict, decide_v4, decide_v6};
 
-use crate::maps::{CONFIG, CONTROL, EGRESS, IDENT, IDENT_KEY, IFACES, IN4, OUT6, SCRATCH, SLICE, SLOT, STATS, TX};
+use crate::maps::{CONFIG, CONTROL, EGRESS, FWD, IDENT, IDENT_KEY, IFACES, IN4, OUT6, SCRATCH, SLICE, SLOT, STATS, TX};
 
 // plan §2.5 rule 2: the core's `FibParams` is the kernel's 64-byte
 // `struct bpf_fib_lookup` (the host asserts the full layout in
@@ -181,14 +182,15 @@ impl Env for MapEnv {
     #[inline(always)]
     fn with_ident<F: FnOnce(&mut IdentEnt) -> u16>(&self, idx: u32, f: F) -> Option<u16> {
         let p = IDENT.get_ptr_mut(idx)?;
-        // SAFETY: this CPU's element of a per-CPU array; XDP runs with
-        // preemption and migration disabled, so nothing else touches it
-        // during `f`.
+        // SAFETY: this CPU's element of a per-CPU array. XDP runs in
+        // softirq (NAPI) context, serialised per CPU against other bottom
+        // halves, with migration disabled, and XDP programs do not nest on
+        // a CPU, so nothing else touches the element during `f`.
         Some(f(unsafe { &mut *p }))
     }
 }
 
-/// Adds `n` to this CPU's counter `idx`.
+/// Adds `n` to this CPU's `STATS` counter `idx`.
 #[inline(always)]
 fn count(idx: u32, n: u64) {
     if let Some(p) = STATS.get_ptr_mut(idx) {
@@ -247,6 +249,13 @@ fn run(ctx: &XdpContext) -> u32 {
 }
 
 /// This CPU's output header block (`SCRATCH`).
+///
+/// PERF-002: fetched for every IPv4/IPv6 frame, also ones declined later,
+/// because the core's `decide_v6` / `decide_v4` take the output block as an
+/// argument and write it during the decision. Fetching it only after the
+/// session match would need an `Env` hook in `plat-xdp-core` (a WU1 API
+/// change); a one-entry per-CPU array lookup is cheap next to the session
+/// hash lookup, and declined frames stop at the first failed check anyway.
 #[inline(always)]
 fn scratch() -> Option<&'static mut [u8; HDR6]> {
     let p = SCRATCH.get_ptr_mut(0)?;
@@ -280,7 +289,7 @@ fn v6_to_v4(ctx: &XdpContext) -> u32 {
     match decide_v6(&env, ctx.ingress_ifindex() as u32, h, frame_len, o) {
         Verdict::Pass(r) => pass(r),
         Verdict::Redirect { ifindex, new_len, trim, touch, .. } => {
-            let v = Out { ifindex, new_len, trim, touch, pkts: StatIdx::PacketsV6ToV4, bytes: StatIdx::BytesV6ToV4 };
+            let v = Out { ifindex, new_len, trim, touch, dir: FwdDir::V6ToV4 };
             // The header shrinks by 20 bytes.
             transmit(ctx, &env, o, (HDR6 - HDR4) as i32, &v)
         }
@@ -305,21 +314,32 @@ fn v4_to_v6(ctx: &XdpContext) -> u32 {
     match decide_v4(&env, ctx.ingress_ifindex() as u32, h, frame_len, o) {
         Verdict::Pass(r) => pass(r),
         Verdict::Redirect { ifindex, new_len, trim, touch, .. } => {
-            let v = Out { ifindex, new_len, trim, touch, pkts: StatIdx::PacketsV4ToV6, bytes: StatIdx::BytesV4ToV6 };
+            let v = Out { ifindex, new_len, trim, touch, dir: FwdDir::V4ToV6 };
             // The header grows by 20 bytes.
             transmit(ctx, &env, o, -((HDR6 - HDR4) as i32), &v)
         }
     }
 }
 
-/// A redirect verdict's fields and its counters.
+/// A redirect verdict's fields and its direction (the `FWD` entry).
 struct Out {
     ifindex: u32,
     new_len: u32,
     trim: u32,
     touch: Option<u64>,
-    pkts: StatIdx,
-    bytes: StatIdx,
+    dir: FwdDir,
+}
+
+/// Counts one forwarded packet of `new_len` bytes: one `FWD` lookup for
+/// both counters (PERF-001).
+#[inline(always)]
+fn count_fwd(dir: FwdDir, new_len: u32) {
+    if let Some(p) = FWD.get_ptr_mut(dir as u32) {
+        // SAFETY: this CPU's element of a per-CPU array (see `with_ident`).
+        let c = unsafe { &mut *p };
+        c.packets += 1;
+        c.bytes += u64::from(new_len);
+    }
 }
 
 /// Applies a redirect: every check has passed and `hdr` holds the output
@@ -330,6 +350,12 @@ struct Out {
 fn transmit<const N: usize>(ctx: &XdpContext, env: &MapEnv, hdr: &[u8; N], head: i32, v: &Out) -> u32 {
     // SAFETY: helper on the program's context. On failure the frame is
     // unchanged, so it can still be passed.
+    //
+    // SEC-003 / RFC-004: for a DF = 0 IPv6 → IPv4 packet the decision has
+    // already advanced this CPU's IDENT counter, so a `headroom` decline
+    // here consumes one Identification value the packet never uses. That
+    // only skips a value of a randomized counter (RFC 7739 §5.3); it leaks
+    // nothing and needs no rollback.
     if unsafe { bpf_xdp_adjust_head(ctx.ctx, head) } != 0 {
         return pass(PassReason::Headroom);
     }
@@ -346,15 +372,15 @@ fn transmit<const N: usize>(ctx: &XdpContext, env: &MapEnv, hdr: &[u8; N], head:
         return aborted();
     }
     // SAFETY: the N bytes at `data` are in the packet (re-checked above);
-    // `hdr` is a stack buffer, so the ranges do not overlap.
+    // `hdr` is this CPU's `SCRATCH` map value, not packet memory, so the
+    // ranges do not overlap.
     unsafe { core::ptr::copy_nonoverlapping(hdr.as_ptr(), data as *mut u8, N) };
     match TX.redirect(v.ifindex, 0) {
         Ok(action) => {
             if let Some(now) = v.touch {
                 env.touch(now);
             }
-            count(v.pkts as u32, 1);
-            count(v.bytes as u32, u64::from(v.new_len));
+            count_fwd(v.dir, v.new_len);
             action
         }
         // EGRESS allowed the interface but TX has no entry (a loader

@@ -14,8 +14,14 @@ the devmap).
         - the deepest bpf-to-bpf call chain, summing the verifier's per-
           subprogram stack depths, exceeds B (default 384; 256 when the
           object combines tail calls with subprograms, plan §2.5 rule 5);
+        - the same chain with every frame rounded up to 32 B, as the kernel
+          sums it, exceeds ROUNDED_LIMIT (512 B less a 64 B margin);
         - processed instructions exceed N (default INSN_BUDGET).
       Prints one "obj-gate: stats ..." line for the logs.
+      Tail calls: the kernel caps each frame of a chain that mixes tail
+      calls and subprograms at 256 B; this gate applies 256 B to the whole
+      deepest chain instead (a stricter simplification; the object has no
+      tail calls today, and the helper is not on check-object's allow-list).
 
   testrun OBJECT VECTORS
       Level-2 smoke (WU2; the full harness is WU3): for each frame of
@@ -66,6 +72,9 @@ XDP_ABORTED, XDP_DROP, XDP_PASS, XDP_TX, XDP_REDIRECT = range(5)
 # plan §2.5 rule 5: stack ≤ 384 B (256 B with tail calls and subprograms).
 STACK_BUDGET = 384
 STACK_BUDGET_TAILCALL = 256
+# PERF-003: the kernel limits the sum of the 32-B-rounded frames along a
+# call chain to 512 B (check_max_stack_depth); keep a 64 B margin on it.
+ROUNDED_LIMIT = 512 - 64
 # Verified ("processed") instructions, limit 1 M. WU2 measured 5553 on
 # 6.1.176 and 3241 on 6.8 (336 B stack on both); the budget is about 2x the
 # larger, so a change that doubles the verifier's work fails here first.
@@ -354,6 +363,8 @@ def evaluate(log, subprogs, calls, tail_calls, max_stack, max_insns):
     problems = []
     if chain > budget:
         problems.append(f"stack: deepest call chain {chain} B > budget {budget} B")
+    if rounded > ROUNDED_LIMIT:
+        problems.append(f"stack: 32 B-rounded call chain {rounded} B > {ROUNDED_LIMIT} B (kernel limit 512 B)")
     if insns > max_insns:
         problems.append(f"verifier: {insns} processed insns > budget {max_insns}")
     return summary, problems
@@ -400,6 +411,19 @@ def self_test():
         ("deepest chain 308 > 307", evaluate(multi, sub, calls, False, 307, 8000), False),
         ("tail calls with subprograms: 256 B budget", evaluate(multi, sub, calls, True, 384, 8000), False),
         ("tail calls without subprograms keep the budget", evaluate(one, [0], [], True, 384, 8000), True),
+        # 15 chained 1-byte frames: raw 15 B passes, rounded 15 x 32 = 480 B fails.
+        (
+            "raw chain passes, rounded chain fails",
+            evaluate(
+                "stack depth " + "+".join(["1"] * 15) + "\nprocessed 10 insns",
+                list(range(0, 150, 10)),
+                [(i * 10 + 1, (i + 1) * 10) for i in range(14)],
+                False,
+                384,
+                8000,
+            ),
+            False,
+        ),
     ]
     failed = 0
     for label, (_summary, problems), want_ok in cases:
@@ -470,6 +494,11 @@ def stat_sum(prog, idx):
     return sum(struct.unpack("<Q", v)[0] for v in prog.maps["STATS"].lookup(struct.pack("<I", idx)))
 
 
+def fwd_sum(prog, key):
+    vals = [struct.unpack("<QQ", v) for v in prog.maps["FWD"].lookup(key)]
+    return (sum(v[0] for v in vals), sum(v[1] for v in vals))
+
+
 def cmd_testrun(path, vectors):
     prog = Program(path)
     try:
@@ -491,14 +520,20 @@ def cmd_testrun(path, vectors):
         if verdict == "redirect":
             _, slot, want = line[4], int(line[5]), bytes.fromhex(line[-1])
             before = prog.maps["SLOT"].lookup(struct.pack("<I", slot))[8:16]
+            # FWD[dir] = {packets, bytes} (PERF-001): dir 0 for IPv6 input.
+            fwd_key = struct.pack("<I", 0 if frame[12:14] == b"\x86\xdd" else 1)
+            fwd0 = fwd_sum(prog, fwd_key)
             rc, out = prog.test_run(frame, ifindex(dev))
             after = prog.maps["SLOT"].lookup(struct.pack("<I", slot))[8:16]
+            fwd1 = fwd_sum(prog, fwd_key)
             if rc != XDP_REDIRECT:
                 problems.append(f"action {rc}, want XDP_REDIRECT")
             elif out != want:
                 problems.append(f"output differs from plat-xdp-core\n    want {want.hex()}\n    got  {out.hex()}")
             elif after == before:
                 problems.append("SLOT.seen_ns not touched")
+            elif fwd1 != (fwd0[0] + 1, fwd0[1] + len(want)):
+                problems.append(f"FWD counters {fwd0} -> {fwd1}, want +1 packet, +{len(want)} bytes")
         elif verdict == "pass":
             reason, idx = line[4], int(line[5])
             before = stat_sum(prog, idx)

@@ -57,6 +57,12 @@ for t in vng timeout; do
     command -v "$t" >/dev/null 2>&1 || die "missing tool: $t" 2
 done
 [ -f "$kimg" ] || die "no kernel image $kimg" 2
+# The guest sees the host's $HOME tree (and /usr, /lib), not /var/tmp, /tmp
+# or other host directories: guest.sh and the object would be missing.
+case "$repo/" in
+    "$HOME"/*) ;;
+    *) die "the repository ($repo) must be under \$HOME ($HOME); the guest cannot see it elsewhere" 2 ;;
+esac
 case "$kimg" in /tmp/*) die "kernel under /tmp is hidden from the guest; use fetch-kernel.sh -o" 2 ;; *) ;; esac
 kimg=$(cd "$(dirname "$kimg")" && pwd)/$(basename "$kimg")
 kver=${kimg##*/vmlinuz-}

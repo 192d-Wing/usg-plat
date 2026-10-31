@@ -24,7 +24,8 @@ allow = ["Apache-2.0", "MIT", "BSD-3-Clause", "Unicode-3.0", "ISC"]
 # dependency, which [sources] (crates.io only) and review would show. cargo-deny
 # accepts the crate's "MIT OR GPL-2.0-only" through MIT alone, so this exception
 # records the decision rather than unblocking the check; it widens nothing for
-# any other crate or version.
+# any other crate or version. A version bump of plat-xdp-ebpf must update the
+# pin here (cargo-deny then warns "license exception was not encountered").
 exceptions = [
     { crate = "aws-lc-fips-sys", allow = ["OpenSSL"] },
     { crate = "plat-xdp-ebpf@0.1.0", allow = ["GPL-2.0-only"] },

@@ -76,12 +76,21 @@ fn pass_reasons_are_stable() {
         assert_eq!(r.stat_idx(), STAT_PASS_BASE + i as u32);
         assert!(r.stat_idx() < STATS_LEN);
     }
-    for (i, s) in StatIdx::ALL.iter().enumerate() {
-        assert_eq!(*s as usize, i);
-        assert!((*s as u32) < STAT_PASS_BASE);
+    for s in StatIdx::ALL {
+        assert!((s as u32) < STAT_PASS_BASE);
     }
+    // 0-3 are reserved (the per-direction counters moved to FWD, PERF-001).
+    assert_eq!(StatIdx::Aborted as u32, 4);
     let stat_names: Vec<_> = StatIdx::ALL.iter().map(|s| s.as_str()).collect();
-    assert_eq!(stat_names, ["packets_v6_to_v4", "packets_v4_to_v6", "bytes_v6_to_v4", "bytes_v4_to_v6", "aborted"]);
+    assert_eq!(stat_names, ["aborted"]);
+    for (i, d) in FwdDir::ALL.iter().enumerate() {
+        assert_eq!(*d as usize, i);
+    }
+    assert_eq!(FwdDir::ALL.map(FwdDir::as_str), ["v6_to_v4", "v4_to_v6"]);
+    let mut b = [0u8; 16];
+    b[..8].copy_from_slice(&3u64.to_ne_bytes());
+    b[8..].copy_from_slice(&99u64.to_ne_bytes());
+    assert_eq!(FwdCounters::from_bytes(&b), FwdCounters { packets: 3, bytes: 99 });
 }
 
 #[test]
