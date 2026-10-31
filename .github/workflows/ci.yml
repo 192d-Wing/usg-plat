@@ -123,6 +123,35 @@ jobs:
       - name: make xdp (bpfel build, eBPF object, licence and helper checks, sha256)
         run: make xdp
 
+  # Level-1 differential harness at the plan §11 case count (advisory, like
+  # xdp-build; NIST 800-53: SA-11(1), advisory until WU8). Release build: the 1M cases take
+  # minutes there and hours in debug.
+  xdp-proptest:
+    name: xdp core proptest (1M cases)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: The workspace build environment has no RUSTC_BOOTSTRAP
+        run: |
+          if [ -n "${RUSTC_BOOTSTRAP+set}" ]; then
+            echo "::error::RUSTC_BOOTSTRAP is set for the workspace build (plan §15)"
+            exit 1
+          fi
+      - name: Install pinned toolchain from rust-toolchain.toml
+        run: rustup toolchain install && rustup show
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install AWS-LC FIPS build deps (CMake, Go, clang)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake golang-go clang
+      - name: PROPTEST_CASES=1000000 cargo test -p plat-xdp-core (release)
+        env:
+          PROPTEST_CASES: "1000000"
+        run: cargo test -p plat-xdp-core --release
+
   # Kernel matrix (plan §11 level 3, decision Q1). Kernels are Debian packages
   # verified through the signed InRelease (deploy/tests/xdp/fetch-kernel.sh),
   # booted with virtme-ng: KVM on x86_64, TCG through qemu-tcg.sh on arm64.
@@ -172,6 +201,15 @@ jobs:
       - name: Record the kernel package and verification
         if: always()
         run: cat target/xdp-kernels/*/kernel.env >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+      - name: Warn when a kernel resolved without a sha256 pin (SEC-003)
+        if: always()
+        run: |
+          for f in target/xdp-kernels/*/kernel.env; do
+            [ -f "$f" ] || continue
+            if grep -qx 'XDP_KERNEL_PINNED=no' "$f"; then
+              echo "::warning title=unpinned test kernel::$(basename "$(dirname "$f")") resolved with XDP_KERNEL_PINNED=no (verified through the signed InRelease only; pin its sha256 in deploy/tests/xdp/kernels.conf)"
+            fi
+          done
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:

@@ -26,7 +26,7 @@ use plat_xdp_core::abi::{
     ROLE_BOTH, SLICE_ACTIVE, SLICE_ADOPTING, SLICE_FENCED, SLICE_INACTIVE, SLOT_DEAD, SlotRec, iface_slot,
 };
 use plat_xdp_core::decide::{Action, Verdict};
-use plat_xdp_core::{HDR4, HDR6, PassReason, classify_v4, classify_v6, decide_frame};
+use plat_xdp_core::{HDR4, HDR6, PassReason, classify_v4, classify_v6};
 use proptest::prelude::*;
 use support::*;
 
@@ -195,6 +195,120 @@ fn live(f: &Flow, p: &Pkt, outbound: bool) -> Result<(), String> {
     })
 }
 
+/// MTU profiles of the size proptest (RFC-001): `(ipv4_mtu, ipv6_mtu,
+/// lowest_ipv6_mtu)`, chosen so every ordering of the thresholds occurs
+/// (`frag6 < mtu6`, `frag6 = mtu6`, `mtu4` below, near and above both).
+const MTU_PROFILES: [(u16, u16, u16); 5] =
+    [(1500, 1500, 1280), (1280, 1300, 1281), (1400, 1281, 1281), (576, 1500, 1500), (1499, 1499, 1280)];
+/// TUN and link MTUs of the size proptest.
+const NET_MTUS: [u32; 7] = [1280, 1281, 1300, 1400, 1460, 1499, 1500];
+
+thread_local! {
+    static FXM: RefCell<HashMap<usize, Reference>> = RefCell::new(HashMap::new());
+}
+
+fn mtu_knobs(profile: usize) -> Knobs {
+    let (mtu4, mtu6, lowest6) = MTU_PROFILES[profile % MTU_PROFILES.len()];
+    Knobs { mtu4, mtu6, lowest6, ..Knobs::default() }
+}
+
+/// [`with_fx`] for the MTU profiles (prefix 0, `copy_tos` on).
+fn with_mtu_fx<R>(profile: usize, f: impl FnOnce(&mut Reference) -> R) -> R {
+    FXM.with(|m| {
+        let mut m = m.borrow_mut();
+        let r = m.entry(profile).or_insert_with(|| Reference::new(&mtu_knobs(profile)));
+        if r.uses > FIXTURE_USES {
+            *r = Reference::new(&mtu_knobs(profile));
+        }
+        f(r)
+    })
+}
+
+/// One size case: the profile, the TUN and link MTUs, the threshold the
+/// packet size is placed next to, and the offset from it.
+#[derive(Debug, Clone)]
+struct SizeCase {
+    profile: usize,
+    tun: usize,
+    link4: usize,
+    link6: usize,
+    target: usize,
+    delta: i32,
+    outbound: bool,
+    df: bool,
+    seed: u8,
+}
+
+fn size_case() -> impl Strategy<Value = SizeCase> {
+    (
+        0..MTU_PROFILES.len(),
+        (0..NET_MTUS.len(), 0..NET_MTUS.len(), 0..NET_MTUS.len()),
+        0..6usize,
+        -2..=2i32,
+        any::<bool>(),
+        any::<bool>(),
+        any::<u8>(),
+    )
+        .prop_map(|(profile, (tun, link4, link6), target, delta, outbound, df, seed)| SizeCase {
+            profile,
+            tun,
+            link4,
+            link6,
+            target,
+            delta,
+            outbound,
+            df,
+            seed,
+        })
+}
+
+/// Safety and exact liveness at the size thresholds: the candidate
+/// redirects if and only if the reference forwards one translated frame.
+fn sizes(c: &SizeCase) -> Result<(), String> {
+    let (mtu4, mtu6, lowest6) = MTU_PROFILES[c.profile];
+    let frag6 = u32::from(lowest6.min(mtu6));
+    let net =
+        Net { tun_mtu: NET_MTUS[c.tun], link_mtu4: NET_MTUS[c.link4], link_mtu6: NET_MTUS[c.link6], ..Net::default() };
+    // Thresholds as IP packet sizes on the input side (the payload is
+    // input size − 48 outbound, − 28 inbound; output sizes differ by 20).
+    let (hdr, other) = if c.outbound { (48i32, -20i32) } else { (28, 20) };
+    let thresholds = if c.outbound {
+        [net.tun_mtu as i32, i32::from(mtu4) - other, net.link_mtu4 as i32 - other, 1260 - other, 1280, 1500]
+    } else {
+        [
+            net.tun_mtu as i32,
+            i32::from(mtu6) - other,
+            frag6 as i32 - other,
+            net.link_mtu6 as i32 - other,
+            1260,
+            1500 - other,
+        ]
+    };
+    let n = (thresholds[c.target] + c.delta - hdr).clamp(0, 1600) as usize;
+    let payload: Vec<u8> = (0..n).map(|i| (i as u8).wrapping_mul(31) ^ c.seed).collect();
+    with_mtu_fx(c.profile, |r| {
+        let mut env = HostEnv::new(&r.cfg, net);
+        let f =
+            Flow { prefix: 0, copy_tos: true, host: u128::from(c.seed) << 8 | 1, sport: 0, net: 0, srv: 9, dport: 0 };
+        let f = Flow { sport: 1024 + u16::from(c.seed), dport: 4000 + u16::from(c.seed), ..f };
+        let s = establish_flow(r, &mut env, &f)?;
+        let p = Pkt { payload, hop: 64, tc: c.seed, flow_label: 0, id: 0x4242, df: c.df, edge: 0 };
+        let (frame, ingress) =
+            if c.outbound { (canonical_out(r, &s, &p), ACCESS_IF) } else { (canonical_in(r, &s, &p), UPSTREAM_IF) };
+        let (got, reference) = differential_full(r, &mut env, &frame, ingress)?;
+        match (got, &reference) {
+            (None, _) => Ok(()),
+            (Some(why), RefOut::Frame(_)) => Err(format!(
+                "liveness: passed ({}) but the slow path forwards one frame: {} bytes, {c:?}",
+                why.as_str(),
+                frame.len()
+            )),
+            (Some(PassReason::TooBig | PassReason::FibFragNeeded), RefOut::Not(_)) => Ok(()),
+            (Some(why), RefOut::Not(_)) => Err(format!("unexpected reason {}: {c:?}", why.as_str())),
+        }
+    })
+}
+
 /// A packet mutated after construction: XOR at offsets (taken modulo the
 /// frame length), then a cut from the end, then trailing bytes.
 #[derive(Debug, Clone)]
@@ -249,6 +363,15 @@ proptest! {
         prop_assert!(r.is_ok(), "{}", r.err().unwrap_or_default());
     }
 
+    /// RFC-001: safety and exact liveness with `ipv4_mtu`, `ipv6_mtu`,
+    /// `lowest_ipv6_mtu`, the TUN MTU and the link MTUs varied, and the
+    /// packet size within ±2 bytes of each threshold.
+    #[test]
+    fn sizes_at_every_mtu_threshold_match_the_engine(c in size_case()) {
+        let r = sizes(&c);
+        prop_assert!(r.is_ok(), "{}", r.err().unwrap_or_default());
+    }
+
     /// Safety under arbitrary header and length mutations of established
     /// session packets, both directions: whatever is redirected equals the
     /// reference.
@@ -286,8 +409,6 @@ proptest! {
         prop_assert!(ph.is_ok(), "plat-packet refused an accepted frame: {:?}", ph);
         let Ok(ph) = ph else { return Ok(()) };
         prop_assert_eq!(ph.traffic_class, c.traffic_class);
-        prop_assert_eq!(ph.flow_label, c.flow_label);
-        prop_assert_eq!(ph.hop_limit, c.hop_limit);
         prop_assert_eq!(ph.payload_len, usize::from(c.payload_len));
         prop_assert_eq!(ph.src, u128::from_be_bytes(c.src6));
         prop_assert_eq!(ph.dst, u128::from_be_bytes(c.dst6));
@@ -295,7 +416,8 @@ proptest! {
         prop_assert_eq!(14 + ph.total_len() + c.trailing as usize, frame.len());
         let l4 = parse_l4(l3, ph.l4_off, ph.total_len(), ph.proto);
         prop_assert_eq!(l4, Ok(L4::Udp {
-            sport: u16::from_be_bytes(c.sport), dport: u16::from_be_bytes(c.dport), csum: c.csum,
+            sport: u16::from_be_bytes(c.sport), dport: u16::from_be_bytes(c.dport),
+            csum: u16::from_be_bytes([frame[60], frame[61]]),
         }));
     }
 
@@ -314,14 +436,15 @@ proptest! {
         prop_assert!(ph.is_ok(), "plat-packet refused an accepted frame: {:?}", ph);
         let Ok(ph) = ph else { return Ok(()) };
         prop_assert_eq!((ph.hdr_len, ph.total_len), (20, usize::from(c.total_len)));
-        prop_assert_eq!((ph.tos, ph.id, ph.df, ph.ttl, ph.proto), (c.tos, c.id, c.df, c.ttl, 17));
+        prop_assert_eq!((ph.tos, ph.df, ph.proto), (c.tos, c.df, 17));
         prop_assert_eq!(ph.src, u32::from_be_bytes(c.src4));
         prop_assert_eq!(ph.dst, u32::from_be_bytes(c.dst4));
         prop_assert!(ph.frag.is_none());
         prop_assert_eq!(14 + ph.total_len + c.trailing as usize, frame.len());
         let l4 = parse_l4(l3, ph.hdr_len, ph.total_len, ph.proto);
         prop_assert_eq!(l4, Ok(L4::Udp {
-            sport: u16::from_be_bytes(c.sport), dport: u16::from_be_bytes(c.dport), csum: c.csum,
+            sport: u16::from_be_bytes(c.sport), dport: u16::from_be_bytes(c.dport),
+            csum: u16::from_be_bytes([frame[40], frame[41]]),
         }));
     }
 }
@@ -436,8 +559,8 @@ fn wrong_role_or_interface_never_redirects() {
     // An unconfigured interface, and one sharing a configured one's slot.
     for ifindex in [9, ACCESS_IF + 64, UPSTREAM_IF + 128] {
         let (fo, fi) = (f.out(), f.inb());
-        assert_eq!(decide_frame(&mut f.env, ifindex, &fo).pass_reason(), Some(PassReason::Role));
-        assert_eq!(decide_frame(&mut f.env, ifindex, &fi).pass_reason(), Some(PassReason::Role));
+        assert_eq!(decide(&f.env, ifindex, &fo).pass_reason(), Some(PassReason::Role));
+        assert_eq!(decide(&f.env, ifindex, &fi).pass_reason(), Some(PassReason::Role));
     }
     // `both` accepts either direction.
     for ifindex in [ACCESS_IF, UPSTREAM_IF] {
@@ -445,8 +568,8 @@ fn wrong_role_or_interface_never_redirects() {
             e.role = ROLE_BOTH;
         }
     }
-    assert_eq!(decide_frame(&mut f.env, UPSTREAM_IF, &o).pass_reason(), None);
-    assert_eq!(decide_frame(&mut f.env, ACCESS_IF, &i).pass_reason(), None);
+    assert_eq!(decide(&f.env, UPSTREAM_IF, &o).pass_reason(), None);
+    assert_eq!(decide(&f.env, ACCESS_IF, &i).pass_reason(), None);
 }
 
 #[test]
@@ -471,7 +594,7 @@ fn non_canonical_destination_never_redirects() {
     let suffix = eth(ACCESS_MAC, CLIENT_MAC, ETH6, &udp6(&U6::new(f.s.src6, f.s.sport, canon | 1, f.s.dport), b"x"));
     let net = f.env.net;
     assert!(matches!(f.r.wire(&suffix, ACCESS_IF, &net), RefOut::Frame(_)), "the slow path translates it");
-    assert_eq!(decide_frame(&mut f.env, ACCESS_IF, &suffix).pass_reason(), Some(PassReason::NoSession));
+    assert_eq!(decide(&f.env, ACCESS_IF, &suffix).pass_reason(), Some(PassReason::NoSession));
     // A non-zero u-octet: the engine refuses it, the fast path misses.
     let uoct = canon | (1u128 << 56);
     let frame = eth(ACCESS_MAC, CLIENT_MAC, ETH6, &udp6(&U6::new(f.s.src6, f.s.sport, uoct, f.s.dport), b"x"));
@@ -492,7 +615,7 @@ fn zero_udp_checksum_never_redirects() {
     i[41] = 0;
     let net = f.env.net;
     assert!(matches!(f.r.wire(&i, UPSTREAM_IF, &net), RefOut::Frame(_)));
-    assert_eq!(decide_frame(&mut f.env, UPSTREAM_IF, &i).pass_reason(), Some(PassReason::UdpZeroCsum));
+    assert_eq!(decide(&f.env, UPSTREAM_IF, &i).pass_reason(), Some(PassReason::UdpZeroCsum));
 }
 
 #[test]
@@ -551,8 +674,44 @@ fn routing_failures_never_redirect() {
     f.env.control.tun_ifindex = 55;
     assert_eq!(f.both(), (Some(PassReason::FibOther), Some(PassReason::FibOther)));
     let mut f = fx();
+    // SEC-005: an unset TUN MTU is an unconfigured fast path.
     f.env.control.tun_mtu = 0;
-    assert_eq!(f.both(), (Some(PassReason::TooBig), Some(PassReason::TooBig)));
+    assert_eq!(f.both(), (Some(PassReason::Disabled), Some(PassReason::Disabled)));
+}
+
+/// SEC-001: the egress allow-list is per direction. Translated IPv4 may
+/// leave only by an interface with `ROLE_UPSTREAM`, translated IPv6 only
+/// by one with `ROLE_ACCESS`; `ROLE_BOTH` allows both.
+#[test]
+fn egress_role_is_checked_per_direction() {
+    use plat_xdp_core::abi::{ROLE_ACCESS, ROLE_BOTH, ROLE_UPSTREAM, iface_slot};
+    let set = |f: &mut Fx, ifindex: u32, role: u8| {
+        some(f.env.egress.get_mut(&iface_slot(ifindex)), "egress entry").role = role;
+    };
+    // v6 -> v4 leaves by UPSTREAM_IF: an access-only (or empty) mask refuses it.
+    for (role, want) in [
+        (ROLE_ACCESS, Some(PassReason::EgressNotAllowed)),
+        (0, Some(PassReason::EgressNotAllowed)),
+        (ROLE_UPSTREAM, None),
+        (ROLE_BOTH, None),
+    ] {
+        let mut f = fx();
+        set(&mut f, UPSTREAM_IF, role);
+        assert_eq!(f.both().0, want, "v6->v4 egress role {role}");
+        assert_eq!(f.both().1, None, "v4->v6 does not use UPSTREAM_IF egress");
+    }
+    // v4 -> v6 leaves by ACCESS_IF: an upstream-only (or empty) mask refuses it.
+    for (role, want) in [
+        (ROLE_UPSTREAM, Some(PassReason::EgressNotAllowed)),
+        (0, Some(PassReason::EgressNotAllowed)),
+        (ROLE_ACCESS, None),
+        (ROLE_BOTH, None),
+    ] {
+        let mut f = fx();
+        set(&mut f, ACCESS_IF, role);
+        assert_eq!(f.both().1, want, "v4->v6 egress role {role}");
+        assert_eq!(f.both().0, None, "v6->v4 does not use ACCESS_IF egress");
+    }
 }
 
 #[test]
@@ -561,7 +720,7 @@ fn seen_is_refreshed_at_most_once_a_second() {
     let slot = f.s.slot as usize;
     let touch = |f: &mut Fx| {
         let o = f.out();
-        match decide_frame(&mut f.env, ACCESS_IF, &o) {
+        match decide(&f.env, ACCESS_IF, &o).action {
             Action::V6ToV4(Verdict::Redirect { touch, slot: s, .. }) => {
                 assert_eq!(s, f.s.slot);
                 touch
@@ -579,22 +738,20 @@ fn seen_is_refreshed_at_most_once_a_second() {
 
 #[test]
 fn ipv4_id_comes_from_the_counter_only_without_df() {
-    let mut f = fx();
+    let f = fx();
     let mut ids = Vec::new();
     for _ in 0..64 {
         let o = f.out();
-        let Action::V6ToV4(Verdict::Redirect { hdr, .. }) = decide_frame(&mut f.env, ACCESS_IF, &o) else {
-            panic!("redirect expected");
-        };
+        let d = decide(&f.env, ACCESS_IF, &o);
+        let Some(hdr) = d.hdr() else { panic!("redirect expected") };
         assert_eq!(hdr[20] & 0x40, 0, "small packet: DF = 0");
         ids.push(u16::from_be_bytes([hdr[18], hdr[19]]));
     }
     let steps: Vec<u16> = ids.windows(2).map(|w| w[1].wrapping_sub(w[0])).collect();
     assert!(steps.iter().all(|s| (1..=8).contains(s)), "{steps:?}");
     let big = out_frame(&f.r, &f.s, &[0u8; 1300], |_| {});
-    let Action::V6ToV4(Verdict::Redirect { hdr, .. }) = decide_frame(&mut f.env, ACCESS_IF, &big) else {
-        panic!("redirect expected");
-    };
+    let d = decide(&f.env, ACCESS_IF, &big);
+    let Some(hdr) = d.hdr() else { panic!("redirect expected") };
     assert_eq!((hdr[18], hdr[19], hdr[20] & 0x40), (0, 0, 0x40));
 }
 
@@ -702,7 +859,7 @@ fn run_case(outbound: bool, name: &str, f: &HashMap<String, String>) -> Result<(
         return Err(format!("{name}: declined, but the slow path translates it as one frame"));
     }
     if p.edge == 2 && want.is_none() {
-        let a = decide_frame(&mut env, ingress, &frame);
+        let a = decide(&env, ingress, &frame);
         let out = some(apply(&frame, &a), "redirect");
         let off = if outbound { 40 } else { 60 };
         if out[off..off + 2] != [0xff, 0xff] {
@@ -724,9 +881,9 @@ fn run_vectors(file: &str, outbound: bool) {
         let res = match parts.as_slice() {
             ["hex", name, input, expected] => {
                 let (input, expected) = (unhex(input), unhex(expected));
-                let mut env = spike_env();
+                let env = spike_env();
                 let ingress = if outbound { ACCESS_IF } else { UPSTREAM_IF };
-                let a = decide_frame(&mut env, ingress, &input);
+                let a = decide(&env, ingress, &input);
                 match apply(&input, &a) {
                     Some(out) => same_frame(&out, &expected).map_err(|e| format!("{name}: {e}")),
                     None => Err(format!("{name}: passed ({:?})", a.pass_reason())),
@@ -768,12 +925,15 @@ fn spike_vector_is_byte_identical_including_id() {
         hex(&expected),
         "0200000001fe020000000101080045000021000000003e111689c633640acb007105ee480035000d674068656c6c6f"
     );
-    let mut env = spike_env();
-    let i = plat_xdp_core::ident::index(env.ident_key.mix(&env.slots[0].src6, &env.slots[0].dst4, 17)) as usize;
-    // Pick the counter so the next ID is 0: ID = counter + step + offset.
+    let env = spike_env();
     let m = env.ident_key.mix(&env.slots[0].src6, &env.slots[0].dst4, 17);
-    let step = plat_xdp_core::ident::step(plat_xdp_core::ident::xorshift(env.rng));
-    env.ident_table[i] = 0u16.wrapping_sub(step).wrapping_sub((m >> 48) as u16);
-    let a = decide_frame(&mut env, ACCESS_IF, &input);
+    let i = plat_xdp_core::ident::index(m) as usize;
+    // Pick the counter so the next ID is 0: ID = counter + step + offset.
+    {
+        let mut t = env.ident.borrow_mut();
+        let step = plat_xdp_core::ident::step(plat_xdp_core::ident::xorshift(t[i].rng));
+        t[i].counter = 0u16.wrapping_sub(step).wrapping_sub((m >> 48) as u16);
+    }
+    let a = decide(&env, ACCESS_IF, &input);
     assert_eq!(some(apply(&input, &a), "redirect"), expected);
 }

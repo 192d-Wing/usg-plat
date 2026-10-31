@@ -17,10 +17,13 @@ fn config() -> ProptestConfig {
     ProptestConfig { cases: cases(), ..ProptestConfig::default() }
 }
 
+/// `fold`'s documented input bound (PERF-003): exact below `2^48`.
+const FOLD_BOUND: u64 = 1 << 48;
+
 /// Partial sums the translator can produce (a few hundred header words at
-/// most) up to far beyond, but below the `2^63` bound of `adjust`.
+/// most) up to far beyond, but below the `2^47` bound of `adjust`.
 fn partial_sum() -> impl Strategy<Value = u64> {
-    prop_oneof![0..=0x3_ffffu64, 0..=u64::from(u32::MAX), 0..=(1u64 << 62)]
+    prop_oneof![0..=0x3_ffffu64, 0..=u64::from(u32::MAX), 0..(1u64 << 47)]
 }
 
 fn arr<const N: usize>(v: &[u8]) -> [u8; N] {
@@ -31,7 +34,7 @@ proptest! {
     #![proptest_config(config())]
 
     #[test]
-    fn fold_and_finish_match(s in any::<u64>()) {
+    fn fold_and_finish_match(s in prop_oneof![0..=0x3_ffffu64, 0..FOLD_BOUND]) {
         prop_assert_eq!(csum::fold(s), ck::fold(s));
         prop_assert_eq!(csum::finish(s), ck::finish(s));
     }
@@ -61,6 +64,9 @@ proptest! {
         same(csum::sum(&arr::<16>(&b[..16])), ck::sum(&b[..16]))?;
         same(csum::sum(&arr::<20>(&b[..20])), ck::sum(&b[..20]))?;
         same(csum::sum(&arr::<40>(&b)), ck::sum(&b))?;
+        let b40 = arr::<40>(&b);
+        prop_assert_eq!(csum::sum_at(&b40, 8, 32), csum::sum(&arr::<32>(&b[8..])));
+        prop_assert_eq!(csum::sum_at(&b40, 12, 8), csum::sum(&arr::<8>(&b[12..20])));
         // The address forms the translator uses are exactly equal.
         let a16 = arr::<16>(&b[..16]);
         prop_assert_eq!(csum::sum(&a16), ck::sum_u128(u128::from_be_bytes(a16)));
@@ -87,9 +93,27 @@ proptest! {
 
 #[test]
 fn fold_edges() {
-    for s in [0, 1, 0xffff, 0x1_0000, 0x1_ffff, 0x2_0000, 0xffff_ffff, 0x1_0000_ffff, u64::MAX, u64::MAX - 1, 1 << 63] {
+    for s in [
+        0,
+        1,
+        0xffff,
+        0x1_0000,
+        0x1_fffe,
+        0x1_ffff,
+        0x2_0000,
+        0xffff_ffff,
+        0x1_0000_fffe,
+        0x1_0000_ffff,
+        0xffff_fffe_ffff,
+        FOLD_BOUND - 1,
+        FOLD_BOUND - 2,
+    ] {
         assert_eq!(csum::fold(s), ck::fold(s), "{s:#x}");
     }
+    // The largest sum a caller can produce: `adjust` with every input at
+    // its bound.
+    let s = 0xffff + 0xffff + (1u64 << 47) - 1;
+    assert_eq!(csum::fold(s), ck::fold(s));
 }
 
 #[test]

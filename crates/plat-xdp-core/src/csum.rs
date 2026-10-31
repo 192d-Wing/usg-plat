@@ -5,7 +5,7 @@
 //!
 //! Partial sums are carried unfolded in a `u64`, as in `plat-packet`.
 //! [`fold`] is unrolled to a constant number of steps (no data-dependent
-//! loop for the eBPF verifier).
+//! loop for the eBPF verifier), which is exact for sums below `2^48`.
 //!
 //! COMPLIANCE MAPPING:
 //! - RFC 1071 - Internet checksum
@@ -27,14 +27,29 @@ pub fn sum<const M: usize>(b: &[u8; M]) -> u64 {
     acc
 }
 
-/// Folds a partial sum to 16 bits (no complement). Five unrolled steps
-/// reach the fixed point of `plat_packet::checksum::fold`'s loop for every
-/// `u64`: after three steps the value is at most `0x2_0000`, and two more
-/// bring that below `0x1_0000`, where a step is the identity.
+/// [`sum`] of the `len` bytes of `b` at `off` (`len` even at every call
+/// site), read in place instead of copied out. Bytes past the end of `b`
+/// read as zero.
+#[inline(always)]
+pub fn sum_at<const N: usize>(b: &[u8; N], off: usize, len: usize) -> u64 {
+    let mut acc: u64 = 0;
+    let mut it = b.iter().skip(off).take(len);
+    while let Some(hi) = it.next() {
+        let lo = it.next().copied().unwrap_or(0);
+        acc += u64::from(u16::from_be_bytes([*hi, lo]));
+    }
+    acc
+}
+
+/// Folds a partial sum to 16 bits (no complement). Input bound:
+/// `s < 2^48`. Three unrolled steps then reach the fixed point of
+/// `plat_packet::checksum::fold`'s loop: the first leaves at most
+/// `0x1_0000_fffe`, the second at most `0x1_fffe`, the third at most
+/// `0xffff`. Every caller stays far below the bound: a sum of the 62-byte
+/// header block is under `2^21`, and [`adjust`] adds two 16-bit values to
+/// one (PERF-003).
 #[inline(always)]
 pub fn fold(s: u64) -> u16 {
-    let s = (s & 0xffff) + (s >> 16);
-    let s = (s & 0xffff) + (s >> 16);
     let s = (s & 0xffff) + (s >> 16);
     let s = (s & 0xffff) + (s >> 16);
     let s = (s & 0xffff) + (s >> 16);
@@ -48,8 +63,8 @@ pub fn finish(s: u64) -> u16 {
 }
 
 /// RFC 1624 eqn. 3, where `old` / `new` are (unfolded) sums of the fields
-/// removed and added. `new` must stay below `2^63` (true for any sum of a
-/// few header words).
+/// removed and added. `old` and `new` must stay below `2^47` (the
+/// [`fold`] bound; true for any sum of a few header words).
 #[inline(always)]
 pub fn adjust(csum: u16, old: u64, new: u64) -> u16 {
     let s = u64::from(!csum) + u64::from(!fold(old)) + new;

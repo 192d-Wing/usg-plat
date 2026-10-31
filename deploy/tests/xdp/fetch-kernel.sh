@@ -18,6 +18,9 @@
 #            under /tmp, which virtme-ng hides from the guest)
 #   -k       keyring (default $XDP_DEBIAN_KEYRING, else
 #            /usr/share/keyrings/debian-archive-keyring.gpg)
+# Prerequisite: the Debian archive keyring. On Debian/Ubuntu hosts install the
+# debian-archive-keyring package (the xdp-vm CI job does); elsewhere point -k /
+# XDP_DEBIAN_KEYRING at a copy. Without it this script fails closed.
 # Output: stdout is the path of the unpacked vmlinuz (one line); OUTDIR/NAME-ARCH
 # holds boot/, lib/modules/KVER and kernel.env (what was fetched and verified).
 # Exit: 0 ok; 1 download or verification failure; 2 usage or missing tool.

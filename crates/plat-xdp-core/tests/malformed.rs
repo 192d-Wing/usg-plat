@@ -13,7 +13,7 @@
 mod support;
 
 use plat_xdp_core::abi::PassReason;
-use plat_xdp_core::{HDR4, HDR6, decide_frame, decide_v4, decide_v6};
+use plat_xdp_core::{HDR4, HDR6, decide_v4, decide_v6};
 use proptest::prelude::*;
 use support::*;
 
@@ -83,7 +83,7 @@ proptest! {
         bytes in proptest::collection::vec(any::<u8>(), 0..300),
         ingress in prop_oneof![Just(ACCESS_IF), Just(UPSTREAM_IF), any::<u32>()],
     ) {
-        let reason = with_fx(|f| decide_frame(&mut f.env, ingress, &bytes).pass_reason());
+        let reason = with_fx(|f| decide(&f.env, ingress, &bytes).pass_reason());
         prop_assert!(reason.is_some());
     }
 
@@ -116,7 +116,8 @@ proptest! {
     ) {
         let (h6, h4): ([u8; HDR6], [u8; HDR4]) = (ok(b6.try_into()), ok(b4.try_into()));
         let (a, b) = with_fx(|f| {
-            (decide_v6(&mut f.env, ACCESS_IF, &h6, len6), decide_v4(&mut f.env, UPSTREAM_IF, &h4, len4))
+            let (mut o4, mut o6) = ([0u8; HDR4], [0u8; HDR6]);
+            (decide_v6(&f.env, ACCESS_IF, &h6, len6, &mut o4), decide_v4(&f.env, UPSTREAM_IF, &h4, len4, &mut o6))
         });
         prop_assert!(matches!(a, plat_xdp_core::Verdict::Pass(_)));
         prop_assert!(matches!(b, plat_xdp_core::Verdict::Pass(_)));
@@ -275,10 +276,13 @@ fn version_mismatch_is_malformed() {
         fix_v4_csum(&mut l3);
         assert_eq!(f.diff(&eth(UPSTREAM_MAC, SERVER_MAC, ETH4, &l3), UPSTREAM_IF), Some(PassReason::BadL3));
     }
-    // The other family's Ethertype.
+    // The other family's Ethertype. PERF-004 order (CONTROL, then the
+    // pure header checks, then IFACES): the IPv6 bytes fail the IPv4
+    // classifier (`bad_l3`) before the access interface's role is looked
+    // up; before round 1 this was `role`.
     let mut o = f.out(b"v");
     o[12..14].copy_from_slice(&ETH4);
-    assert_eq!(f.diff(&o, ACCESS_IF), Some(PassReason::Role));
+    assert_eq!(f.diff(&o, ACCESS_IF), Some(PassReason::BadL3));
 }
 
 #[test]
@@ -366,16 +370,16 @@ fn fragments_extension_headers_and_other_protocols() {
 
 #[test]
 fn short_frames() {
-    let mut f = fx();
+    let f = fx();
     let o = f.out(b"");
     for n in 0..14 {
-        assert_eq!(decide_frame(&mut f.env, ACCESS_IF, &o[..n]).pass_reason(), Some(PassReason::NotIp));
+        assert_eq!(decide(&f.env, ACCESS_IF, &o[..n]).pass_reason(), Some(PassReason::NotIp));
     }
     for n in 14..HDR6 {
-        assert_eq!(decide_frame(&mut f.env, ACCESS_IF, &o[..n]).pass_reason(), Some(PassReason::BadL3));
+        assert_eq!(decide(&f.env, ACCESS_IF, &o[..n]).pass_reason(), Some(PassReason::BadL3));
     }
     let i = f.inb(b"");
     for n in 14..HDR4 {
-        assert_eq!(decide_frame(&mut f.env, UPSTREAM_IF, &i[..n]).pass_reason(), Some(PassReason::BadL3));
+        assert_eq!(decide(&f.env, UPSTREAM_IF, &i[..n]).pass_reason(), Some(PassReason::BadL3));
     }
 }

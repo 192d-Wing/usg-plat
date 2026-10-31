@@ -30,9 +30,11 @@ endif
 check-notls:
 	cargo clippy $(NOTLS_PKGS) --no-default-features --all-targets -- -D warnings
 
-check: fmt clippy check-linux check-notls
+# xdp-env (defined below) refuses a pre-set RUSTC_BOOTSTRAP, so the required
+# CI jobs (which run these targets) assert it too (SEC-004 / NIST-007).
+check: xdp-env fmt clippy check-linux check-notls
 
-test:
+test: xdp-env
 	cargo test --workspace
 
 # Deploy scripts: POSIX syntax, shellcheck (required when CI=true) and a stubbed run
@@ -121,6 +123,10 @@ endif
 # Levels 2-4 in virtme-ng VMs (Linux only; plan §11): fetch each matrix kernel
 # through the signed Debian chain, boot it, run deploy/tests/xdp/guest.sh.
 # WU3 adds the level-2 test_run binary as the guest's second argument.
+# Prerequisites: virtme-ng, QEMU, gpgv and the Debian archive keyring
+# (`apt-get install debian-archive-keyring`, as the xdp-vm CI job does), or
+# XDP_DEBIAN_KEYRING=/path/to/debian-archive-keyring.gpg; without it
+# fetch-kernel.sh fails closed ("keyring not found").
 test-xdp: xdp-env
 	@[ "$$(uname -s)" = Linux ] || { echo "ERROR: test-xdp needs Linux with virtme-ng and QEMU (plan §11)" >&2; exit 1; }
 	@for k in $(XDP_KERNELS); do \

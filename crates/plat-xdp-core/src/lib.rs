@@ -29,8 +29,10 @@
 //! COMPLIANCE MAPPING:
 //! - NIST 800-53: SI-10 (Information Input Validation) - fixed-layout
 //!   validation; malformed input is declined, never a panic
-//! - NIST 800-53: SC-7 (Boundary Protection) - exact session match, slice
-//!   fencing, dead-man deadline, interface roles and egress allow-list
+//! - NIST 800-53: SC-7 (Boundary Protection), SC-24 - exact session match,
+//!   slice fencing, dead-man deadline, interface roles and the
+//!   per-direction egress allow-list. Decision logic only; enforcement
+//!   requires `plat-xdp-ebpf` (WU2) and the `platd` writer (WU4)
 //! - RFC 7915 §4.1, §5.1 - header translation; RFC 1624 - checksum update
 
 #![no_std]
@@ -47,7 +49,7 @@ pub mod rewrite;
 pub use abi::{PassReason, StatIdx};
 pub use classify::{V4Meta, V6Meta, classify_v4, classify_v6};
 pub use decide::{Action, Env, Verdict, decide_frame, decide_v4, decide_v6};
-pub use rewrite::{Out4Params, Out6Params, rewrite_v4_to_v6, rewrite_v6_to_v4};
+pub use rewrite::{rewrite_v4_to_v6, rewrite_v6_to_v4};
 
 /// Ethernet header length.
 pub const ETH: usize = 14;

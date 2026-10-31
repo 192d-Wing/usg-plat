@@ -11,6 +11,7 @@
 // Shared by several test crates; each uses a different subset.
 #![allow(dead_code)]
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -20,8 +21,8 @@ use plat_nat64::{Nat64, Verdict as EngineVerdict, WorkerCtx};
 use plat_packet::checksum as ck;
 use plat_xdp_core::abi::{
     AF_INET, AF_INET6, Control, EgressEnt, FIB_RET_FRAG_NEEDED, FIB_RET_FWD_DISABLED, FIB_RET_NO_NEIGH,
-    FIB_RET_SUCCESS, FibParams, IfaceEnt, Key4, Key6, ROLE_ACCESS, ROLE_UPSTREAM, SLICE_ACTIVE, SLOT_LIVE, SliceEnt,
-    SlotRec, XlatConfig, iface_slot,
+    FIB_RET_SUCCESS, FibParams, IdentEnt, IfaceEnt, Key4, Key6, ROLE_ACCESS, ROLE_UPSTREAM, SLICE_ACTIVE, SLOT_LIVE,
+    SliceEnt, SlotRec, XlatConfig, iface_slot,
 };
 use plat_xdp_core::decide::{Action, Env, Verdict};
 use plat_xdp_core::ident::{self, IdentKey};
@@ -147,8 +148,8 @@ pub struct HostEnv {
     pub slices: Vec<SliceEnt>,
     pub net: Net,
     pub ident_key: IdentKey,
-    pub ident_table: Vec<u16>,
-    pub rng: u64,
+    /// This "CPU"'s `IDENT` entries (counter and step generator state).
+    pub ident: RefCell<Vec<IdentEnt>>,
     /// Overrides the FIB result's MACs (the spike vectors' addresses).
     pub fib_macs: Option<([u8; 6], [u8; 6])>,
 }
@@ -160,7 +161,7 @@ impl HostEnv {
         let mut egress = HashMap::new();
         for (ifindex, mac, role) in [(ACCESS_IF, ACCESS_MAC, ROLE_ACCESS), (UPSTREAM_IF, UPSTREAM_MAC, ROLE_UPSTREAM)] {
             ifaces.insert(iface_slot(ifindex), IfaceEnt { ifindex, mac, role, pad: 0 });
-            egress.insert(iface_slot(ifindex), EgressEnt { ifindex, allowed: 1, pad: [0; 3] });
+            egress.insert(iface_slot(ifindex), EgressEnt { ifindex, allowed: 1, role, pad: [0; 2] });
         }
         Self {
             ifaces,
@@ -185,8 +186,15 @@ impl HostEnv {
             slices: vec![SliceEnt { state: SLICE_ACTIVE, pad: [0; 3], generation: GEN }],
             net,
             ident_key: IdentKey::new(0x0123_4567_89ab_cdef, 0x0fed_cba9_8765_4321),
-            ident_table: (0..ident::TABLE).map(|i| (i as u16).wrapping_mul(40_503)).collect(),
-            rng: 0x9e37_79b9_7f4a_7c15,
+            ident: RefCell::new(
+                (0..ident::TABLE)
+                    .map(|i| IdentEnt {
+                        rng: (0x9e37_79b9_7f4a_7c15 ^ u64::from(i).wrapping_mul(0x2545_f491_4f6c_dd1d)) | 1,
+                        counter: (i as u16).wrapping_mul(40_503),
+                        pad: [0; 6],
+                    })
+                    .collect(),
+            ),
             fib_macs: None,
         }
     }
@@ -202,12 +210,12 @@ impl HostEnv {
 }
 
 impl Env for HostEnv {
-    fn iface(&self, ifindex: u32) -> Option<IfaceEnt> {
-        self.ifaces.get(&iface_slot(ifindex)).copied()
+    fn iface(&self, ifindex: u32) -> Option<&IfaceEnt> {
+        self.ifaces.get(&iface_slot(ifindex))
     }
 
-    fn control(&self) -> Option<Control> {
-        Some(self.control)
+    fn control(&self) -> Option<&Control> {
+        Some(&self.control)
     }
 
     fn config(&self) -> Option<XlatConfig> {
@@ -226,17 +234,17 @@ impl Env for HostEnv {
         self.in4.get(key).copied()
     }
 
-    fn slot(&self, idx: u32) -> Option<SlotRec> {
-        self.slots.get(idx as usize).copied()
+    fn slot(&self, idx: u32) -> Option<&SlotRec> {
+        self.slots.get(idx as usize)
     }
 
-    fn slice(&self, idx: u16) -> Option<SliceEnt> {
-        self.slices.get(usize::from(idx)).copied()
+    fn slice(&self, idx: u16) -> Option<&SliceEnt> {
+        self.slices.get(usize::from(idx))
     }
 
     /// The kernel's order: forwarding on the ingress device, route, MTU,
     /// neighbour.
-    fn fib(&mut self, p: &mut FibParams) -> i64 {
+    fn fib(&self, p: &mut FibParams) -> i64 {
         if p.ifindex != TUN_IF {
             return -22;
         }
@@ -262,17 +270,16 @@ impl Env for HostEnv {
         FIB_RET_SUCCESS
     }
 
-    fn egress(&self, ifindex: u32) -> Option<EgressEnt> {
-        self.egress.get(&iface_slot(ifindex)).copied()
+    fn egress(&self, ifindex: u32) -> Option<&EgressEnt> {
+        self.egress.get(&iface_slot(ifindex))
     }
 
-    fn ident(&mut self, src6: &[u8; 16], dst4: &[u8; 4]) -> u16 {
-        let m = self.ident_key.mix(src6, dst4, 17);
-        self.rng = ident::xorshift(self.rng);
-        let i = ident::index(m) as usize;
-        let (c, id) = ident::advance(self.ident_table[i], ident::step(self.rng), m);
-        self.ident_table[i] = c;
-        id
+    fn ident_key(&self) -> Option<&IdentKey> {
+        Some(&self.ident_key)
+    }
+
+    fn with_ident<F: FnOnce(&mut IdentEnt) -> u16>(&self, idx: u32, f: F) -> Option<u16> {
+        self.ident.borrow_mut().get_mut(idx as usize).map(f)
     }
 }
 
@@ -607,13 +614,45 @@ pub fn base_sum4(src: u32, dst: u32, sport: u16, dport: u16, payload_len: usize)
     ck::pseudo_v4(src, dst, 17, l) + u64::from(sport) + u64::from(dport) + u64::from(l)
 }
 
+/// A decision and the output header block it wrote.
+#[derive(Debug, Clone, Copy)]
+pub struct Decided {
+    pub action: Action,
+    out: [u8; HDR6],
+}
+
+impl Decided {
+    pub fn pass_reason(&self) -> Option<PassReason> {
+        self.action.pass_reason()
+    }
+
+    /// A redirect's output header block ([`HDR4`] or [`HDR6`] bytes).
+    pub fn hdr(&self) -> Option<&[u8]> {
+        match self.action {
+            Action::V6ToV4(Verdict::Redirect { .. }) => Some(&self.out[..HDR4]),
+            Action::V4ToV6(Verdict::Redirect { .. }) => Some(&self.out[..]),
+            _ => None,
+        }
+    }
+}
+
+/// [`plat_xdp_core::decide_frame`] with an output block that starts as
+/// junk (0xA5), so a byte the rewrite fails to write shows up as a
+/// mismatch.
+pub fn decide(env: &HostEnv, ingress: u32, frame: &[u8]) -> Decided {
+    let mut out = [0xa5u8; HDR6];
+    let action = plat_xdp_core::decide_frame(env, ingress, frame, &mut out);
+    Decided { action, out }
+}
+
 /// The frame a redirect produces: the output header block, then the
 /// payload, trimmed to `new_len`. Checks that `new_len` and `trim` account
 /// for every input byte.
-pub fn apply(frame: &[u8], a: &Action) -> Option<Vec<u8>> {
-    let (hdr, in_hdr, new_len, trim): (&[u8], usize, u32, u32) = match a {
-        Action::V6ToV4(Verdict::Redirect { hdr, new_len, trim, .. }) => (hdr, HDR6, *new_len, *trim),
-        Action::V4ToV6(Verdict::Redirect { hdr, new_len, trim, .. }) => (hdr, HDR4, *new_len, *trim),
+pub fn apply(frame: &[u8], d: &Decided) -> Option<Vec<u8>> {
+    let hdr = d.hdr()?;
+    let (in_hdr, new_len, trim) = match d.action {
+        Action::V6ToV4(Verdict::Redirect { new_len, trim, .. }) => (HDR6, new_len, trim),
+        Action::V4ToV6(Verdict::Redirect { new_len, trim, .. }) => (HDR4, new_len, trim),
         _ => return None,
     };
     let body = new_len as usize - hdr.len();
@@ -658,7 +697,7 @@ pub fn differential_full(
     frame: &[u8],
     ingress: u32,
 ) -> Result<(Option<PassReason>, RefOut), String> {
-    let a = plat_xdp_core::decide_frame(env, ingress, frame);
+    let a = decide(env, ingress, frame);
     let net = env.net;
     let reference = r.wire(frame, ingress, &net);
     match apply(frame, &a) {

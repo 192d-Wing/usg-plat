@@ -101,7 +101,12 @@ tests in the rows above.
    without an active or reserve-backed slice reports, which is transient;
    other limit reasons still answer, and legacy pools answer 1/3.
 8. **IPv4 Identification uniqueness** (RFC 6864): unique per counter for at
-   least 8192 packets (65536 / maximum step 8), not tracked per flow.
+   least 8192 packets (65536 / maximum step 8), not tracked per flow. With
+   the XDP fast path (POAM-016 Phase 1, not wired yet), the fast path
+   (per-CPU `IDENT` table, `crates/plat-xdp-core/src/ident.rs`) and the slow
+   path (per-worker table) draw IDs independently, so a flow that switches
+   paths has only probabilistic uniqueness across the switch (POAM-038).
+   DF = 1 packets send ID 0 on both paths and are not affected.
 9. **Parameter Problem scope** (RFC-005): generated only for an active
    Routing header; other unsupported extension headers (Hop-by-Hop not
    first, duplicate Fragment Header) are silent drops.

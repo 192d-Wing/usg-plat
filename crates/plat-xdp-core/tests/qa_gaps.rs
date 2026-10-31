@@ -16,8 +16,8 @@ use std::collections::BTreeSet;
 use plat_xdp_core::abi::{
     SLICE_ACTIVE, SLICE_ADOPTING, SLICE_FENCED, SLICE_INACTIVE, SLOT_DEAD, SLOT_LIVE, SliceEnt, iface_slot,
 };
-use plat_xdp_core::decide::{Action, Verdict};
-use plat_xdp_core::{PassReason, decide_frame};
+
+use plat_xdp_core::PassReason;
 use proptest::prelude::*;
 use support::*;
 
@@ -91,7 +91,7 @@ fn every_pass_reason_is_reachable_and_exact() {
     o[..6].copy_from_slice(&[0xff; 6]);
     check("broadcast v6", f.diff(&o, ACCESS_IF), PassReason::NotForUs);
     let i = f.inb();
-    check("unconfigured if", decide_frame(&mut f.env, 9, &i).pass_reason(), PassReason::Role);
+    check("unconfigured if", decide(&f.env, 9, &i).pass_reason(), PassReason::Role);
     let mut o = f.out();
     o[14] = 0x40 | (o[14] & 0x0f);
     check("v6 version 4", f.diff(&o, ACCESS_IF), PassReason::BadL3);
@@ -188,12 +188,13 @@ fn every_prefix_length_canonical_only() {
         let canon = f.r.prefix.embed(f.s.dst4);
         assert_eq!(f.diff(&f.out(), ACCESS_IF), None, "{p} out");
         let i = f.inb();
-        match decide_frame(&mut f.env, UPSTREAM_IF, &i) {
-            Action::V4ToV6(Verdict::Redirect { hdr, .. }) => {
+        let d = decide(&f.env, UPSTREAM_IF, &i);
+        match d.hdr() {
+            Some(hdr) => {
                 assert_eq!(hdr[22..38], canon.to_be_bytes(), "{p}: source is the canonical embedding");
                 assert_eq!(hdr[38..54], f.s.src6.to_be_bytes(), "{p}: destination is the subscriber");
             }
-            other => panic!("{p}: {other:?}"),
+            None => panic!("{p}: {:?}", d.action),
         }
         assert_eq!(f.diff(&i, UPSTREAM_IF), None, "{p} in");
 
@@ -222,11 +223,10 @@ fn flow_label_is_ignored_outbound_and_zero_inbound() {
     });
     assert_eq!(f.diff(&o, ACCESS_IF), None);
     let i = f.in_with(b"flow", |h| h.tos = 0xff);
-    match decide_frame(&mut f.env, UPSTREAM_IF, &i) {
-        Action::V4ToV6(Verdict::Redirect { hdr, .. }) => {
-            assert_eq!(hdr[14..18], [0x6f, 0xf0, 0, 0], "version 6, TC 0xff, flow label 0");
-        }
-        other => panic!("{other:?}"),
+    let d = decide(&f.env, UPSTREAM_IF, &i);
+    match d.hdr() {
+        Some(hdr) => assert_eq!(hdr[14..18], [0x6f, 0xf0, 0, 0], "version 6, TC 0xff, flow label 0"),
+        None => panic!("{:?}", d.action),
     }
     assert_eq!(f.diff(&i, UPSTREAM_IF), None);
 }
@@ -344,8 +344,8 @@ proptest! {
                         _ => Some(PassReason::SliceInactive),
                     }
                 };
-                prop_assert_eq!(decide_frame(&mut f.env, ACCESS_IF, &o).pass_reason(), want, "out after {:?}", op);
-                prop_assert_eq!(decide_frame(&mut f.env, UPSTREAM_IF, &i).pass_reason(), want, "in after {:?}", op);
+                prop_assert_eq!(decide(&f.env, ACCESS_IF, &o).pass_reason(), want, "out after {:?}", op);
+                prop_assert_eq!(decide(&f.env, UPSTREAM_IF, &i).pass_reason(), want, "in after {:?}", op);
             }
             Ok(())
         })?;

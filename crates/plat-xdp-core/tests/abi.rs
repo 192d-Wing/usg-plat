@@ -10,7 +10,7 @@ use std::mem::size_of;
 use plat_xdp_core::abi::*;
 use plat_xdp_core::ident::{self, IdentKey};
 use proptest::prelude::*;
-use support::cases;
+use support::{cases, ok};
 
 fn config() -> ProptestConfig {
     ProptestConfig { cases: cases().min(10_000), ..ProptestConfig::default() }
@@ -27,6 +27,18 @@ fn sizes() {
     assert_eq!(size_of::<IfaceEnt>(), 12);
     assert_eq!(size_of::<EgressEnt>(), 8);
     assert_eq!(size_of::<FibParams>(), 64);
+    assert_eq!(size_of::<IdentEnt>(), 16);
+    assert_eq!(size_of::<IdentKey>(), 16);
+}
+
+/// PERF-001 host guard: the verdict carries no header block, so returning
+/// it through `Result` and `Action` copies a few words, not 42–62 bytes.
+/// (The eBPF stack itself is measured from the verifier log in WU2/WU3.)
+#[test]
+fn verdict_is_small() {
+    use plat_xdp_core::{Action, Verdict};
+    assert!(size_of::<Verdict>() <= 32, "Verdict is {} bytes", size_of::<Verdict>());
+    assert!(size_of::<Action>() <= 40, "Action is {} bytes", size_of::<Action>());
 }
 
 #[test]
@@ -76,7 +88,10 @@ fn pass_reasons_are_stable() {
 fn ident_key_debug_is_redacted() {
     let k = IdentKey::new(0x1111_2222_3333_4444, 0x5555_6666_7777_8888);
     assert_eq!(format!("{k:?}"), "IdentKey(<redacted>)");
-    assert_eq!(k.k1 & 1, 1);
+    let b = k.to_bytes();
+    assert_eq!(u64::from_ne_bytes(ok(b[8..].try_into())) & 1, 1, "k1 forced odd");
+    assert_eq!(IdentKey::from_bytes(&b), k);
+    assert_eq!(IdentKey::from_bytes(&[0; 16]), IdentKey::new(0, 0));
 }
 
 /// `plat_nat64::ident::IdentKey::mix` on `u128` (its fields are private,
@@ -141,7 +156,7 @@ proptest! {
         prop_assert_eq!(cfg.xlat().copy_tos, x & 1 == 1);
         let i = IfaceEnt { ifindex: n, mac: [a[0], a[1], a[2], a[3], a[4], a[5]], role: x, pad: 0 };
         prop_assert_eq!(IfaceEnt::from_bytes(&i.to_bytes()), i);
-        let e = EgressEnt { ifindex: n, allowed: x, pad: [0; 3] };
+        let e = EgressEnt { ifindex: n, allowed: x, role: x.rotate_left(3), pad: [0; 2] };
         prop_assert_eq!(EgressEnt::from_bytes(&e.to_bytes()), e);
     }
 
@@ -163,5 +178,11 @@ proptest! {
         let (c, id) = ident::advance(counter, step, m);
         prop_assert_eq!(c, counter.wrapping_add(step));
         prop_assert_eq!(id, c.wrapping_add((m >> 48) as u16));
+        // `next` is one generator step plus `advance`, stored back in the
+        // IDENT entry.
+        let mut e = IdentEnt { rng, counter, pad: [0; 6] };
+        prop_assert_eq!(ident::next(&mut e, m), id);
+        prop_assert_eq!((e.rng, e.counter), (r, c));
+        prop_assert_eq!(IdentEnt::from_bytes(&e.to_bytes()), e);
     }
 }

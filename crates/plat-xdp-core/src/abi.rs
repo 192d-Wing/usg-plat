@@ -12,9 +12,13 @@
 //!
 //! COMPLIANCE MAPPING:
 //! - NIST 800-53: SC-5 (Denial-of-Service Protection) - every map has a
-//!   fixed size; the constants below bound the ones not sized from config
-//! - NIST 800-53: CM-6 - the `CONFIG` record is written once by the loader
-//!   and frozen; `platd` verifies its digest
+//!   fixed size; the constants below bound the ones not sized from config.
+//!   Decision logic and layouts only; enforcement requires the eBPF program
+//!   (`plat-xdp-ebpf`, WU2) and the `platd` map writer (WU4)
+//!
+//! [`ConfigRec::digest`] is only the ABI field for the frozen `CONFIG`
+//! record's digest: freezing the map and verifying the digest are WU3/WU4,
+//! and no CM-6 claim is made until they land.
 
 use core::mem::{offset_of, size_of};
 
@@ -165,7 +169,8 @@ pub struct SliceEnt {
     pub generation: u32,
 }
 
-/// `CONFIG` record: written by the loader, then frozen.
+/// `CONFIG` record. The design has the loader write it once and freeze it
+/// (WU3) and `platd` check [`ConfigRec::digest`] (WU4); neither exists yet.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ConfigRec {
@@ -179,7 +184,8 @@ pub struct ConfigRec {
     pub copy_tos: u8,
     /// 1 with a sliced cluster pool.
     pub sliced: u8,
-    /// SHA-256 of the translation parameters, checked by `platd`.
+    /// Field for the SHA-256 of the translation parameters (written and
+    /// verified by WU3/WU4).
     pub digest: [u8; 32],
 }
 
@@ -207,13 +213,38 @@ pub struct IfaceEnt {
 }
 
 /// `EGRESS` entry (written by the loader): the configured interfaces a
-/// translated packet may leave by.
+/// translated packet may leave by, and in which direction. IPv6→IPv4
+/// output needs [`ROLE_UPSTREAM`], IPv4→IPv6 output [`ROLE_ACCESS`], so a
+/// redirect can never send translated IPv4 out of an access interface (or
+/// IPv6 out of an upstream one), which the host `nftables` `oif` policy
+/// would have refused (SEC-001).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct EgressEnt {
     pub ifindex: u32,
     pub allowed: u8,
-    pub pad: [u8; 3],
+    /// `ROLE_*` mask of the directions whose output may leave here.
+    pub role: u8,
+    pub pad: [u8; 2],
+}
+
+/// `IDENT` per-CPU array value: one RFC 7739 §5.3 counter and the
+/// xorshift64 state of its random step. The loader seeds `rng` non-zero
+/// (and `counter` at random) from `getrandom` for every CPU and index, so
+/// the program needs no random-number helper (PERF-005). A zero `rng`,
+/// which the loader never writes, degrades to a step of 1, never a panic.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub struct IdentEnt {
+    pub rng: u64,
+    pub counter: u16,
+    pub pad: [u8; 6],
+}
+
+impl core::fmt::Debug for IdentEnt {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("IdentEnt(<redacted>)")
+    }
 }
 
 /// Kernel `struct bpf_fib_lookup` (64 bytes). Unions are flattened to their
@@ -298,6 +329,12 @@ const _: () = {
     assert!(size_of::<EgressEnt>() == 8);
     assert!(offset_of!(EgressEnt, ifindex) == 0);
     assert!(offset_of!(EgressEnt, allowed) == 4);
+    assert!(offset_of!(EgressEnt, role) == 5);
+    assert!(offset_of!(EgressEnt, pad) == 6);
+
+    assert!(size_of::<IdentEnt>() == 16);
+    assert!(offset_of!(IdentEnt, rng) == 0);
+    assert!(offset_of!(IdentEnt, counter) == 8);
 
     // linux/bpf.h `struct bpf_fib_lookup`.
     assert!(size_of::<FibParams>() == 64);
@@ -545,16 +582,37 @@ impl EgressEnt {
         let mut b = [0u8; 8];
         put(&mut b, offset_of!(EgressEnt, ifindex), &self.ifindex.to_ne_bytes());
         put(&mut b, offset_of!(EgressEnt, allowed), &[self.allowed]);
+        put(&mut b, offset_of!(EgressEnt, role), &[self.role]);
         put(&mut b, offset_of!(EgressEnt, pad), &self.pad);
         b
     }
 
     pub fn from_bytes(b: &[u8; 8]) -> Self {
         let [allowed] = take(b, offset_of!(EgressEnt, allowed));
+        let [role] = take(b, offset_of!(EgressEnt, role));
         Self {
             ifindex: u32::from_ne_bytes(take(b, offset_of!(EgressEnt, ifindex))),
             allowed,
+            role,
             pad: take(b, offset_of!(EgressEnt, pad)),
+        }
+    }
+}
+
+impl IdentEnt {
+    pub fn to_bytes(&self) -> [u8; 16] {
+        let mut b = [0u8; 16];
+        put(&mut b, offset_of!(IdentEnt, rng), &self.rng.to_ne_bytes());
+        put(&mut b, offset_of!(IdentEnt, counter), &self.counter.to_ne_bytes());
+        put(&mut b, offset_of!(IdentEnt, pad), &self.pad);
+        b
+    }
+
+    pub fn from_bytes(b: &[u8; 16]) -> Self {
+        Self {
+            rng: u64::from_ne_bytes(take(b, offset_of!(IdentEnt, rng))),
+            counter: u16::from_ne_bytes(take(b, offset_of!(IdentEnt, counter))),
+            pad: take(b, offset_of!(IdentEnt, pad)),
         }
     }
 }
@@ -591,7 +649,8 @@ pub enum PassReason {
     /// TTL / hop limit ≤ 2 (two-hop model, RFC-007): the kernel or `platd`
     /// answers with Time Exceeded.
     HopLimit = 10,
-    /// `CONTROL.enabled` is not 1.
+    /// `CONTROL` missing, `enabled` not 1, `tun_ifindex` or `tun_mtu` 0,
+    /// or the `IDENT` / `IDENT_KEY` entry missing.
     Disabled = 11,
     /// The dead-man deadline passed.
     Deadline = 12,
@@ -612,7 +671,8 @@ pub enum PassReason {
     FibFragNeeded = 19,
     /// `bpf_fib_lookup`: any other result.
     FibOther = 20,
-    /// The FIB egress interface is not in `EGRESS`.
+    /// The FIB egress interface is not in `EGRESS`, or its role mask does
+    /// not allow this direction's output.
     EgressNotAllowed = 21,
     /// `bpf_xdp_adjust_head` failed (no headroom; eBPF program only).
     Headroom = 22,

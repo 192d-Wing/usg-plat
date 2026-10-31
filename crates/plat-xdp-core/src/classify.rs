@@ -44,21 +44,18 @@ fn is_ext_header(nh: u8) -> bool {
     matches!(nh, 0 | 43 | 44 | 50 | 51 | 60 | 135 | 139 | 140 | 253 | 254)
 }
 
-/// Fields of an accepted Ethernet + IPv6 + UDP frame. Addresses and ports
-/// are in network order, as in the packet and the map keys.
+/// Fields of an accepted Ethernet + IPv6 + UDP frame that the decision
+/// uses (the rewrite reads the rest from the header block). Addresses and
+/// ports are in network order, as in the packet and the map keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct V6Meta {
     pub traffic_class: u8,
-    pub flow_label: u32,
-    pub hop_limit: u8,
     /// IPv6 Payload Length (= UDP length, at least 8).
     pub payload_len: u16,
     pub src6: [u8; 16],
     pub dst6: [u8; 16],
     pub sport: [u8; 2],
     pub dport: [u8; 2],
-    /// UDP checksum (non-zero).
-    pub csum: u16,
     /// Frame bytes after the IPv6 packet (to trim).
     pub trailing: u32,
 }
@@ -67,8 +64,6 @@ pub struct V6Meta {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct V4Meta {
     pub tos: u8,
-    pub ttl: u8,
-    pub id: u16,
     pub df: bool,
     /// IPv4 Total Length (= 20 + UDP length, at least 28).
     pub total_len: u16,
@@ -76,8 +71,6 @@ pub struct V4Meta {
     pub dst4: [u8; 4],
     pub sport: [u8; 2],
     pub dport: [u8; 2],
-    /// UDP checksum (non-zero).
-    pub csum: u16,
     /// Frame bytes after the IPv4 packet (Ethernet padding, to trim).
     pub trailing: u32,
 }
@@ -87,7 +80,8 @@ fn be16(b: [u8; 2]) -> u16 {
     u16::from_be_bytes(b)
 }
 
-/// The Ethertype of a header block.
+/// The Ethertype of a header block. [`classify_v6`] / [`classify_v4`]
+/// check it; [`crate::decide_frame`] reads it only to dispatch (PERF-007).
 #[inline(always)]
 pub fn ethertype<const N: usize>(h: &[u8; N]) -> u16 {
     be16(take(h, 12))
@@ -123,8 +117,7 @@ pub fn classify_v6(h: &[u8; HDR6], frame_len: u32) -> Result<V6Meta, PassReason>
     if be16(take(h, u + 4)) != plen {
         return Err(PassReason::UdpLen);
     }
-    let csum = be16(take(h, u + 6));
-    if csum == 0 {
+    if be16(take(h, u + 6)) == 0 {
         return Err(PassReason::UdpZeroCsum);
     }
     if hop < MIN_HOP {
@@ -132,14 +125,11 @@ pub fn classify_v6(h: &[u8; HDR6], frame_len: u32) -> Result<V6Meta, PassReason>
     }
     Ok(V6Meta {
         traffic_class: (vtf >> 20) as u8,
-        flow_label: vtf & 0x000f_ffff,
-        hop_limit: hop,
         payload_len: plen,
         src6: take(h, ETH + 8),
         dst6: take(h, ETH + 24),
         sport: take(h, u),
         dport: take(h, u + 2),
-        csum,
         trailing: frame_len - end,
     })
 }
@@ -156,7 +146,7 @@ pub fn classify_v4(h: &[u8; HDR4], frame_len: u32) -> Result<V4Meta, PassReason>
         return Err(PassReason::NotIp);
     }
     let ip: [u8; IP4] = take(h, ETH);
-    let [vihl, tos, t0, t1, i0, i1, f0, f1, ttl, proto, ..] = ip;
+    let [vihl, tos, t0, t1, _, _, f0, f1, ttl, proto, ..] = ip;
     if vihl >> 4 != 4 {
         return Err(PassReason::BadL3);
     }
@@ -186,8 +176,7 @@ pub fn classify_v4(h: &[u8; HDR4], frame_len: u32) -> Result<V4Meta, PassReason>
     if be16(take(h, u + 4)) != total - IP4 as u16 {
         return Err(PassReason::UdpLen);
     }
-    let csum = be16(take(h, u + 6));
-    if csum == 0 {
+    if be16(take(h, u + 6)) == 0 {
         return Err(PassReason::UdpZeroCsum);
     }
     if ttl < MIN_HOP {
@@ -195,15 +184,12 @@ pub fn classify_v4(h: &[u8; HDR4], frame_len: u32) -> Result<V4Meta, PassReason>
     }
     Ok(V4Meta {
         tos,
-        ttl,
-        id: be16([i0, i1]),
         df: ff & 0x4000 != 0,
         total_len: total,
         src4: take(&ip, 12),
         dst4: take(&ip, 16),
         sport: take(h, u),
         dport: take(h, u + 2),
-        csum,
         trailing: frame_len - end,
     })
 }

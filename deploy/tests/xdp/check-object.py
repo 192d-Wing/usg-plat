@@ -28,10 +28,11 @@ import sys
 LICENSE = b"Dual MIT/GPL\x00"
 
 # include/uapi/linux/bpf.h __BPF_FUNC_MAPPER order (identical in v6.1 and later).
+# No bpf_map_update_elem (2) or bpf_map_delete_elem (3): the program creates
+# and removes no per-packet map state; it writes only through lookup pointers
+# (SLOT.seen_ns, IDENT, STATS). NIST 800-53 SC-5.
 ALLOWED_HELPERS = {
     1: "bpf_map_lookup_elem",
-    2: "bpf_map_update_elem",
-    3: "bpf_map_delete_elem",
     5: "bpf_ktime_get_ns",
     8: "bpf_get_smp_processor_id",
     28: "bpf_csum_diff",
@@ -173,6 +174,16 @@ def self_test():
         ("MIT-only licence", build_elf([(b"xdp", 1, 0x6, ok_code), (b"license", 1, 0x3, b"MIT\x00")]), 1),
         ("no licence", build_elf([(b"xdp", 1, 0x6, ok_code)]), 1),
         ("bpf_trace_printk", build_elf([(b"xdp", 1, 0x6, insn(OP_CALL, imm=6)), (b"license", 1, 0x3, LICENSE)]), 1),
+        (
+            "bpf_map_update_elem",
+            build_elf([(b"xdp", 1, 0x6, insn(OP_CALL, imm=2)), (b"license", 1, 0x3, LICENSE)]),
+            1,
+        ),
+        (
+            "bpf_map_delete_elem",
+            build_elf([(b"xdp", 1, 0x6, insn(OP_CALL, imm=3)), (b"license", 1, 0x3, LICENSE)]),
+            1,
+        ),
         ("kfunc", build_elf([(b"xdp", 1, 0x6, insn(OP_CALL, src=2, imm=6)), (b"license", 1, 0x3, LICENSE)]), 1),
         (
             "aya-log symbol",
