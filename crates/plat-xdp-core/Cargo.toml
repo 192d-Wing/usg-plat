@@ -1,0 +1,25 @@
+[package]
+name = "plat-xdp-core"
+description = "no_std fixed-layout UDP classifier, rewriter and BPF map ABI shared by the usg-plat XDP fast path and its host tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# Aya, which builds this crate into the eBPF object, needs 1.98.
+rust-version = "1.98"
+publish.workspace = true
+
+# No dependencies: the crate is compiled into the eBPF object (core only,
+# no alloc). Keep it that way.
+[dependencies]
+
+[dev-dependencies]
+plat-common.workspace = true
+plat-packet.workspace = true
+plat-xlat.workspace = true
+plat-nat64.workspace = true
+plat-audit.workspace = true
+crossbeam-channel.workspace = true
+proptest.workspace = true
+
+[lints]
+workspace = true
