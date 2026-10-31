@@ -147,6 +147,25 @@ table_shards = 1024
 # Released port blocks are held back this long before reuse (RFC 6888
 # REQ-8; 120..=3600).
 block_cooldown_secs = 120
+# TCP simultaneous open (RFC 6146 §3.5.2.2): an unsolicited inbound SYN to a
+# bound port that address(-port)-dependent filtering refuses is held (never
+# forwarded, never opens the filter, never keeps the BIB alive) for
+# held_syn_secs (TCP_INCOMING_SYN, 6..=60). A SYN from the subscriber to the
+# same remote in that window opens the session ESTABLISHED. SYNs to unbound
+# ports stay a silent drop. Bounded by max_held_syns (node-wide, 0 disables)
+# and max_held_syns_per_bib (1..=8, one per remote address); check-config prints the worst-case
+# memory (SC-5). No effect with filtering = "endpoint_independent".
+tcp_simultaneous_open = true
+max_held_syns = 16384
+max_held_syns_per_bib = 4
+held_syn_secs = 6
+# ICMPv4 Port Unreachable for a held SYN that expires unmatched (RFC 6146
+# §3.5.2.2). Off by default (documented deviation, like
+# translation.send_inbound_unreachable); rate-limited by
+# translation.icmp_errors_per_sec when on. Warning: when on, the node sends
+# a delayed ICMP to the claimed source of any spoofable SYN it held, i.e. it
+# becomes a delayed reflector (SEC-002), bounded by the held-SYN caps.
+held_syn_unreachable = false
 
 [timeouts]
 udp_secs = 300

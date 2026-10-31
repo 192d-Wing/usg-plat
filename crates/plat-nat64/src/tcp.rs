@@ -1,5 +1,11 @@
-//! TCP session state machine (RFC 6146 §3.5.2), without simultaneous open:
-//! an unsolicited inbound SYN is dropped rather than held (POAM-008).
+//! TCP session state machine (RFC 6146 §3.5.2).
+//!
+//! Simultaneous open: an unsolicited inbound SYN refused by ADF/APDF on a
+//! bound port is held, not as a session but as a slot on its BIB
+//! ([`crate::held`]); a subscriber SYN to the same remote before
+//! TCP_INCOMING_SYN expires creates the session in the state V4 INIT + V6
+//! SYN reaches, ESTABLISHED. A SYN to an unbound port is silently dropped
+//! (RFC 6146 §3.5.2.2 security-policy clause).
 
 /// Which side a packet came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +31,7 @@ pub enum TcpState {
 pub const FIN: u8 = 0x01;
 pub const SYN: u8 = 0x02;
 pub const RST: u8 = 0x04;
+pub const ACK: u8 = 0x10;
 
 /// Which idle timer applies after a transition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

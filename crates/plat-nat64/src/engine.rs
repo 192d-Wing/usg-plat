@@ -7,7 +7,7 @@ use plat_common::config::{Filtering, FragmentsConfig, UdpZeroChecksum};
 use plat_common::{Clock, Config, Counter, Counters, DropReason, Ipv4Cidr, Ipv6Cidr};
 use plat_packet::{
     Frag, Ipv4Hdr, Ipv6Hdr, L4, ParseError, parse_l4, parse_v4, parse_v4_ignore_source_route, parse_v6,
-    parse_v6_ignore_routing, proto,
+    parse_v6_ignore_routing, proto, tcp_seq,
 };
 use plat_xlat::icmp::{
     self, icmp4_err_to_v6, icmp4_error_local, icmp6_err_to_v4, icmp6_error_local, quoted_v4, quoted_v6,
@@ -15,13 +15,14 @@ use plat_xlat::icmp::{
 use plat_xlat::rfc6052::{is_never_translatable_v4, is_non_global_v4};
 use plat_xlat::siit::{
     FRAG6_HDR, FragSink, proto_4to6, v4_frag_to_v6, v4_frag_to_v6_split, v6_frag_to_v4, v6_frag_to_v4_split,
-    write_v6_header,
+    write_v4_header, write_v6_header,
 };
 use plat_xlat::{
     Frags, HEADROOM, Map4, Map6, Prefix6052, XlatError, v4_to_v6, v4_to_v6_fragments, v6_to_v4, v6_to_v4_fragments,
 };
 
 use crate::frag::{Acct, FragKey, FragTable, Fwd, Kind, Reassembled, St};
+use crate::held::{HeldSynExpiry, SynMeta};
 use crate::ident::{IdentKey, IdentState};
 use crate::repl::ReplProducer;
 use crate::state::{ClusterSetup, Key4, Key6, Mapped, State};
@@ -56,6 +57,11 @@ pub const FRAG_OUT_BYTES: usize = 72 * 1024;
 pub const MAX_FRAGMENTS: usize = 65535_usize.div_ceil(1280 - FRAG6_HDR);
 /// Fragment-table sets scanned per housekeeping call.
 const HOUSEKEEP_SETS: usize = 8;
+/// Held-SYN expiry ICMPs sent per housekeeping call at most.
+const HOUSEKEEP_HELD_ICMP: usize = 8;
+/// Length of a held-SYN expiry ICMP: IPv4 + ICMP headers, then the quoted
+/// IPv4 header and first 8 bytes of TCP (RFC 792).
+const HELD_ICMP_LEN: usize = 56;
 
 /// Per-worker scratch state. Owned by exactly one thread.
 #[derive(Debug)]
@@ -167,6 +173,43 @@ impl WorkerCtx {
             false
         }
     }
+}
+
+/// The fields of an inbound SYN that a held slot keeps (bounds-checked
+/// read of the sequence number through `plat-packet`).
+#[cold]
+#[inline(never)]
+fn syn_meta(pkt: &[u8], h: &Ipv4Hdr) -> Option<SynMeta> {
+    Some(SynMeta {
+        seq: tcp_seq(pkt, h.hdr_len, h.total_len)?,
+        ttl: h.ttl,
+        tos: h.tos,
+        ident: h.id,
+        len: u16::try_from(h.total_len).ok()?,
+        df: h.df,
+    })
+}
+
+/// Builds the ICMPv4 Port Unreachable for an expired held SYN: from the
+/// pool address to the SYN's source, quoting a rebuilt IPv4 header (no
+/// options, the SYN's DF bit, checksum recomputed) and the first 8 bytes of TCP
+/// (ports and sequence number).
+fn held_icmp(e: &HeldSynExpiry, ident: u16) -> [u8; HELD_ICMP_LEN] {
+    use plat_packet::checksum as ck;
+    let mut o = [0u8; HELD_ICMP_LEN];
+    let (outer, rest) = o.split_at_mut(20);
+    let (icmp_hdr, quote) = rest.split_at_mut(8);
+    let (q_ip, q_tcp) = quote.split_at_mut(20);
+    write_v4_header(q_ip, e.tos, e.len, e.ident, e.df, false, 0, e.ttl, proto::TCP, e.src4, e.dst4);
+    q_tcp[..2].copy_from_slice(&e.sport.to_be_bytes());
+    q_tcp[2..4].copy_from_slice(&e.dport.to_be_bytes());
+    q_tcp[4..8].copy_from_slice(&e.seq.to_be_bytes());
+    icmp_hdr[0] = 3;
+    icmp_hdr[1] = 3;
+    let c = ck::finish(ck::sum(icmp_hdr) + ck::sum(quote));
+    icmp_hdr[2..4].copy_from_slice(&c.to_be_bytes());
+    write_v4_header(outer, 0, HELD_ICMP_LEN as u16, ident, false, false, 0, 64, proto::ICMP, e.dst4, e.src4);
+    o
 }
 
 fn from_parse(e: ParseError) -> DropReason {
@@ -366,11 +409,71 @@ impl Nat64 {
     }
 
     /// Per-worker housekeeping, called by the worker between packets (every
-    /// batch and when idle): incremental fragment expiry and the
-    /// `plat_fragment_entries` gauge. Never blocks.
-    pub fn housekeep(&self, ctx: &mut WorkerCtx) {
+    /// batch and when idle): incremental fragment expiry, the
+    /// `plat_fragment_entries` gauge and, with `nat64.held_syn_unreachable`,
+    /// up to 8 held-SYN expiry ICMPs. Returns the number of packets placed
+    /// in [`WorkerCtx::fragments`] for the caller to transmit. Never blocks.
+    pub fn housekeep(&self, ctx: &mut WorkerCtx) -> usize {
         ctx.ftab.housekeep(self.state.now_ms(), HOUSEKEEP_SETS, &ctx.counters);
         ctx.counters.set_fragment_entries(u64::from(ctx.ftab.len()));
+        if ctx.frags.count != 0 {
+            ctx.frags.clear();
+        }
+        if !self.state.held_icmp_enabled() {
+            return 0;
+        }
+        self.held_expiry_icmp(ctx)
+    }
+
+    /// Sends ICMPv4 Port Unreachable (3/3) for expired held SYNs, from the
+    /// pool address the SYN was sent to, quoting the stored IPv4 header and
+    /// the first 8 bytes of TCP. Rate-limited by the worker's token bucket;
+    /// a slice this node no longer serves sends nothing.
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - RFC 6146 §3.5.2.2 - V4 INIT expiry: Port Unreachable containing
+    ///   the stored SYN, sent to its source (`nat64.held_syn_unreachable`)
+    /// - RFC 792, RFC 1812 §4.3.2.3 - quote of the IP header + 8 bytes
+    /// - NIST 800-53: SC-5 - per-worker token bucket (non-PMTU share),
+    ///   bounded per call
+    /// - NIST 800-53: SC-24, CP-10 - only from an owned, Active slice
+    #[cold]
+    #[inline(never)]
+    fn held_expiry_icmp(&self, ctx: &mut WorkerCtx) -> usize {
+        let mut pending = [HeldSynExpiry {
+            src4: 0,
+            dst4: 0,
+            sport: 0,
+            dport: 0,
+            seq: 0,
+            ttl: 0,
+            tos: 0,
+            ident: 0,
+            len: 0,
+            df: false,
+        }; HOUSEKEEP_HELD_ICMP];
+        let n = self.state.drain_held_expiry(&mut pending);
+        for e in pending.iter().take(n) {
+            let owned = match self.state.pool.index(e.dst4) {
+                Some(i) => self.state.pool.check_idx_in(self.sliced, i),
+                None => Err(DropReason::WrongNode),
+            };
+            if let Err(d) = owned {
+                ctx.counters.record_drop(d);
+                continue;
+            }
+            if !ctx.icmp_token(self.state.now_ms(), self.icmp_rate, false) {
+                ctx.counters.inc(Counter::IcmpErrorsRateLimited);
+                continue;
+            }
+            let ident = self.ident_key.next(&mut ctx.ident, u128::from(e.dst4), e.src4, proto::ICMP);
+            let pkt = held_icmp(e, ident);
+            if ctx.frags.push_copy(&mut ctx.frag_out, &pkt).is_ok() {
+                ctx.counters.inc(Counter::IcmpErrorsGenerated);
+                ctx.counters.inc(Counter::IcmpUnreachableSent);
+            }
+        }
+        ctx.frags.count
     }
 
     /// Processes the packet at `buf[start..start + len]`. `start` must leave
@@ -942,8 +1045,16 @@ impl Nat64 {
             self.state.filter_inbound(k4, (h.src, sport))?;
             return self.frag_needed_v4(buf, start, &h, ctx);
         }
-        let k6 = match self.state.inbound(k4, (h.src, sport), flags, &ctx.counters) {
-            Ok(k6) => k6,
+        // RFC 6146 §3.5.2.2: an unfragmented (checked above) wire SYN
+        // without ACK/RST/FIN may be held for simultaneous open if the
+        // filter refuses it (SYN+FIN is never a valid open, RFC-003).
+        // Hairpinned SYNs are not held.
+        let syn = (p == proto::TCP && !hairpin && flags & (tcp::SYN | tcp::RST | tcp::ACK | tcp::FIN) == tcp::SYN)
+            .then(|| syn_meta(pkt, &h))
+            .flatten();
+        let k6 = match self.state.inbound_or_hold(k4, (h.src, sport), flags, syn, &ctx.counters) {
+            Ok(Some(k6)) => k6,
+            Ok(None) => return Ok(Out::Held),
             Err(e) => return self.inbound_refused(buf, start, &h, hairpin || p == proto::TCP, e, ctx),
         };
         let m = Map6 { src: self.prefix.embed(h.src), dst: k6.addr, sport, dport: k6.port };

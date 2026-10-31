@@ -44,7 +44,7 @@ hardened audit trail, FIPS TLS and clustered high availability.
 | Port allocation | Per-subscriber port blocks, paired pooling, random port inside the block, 120 s cool-down before a block is reused | Per-flow ports (RFC 6056), `pool4` with marks and port ranges |
 | Static BIB entries (port forwarding) | No | Yes |
 | Filtering | Address-dependent (default), endpoint-independent or address-and-port-dependent | Address-dependent toggle, option to drop externally initiated TCP |
-| TCP simultaneous open | No: unsolicited inbound SYN is dropped (POAM-008) | Yes: holds the SYN for 6 s |
+| TCP simultaneous open | Yes: a refused SYN on a port with a BIB is held `held_syn_secs` (default 6 s), bounded by per-BIB and node caps; SYNs to unbound ports dropped by policy; expiry ICMP opt-in | Yes: holds the SYN for 6 s |
 | Hairpinning | Yes, including across cluster nodes | Yes |
 | Protocols | TCP, UDP, ICMP | TCP, UDP, ICMP |
 | Per-subscriber limits | Sessions, blocks and `max_subscribers` | Limited (BIB size limit) |
@@ -84,7 +84,6 @@ hardened audit trail, FIPS TLS and clustered high availability.
 - **usg-plat gaps worth considering against Jool:**
   - Per-packet TUN syscall cost (POAM-016). AF_XDP or batched I/O would be
     the fix.
-  - No TCP simultaneous open (POAM-008).
   - No static BIB entries.
   - No configuration reload at run time.
   - One NAT64 prefix per daemon.

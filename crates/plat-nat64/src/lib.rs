@@ -28,6 +28,7 @@
 
 pub mod engine;
 pub mod frag;
+pub mod held;
 pub mod ident;
 pub mod pool;
 pub mod repl;
@@ -36,6 +37,7 @@ pub mod state;
 pub mod tcp;
 
 pub use engine::{Nat64, Verdict, WorkerCtx};
+pub use held::{HeldSynExpiry, SynMeta};
 pub use pool::{AllocFail, SliceState};
 pub use repl::{AdoptInput, Directory, Home, ReplHub, ReplProducer, ReplRecord, Shadow, ShadowError};
 pub use state::{

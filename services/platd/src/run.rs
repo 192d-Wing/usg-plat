@@ -56,11 +56,16 @@ pub fn worker<Q: PacketQueue>(
     }
     while !stop.load(Ordering::Relaxed) {
         // Fragment expiry and the fragment gauge, every 64 packets and when
-        // idle (no blocking, no allocation).
+        // idle (no blocking, no allocation); held-SYN expiry ICMPs it
+        // produced (RFC 6146 §3.5.2.2, off by default) are sent here.
         since_housekeep += 1;
         if since_housekeep >= 64 {
             since_housekeep = 0;
-            nat.housekeep(&mut ctx);
+            if nat.housekeep(&mut ctx) > 0 {
+                for f in ctx.fragments() {
+                    transmit(&mut q, f, &counters);
+                }
+            }
         }
         let n = match q.recv(&mut buf[HEADROOM..]) {
             Ok(Some(n)) => n,

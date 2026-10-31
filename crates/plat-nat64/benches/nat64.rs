@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use common::{Fx, config, fixture, fixture_q, l4_sum4, l4_sum6, run, run_all, sub, synth, udp4, udp6};
+use common::{Fx, config, fixture, fixture_q, l4_sum4, l4_sum6, run, run_all, sub, synth, tcp4, tcp6, udp4, udp6};
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use plat_audit::{AcquireReason, AuditSink};
 use plat_cluster::SliceMap;
@@ -188,6 +188,66 @@ fn bench(c: &mut Criterion) {
             i = i.wrapping_add(1);
             buf[HEADROOM..HEADROOM + u.len()].copy_from_slice(u);
             black_box(big.nat.process(&mut buf, HEADROOM, u.len(), &mut big.ctx));
+        })
+    });
+
+    // POAM-008: an unsolicited SYN flood to one bound port under APDF. With
+    // simultaneous open on, the BIB's slots fill and the rest is refused
+    // (`held_syn_limit`); off, every SYN is `filtered`. The difference is
+    // the cost of the cold hold path (slot scan + cap check).
+    for (name, on) in [("inbound_syn_flood_held_apdf", "true"), ("inbound_syn_flood_filtered_apdf", "false")] {
+        let mut sf = fixture(&[
+            ("filtering = \"address_dependent\"", "filtering = \"address_port_dependent\""),
+            (
+                "tcp_simultaneous_open = true",
+                if on == "true" { "tcp_simultaneous_open = true" } else { "tcp_simultaneous_open = false" },
+            ),
+        ]);
+        let out = run(&mut sf, &tcp6(sub(1, 1), 40000, 0xc633_6407, 443, 0x02)).unwrap();
+        let (a, p) = (plat_packet::be32(&out, 12), plat_packet::be16(&out, 20));
+        let syns: Vec<_> = (0..256u32).map(|i| tcp4(0x0b00_0000 + i, 1000, a, p, 0x02)).collect();
+        let mut i = 0usize;
+        g.bench_function(name, |b| {
+            b.iter(|| {
+                let u = &syns[i & 255];
+                i = i.wrapping_add(1);
+                buf[HEADROOM..HEADROOM + u.len()].copy_from_slice(u);
+                black_box(sf.nat.process(&mut buf, HEADROOM, u.len(), &mut sf.ctx));
+            })
+        });
+    }
+
+    // PERF-001: the real hold path. Each SYN goes to a fresh bound BIB
+    // (APDF), so every iteration takes a slot and allocates that BIB's
+    // slot array. Engines and bindings are built untimed in chunks.
+    g.bench_function("inbound_syn_held_fresh_bib_apdf", |b| {
+        b.iter_custom(|iters| {
+            let mut buf = vec![0u8; HEADROOM + 2048];
+            let mut total = Duration::ZERO;
+            let mut left = iters as usize;
+            while left > 0 {
+                let n = left.min(FLOW_CHUNK);
+                let mut fx =
+                    fixture(&[("filtering = \"address_dependent\"", "filtering = \"address_port_dependent\"")]);
+                let syns: Vec<_> = (0..n)
+                    .map(|i| {
+                        let p6 = tcp6(sub((i / 100) as u16 + 1, 1), 1000 + (i % 100) as u16, 0xc633_6407, 443, 0x02);
+                        let out = run(&mut fx, &p6).unwrap();
+                        let (a, p) = (plat_packet::be32(&out, 12), plat_packet::be16(&out, 20));
+                        tcp4(0x0b00_0001, 1000, a, p, 0x02)
+                    })
+                    .collect();
+                let start = Instant::now();
+                for p in &syns {
+                    buf[HEADROOM..HEADROOM + p.len()].copy_from_slice(p);
+                    black_box(fx.nat.process(&mut buf, HEADROOM, p.len(), &mut fx.ctx));
+                }
+                total += start.elapsed();
+                assert_eq!(fx.nat.state().held_syn_count(), n as u64, "every SYN held");
+                drop(fx);
+                left -= n;
+            }
+            total
         })
     });
 

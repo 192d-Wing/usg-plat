@@ -4,6 +4,54 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 
 ## [Unreleased]
 
+### TCP simultaneous open (branch `fix/poam-008-simultaneous-open`, closes POAM-008)
+
+- RFC 6146 §3.5.2.2: an unsolicited inbound IPv4 SYN (no ACK/RST,
+  unfragmented, not hairpinned) to a **bound** pool port that
+  address-dependent or address-and-port-dependent filtering refuses is now
+  held for `held_syn_secs` (TCP_INCOMING_SYN, default 6 s) instead of
+  dropped. If the subscriber sends a SYN to the same remote in that window,
+  the session opens ESTABLISHED (TCP_EST); the stored SYN is discarded. A
+  held SYN is never forwarded, never opens the filter, is not a session (no
+  session quota, no replication) and never keeps its BIB alive. It creates
+  no BIB, port block, session or audit record. SYNs to unbound ports stay a
+  silent drop (RFC security-policy clause). Held SYNs live in the shared
+  `bib4` shard of their BIB (no new lock), so the inbound and outbound SYN
+  may arrive on different workers.
+- One slot per remote address per BIB: a repeat SYN from the same address
+  and port is a duplicate, and one from another port of that address is
+  refused (`held_syn_limit`) while the slot is live. An expired, unswept
+  slot is reused in place; if `held_syn_unreachable` is on, the old SYN's
+  expiry ICMP is sent at reuse. SYN+FIN
+  is never held. A BIB's held-SYN array is freed when its last slot
+  clears, so arrays never exceed `max_held_syns`.
+- New `[nat64]` keys (additive): `tcp_simultaneous_open` (default `true`),
+  `max_held_syns` (default 16384, 0..=1048576, 0 disables),
+  `max_held_syns_per_bib` (default 4, 1..=8), `held_syn_secs` (default 6,
+  6..=60), `held_syn_unreachable` (default `false`: ICMPv4 Port Unreachable
+  for an expired held SYN, rate-limited by
+  `translation.icmp_errors_per_sec`, only from an Active owned slice;
+  requires `tcp_simultaneous_open`). No effect under endpoint-independent
+  filtering (`check-config` warns).
+- `check-config` prints the worst-case held-SYN memory, which is also part
+  of the start-up memory requirement (`memory::required_bytes`).
+- Metrics: drop reason `held_syn_limit`; counters `tcp_syn_held`,
+  `tcp_syn_held_dup`, `tcp_syn_held_matched` (per worker),
+  `plat_tcp_syn_held_expired_total`, `plat_held_syn_icmp_lost_total`; gauge
+  `plat_held_syns`. `Nat64::housekeep` now returns the number of packets it
+  placed in `WorkerCtx::fragments` (the worker transmits them).
+- **Behaviour change (default on):** with the defaults, such a SYN is
+  counted `tcp_syn_held` instead of `filtered`; dashboards/alerts keyed on
+  `filtered` under ADF/APDF will see that count drop. Set
+  `tcp_simultaneous_open = false` for the previous behaviour.
+- **Memory:** the start-up memory gate grows by the worst-case held-SYN
+  memory (about 4.46 MB at defaults); `MemoryMax=8G` in `platd.service`
+  is unaffected.
+- **Reflector note:** enabling `held_syn_unreachable` makes the node a
+  delayed, rate-limited ICMP reflector toward the (possibly spoofed) SYN
+  source; it stays off by default. SIEM schema unchanged (7): `held_syn_limit` is a
+  new `plat.counter.name` value only.
+
 ### RFC 6888 citation fixes (branch `fix/rfc6888-req12-citations`)
 
 Documentation and comments only; no behaviour or schema change.

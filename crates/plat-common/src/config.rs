@@ -724,6 +724,55 @@ pub struct Nat64Config {
     ///   (POAM-010)
     #[serde(default = "d_cooldown")]
     pub block_cooldown_secs: u32,
+    /// Hold an unsolicited inbound TCP SYN to a bound port refused by
+    /// address(-port)-dependent filtering for `held_syn_secs`, so a TCP
+    /// simultaneous open completes when the subscriber's own SYN follows.
+    /// No effect under endpoint-independent filtering (already admitted).
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - RFC 6146 §3.5.2.2 - V4 SYN stored in V4 INIT (closes POAM-008)
+    #[serde(default = "d_true")]
+    pub tcp_simultaneous_open: bool,
+    /// Node-wide cap on held inbound SYNs (0 disables holding).
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: SC-5 - bounded attacker-creatable state
+    #[serde(default = "d_max_held_syns")]
+    pub max_held_syns: u32,
+    /// Held SYNs per BIB (1..=8).
+    #[serde(default = "d_max_held_syns_per_bib")]
+    pub max_held_syns_per_bib: u8,
+    /// TCP_INCOMING_SYN (RFC 6146 §4, RFC 5382): 6..=60 s.
+    #[serde(default = "d_held_syn_secs")]
+    pub held_syn_secs: u32,
+    /// Answer an unmatched held SYN with ICMPv4 Port Unreachable (3/3) when
+    /// it expires (RFC 6146 §3.5.2.2). Off by default: documented deviation,
+    /// no delayed reflection and no binding-activity oracle.
+    #[serde(default)]
+    pub held_syn_unreachable: bool,
+}
+
+/// Upper bound accepted for `nat64.max_held_syns`.
+pub const MAX_HELD_SYNS: u32 = 1 << 20;
+/// Upper bound accepted for `nat64.max_held_syns_per_bib`.
+pub const MAX_HELD_SYNS_PER_BIB: u8 = 8;
+/// Bytes of one held-SYN slot (asserted in `plat_nat64::held`).
+pub const HELD_SYN_SLOT_BYTES: u64 = 32;
+/// Bytes of one expiry ICMP ring entry (asserted in `plat_nat64::held`).
+pub const HELD_SYN_EXPIRY_BYTES: u64 = 24;
+/// Allocation overhead of one per-BIB slot array (allocator).
+pub const HELD_SYN_BOX_BYTES: u64 = 16;
+/// Upper bound of the expiry ICMP ring.
+pub const HELD_SYN_RING_MAX: u32 = 4096;
+
+fn d_max_held_syns() -> u32 {
+    16_384
+}
+fn d_max_held_syns_per_bib() -> u8 {
+    4
+}
+fn d_held_syn_secs() -> u32 {
+    6
 }
 
 fn d_cooldown() -> u32 {
@@ -785,6 +834,34 @@ pub struct PoolCapacity {
 }
 
 impl Nat64Config {
+    /// Holding is in effect: enabled, a non-zero cap, and a filtering mode
+    /// that refuses unsolicited inbound (ADF/APDF).
+    pub fn holds_syns(&self) -> bool {
+        self.tcp_simultaneous_open && self.max_held_syns > 0 && self.filtering != Filtering::EndpointIndependent
+    }
+
+    /// Capacity of the held-SYN expiry ICMP ring (0 when the ICMP is off).
+    pub fn held_syn_ring(&self) -> u32 {
+        if self.holds_syns() && self.held_syn_unreachable { self.max_held_syns.min(HELD_SYN_RING_MAX) } else { 0 }
+    }
+
+    /// Worst-case held-SYN memory: every held SYN alone on its BIB (one
+    /// slot array each), plus the expiry ring.
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: SC-5 - bounded, reported by `check-config`
+    pub fn held_syn_memory(&self) -> u64 {
+        if !self.holds_syns() {
+            return 0;
+        }
+        // A BIB's slot array is fixed at `MAX_HELD_SYNS_PER_BIB` slots (a
+        // thin pointer on the BIB); `max_held_syns_per_bib` caps the use.
+        let per_box = HELD_SYN_SLOT_BYTES * u64::from(MAX_HELD_SYNS_PER_BIB) + HELD_SYN_BOX_BYTES;
+        u64::from(self.max_held_syns)
+            .saturating_mul(per_box)
+            .saturating_add(u64::from(self.held_syn_ring()).saturating_mul(HELD_SYN_EXPIRY_BYTES))
+    }
+
     /// Blocks per pool address (same arithmetic as `plat_nat64::pool`).
     pub fn blocks_per_addr(&self) -> u64 {
         self.blocks_per_addr_with(self.port_block_size)
@@ -1759,6 +1836,21 @@ impl Config {
         if !(120..=3600).contains(&n.block_cooldown_secs) {
             return invalid("nat64.block_cooldown_secs must be 120..=3600 (RFC 6888 REQ-8)");
         }
+        // COMPLIANCE MAPPING:
+        // - NIST 800-53: SC-5, CM-6 - bounded held-SYN state
+        // - RFC 6146 §4 - TCP_INCOMING_SYN is at least 6 s
+        if n.max_held_syns > MAX_HELD_SYNS {
+            return invalid(format!("nat64.max_held_syns must be 0..={MAX_HELD_SYNS}"));
+        }
+        if !(1..=MAX_HELD_SYNS_PER_BIB).contains(&n.max_held_syns_per_bib) {
+            return invalid(format!("nat64.max_held_syns_per_bib must be 1..={MAX_HELD_SYNS_PER_BIB}"));
+        }
+        if !(6..=60).contains(&n.held_syn_secs) {
+            return invalid("nat64.held_syn_secs must be 6..=60 (RFC 6146 §4 TCP_INCOMING_SYN)");
+        }
+        if n.held_syn_unreachable && !n.tcp_simultaneous_open {
+            return invalid("nat64.held_syn_unreachable requires nat64.tcp_simultaneous_open = true");
+        }
         self.validate_cluster()
     }
 
@@ -2019,6 +2111,58 @@ mod tests {
         let off = base().replace("# cluster_interfaces = [\"eth1\"]", "cluster_interfaces = [\"eth1\"]");
         assert!(invalid_msg(&off).contains("only valid with cross_node_hairpin"));
         assert!(!Config::from_toml(&base()).unwrap().translation.cross_node_hairpin);
+    }
+
+    #[test]
+    fn held_syn_keys_defaults_and_ranges() {
+        let c = Config::from_toml(EXAMPLE).unwrap();
+        let n = &c.nat64;
+        assert!(n.tcp_simultaneous_open && !n.held_syn_unreachable);
+        assert_eq!((n.max_held_syns, n.max_held_syns_per_bib, n.held_syn_secs), (16_384, 4, 6));
+        assert!(n.holds_syns());
+        assert_eq!(n.held_syn_ring(), 0);
+        // Absent keys take the same defaults.
+        let bare = EXAMPLE
+            .replace("tcp_simultaneous_open = true\n", "")
+            .replace("max_held_syns = 16384\n", "")
+            .replace("max_held_syns_per_bib = 4\n", "")
+            .replace("held_syn_secs = 6\n", "")
+            .replace("held_syn_unreachable = false\n", "");
+        let d = Config::from_toml(&bare).unwrap();
+        assert!(d.nat64.tcp_simultaneous_open && !d.nat64.held_syn_unreachable);
+        assert_eq!((d.nat64.max_held_syns, d.nat64.max_held_syns_per_bib, d.nat64.held_syn_secs), (16_384, 4, 6));
+        for (from, to, msg) in [
+            ("held_syn_secs = 6", "held_syn_secs = 5", "held_syn_secs"),
+            ("held_syn_secs = 6", "held_syn_secs = 61", "held_syn_secs"),
+            ("max_held_syns_per_bib = 4", "max_held_syns_per_bib = 0", "max_held_syns_per_bib"),
+            ("max_held_syns_per_bib = 4", "max_held_syns_per_bib = 9", "max_held_syns_per_bib"),
+            ("max_held_syns = 16384", "max_held_syns = 1048577", "max_held_syns"),
+        ] {
+            assert!(invalid_msg(&EXAMPLE.replace(from, to)).contains(msg), "{to}");
+        }
+        let icmp_only = EXAMPLE
+            .replace("tcp_simultaneous_open = true", "tcp_simultaneous_open = false")
+            .replace("held_syn_unreachable = false", "held_syn_unreachable = true");
+        assert!(invalid_msg(&icmp_only).contains("requires nat64.tcp_simultaneous_open"));
+        for ok in ["held_syn_secs = 60", "max_held_syns = 0", "max_held_syns = 1048576"] {
+            let key = ok.split(" = ").next().unwrap_or_default();
+            let line = EXAMPLE.lines().find(|l| l.starts_with(&format!("{key} = "))).unwrap();
+            assert!(Config::from_toml(&EXAMPLE.replace(line, ok)).is_ok(), "{ok}");
+        }
+        // Holding is off under EIF or with a zero cap; the ring exists only
+        // with the ICMP on.
+        let eif = Config::from_toml(
+            &EXAMPLE.replace("filtering = \"address_dependent\"", "filtering = \"endpoint_independent\""),
+        )
+        .unwrap();
+        assert!(!eif.nat64.holds_syns());
+        assert_eq!(eif.nat64.held_syn_memory(), 0);
+        let icmp =
+            Config::from_toml(&EXAMPLE.replace("held_syn_unreachable = false", "held_syn_unreachable = true")).unwrap();
+        assert_eq!(icmp.nat64.held_syn_ring(), 4096);
+        assert_eq!(icmp.nat64.held_syn_memory(), 16_384 * (8 * 32 + 16) + 4096 * 24);
+        let unknown = EXAMPLE.replace("held_syn_secs = 6", "held_syn_secs = 6\nheld_syn_typo = 1");
+        assert!(Config::from_toml(&unknown).is_err());
     }
 
     #[test]

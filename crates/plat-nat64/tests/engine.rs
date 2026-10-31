@@ -88,7 +88,15 @@ fn tcp_requires_syn() {
     let (src4, sport4, ..) = v4_tuple(&out);
     let back = run(&mut fx, &tcp4(SERVER, 443, src4, sport4, 0x12)).unwrap();
     v6_ok(&back);
-    // Unsolicited inbound SYN from another host is filtered.
+    // An unsolicited inbound SYN from another host is held for simultaneous
+    // open (RFC 6146 §3.5.2.2): consumed, never forwarded.
+    assert!(run_all(&mut fx, &tcp4(OTHER, 443, src4, sport4, 0x02)).unwrap().is_empty());
+    // Anything else from it is filtered.
+    assert_eq!(run(&mut fx, &tcp4(OTHER, 443, src4, sport4, 0x10)).unwrap_err(), DropReason::Filtered);
+    // With simultaneous open off, the SYN is filtered as before.
+    let mut fx = fixture(&[("tcp_simultaneous_open = true", "tcp_simultaneous_open = false")]);
+    let out = run(&mut fx, &tcp6(sub(1, 1), 40000, SERVER, 443, 0x02)).unwrap();
+    let (src4, sport4, ..) = v4_tuple(&out);
     assert_eq!(run(&mut fx, &tcp4(OTHER, 443, src4, sport4, 0x02)).unwrap_err(), DropReason::Filtered);
 }
 

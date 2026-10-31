@@ -188,6 +188,32 @@ fn fips_active() -> bool {
 /// (later entries override earlier ones, as in systemd).
 const UNIT_PATHS: [&str; 2] = ["/usr/lib/systemd/system/platd.service", "/etc/systemd/system/platd.service"];
 
+/// The `check-config` held-SYN line (RFC 6146 §3.5.2.2): worst-case
+/// memory, or why holding is off.
+///
+/// COMPLIANCE MAPPING:
+/// - NIST 800-53: SC-5, CM-6 - the bound of attacker-creatable held state
+///   is visible before start
+fn held_syn_summary(cfg: &Config) -> String {
+    let n = &cfg.nat64;
+    if n.holds_syns() {
+        format!(
+            "held SYN memory (worst case): {} bytes ({} SYNs, {} per BIB, {} s, expiry ICMP {}; SC-5)\n",
+            n.held_syn_memory(),
+            n.max_held_syns,
+            n.max_held_syns_per_bib,
+            n.held_syn_secs,
+            if n.held_syn_unreachable { "on" } else { "off" },
+        )
+    } else if n.tcp_simultaneous_open && n.max_held_syns > 0 {
+        "WARNING: nat64.tcp_simultaneous_open has no effect with filtering = \"endpoint_independent\" \
+         (inbound SYNs to bound ports are already admitted)\n"
+            .into()
+    } else {
+        "held SYNs: off\n".into()
+    }
+}
+
 /// The `check-config` memory section: the requirement and, when a unit file
 /// is found, a warning if its `MemoryMax=` is lower. `platd run` enforces the
 /// limit itself; this only catches a mis-sized unit before a restart.
@@ -372,6 +398,7 @@ fn main() -> ExitCode {
                 }
                 print!("{}", capacity_summary(&cfg, owned.len() as u64));
                 println!("fragment memory per worker: {} bytes (SC-5)", cfg.translation.fragments.memory_per_worker());
+                print!("{}", held_syn_summary(&cfg));
                 print!("{}", memory_summary(&cfg, unit.as_deref()));
                 if let Some(f) = cfg.audit.file.as_ref() {
                     println!("audit file min_free_bytes: {} (AU-5(1))", f.min_free_bytes);
@@ -608,6 +635,16 @@ mod tests {
     }
 
     /// POAM-021: check-config warns when the unit's MemoryMax is too low.
+    #[test]
+    fn held_syn_summary_reports_memory_or_why_off() {
+        let mut cfg = example(&[]);
+        assert!(held_syn_summary(&cfg).starts_with("held SYN memory (worst case): 4456448 bytes"));
+        cfg.nat64.filtering = plat_common::config::Filtering::EndpointIndependent;
+        assert!(held_syn_summary(&cfg).starts_with("WARNING: nat64.tcp_simultaneous_open has no effect"));
+        cfg.nat64.tcp_simultaneous_open = false;
+        assert_eq!(held_syn_summary(&cfg), "held SYNs: off\n");
+    }
+
     #[test]
     fn memory_summary_warns_on_small_unit_limit() {
         let cfg = example(&[]);
