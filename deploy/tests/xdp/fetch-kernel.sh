@@ -77,7 +77,7 @@ set +f
 base=$1 suite=$2 vglob=$3
 case "$base" in https://*) ;; *) die "base URL must be https: $base" 2 ;; esac
 snapshot=no
-case "$base" in https://snapshot.debian.org/*) snapshot=yes ;; esac
+case "$base" in https://snapshot.debian.org/*) snapshot=yes ;; *) ;; esac
 
 dest=$out/$name-$arch
 work=$out/.dl-$name-$arch
@@ -85,7 +85,10 @@ rm -rf "$work"
 mkdir -p "$work"
 trap 'rm -rf "$work"' EXIT INT TERM
 
-fetch() { curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --max-time 900 -o "$2" "$1" || die "download failed: $1"; }
+fetch() {
+    url=$1 file=$2
+    curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --max-time 900 -o "$file" "$url" || die "download failed: $url"
+}
 
 # 1. Signed Release.
 fetch "$base/dists/$suite/InRelease" "$work/InRelease"
@@ -150,7 +153,7 @@ while IFS=$tab read -r p v f h; do
     abi=$(printf '%s\n' "$p" | sed -nE "s/^linux-image-($abi_re)-$arch-unsigned\$/\\1/p; s/^linux-binary-unsigned-($abi_re)-$arch\$/\\1/p")
     [ -n "$abi" ] || continue
     # shellcheck disable=SC2254 # vglob is a pattern by design
-    case "$v" in $vglob) printf '%s\t%s\t%s\t%s\t%s\n' "$p" "$v" "$f" "$h" "$abi" >>"$work/matching" ;; esac
+    case "$v" in $vglob) printf '%s\t%s\t%s\t%s\t%s\n' "$p" "$v" "$f" "$h" "$abi" >>"$work/matching" ;; *) ;; esac
 done <<EOF
 $(grep -E "^linux-(image|binary-unsigned)-[0-9]" "$work/index")
 EOF
@@ -168,6 +171,7 @@ case "$package" in
             die "split layout without $mods $version in $suite"
         debs="$package $mods"
         ;;
+    *) ;;
 esac
 
 # Download and verify each .deb against Packages and its pin.

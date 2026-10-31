@@ -19,6 +19,7 @@ for a do
     case "$prev" in
         -M | -machine) [ "$a" = virt,gic-version=host ] && a=virt,gic-version=3 ;;
         -cpu) [ "$a" = host ] && a=max,pauth-impdef=on ;;
+        *) ;;
     esac
     set -- "$@" "$a"
     prev=$a
