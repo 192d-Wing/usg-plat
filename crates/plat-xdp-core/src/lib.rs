@@ -67,8 +67,17 @@ pub const HDR4: usize = ETH + IP4 + UDP;
 /// Copies `M` bytes of `src` starting at `off` into a new array. Offsets are
 /// constants at every call site; bytes past the end of `src` read as zero
 /// instead of panicking.
+///
+/// The in-range case is one fixed-size copy (`first_chunk`), which LLVM
+/// lowers to a few loads in the eBPF object; an iterator copy with `skip`
+/// was lowered to `memcpy` calls of computed length, a loop in `.text`
+/// (PERF-002, PERF-009). The byte loop below is reached only for an
+/// out-of-range constant offset and folds away otherwise.
 #[inline(always)]
 pub(crate) fn take<const N: usize, const M: usize>(src: &[u8; N], off: usize) -> [u8; M] {
+    if let Some(a) = src.get(off..).and_then(<[u8]>::first_chunk::<M>) {
+        return *a;
+    }
     let mut a = [0u8; M];
     for (d, s) in a.iter_mut().zip(src.iter().skip(off)) {
         *d = *s;
@@ -78,10 +87,63 @@ pub(crate) fn take<const N: usize, const M: usize>(src: &[u8; N], off: usize) ->
 
 /// Writes `src` into `dst` at `off`. Offsets are constants at every call
 /// site; bytes that would land past the end of `dst` are dropped instead of
-/// panicking.
+/// panicking. As in [`take`], the in-range case is one fixed-size copy.
 #[inline(always)]
 pub(crate) fn put<const N: usize, const M: usize>(dst: &mut [u8; N], off: usize, src: &[u8; M]) {
+    if let Some(d) = dst.get_mut(off..).and_then(<[u8]>::first_chunk_mut::<M>) {
+        *d = *src;
+        return;
+    }
     for (d, s) in dst.iter_mut().skip(off).zip(src.iter()) {
         *d = *s;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{put, take};
+
+    /// The fixed-size fast path and the byte-loop fallback agree with the
+    /// documented semantics (PERF-002 rewrite): in range, an exact copy;
+    /// past the end, zeros read and writes dropped.
+    #[test]
+    fn take_and_put_in_and_out_of_range() {
+        let src: [u8; 6] = [1, 2, 3, 4, 5, 6];
+        assert_eq!(take::<6, 2>(&src, 0), [1, 2]);
+        assert_eq!(take::<6, 2>(&src, 4), [5, 6]);
+        assert_eq!(take::<6, 4>(&src, 4), [5, 6, 0, 0]);
+        assert_eq!(take::<6, 2>(&src, 6), [0, 0]);
+        assert_eq!(take::<6, 2>(&src, usize::MAX), [0, 0]);
+
+        let mut dst = [0u8; 6];
+        put(&mut dst, 1, &[9, 8]);
+        assert_eq!(dst, [0, 9, 8, 0, 0, 0]);
+        put(&mut dst, 4, &[7, 7, 7]);
+        assert_eq!(dst, [0, 9, 8, 0, 7, 7]);
+        put(&mut dst, 6, &[1]);
+        put(&mut dst, usize::MAX, &[1]);
+        assert_eq!(dst, [0, 9, 8, 0, 7, 7]);
+    }
+
+    #[test]
+    fn sum_at_matches_a_byte_reference() {
+        let b: [u8; 7] = [0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde];
+        let reference = |off: usize, len: usize| {
+            let s: [u8; 7] = core::array::from_fn(|i| if i >= off && i < off.saturating_add(len) { b[i] } else { 0 });
+            let mut acc = 0u64;
+            let mut i = off;
+            while i < off.saturating_add(len).min(7) {
+                let hi = s[i];
+                let lo = if i + 1 < off.saturating_add(len).min(7) { s[i + 1] } else { 0 };
+                acc += u64::from(u16::from_be_bytes([hi, lo]));
+                i += 2;
+            }
+            acc
+        };
+        for off in 0..9 {
+            for len in 0..10 {
+                assert_eq!(crate::csum::sum_at(&b, off, len), reference(off, len), "off {off} len {len}");
+            }
+        }
     }
 }

@@ -17,11 +17,18 @@ allow = ["Apache-2.0", "MIT", "BSD-3-Clause", "Unicode-3.0", "ISC"]
 # (user decision Option A, POAM-016): plat-xdp-ebpf is "MIT OR GPL-2.0-only" and
 # its object declares "Dual MIT/GPL" because the kernel helper bpf_fib_lookup is
 # gpl_only. Every other crate, including plat-xdp-core, plat-xdp and
-# plat-xdp-loader, stays Apache-2.0 (license.workspace). The crate arrives with
-# WU2; until then cargo-deny reports this exception as unused (a warning).
+# plat-xdp-loader, stays Apache-2.0 (license.workspace). SEC-007: the exception
+# is pinned to the workspace crate's exact version (crates/plat-xdp-ebpf,
+# publish = false). cargo-deny 0.20 package specs take a name and version but
+# no source; a registry crate of the same name could only enter through a
+# dependency, which [sources] (crates.io only) and review would show. cargo-deny
+# accepts the crate's "MIT OR GPL-2.0-only" through MIT alone, so this exception
+# records the decision rather than unblocking the check; it widens nothing for
+# any other crate or version. A version bump of plat-xdp-ebpf must update the
+# pin here (cargo-deny then warns "license exception was not encountered").
 exceptions = [
     { crate = "aws-lc-fips-sys", allow = ["OpenSSL"] },
-    { crate = "plat-xdp-ebpf", allow = ["GPL-2.0-only"] },
+    { crate = "plat-xdp-ebpf@0.1.0", allow = ["GPL-2.0-only"] },
 ]
 
 [bans]

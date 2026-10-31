@@ -5,19 +5,32 @@
 #
 #   1. the guest runs the expected kernel; bpffs is mounted;
 #   2. kernel smoke: XDP load + BPF_PROG_TEST_RUN (xdp-smoke.py);
-#   3. the level-2 netns topology comes up (netns.sh);
-#   4. level 2: the plat-xdp test_run suite inside that netns, when its test
+#   3. with -o OBJECT: the stack and instruction gate on the plat-xdp-ebpf
+#      object (obj-gate.py stats: verifier statistics, ≤ 384 B deepest call
+#      chain, processed-instruction budget; fails closed);
+#   4. the level-2 netns topology comes up (netns.sh);
+#   5. with -o OBJECT: the level-2 smoke vectors on the object inside that
+#      netns (obj-gate.py testrun, level2-vectors.txt);
+#   6. level 2: the plat-xdp test_run suite inside that netns, when its test
 #      binary is passed (WU3 adds it; skipped until then);
-#   5. level 4: the e2e topology, then e2e.sh run (skips, exit 77, until
+#   7. level 4: the e2e topology, then e2e.sh run (skips, exit 77, until
 #      platd and plat-xdp-loader with the xdp feature exist, WU5/WU6).
 #
-# Usage: guest.sh KVER [LEVEL2_TEST_BIN]
+# Usage: guest.sh [-o OBJECT] KVER [LEVEL2_TEST_BIN]
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
 fail() { echo "XDP-GUEST-FAIL: $*"; exit 1; }
 
-[ $# -ge 1 ] || fail "usage: guest.sh KVER [LEVEL2_TEST_BIN]"
+object=
+while getopts o: opt; do
+    case "$opt" in
+        o) object=$OPTARG ;;
+        *) fail "usage: guest.sh [-o OBJECT] KVER [LEVEL2_TEST_BIN]" ;;
+    esac
+done
+shift $((OPTIND - 1))
+[ $# -ge 1 ] || fail "usage: guest.sh [-o OBJECT] KVER [LEVEL2_TEST_BIN]"
 want=$1
 level2=${2:-}
 
@@ -29,7 +42,18 @@ if [ -e /sys/kernel/btf/vmlinux ]; then echo "BTF: yes"; else echo "BTF: no"; fi
 
 python3 -I "$here/xdp-smoke.py" || fail "kernel smoke test"
 
+if [ -n "$object" ]; then
+    [ -f "$object" ] || fail "no object $object"
+    python3 -I "$here/obj-gate.py" stats "$object" || fail "stack and instruction gate"
+else
+    echo "SKIP: eBPF object gates (no -o OBJECT)"
+fi
+
 "$here/netns.sh" up platxdp || fail "netns topology"
+if [ -n "$object" ]; then
+    nsenter --net=/run/netns/platxdp python3 -I "$here/obj-gate.py" testrun "$object" "$here/level2-vectors.txt" ||
+        fail "level-2 smoke vectors"
+fi
 if [ -n "$level2" ]; then
     [ -x "$level2" ] || fail "level-2 test binary not executable: $level2"
     nsenter --net=/run/netns/platxdp "$level2" --ignored --test-threads=1 || fail "level 2 test_run suite"

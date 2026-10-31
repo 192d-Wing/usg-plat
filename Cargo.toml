@@ -10,6 +10,8 @@ members = [
     "crates/plat-cluster",
     "crates/plat-tls",
     "crates/plat-xdp-core",
+    # bpfel-unknown-none program; on the host a stub main (plan §15).
+    "crates/plat-xdp-ebpf",
     "services/platd",
 ]
 

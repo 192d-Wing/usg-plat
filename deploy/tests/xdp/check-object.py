@@ -8,6 +8,11 @@
     the allow-list verified in spike Q7; no bpf_printk / bpf_trace_vprintk /
     bpf_snprintf / ringbuf or perf output; no kfunc calls (src_reg 2);
   - no aya-log maps or symbols (AYA_LOGS and friends);
+  - no loop: the control-flow graph of every program and of every function
+    reachable from one through bpf-to-bpf calls has no cycle (PERF-009, plan
+    §2.5 rule 5; backward jumps that do not close a cycle, such as a shared
+    exit block, are fine). Unreachable `.text` functions (compiler_builtins'
+    memcpy/memset, never loaded) are not checked;
   - prints the object's SHA-256 for the CI record.
 
 Adding a helper means recording its gpl_only flag at the 6.1 and current kernel
@@ -18,7 +23,8 @@ Exit: 0 ok, 1 a check failed, 2 usage or unreadable / not an eBPF ELF.
 
 COMPLIANCE MAPPING:
 - NIST 800-53: CM-10 (Software Usage Restrictions) - licence string;
-  SA-11 (Developer Testing), SI-7 (Integrity) - helper allow-list, digest
+  SA-11 (Developer Testing), SI-7 (Integrity) - helper allow-list, digest;
+  SC-5 (Denial-of-Service Protection) - no loops in the per-packet program
 """
 
 import hashlib
@@ -30,7 +36,7 @@ LICENSE = b"Dual MIT/GPL\x00"
 # include/uapi/linux/bpf.h __BPF_FUNC_MAPPER order (identical in v6.1 and later).
 # No bpf_map_update_elem (2) or bpf_map_delete_elem (3): the program creates
 # and removes no per-packet map state; it writes only through lookup pointers
-# (SLOT.seen_ns, IDENT, STATS). NIST 800-53 SC-5.
+# (SLOT.seen_ns, IDENT, SCRATCH, STATS, FWD). NIST 800-53 SC-5.
 ALLOWED_HELPERS = {
     1: "bpf_map_lookup_elem",
     5: "bpf_ktime_get_ns",
@@ -56,7 +62,11 @@ SHF_EXECINSTR = 0x4
 SHT_SYMTAB = 2
 OP_CALL = 0x85
 OP_LD_IMM64 = 0x18
+BPF_PSEUDO_CALL = 1
 BPF_PSEUDO_KFUNC_CALL = 2
+SHT_REL = 9
+STT_FUNC = 2
+R_BPF_64_32 = 10
 
 
 class NotBpf(Exception):
@@ -91,6 +101,130 @@ def sections(data):
         yield strtab[name : end if end >= 0 else None].decode(errors="replace"), typ, flags, body, link, entsize, raw
 
 
+def parse(data):
+    """Sections (dicts), with symbols and relocations resolved by index."""
+    secs = []
+    for name, typ, flags, body, link, entsize, raw in sections(data):
+        secs.append({"name": name, "type": typ, "flags": flags, "body": body, "link": link, "entsize": entsize})
+    # sh_info of each section (the target of a SHT_REL), re-read from the header table.
+    (shoff,) = struct.unpack_from("<Q", data, 0x28)
+    for i, sec in enumerate(secs):
+        (sec["info"],) = struct.unpack_from("<I", data, shoff + i * 64 + 44)
+    syms = []
+    for sec in secs:
+        if sec["type"] == SHT_SYMTAB and sec["entsize"] == 24 and sec["link"] < len(secs):
+            strs = secs[sec["link"]]["body"]
+            body = sec["body"]
+            for off in range(0, len(body) - 23, 24):
+                st_name, st_info, _other, shndx, value, size = struct.unpack_from("<IBBHQQ", body, off)
+                end = strs.find(b"\x00", st_name)
+                syms.append(
+                    {
+                        "name": strs[st_name : end if end >= 0 else None].decode(errors="replace"),
+                        "type": st_info & 0xF,
+                        "shndx": shndx,
+                        "value": value,
+                        "size": size,
+                    }
+                )
+    rels = {}  # (section index, byte offset) -> symbol
+    for sec in secs:
+        if sec["type"] == SHT_REL:
+            body = sec["body"]
+            for off in range(0, len(body) - 15, 16):
+                r_off, r_info = struct.unpack_from("<QQ", body, off)
+                sym = r_info >> 32
+                if (r_info & 0xFFFFFFFF) == R_BPF_64_32 and sym < len(syms):
+                    rels[(sec["info"], r_off)] = syms[sym]
+    return secs, syms, rels
+
+
+def functions(secs, syms):
+    """(section index, start insn, end insn, name) of every function; a code
+    section without FUNC symbols is one function."""
+    funcs = []
+    for i, sec in enumerate(secs):
+        if not sec["flags"] & SHF_EXECINSTR:
+            continue
+        n = len(sec["body"]) // 8
+        fs = sorted((s for s in syms if s["shndx"] == i and s["type"] == STT_FUNC), key=lambda s: s["value"])
+        if not fs:
+            funcs.append((i, 0, n, sec["name"]))
+        for s in fs:
+            start = s["value"] // 8
+            end = start + s["size"] // 8 if s["size"] else n
+            funcs.append((i, start, min(end, n), s["name"]))
+    return funcs
+
+
+def loops(data):
+    """Problems: every cycle in the CFG of code reachable from a program."""
+    secs, syms, rels = parse(data)
+    funcs = functions(secs, syms)
+    by_start = {(f[0], f[1]): f for f in funcs}
+    problems = []
+    todo = [f for f in funcs if secs[f[0]]["name"] != ".text"]
+    seen = set()
+    while todo:
+        f = todo.pop()
+        if f in seen:
+            continue
+        seen.add(f)
+        si, start, end, fname = f
+        body = secs[si]["body"]
+
+        def decode(k):
+            op, regs, off, imm = struct.unpack_from("<BBhi", body, k * 8)
+            return op, regs >> 4, off, imm
+
+        def succ(k):
+            op, src, off, imm = decode(k)
+            cls, code = op & 7, op & 0xF0
+            nxt = k + (2 if op == OP_LD_IMM64 else 1)
+            if cls not in (5, 6):
+                return [nxt]
+            if code == 0x90:  # exit
+                return []
+            if code == 0x80:  # call: falls through
+                if src == BPF_PSEUDO_CALL:
+                    sym = rels.get((si, k * 8))
+                    if sym is not None:
+                        target = (sym["shndx"], sym["value"] // 8 + (imm + 1 if sym["type"] != STT_FUNC else 0))
+                    else:
+                        target = (si, k + 1 + imm)
+                    callee = by_start.get(target)
+                    if callee is None:
+                        problems.append(f"{secs[si]['name']}+{k * 8:#x}: call to an unknown function")
+                    else:
+                        todo.append(callee)
+                return [nxt]
+            if code == 0x00:  # ja (JMP32 class: 32-bit offset in imm)
+                return [k + 1 + (imm if cls == 6 else off)]
+            return [nxt, k + 1 + off]
+
+        # Iterative DFS; an edge to a node on the stack closes a cycle.
+        state = {}
+        stack = [(start, iter(succ(start)))]
+        state[start] = 1
+        while stack:
+            k, it = stack[-1]
+            nxt = next(it, None)
+            if nxt is None:
+                state[k] = 2
+                stack.pop()
+                continue
+            if not start <= nxt < end:
+                problems.append(f"{fname}+{k * 8:#x}: jump out of the function")
+                continue
+            st = state.get(nxt)
+            if st == 1:
+                problems.append(f"{fname}+{k * 8:#x}: loop back-edge to +{nxt * 8:#x}")
+            elif st is None:
+                state[nxt] = 1
+                stack.append((nxt, iter(succ(nxt))))
+    return problems
+
+
 def check(data):
     """Return a list of problems (empty when the object passes)."""
     problems = []
@@ -121,6 +255,7 @@ def check(data):
                 sym = strs[st_name : end if end >= 0 else None].decode(errors="replace")
                 if any(p in sym for p in FORBIDDEN_NAME_PARTS):
                     problems.append(f"forbidden symbol {sym}")
+    problems.extend(loops(data))
     if license_seen is None:
         problems.append("no license section")
     elif license_seen != LICENSE:
@@ -162,8 +297,8 @@ def build_elf(secs, symbols=()):
     return hdr + body + sh
 
 
-def insn(op, src=0, imm=0):
-    return struct.pack("<BBhi", op, src << 4, 0, imm)
+def insn(op, src=0, imm=0, off=0):
+    return struct.pack("<BBhi", op, src << 4, off, imm)
 
 
 def self_test():
@@ -196,6 +331,38 @@ def self_test():
                 [(b"xdp", 1, 0x6, insn(OP_LD_IMM64) + insn(OP_CALL, imm=6) + insn(0x95)), (b"license", 1, 0x3, LICENSE)]
             ),
             0,
+        ),
+        (
+            "loop (ja back to the start)",
+            build_elf([(b"xdp", 1, 0x6, insn(0xB7) + insn(0x05, off=-2)), (b"license", 1, 0x3, LICENSE)]),
+            1,
+        ),
+        (
+            "conditional loop",
+            build_elf([(b"xdp", 1, 0x6, insn(0xB7) + insn(0x55, off=-2) + insn(0x95)), (b"license", 1, 0x3, LICENSE)]),
+            1,
+        ),
+        (
+            "backward jump to a shared exit is not a loop",
+            build_elf(
+                [
+                    (b"xdp", 1, 0x6, insn(0x15, off=2) + insn(0xB7, imm=2) + insn(0x95) + insn(0x05, off=-3)),
+                    (b"license", 1, 0x3, LICENSE),
+                ]
+            ),
+            0,
+        ),
+        (
+            "unreachable .text loop is not checked",
+            build_elf(
+                [(b"xdp", 1, 0x6, ok_code), (b".text", 1, 0x6, insn(0x05, off=-1)), (b"license", 1, 0x3, LICENSE)]
+            ),
+            0,
+        ),
+        (
+            "call to an unknown function",
+            build_elf([(b"xdp", 1, 0x6, insn(OP_CALL, src=1, imm=0) + insn(0x95)), (b"license", 1, 0x3, LICENSE)]),
+            1,
         ),
         (
             "non-executable data is not scanned",
@@ -236,7 +403,7 @@ def main(argv):
         print(f"check-object: {p}", file=sys.stderr)
     if problems:
         return 1
-    print("check-object: ok (Dual MIT/GPL, helpers on the allow-list, no aya-log)")
+    print("check-object: ok (Dual MIT/GPL, helpers on the allow-list, no aya-log, no loops)")
     return 0
 
 

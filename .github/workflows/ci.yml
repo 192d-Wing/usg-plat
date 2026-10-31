@@ -120,8 +120,10 @@ jobs:
         run: deploy/tests/xdp/check-llvm-major.sh "$HOME/.local/bin/bpf-linker"
       - name: make check-xdp (scripts, bpfel clippy, xdp-feature clippy)
         run: make check-xdp
-      - name: make xdp (bpfel build, eBPF object, licence and helper checks, sha256)
+      - name: make xdp (bpfel build, eBPF object, licence, helper and loop checks, sha256)
         run: make xdp
+      - name: The object is reproducible from another directory and has no host paths (SEC-001)
+        run: deploy/tests/xdp/check-repro.sh target/xdp/plat-xdp-ebpf "$RUNNER_TEMP/xdp-repro"
 
   # Level-1 differential harness at the plan §11 case count (advisory, like
   # xdp-build; NIST 800-53: SA-11(1), advisory until WU8). Release build: the 1M cases take
@@ -155,9 +157,12 @@ jobs:
   # Kernel matrix (plan §11 level 3, decision Q1). Kernels are Debian packages
   # verified through the signed InRelease (deploy/tests/xdp/fetch-kernel.sh),
   # booted with virtme-ng: KVM on x86_64, TCG through qemu-tcg.sh on arm64.
-  # Today: boot, kernel smoke test (XDP load + BPF_PROG_TEST_RUN), netns and
-  # e2e topologies; level 2 and 4 skip until WU3/WU5. Becomes a required check
-  # on main before [xdp] is documented as supported.
+  # Today: boot, kernel smoke test (XDP load + BPF_PROG_TEST_RUN), the
+  # plat-xdp-ebpf object's stack/instruction gate and level-2 smoke vectors
+  # (obj-gate.py; the object is built here with the pinned bpf-linker, as in
+  # xdp-build), netns and e2e topologies; the full level 2 and level 4 skip
+  # until WU3/WU5. Becomes a required check on main before [xdp] is
+  # documented as supported.
   xdp-vm:
     name: xdp vm (${{ matrix.kernel }}, ${{ matrix.arch }})
     strategy:
@@ -173,7 +178,7 @@ jobs:
             runner: ubuntu-24.04-arm
             qemu: qemu-system-arm
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    timeout-minutes: 40
     env:
       XDP_KERNELS: ${{ matrix.kernel }}
       XDP_VNG_FLAGS: -m
@@ -182,11 +187,28 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: The workspace build environment has no RUSTC_BOOTSTRAP
+        run: |
+          if [ -n "${RUSTC_BOOTSTRAP+set}" ]; then
+            echo "::error::RUSTC_BOOTSTRAP is set for the workspace build (plan §15)"
+            exit 1
+          fi
+      - name: Install pinned toolchain from rust-toolchain.toml (incl. rust-src)
+        run: rustup toolchain install && rustup show
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install virtme-ng, QEMU, gpgv and the Debian archive keyring
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends virtme-ng "$QEMU_PKG" busybox-static file kmod \
-            gpgv debian-archive-keyring xz-utils iproute2 iputils-ping
+            gpgv debian-archive-keyring xz-utils iproute2 iputils-ping zstd
+      - name: Install bpf-linker 0.12.0 (release tarball, sha256-pinned)
+        run: |
+          deploy/tests/xdp/install-bpf-linker.sh "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: rustc and bpf-linker share one LLVM major
+        run: deploy/tests/xdp/check-llvm-major.sh "$HOME/.local/bin/bpf-linker"
       - name: Allow the runner user to open /dev/kvm (when the host offers it)
         run: |
           if [ -e /dev/kvm ]; then
@@ -196,7 +218,7 @@ jobs:
           else
             echo "no /dev/kvm: TCG"
           fi
-      - name: make test-xdp (fetch, verify, boot, guest checks)
+      - name: make test-xdp (object build, fetch, verify, boot, guest checks and object gates)
         run: make test-xdp
       - name: Record the kernel package and verification
         if: always()
@@ -217,5 +239,6 @@ jobs:
           path: |
             target/xdp-vm/*.log
             target/xdp-kernels/*/kernel.env
+            target/xdp/plat-xdp-ebpf.sha256
           if-no-files-found: ignore
           retention-days: 14

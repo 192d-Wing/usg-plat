@@ -1,0 +1,28 @@
+[package]
+name = "plat-xdp-ebpf"
+description = "eBPF/XDP fast path of usg-plat for established UDP sessions (bpfel-unknown-none; a stub binary on the host)"
+version.workspace = true
+edition.workspace = true
+# Decision Q2, Option A: the object calls bpf_fib_lookup (gpl_only), so this
+# crate alone is dual licensed and the object's licence section says
+# "Dual MIT/GPL". Every other crate stays on the workspace licence.
+license = "MIT OR GPL-2.0-only"
+# Aya needs 1.98.
+rust-version = "1.98"
+publish.workspace = true
+
+[dependencies]
+plat-xdp-core.workspace = true
+
+# Only the bpfel-unknown-none build links Aya: the host build (cargo
+# --workspace, check-linux) is a stub `main` with no eBPF code. Cargo.lock,
+# cargo-deny and cargo-audit still cover these (plan §15).
+[target.'cfg(target_arch = "bpf")'.dependencies]
+aya-ebpf.workspace = true
+
+[[bin]]
+name = "plat-xdp-ebpf"
+path = "src/main.rs"
+
+[lints]
+workspace = true

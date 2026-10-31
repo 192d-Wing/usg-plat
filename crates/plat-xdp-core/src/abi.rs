@@ -746,32 +746,72 @@ impl PassReason {
 }
 
 /// `STATS` indices of the non-pass counters. Stable; append only.
+/// Indices 0-3 are reserved: they held the per-direction packet and byte
+/// counters, which moved to [`FwdCounters`] in `FWD` so a forwarded packet
+/// costs one counter lookup (PERF-001, WU2).
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StatIdx {
-    /// `plat_xdp_packets_total{dir="v6_to_v4"}`.
-    PacketsV6ToV4 = 0,
-    /// `plat_xdp_packets_total{dir="v4_to_v6"}`.
-    PacketsV4ToV6 = 1,
-    /// `plat_xdp_bytes_total{dir="v6_to_v4"}` (output frame bytes).
-    BytesV6ToV4 = 2,
-    /// `plat_xdp_bytes_total{dir="v4_to_v6"}`.
-    BytesV4ToV6 = 3,
-    /// `plat_xdp_aborted_total`: a bounds re-check failed after an adjust.
+    /// `plat_xdp_aborted_total`: a bounds re-check failed after an adjust,
+    /// or `TX` had no entry after the rewrite.
     Aborted = 4,
 }
 
 impl StatIdx {
-    pub const ALL: [StatIdx; 5] =
-        [Self::PacketsV6ToV4, Self::PacketsV4ToV6, Self::BytesV6ToV4, Self::BytesV4ToV6, Self::Aborted];
+    pub const ALL: [StatIdx; 1] = [Self::Aborted];
 
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::PacketsV6ToV4 => "packets_v6_to_v4",
-            Self::PacketsV4ToV6 => "packets_v4_to_v6",
-            Self::BytesV6ToV4 => "bytes_v6_to_v4",
-            Self::BytesV4ToV6 => "bytes_v4_to_v6",
             Self::Aborted => "aborted",
+        }
+    }
+}
+
+/// `FWD` entries: one per direction ([`FwdDir`]).
+pub const FWD_DIRS: u32 = 2;
+
+/// `FWD` index: the direction of a forwarded packet.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FwdDir {
+    /// `dir="v6_to_v4"`.
+    V6ToV4 = 0,
+    /// `dir="v4_to_v6"`.
+    V4ToV6 = 1,
+}
+
+impl FwdDir {
+    pub const ALL: [FwdDir; FWD_DIRS as usize] = [Self::V6ToV4, Self::V4ToV6];
+
+    /// The `dir` label of `plat_xdp_packets_total` / `plat_xdp_bytes_total`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::V6ToV4 => "v6_to_v4",
+            Self::V4ToV6 => "v4_to_v6",
+        }
+    }
+}
+
+/// `FWD` per-CPU array value: forwarded packets and output frame bytes of
+/// one direction, adjacent so one lookup updates both (PERF-001).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FwdCounters {
+    pub packets: u64,
+    pub bytes: u64,
+}
+
+const _: () = {
+    assert!(size_of::<FwdCounters>() == 16);
+    assert!(offset_of!(FwdCounters, packets) == 0);
+    assert!(offset_of!(FwdCounters, bytes) == 8);
+};
+
+impl FwdCounters {
+    pub fn from_bytes(b: &[u8; 16]) -> Self {
+        Self {
+            packets: u64::from_ne_bytes(take(b, offset_of!(FwdCounters, packets))),
+            bytes: u64::from_ne_bytes(take(b, offset_of!(FwdCounters, bytes))),
         }
     }
 }
