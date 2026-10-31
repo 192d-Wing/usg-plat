@@ -1090,6 +1090,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "plat-xdp-core"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "plat-audit",
+ "plat-common",
+ "plat-nat64",
+ "plat-packet",
+ "plat-xlat",
+ "proptest",
+]
+
+[[package]]
 name = "plat-xlat"
 version = "0.1.0"
 dependencies = [
