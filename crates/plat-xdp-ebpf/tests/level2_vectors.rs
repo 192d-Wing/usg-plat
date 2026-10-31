@@ -25,7 +25,8 @@ use std::fmt::Write as _;
 
 use plat_xdp_core::abi::{
     AF_INET, AF_INET6, ConfigRec, Control, EgressEnt, FIB_RET_SUCCESS, FibParams, IdentEnt, IfaceEnt, Key4, Key6,
-    PassReason, ROLE_ACCESS, ROLE_UPSTREAM, SLICE_ACTIVE, SLOT_LIVE, SliceEnt, SlotRec, XlatConfig,
+    PassReason, ROLE_ACCESS, ROLE_UPSTREAM, SLICE_ACTIVE, SLICE_ADOPTING, SLICE_FENCED, SLOT_DEAD, SLOT_LIVE, SliceEnt,
+    SlotRec, XlatConfig,
 };
 use plat_xdp_core::decide::{Action, Env, Verdict};
 use plat_xdp_core::ident::{self, IdentKey};
@@ -260,6 +261,56 @@ enum Want {
     Pass(PassReason),
 }
 
+/// Per-frame map state on top of the shared state (QA, WU2): the
+/// map-state declines plan §11 level 2 lists that the smoke harness can
+/// reach by writing maps (`with FRAME ...` lines; obj-gate.py applies them
+/// after the shared state and the next frame's shared state undoes them).
+#[derive(Clone, Copy)]
+enum Ovr {
+    /// CONTROL = {enabled, tun0, deadline_ns, tun_mtu}.
+    Control { enabled: u32, deadline_ns: u64, tun_mtu: u32 },
+    /// SLICE[0] = {state, generation}.
+    Slice { state: u8, generation: u32 },
+    /// SLOT[SLOT].state.
+    SlotState(u8),
+    /// EGRESS[DEV] role mask (allowed stays 1).
+    EgressRole(u32, u8),
+}
+
+impl Ovr {
+    fn apply(self, env: &mut NsEnv) {
+        match self {
+            Self::Control { enabled, deadline_ns, tun_mtu } => {
+                env.control.enabled = enabled;
+                env.control.deadline_ns = deadline_ns;
+                env.control.tun_mtu = tun_mtu;
+            }
+            Self::Slice { state, generation } => {
+                env.slice.state = state;
+                env.slice.generation = generation;
+            }
+            Self::SlotState(st) => env.rec.state = st,
+            Self::EgressRole(dev, role) => {
+                for e in env.egress.iter_mut().filter(|e| e.ifindex == dev) {
+                    e.role = role;
+                }
+            }
+        }
+    }
+
+    fn line(self, frame: &str, env: &NsEnv) -> String {
+        let le = |i: u32| hex(&i.to_le_bytes());
+        match self {
+            Self::Control { enabled, deadline_ns, tun_mtu } => {
+                format!("with {frame} control tun0 {tun_mtu} {enabled} {deadline_ns}")
+            }
+            Self::Slice { .. } => format!("with {frame} map SLICE {} {}", le(0), hex(&env.slice.to_bytes())),
+            Self::SlotState(_) => format!("with {frame} map SLOT {} {}", le(SLOT), hex(&env.rec.to_bytes())),
+            Self::EgressRole(dev, role) => format!("with {frame} egress {} {role}", ifname(dev)),
+        }
+    }
+}
+
 fn ifname(i: u32) -> &'static str {
     match i {
         ACC => "acc0",
@@ -281,6 +332,68 @@ fn generate() -> String {
     arp.extend_from_slice(&[0x02, 0, 0, 0, 0x02, 0xfe, 0x08, 0x06]);
     arp.resize(42, 0);
 
+    let mut not_for_us = spike5.clone();
+    not_for_us[..6].copy_from_slice(&[0x33, 0x33, 0, 0, 0, 1]);
+    let ctl = |enabled, deadline_ns, tun_mtu| Ovr::Control { enabled, deadline_ns, tun_mtu };
+    // QA (WU2): map-state declines, plan §11 level 2 "map-state tests".
+    let declines: Vec<(&str, u32, Vec<u8>, Want, Ovr)> = vec![
+        ("v6_control_disabled", ACC, spike5.clone(), Want::Pass(PassReason::Disabled), ctl(0, u64::MAX, LINK_MTU)),
+        ("v4_control_disabled", UP, in5.clone(), Want::Pass(PassReason::Disabled), ctl(0, u64::MAX, LINK_MTU)),
+        ("v6_control_tun_mtu_0", ACC, spike5.clone(), Want::Pass(PassReason::Disabled), ctl(1, u64::MAX, 0)),
+        ("v6_deadline_past", ACC, spike5.clone(), Want::Pass(PassReason::Deadline), ctl(1, 1, LINK_MTU)),
+        ("v4_deadline_past", UP, in5.clone(), Want::Pass(PassReason::Deadline), ctl(1, 1, LINK_MTU)),
+        (
+            "v6_1300b_above_tun_mtu",
+            ACC,
+            core_input(CORE_V6, "spike_1300b_df"),
+            Want::Pass(PassReason::TooBig),
+            ctl(1, u64::MAX, 1280),
+        ),
+        (
+            "v6_slice_fenced",
+            ACC,
+            spike5.clone(),
+            Want::Pass(PassReason::SliceInactive),
+            Ovr::Slice { state: SLICE_FENCED, generation: GEN },
+        ),
+        (
+            "v4_slice_adopting",
+            UP,
+            in5.clone(),
+            Want::Pass(PassReason::SliceInactive),
+            Ovr::Slice { state: SLICE_ADOPTING, generation: GEN },
+        ),
+        (
+            "v6_slice_generation_bumped",
+            ACC,
+            spike5.clone(),
+            Want::Pass(PassReason::SliceInactive),
+            Ovr::Slice { state: SLICE_ACTIVE, generation: GEN + 1 },
+        ),
+        (
+            "v4_slice_generation_bumped",
+            UP,
+            in5.clone(),
+            Want::Pass(PassReason::SliceInactive),
+            Ovr::Slice { state: SLICE_ACTIVE, generation: GEN + 1 },
+        ),
+        ("v6_slot_dead", ACC, spike5.clone(), Want::Pass(PassReason::SlotDead), Ovr::SlotState(SLOT_DEAD)),
+        ("v4_slot_dead", UP, in5.clone(), Want::Pass(PassReason::SlotDead), Ovr::SlotState(SLOT_DEAD)),
+        (
+            "v6_egress_up0_access_only",
+            ACC,
+            spike5.clone(),
+            Want::Pass(PassReason::EgressNotAllowed),
+            Ovr::EgressRole(UP, ROLE_ACCESS),
+        ),
+        (
+            "v4_egress_acc0_upstream_only",
+            UP,
+            in5.clone(),
+            Want::Pass(PassReason::EgressNotAllowed),
+            Ovr::EgressRole(ACC, ROLE_UPSTREAM),
+        ),
+    ];
     let frames: Vec<(&str, u32, Vec<u8>, Want)> = vec![
         ("v6_spike_5b_payload_df0", ACC, spike5.clone(), Want::Redirect),
         ("v6_spike_1300b_df", ACC, core_input(CORE_V6, "spike_1300b_df"), Want::Redirect),
@@ -294,12 +407,22 @@ fn generate() -> String {
         ("v4_no_session", UP, no_session4, Want::Pass(PassReason::NoSession)),
         ("arp_not_ip", ACC, arp, Want::Pass(PassReason::NotIp)),
         ("v6_short_bad_l3", ACC, spike5[..40].to_vec(), Want::Pass(PassReason::BadL3)),
+        ("v6_multicast_not_for_us", ACC, not_for_us, Want::Pass(PassReason::NotForUs)),
     ];
+    let frames = frames
+        .into_iter()
+        .map(|(n, i, f, w)| (n, i, f, w, None))
+        .chain(declines.into_iter().map(|(n, i, f, w, o)| (n, i, f, w, Some(o))));
 
     let mut idents = BTreeSet::new();
     let mut lines = String::new();
-    for (name, ingress, frame, want) in &frames {
-        let env = NsEnv::new();
+    for (name, ingress, frame, want, ovr) in frames {
+        let (name, ingress, frame, want) = (&name, &ingress, &frame, &want);
+        let mut env = NsEnv::new();
+        if let Some(o) = ovr {
+            o.apply(&mut env);
+            writeln!(lines, "{}", o.line(name, &env)).unwrap_or_else(|e| panic!("{e}"));
+        }
         let mut out = [0xa5u8; HDR6];
         let action = plat_xdp_core::decide_frame(&env, *ingress, frame, &mut out);
         match (want, action.pass_reason()) {
@@ -371,7 +494,8 @@ const HEADER: &str = "\
 #   percpu NAME KEY VALUE     the same value for every CPU
 #   iface DEV ROLE MAC        IFACES[ifindex % 64] = {ifindex, MAC, ROLE}
 #   egress DEV ROLE           EGRESS[ifindex % 64] = {ifindex, 1, ROLE}; TX[ifindex]
-#   control DEV MTU           CONTROL[0] = {1, ifindex(DEV), u64::MAX, MTU}
+#   control DEV MTU [EN DL]   CONTROL[0] = {EN (1), ifindex(DEV), DL (u64::MAX), MTU}
+#   with FRAME <state line>   applied after the shared state, for FRAME only
 # Frames (ingress_ifindex = DEV):
 #   frame NAME DEV redirect EGRESS SLOT IN OUT    XDP_REDIRECT, output == OUT,
 #                                                 SLOT[SLOT].seen_ns touched
@@ -399,4 +523,13 @@ fn vectors_cover_both_directions_and_declines() {
     assert!(n("frame v6_") >= 3 && n("frame v4_") >= 3);
     assert!(v.lines().any(|l| l.starts_with("frame v6_no_session ") && l.contains(" pass no_session ")));
     assert!(v.lines().any(|l| l.starts_with("percpu IDENT ")), "a DF = 0 IPv6 vector draws an ID");
+    // QA (WU2): every map-state decline of plan §11 level 2 the smoke
+    // harness can reach, and every frame with a `with` line exists.
+    for r in ["disabled", "deadline", "slice_inactive", "slot_dead", "too_big", "egress_not_allowed", "not_for_us"] {
+        assert!(v.lines().any(|l| l.starts_with("frame ") && l.contains(&format!(" pass {r} "))), "no {r} vector");
+    }
+    for w in v.lines().filter(|l| l.starts_with("with ")) {
+        let f = w.split_whitespace().nth(1).unwrap_or_default();
+        assert!(v.lines().any(|l| l.starts_with(&format!("frame {f} "))), "with line for unknown frame {f}");
+    }
 }

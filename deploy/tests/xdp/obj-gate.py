@@ -420,7 +420,7 @@ def ifindex(name):
 
 
 def parse_vectors(path):
-    state, frames = [], []
+    state, frames, extra = [], [], {}
     with open(path) as f:
         for n, line in enumerate(f, 1):
             line = line.split("#", 1)[0].split()
@@ -431,9 +431,15 @@ def parse_vectors(path):
                 state.append(line)
             elif kind == "frame":
                 frames.append(line)
+            elif kind == "with" and len(line) > 2 and line[2] in ("map", "percpu", "iface", "egress", "control"):
+                extra.setdefault(line[1], []).append(line[2:])
             else:
                 raise Usage(f"{path}:{n}: unknown line kind {kind}")
-    return state, frames
+    names = {f[1] for f in frames}
+    for name in extra:
+        if name not in names:
+            raise Usage(f"{path}: 'with' line for unknown frame {name}")
+    return state, frames, extra
 
 
 def apply_state(prog, state):
@@ -453,8 +459,11 @@ def apply_state(prog, state):
             maps["EGRESS"].update(struct.pack("<I", i % 64), struct.pack("<IBBH", i, 1, int(role), 0))
             maps["TX"].update(struct.pack("<I", i), struct.pack("<Ii", i, 0)[: maps["TX"].value_size])
         elif kind == "control":  # Control {enabled, tun_ifindex, deadline_ns u64, tun_mtu, pad}
-            _, dev, mtu = line
-            maps["CONTROL"].update(struct.pack("<I", 0), struct.pack("<IIQII", 1, ifindex(dev), 2**64 - 1, int(mtu), 0))
+            _, dev, mtu, *rest = line
+            enabled, deadline = (int(rest[0]), int(rest[1])) if rest else (1, 2**64 - 1)
+            maps["CONTROL"].update(
+                struct.pack("<I", 0), struct.pack("<IIQII", enabled, ifindex(dev), deadline, int(mtu), 0)
+            )
 
 
 def stat_sum(prog, idx):
@@ -467,7 +476,7 @@ def cmd_testrun(path, vectors):
         prog.load(log_level=0, log_size=0)
     except OSError as e:
         raise Fail(f"BPF_PROG_LOAD failed: {e} (run 'stats' for the verifier log)") from None
-    state, frames = parse_vectors(vectors)
+    state, frames, extra = parse_vectors(vectors)
     if not frames:
         raise Fail(f"{vectors}: no frames")
     failed = 0
@@ -476,6 +485,7 @@ def cmd_testrun(path, vectors):
         # frame NAME INGRESS pass REASON STAT_IDX IN
         name, dev, verdict = line[1], line[2], line[3]
         apply_state(prog, state)
+        apply_state(prog, extra.get(name, []))
         frame = bytes.fromhex(line[-2] if verdict == "redirect" else line[-1])
         problems = []
         if verdict == "redirect":
