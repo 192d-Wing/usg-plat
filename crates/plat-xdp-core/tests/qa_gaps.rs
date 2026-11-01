@@ -14,7 +14,8 @@ use std::cell::RefCell;
 use std::collections::BTreeSet;
 
 use plat_xdp_core::abi::{
-    SLICE_ACTIVE, SLICE_ADOPTING, SLICE_FENCED, SLICE_INACTIVE, SLOT_DEAD, SLOT_LIVE, SliceEnt, iface_slot,
+    SLICE_ACTIVE, SLICE_ADOPTING, SLICE_FENCED, SLICE_INACTIVE, SLOT_DEAD, SLOT_FAILED, SLOT_LIVE, SLOT_PENDING,
+    SliceEnt, iface_slot,
 };
 
 use plat_xdp_core::PassReason;
@@ -138,10 +139,14 @@ fn every_pass_reason_is_reachable_and_exact() {
 
     // Table-state reasons, both directions.
     type Mutator = fn(&mut Fx);
-    let cases: [(&str, Mutator, PassReason); 10] = [
+    let cases: [(&str, Mutator, PassReason); 12] = [
         ("disabled", |f| f.env.control.enabled = 0, PassReason::Disabled),
         ("deadline", |f| f.env.now = f.env.control.deadline_ns + 1, PassReason::Deadline),
         ("dead slot", |f| f.env.slots[f.s.slot as usize].state = SLOT_DEAD, PassReason::SlotDead),
+        // WU5 redesign: only LIVE is forwarded; PENDING (publish not yet
+        // done) and FAILED (publish failed, awaiting gc) pass.
+        ("pending slot", |f| f.env.slots[f.s.slot as usize].state = SLOT_PENDING, PassReason::SlotDead),
+        ("failed slot", |f| f.env.slots[f.s.slot as usize].state = SLOT_FAILED, PassReason::SlotDead),
         ("fenced", |f| f.env.slices[0].state = SLICE_FENCED, PassReason::SliceInactive),
         ("tun mtu", |f| f.env.control.tun_mtu = 10, PassReason::TooBig),
         ("forwarding", |f| f.env.net.forwarding = false, PassReason::FibFwdDisabled),

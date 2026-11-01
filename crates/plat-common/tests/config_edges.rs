@@ -620,6 +620,21 @@ fn xdp_rules() {
     xdp_invalid(&format!("enabled = true\nheartbeat_ms = 50\ndeadline_ms = 199\n{IF1}"), "deadline_ms");
 }
 
+/// QA (WU5): the accepting side of each [xdp] range edge not covered above.
+#[test]
+fn xdp_accepting_edges() {
+    let many = |n: usize| -> String {
+        (0..n).map(|i| format!("[[xdp.interfaces]]\nname = \"e{i}\"\nrole = \"both\"\n")).collect()
+    };
+    assert!(xdp(&format!("enabled = true\n{}", many(32))).is_ok(), "32 interfaces");
+    assert!(xdp(&format!("enabled = true\nheartbeat_ms = 1000\ndeadline_ms = 4000\n{IF1}")).is_ok());
+    xdp_invalid(&format!("enabled = true\nheartbeat_ms = 1000\ndeadline_ms = 3999\n{IF1}"), "deadline_ms");
+    assert!(
+        xdp("enabled = true\n[[xdp.interfaces]]\nname = \"abcdefghijklmno\"\nrole = \"access\"\n").is_ok(),
+        "IFNAMSIZ - 1"
+    );
+}
+
 #[test]
 fn xdp_unknown_fields_and_values_are_parse_errors() {
     for body in [

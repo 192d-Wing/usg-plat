@@ -1149,4 +1149,43 @@ pub(crate) mod tests {
         }
         assert_eq!(m.counters().sessions.get(), live.len() as u64);
     }
+
+    /// QA (WU5 redesign): the publisher stopped or never started. Nothing
+    /// reaches the hash maps, so the fast path never forwards (only `LIVE`
+    /// is forwarded); retires still go DEAD under the caller's lock; slots
+    /// are never recycled before their deletes ran (the pool exhausts
+    /// into `Slots`, i.e. slow path only), and the per-partition op queues
+    /// stay within their two-ops-per-slot bound (SC-5). One late flush
+    /// drains everything and the slots come back after the grace period.
+    #[test]
+    fn publisher_stopped_fails_safe_and_bounded() {
+        let (t, m) = mirror(64, 8);
+        let mut held = Vec::new();
+        for n in 0..32u8 {
+            if let Ok(s) = m.install(&entry(n), 1, usize::from(n) % 4) {
+                held.push((s, entry(n)));
+            }
+        }
+        assert_eq!(held.len(), 8, "exactly the slot pool, then Slots");
+        for (s, _) in &held {
+            assert_eq!(m.record(*s).map(|r| r.state), Some(SLOT_PENDING));
+        }
+        assert!(t.out6.lock().is_empty() && t.in4.lock().is_empty(), "no publisher: no entry");
+        for (s, e) in &held {
+            assert!(m.retire(*s, e).is_ok());
+            assert_eq!(m.record(*s).map(|r| r.state), Some(SLOT_DEAD), "never re-matched");
+        }
+        assert_eq!(m.counters().retires.get(), 8, "every retire deferred: queue bound held");
+        m.slot_allocator().advance_epoch();
+        m.slot_allocator().advance_epoch();
+        assert_eq!(m.slot_allocator().recycle(), 0, "no recycle before the deletes ran");
+        assert_eq!(m.install(&entry(40), 1, 0), Err(InstallError::Slots));
+        assert_eq!(m.flush(), 16, "8 publishes (refused: retired) + 8 retires");
+        assert!(t.out6.lock().is_empty() && t.in4.lock().is_empty());
+        assert_eq!(m.counters().installs.get(), 0);
+        m.slot_allocator().advance_epoch();
+        m.slot_allocator().advance_epoch();
+        assert_eq!(m.slot_allocator().recycle(), 8);
+        assert!(m.install(&entry(40), 1, 0).is_ok());
+    }
 }

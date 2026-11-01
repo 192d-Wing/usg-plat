@@ -30,8 +30,10 @@
 # Environment: PLATD, PLAT_XDP_LOADER: the binaries to test (`make xdp`
 # builds both under target/release); without them `run` skips (exit 77), so
 # the virtme-ng guests of `make test-xdp` skip level 4 unless given them.
-# E2E_ECHOES (default 150), E2E_PCAP=1 (captures), E2E_KEEP=1 (keep the
-# work directory).
+# E2E_MODE=native|generic (default native), E2E_TX_OFFLOAD=on (QA repro:
+# the senders keep TX checksum offload, so the fast path sees
+# CHECKSUM_PARTIAL; expected to fail), E2E_ECHOES (default 150),
+# E2E_PCAP=1 (captures), E2E_KEEP=1 (keep the work directory).
 # Exit: 0 pass; 1 failure; 2 usage; 77 skipped (prerequisites missing).
 set -eu
 
@@ -120,8 +122,12 @@ run() {
     # checksum holds only the pseudo-header sum), which no wire delivers:
     # the fast path's RFC 1624 update of such a sum yields a wrong checksum.
     # Full checksums, as from a real NIC.
-    nsx "$NS_C" ethtool -K c0 gro on tx off >/dev/null || die "ethtool -K c0"
-    nsx "$NS_S" ethtool -K s0 gro on tx off >/dev/null || die "ethtool -K s0"
+    # E2E_TX_OFFLOAD=on (QA repro) keeps TX checksum offload on, so
+    # the senders emit CHECKSUM_PARTIAL and the fast-path echoes are lost.
+    tx=${E2E_TX_OFFLOAD:-off}
+    case $tx in on | off) ;; *) die "E2E_TX_OFFLOAD must be on or off" 2 ;; esac
+    nsx "$NS_C" ethtool -K c0 gro on tx "$tx" >/dev/null || die "ethtool -K c0"
+    nsx "$NS_S" ethtool -K s0 gro on tx "$tx" >/dev/null || die "ethtool -K s0"
     # The fixed pin directory (plan §7), a dedicated bpffs.
     mkdir -p /run/plat/bpf
     chmod 0755 /run/plat
@@ -139,6 +145,8 @@ run() {
     ip -n "$NS_P" -6 route add 64:ff9b:1::/96 dev plat0
     ip -n "$NS_P" route add 192.0.2.0/24 dev plat0
 
+    xmode=${E2E_MODE:-native}
+    case $xmode in native | generic) ;; *) die "E2E_MODE must be native or generic" 2 ;; esac
     cfg=$work/platd.toml
     sed -e "s|/var/log/plat/nat64-audit.jsonl|$work/audit.jsonl|" \
         -e 's|min_free_bytes = 2147483648|min_free_bytes = 1048576|' \
@@ -155,7 +163,8 @@ run() {
 
 [xdp]
 enabled = true
-mode = "native"
+mode = "$xmode"
+allow_generic = true
 max_sessions = 65536
 heartbeat_ms = 250
 deadline_ms = 1000
@@ -263,7 +272,7 @@ print(ok)
         die "audit: no xdp_fastpath_state enabled/start"
     grep -q '"event.action":"xdp_fastpath_state".*"event.reason":"shutdown"' "$work/audit.jsonl" ||
         die "audit: no xdp_fastpath_state shutdown"
-    grep -q '"event.action":"service_start".*"plat.xdp.mode":"native"' "$work/audit.jsonl" ||
+    grep -q '"event.action":"service_start".*"plat.xdp.mode":"'"$xmode"'"' "$work/audit.jsonl" ||
         die "audit: service_start without plat.xdp.mode"
     echo "e2e: PASS audit (service_start plat.xdp.*, xdp_fastpath_state start/shutdown)" >&2
     echo "e2e: not yet covered: capture comparison with a TUN-only run, frag_needed_revalidate (WU6/WU8)" >&2

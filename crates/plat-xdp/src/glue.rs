@@ -237,6 +237,18 @@ mod tests {
         assert_ne!(fx.nat.state().session_slot(kl, (SERVER, 53)), Some(NO_SLOT));
         m.flush();
         assert_eq!(t.in4.lock().len(), 1, "the other session's entry is kept");
+        // QA: the forgotten session is mirrored again on its next
+        // slow-path hit once there is room and the back-offs passed.
+        t.in4.lock().clear();
+        t.out6.lock().clear();
+        fx.clock.advance(Duration::from_secs(3));
+        std::thread::sleep(crate::mirror::INSTALL_BACKOFF + Duration::from_millis(50));
+        let sport = if kf == k1 { 1000 } else { 1001 };
+        let (k_again, s_again) = flow(&mut fx, sport);
+        assert_eq!(k_again, kf, "same session");
+        assert_ne!(s_again, NO_SLOT, "re-mirrored");
+        m.flush();
+        assert_eq!(m.record(s_again).map(|r| r.state), Some(SLOT_LIVE));
     }
 
     #[test]
