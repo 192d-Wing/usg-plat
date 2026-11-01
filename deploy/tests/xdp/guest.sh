@@ -9,7 +9,7 @@
 #      object (obj-gate.py stats: verifier statistics, ≤ 384 B deepest call
 #      chain, processed-instruction budget; fails closed), run once as
 #      root and once with only CAP_BPF CAP_NET_ADMIN (no CAP_PERFMON;
-#      fatal from 6.3, reported below 6.3, POAM-040);
+#      fatal on every kernel; the [xdp] minimum is 6.6);
 #   4. the level-2 netns topology comes up (netns.sh);
 #   5. with -o OBJECT: the level-2 smoke vectors on the object inside that
 #      netns (obj-gate.py testrun, level2-vectors.txt);
@@ -56,22 +56,9 @@ if [ -n "$object" ]; then
     echo "least-privilege load (CAP_BPF CAP_NET_ADMIN):"
     lp=$(mktemp -d)
     cp "$here/obj-gate.py" "$object" "$lp/"
-    # Before 6.3 the verifier also refuses, without CAP_PERFMON, a partial
-    # stack store into a slot holding a spilled scalar, which the object
-    # hits on 6.1 (POAM-040): there a refusal is reported, not fatal, until
-    # the floor or the codegen is decided. From 6.3 it is fatal.
-    rel=$(uname -r)
-    maj=${rel%%.*}
-    min=${rel#*.}
-    min=${min%%[!0-9]*}
-    if setpriv --bounding-set=-all,+bpf,+net_admin --inh-caps=-all -- \
-        python3 -I "$lp/obj-gate.py" stats "$lp/$(basename "$object")"; then
-        echo "least-privilege load: ok"
-    elif [ "$maj" -lt 6 ] || { [ "$maj" -eq 6 ] && [ "$min" -lt 3 ]; }; then
-        echo "KNOWN: least-privilege load refused on $rel (< 6.3; POAM-040)"
-    else
+    setpriv --bounding-set=-all,+bpf,+net_admin --inh-caps=-all -- \
+        python3 -I "$lp/obj-gate.py" stats "$lp/$(basename "$object")" ||
         fail "load with CAP_BPF CAP_NET_ADMIN only (no CAP_PERFMON)"
-    fi
     rm -rf "$lp"
 else
     echo "SKIP: eBPF object gates (no -o OBJECT)"

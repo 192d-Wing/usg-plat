@@ -15,7 +15,7 @@
     memcpy/memset, never loaded) are not checked;
   - prints the object's SHA-256 for the CI record.
 
-Adding a helper means recording its gpl_only flag at the 6.1 and current kernel
+Adding a helper means recording its gpl_only flag at the minimum (6.6; 6.1 was also recorded) and current kernel
 tags (plan §2.5 rule 4) and extending ALLOWED_HELPERS in the same change.
 
 Usage: python3 -I check-object.py OBJECT | --self-test

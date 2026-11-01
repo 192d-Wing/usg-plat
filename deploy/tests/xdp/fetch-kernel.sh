@@ -12,7 +12,7 @@
 #      (snapshot sources must be pinned).
 #
 # Usage: fetch-kernel.sh [-a amd64|arm64] [-o OUTDIR] [-k KEYRING] NAME
-#   NAME     a `kernel` entry in kernels.conf (6.1, 6.6, 6.12, latest)
+#   NAME     a `kernel` entry in kernels.conf (6.6, 6.12, latest; 6.1 for the loader-refusal check)
 #   -a       Debian architecture (default: from uname -m)
 #   -o       output directory (default: target/xdp-kernels in the repo; not
 #            under /tmp, which virtme-ng hides from the guest)

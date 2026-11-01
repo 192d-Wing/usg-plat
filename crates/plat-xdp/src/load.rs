@@ -36,6 +36,29 @@ use sha2::{Digest, Sha256};
 use plat_common::config::{Config, Partition};
 use plat_xdp_core::abi::{ConfigRec, ROLE_ACCESS, ROLE_BOTH, ROLE_UPSTREAM};
 
+/// Minimum kernel for `[xdp]` (user decision 2026-11-01): 6.6 LTS. Below
+/// 6.3 the verifier refuses the object without CAP_PERFMON (partial stack
+/// stores into a spilled slot, closed POAM-040), and the loader never gets
+/// CAP_PERFMON.
+pub const MIN_KERNEL: (u32, u32) = (6, 6);
+
+/// `(major, minor)` of a kernel release string (`uname -r`): `6.8.0-147-generic`,
+/// `7.2.14`, `6.6.13-arm64`, `6.12.107+deb13-amd64`. `None` if it does not
+/// start with `MAJOR.MINOR`.
+pub fn parse_kernel_release(r: &str) -> Option<(u32, u32)> {
+    let mut it = r.trim().splitn(3, '.');
+    let major = it.next()?.parse().ok()?;
+    let minor_part = it.next()?;
+    let end = minor_part.find(|c: char| !c.is_ascii_digit()).unwrap_or(minor_part.len());
+    let minor = minor_part.get(..end).filter(|m| !m.is_empty())?.parse().ok()?;
+    Some((major, minor))
+}
+
+/// Whether `release` meets [`MIN_KERNEL`] (an unparsable release does not).
+pub fn kernel_supported(release: &str) -> bool {
+    parse_kernel_release(release).is_some_and(|v| v >= MIN_KERNEL)
+}
+
 /// Most interfaces in `[xdp]` (plan §4.5).
 pub const MAX_INTERFACES: usize = 32;
 /// `xdp.max_sessions` range floor.
@@ -348,6 +371,12 @@ mod linux {
         #[error("[xdp] is not enabled in the configuration")]
         Disabled,
         #[error(
+            "kernel {0} is below the [xdp] minimum {maj}.{min} (the program cannot load with CAP_BPF and CAP_NET_ADMIN alone)",
+            maj = super::MIN_KERNEL.0,
+            min = super::MIN_KERNEL.1
+        )]
+        KernelTooOld(String),
+        #[error(
             "kernel.unprivileged_bpf_disabled must be 1 or 2 (is {0}); unprivileged program load must be off (AC-6(10))"
         )]
         UnprivilegedBpf(String),
@@ -428,6 +457,13 @@ mod linux {
     /// pin directory.
     #[derive(Debug)]
     pub struct Loader;
+
+    /// The running kernel must meet [`super::MIN_KERNEL`].
+    pub fn check_kernel() -> Result<(), LoadError> {
+        let r = fs::read_to_string("/proc/sys/kernel/osrelease").map_err(io_err("/proc/sys/kernel/osrelease"))?;
+        let r = r.trim();
+        if super::kernel_supported(r) { Ok(()) } else { Err(LoadError::KernelTooOld(r.into())) }
+    }
 
     /// `kernel.unprivileged_bpf_disabled` must be 1 or 2.
     pub fn check_unprivileged_bpf() -> Result<(), LoadError> {
@@ -646,6 +682,7 @@ mod linux {
             if !p.xdp.enabled {
                 return Err(LoadError::Disabled);
             }
+            check_kernel()?;
             check_unprivileged_bpf()?;
             check_bpffs(dir)?;
             check_no_frags(object)?;
@@ -1075,6 +1112,30 @@ mod tests {
             (c.translation.nat64_prefix.network(), c.translation.nat64_prefix.prefix_len())
         );
         assert_eq!((a.mtu4, a.copy_tos, a.sliced), (c.translation.ipv4_mtu, u8::from(c.translation.copy_tos), 0));
+    }
+
+    #[test]
+    fn kernel_release_floor() {
+        for (r, v) in [
+            ("6.8.0-147-generic", Some((6, 8))),
+            ("7.2.14", Some((7, 2))),
+            ("6.6.13-arm64", Some((6, 6))),
+            ("6.12.107+deb13-amd64", Some((6, 12))),
+            ("6.1.0-50-arm64\n", Some((6, 1))),
+            ("6.10-rc1", Some((6, 10))),
+            ("6", None),
+            ("x.y", None),
+            ("6.-1", None),
+            ("", None),
+        ] {
+            assert_eq!(parse_kernel_release(r), v, "{r:?}");
+        }
+        for r in ["6.6.0", "6.6.13-arm64", "6.8.0-147-generic", "6.12.1", "7.0.0", "7.2.14"] {
+            assert!(kernel_supported(r), "{r}");
+        }
+        for r in ["6.1.0-50-arm64", "6.5.9", "5.19.0", "garbage"] {
+            assert!(!kernel_supported(r), "{r}");
+        }
     }
 
     #[test]

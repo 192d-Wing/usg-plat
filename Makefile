@@ -70,7 +70,7 @@ BPF_TARGET := bpfel-unknown-none
 BPF_STD := --target $(BPF_TARGET) -Z build-std=core
 # Kernel matrix for test-xdp (deploy/tests/xdp/kernels.conf); XDP_VNG_FLAGS=-m on
 # CI runners installs the kernel modules into /lib/modules.
-XDP_KERNELS ?= 6.1 6.6 6.12 latest
+XDP_KERNELS ?= 6.6 6.12 latest
 XDP_VNG_FLAGS ?=
 
 .PHONY: xdp check-xdp test-xdp bench-xdp xdp-env

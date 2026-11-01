@@ -168,7 +168,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        kernel: ["6.1", "6.6", "6.12", "latest"]
+        # [xdp] minimum is 6.6 LTS (user decision 2026-11-01).
+        kernel: ["6.6", "6.12", "latest"]
         arch: [x86_64, aarch64]
         include:
           - arch: x86_64

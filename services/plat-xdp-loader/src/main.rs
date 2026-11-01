@@ -17,17 +17,13 @@
 //! maps).
 //!
 //! The program derives the frame length with `bpf_xdp_get_buff_len`, not
-//! by subtracting packet pointers, so on kernels 6.3 and later (verified
-//! 6.6, 6.8) CAP_BPF and CAP_NET_ADMIN suffice and the verifier keeps its
-//! Spectre v1/v4 hardening (no CAP_PERFMON, SEC-001). The state file goes
+//! by subtracting packet pointers, so CAP_BPF and CAP_NET_ADMIN suffice and the verifier keeps its
+//! Spectre v1/v4 hardening (no CAP_PERFMON, SEC-001). It refuses kernels
+//! below the `[xdp]` minimum 6.6 before creating anything (older verifiers
+//! need CAP_PERFMON for this object; closed POAM-040). The state file goes
 //! through `plat_xdp::load::StateDir` (owner and mode checked, no link
 //! followed), and a state file that cannot be written rolls the attach
 //! back.
-//!
-// POAM: POAM-040 - on 6.1 the verifier still refuses the object without
-// CAP_PERFMON (partial stack store into a spilled slot); the loader is not
-// given CAP_PERFMON, so the fast path cannot be loaded on 6.1 with least
-// privilege until the kernel floor or the codegen is decided.
 //!
 //! COMPLIANCE MAPPING:
 //! - NIST 800-53: AC-6 (Least Privilege), AC-6(1) - privileged loading
