@@ -1,0 +1,22 @@
+[package]
+name = "plat-xdp-loader"
+description = "One-shot privileged loader of the usg-plat XDP fast path: creates and pins the maps and program under /run/plat/bpf, attaches, exits"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# Aya (through plat-xdp) needs 1.98.
+rust-version = "1.98"
+publish.workspace = true
+
+[features]
+default = []
+# Embed the eBPF object (needs bpf-linker; plan §15). Without it the binary
+# refuses to attach.
+xdp = ["plat-xdp/xdp"]
+
+[dependencies]
+plat-xdp.workspace = true
+clap.workspace = true
+
+[lints]
+workspace = true

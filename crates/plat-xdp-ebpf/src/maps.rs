@@ -20,8 +20,8 @@
 //!   (`BPF_F_RDONLY_PROG`)
 //! - CLAUDE.md rule 3 - the kernel keys every BPF hash map with a random
 //!   seed (`htab->hashrnd`) unless `BPF_F_ZERO_SEED` is set. Requirement on
-//!   the loader (WU3, not written yet; POAM-016): never set
-//!   `BPF_F_ZERO_SEED` on `OUT6` / `IN4`
+//!   the loader: never set `BPF_F_ZERO_SEED` on `OUT6` / `IN4` (checked by
+//!   `plat_xdp::load` after creating the maps and by `XdpMaps::open_pinned`)
 
 use aya_ebpf::bindings::{BPF_F_MMAPABLE, BPF_F_RDONLY_PROG};
 use aya_ebpf::macros::map;

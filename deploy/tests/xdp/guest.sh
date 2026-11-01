@@ -7,12 +7,14 @@
 #   2. kernel smoke: XDP load + BPF_PROG_TEST_RUN (xdp-smoke.py);
 #   3. with -o OBJECT: the stack and instruction gate on the plat-xdp-ebpf
 #      object (obj-gate.py stats: verifier statistics, ≤ 384 B deepest call
-#      chain, processed-instruction budget; fails closed);
+#      chain, processed-instruction budget; fails closed), run once as
+#      root and once with only CAP_BPF CAP_NET_ADMIN (no CAP_PERFMON;
+#      fatal on every kernel; the [xdp] minimum is 6.6);
 #   4. the level-2 netns topology comes up (netns.sh);
 #   5. with -o OBJECT: the level-2 smoke vectors on the object inside that
 #      netns (obj-gate.py testrun, level2-vectors.txt);
 #   6. level 2: the plat-xdp test_run suite inside that netns, when its test
-#      binary is passed (WU3 adds it; skipped until then);
+#      binary is passed (make test-xdp builds it; vng-run.sh -l);
 #   7. level 4: the e2e topology, then e2e.sh run (skips, exit 77, until
 #      platd and plat-xdp-loader with the xdp feature exist, WU5/WU6).
 #
@@ -45,6 +47,19 @@ python3 -I "$here/xdp-smoke.py" || fail "kernel smoke test"
 if [ -n "$object" ]; then
     [ -f "$object" ] || fail "no object $object"
     python3 -I "$here/obj-gate.py" stats "$object" || fail "stack and instruction gate"
+    # SEC-001 (AC-6): the loader runs with CAP_BPF and CAP_NET_ADMIN only
+    # (plan §7). Without CAP_PERFMON the verifier is stricter (no pointer
+    # arithmetic leaks, Spectre v1/v4 sanitation, partial stack writes), so
+    # the object must also load with exactly those capabilities.
+    # Without CAP_DAC_OVERRIDE root may not read the shared home tree, so
+    # the gate and the object are copied to a root-owned directory first.
+    echo "least-privilege load (CAP_BPF CAP_NET_ADMIN):"
+    lp=$(mktemp -d)
+    cp "$here/obj-gate.py" "$object" "$lp/"
+    setpriv --bounding-set=-all,+bpf,+net_admin --inh-caps=-all -- \
+        python3 -I "$lp/obj-gate.py" stats "$lp/$(basename "$object")" ||
+        fail "load with CAP_BPF CAP_NET_ADMIN only (no CAP_PERFMON)"
+    rm -rf "$lp"
 else
     echo "SKIP: eBPF object gates (no -o OBJECT)"
 fi
@@ -58,7 +73,7 @@ if [ -n "$level2" ]; then
     [ -x "$level2" ] || fail "level-2 test binary not executable: $level2"
     nsenter --net=/run/netns/platxdp "$level2" --ignored --test-threads=1 || fail "level 2 test_run suite"
 else
-    echo "SKIP: level 2 (no plat-xdp test_run binary; WU3)"
+    echo "SKIP: level 2 (no plat-xdp test_run binary passed)"
 fi
 "$here/netns.sh" down platxdp
 

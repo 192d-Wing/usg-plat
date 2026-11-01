@@ -7,6 +7,18 @@ use std::time::Duration;
 #[cfg(target_os = "linux")]
 pub mod tun;
 
+/// BPF map pins and element operations (XDP fast path; plan §2.2).
+#[cfg(target_os = "linux")]
+pub mod bpf_obj;
+
+/// Shared-memory views of mmapable BPF arrays (XDP fast path).
+#[cfg(target_os = "linux")]
+pub mod bpf_mmap;
+
+/// Interface index and MAC by name (XDP loader).
+#[cfg(target_os = "linux")]
+pub mod netdev;
+
 pub mod mem;
 
 pub mod cred;

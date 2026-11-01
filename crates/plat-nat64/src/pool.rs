@@ -16,13 +16,16 @@
 //!   backup acknowledged its reservation.
 
 use std::collections::{HashSet, VecDeque};
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering, fence};
 
 use ahash::RandomState;
 use crossbeam_utils::CachePadded;
 use parking_lot::Mutex;
 use plat_cluster::{SliceId, SliceMap};
 use plat_common::DropReason;
+
+use crate::mirror::{LEGACY_GENERATION, Mirror};
 
 /// A block: index into the pool's address list plus block number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -135,6 +138,9 @@ pub struct Pool {
     /// Padded (PERF-005): the sweeper's lock writes must not share a line
     /// with the read-mostly fields above.
     cooling: CachePadded<Mutex<VecDeque<(u64, BlockRef)>>>,
+    /// Session mirror told about every slice state change (cold; `None`
+    /// without a fast path).
+    mirror: Option<Arc<dyn Mirror>>,
 }
 
 /// Per-slice allocation state.
@@ -244,6 +250,9 @@ struct Sliced {
     shift: u32,
     /// Read on every packet; written only on ownership changes.
     state: Box<[AtomicU8]>,
+    /// Per-slice generation, bumped (under the slice mutex) on every
+    /// transition to Active; read only when a session is mirrored.
+    gens: Box<[AtomicU32]>,
     slices: Box<[CachePadded<Mutex<SliceAlloc>>]>,
     /// Slice ids with allocatable blocks (lazy).
     avail: CachePadded<Mutex<VecDeque<SliceId>>>,
@@ -307,6 +316,7 @@ impl Pool {
             owned_blocks: CachePadded::new(AtomicU64::new(0)),
             cooldown_ms: 0,
             cooling: CachePadded::new(Mutex::new(VecDeque::new())),
+            mirror: None,
         }
     }
 
@@ -330,6 +340,7 @@ impl Pool {
         }
         let bpa = blocks_per_addr(port_min, port_max, block_size);
         let state = (0..slices.len()).map(|_| AtomicU8::new(SliceState::Inactive as u8)).collect();
+        let gens = (0..slices.len()).map(|_| AtomicU32::new(0)).collect();
         let sl = (0..slices.len() as u32)
             .map(|s| {
                 let mut a = SliceAlloc {
@@ -361,6 +372,7 @@ impl Pool {
             sliced: Some(Box::new(Sliced {
                 shift: 32 - u32::from(slices.slice_len()),
                 state,
+                gens,
                 slices: sl,
                 avail: CachePadded::new(Mutex::new(VecDeque::new())),
                 listed: CachePadded::new(AtomicU32::new(0)),
@@ -377,7 +389,38 @@ impl Pool {
             owned_blocks: CachePadded::new(AtomicU64::new(0)),
             cooldown_ms: 0,
             cooling: CachePadded::new(Mutex::new(VecDeque::new())),
+            mirror: None,
         })
+    }
+
+    /// Attaches the session mirror and publishes every slice's current
+    /// state and generation to it (legacy: slice 0 Active with
+    /// [`LEGACY_GENERATION`]). Called before workers start.
+    pub fn set_mirror(&mut self, m: Arc<dyn Mirror>) {
+        match &self.sliced {
+            None => m.slice_state(0, SliceState::Active, LEGACY_GENERATION),
+            Some(s) => {
+                for (i, m_) in s.slices.iter().enumerate() {
+                    // Under the slice mutex, like every later change.
+                    let _g = m_.lock();
+                    let (Some(flag), Some(g), Ok(id)) = (s.state.get(i), s.gens.get(i), SliceId::try_from(i)) else {
+                        continue;
+                    };
+                    m.slice_state(id, SliceState::from_u8(flag.load(Ordering::Relaxed)), g.load(Ordering::Relaxed));
+                }
+            }
+        }
+        self.mirror = Some(m);
+    }
+
+    /// Generation of slice `id` ([`LEGACY_GENERATION`] in a legacy pool).
+    /// Read after an Acquire load of the slice state saw Active, it is the
+    /// generation of that activation or a later one.
+    pub fn slice_gen(&self, id: SliceId) -> u32 {
+        match &self.sliced {
+            None => LEGACY_GENERATION,
+            Some(s) => s.gens.get(usize::from(id)).map_or(0, |g| g.load(Ordering::Relaxed)),
+        }
     }
 
     /// Released blocks wait `ms` before they can be allocated again.
@@ -544,6 +587,18 @@ impl Pool {
     /// Sets the ownership state of slice `id`. Returns the previous state.
     /// The state is stored under the slice lock so the owned/free counters
     /// stay consistent with it.
+    ///
+    /// With a session mirror the change is mirrored in the same critical
+    /// section, ordered so the mirror is never more permissive than the
+    /// engine (plan §9): leaving Active (or any non-Active change) writes
+    /// the mirror first, then a SeqCst fence, then the engine flag; entering
+    /// Active bumps the generation, stores the flag (Release, so a worker
+    /// that sees Active reads the new generation), then writes the mirror.
+    /// Entries of an earlier activation never match again.
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: SC-24 - a fenced slice stops in the fast path no later
+    ///   than in the engine
     pub fn set_slice_state(&self, id: SliceId, st: SliceState) -> Option<SliceState> {
         let s = self.sliced.as_ref()?;
         let m = s.slices.get(usize::from(id))?;
@@ -562,9 +617,23 @@ impl Pool {
                 s.gated.fetch_sub(1, Ordering::Relaxed);
             }
         }
-        // Release: the imported tables and queued audit records happen
-        // before a worker can observe Active.
+        let gen_slot = s.gens.get(usize::from(id))?;
+        if st != SliceState::Active
+            && let Some(mi) = &self.mirror
+        {
+            mi.slice_state(id, st, gen_slot.load(Ordering::Relaxed));
+            fence(Ordering::SeqCst);
+        }
+        let generation =
+            if st == SliceState::Active { gen_slot.fetch_add(1, Ordering::Relaxed).wrapping_add(1) } else { 0 };
+        // Release: the imported tables and queued audit records (and the
+        // new generation) happen before a worker can observe Active.
         flag.store(st as u8, Ordering::Release);
+        if st == SliceState::Active
+            && let Some(mi) = &self.mirror
+        {
+            mi.slice_state(id, st, generation);
+        }
         if st == SliceState::Active {
             self.owned_blocks.fetch_add(blocks, Ordering::Relaxed);
             self.free_blocks.fetch_add(ready, Ordering::Relaxed);

@@ -13,7 +13,11 @@
 //!   the `seen_ns` touch and `bpf_redirect_map` (plan §2.5 rules 1 and 3).
 //!
 //! Lengths are compared as scalars and packet pointers are offset only by
-//! constants (plan §2.5 rule 1). There are no loops and no bpf-to-bpf calls:
+//! constants (plan §2.5 rule 1). Packet pointers are
+//! never subtracted: `pointer -= pointer` needs `allow_ptr_leaks`
+//! (CAP_PERFMON), which also turns off the verifier's Spectre v1/v4
+//! hardening for the program (SEC-001). The frame length comes from
+//! `bpf_xdp_get_buff_len` instead ([`frame_len`]). There are no loops and no bpf-to-bpf calls:
 //! everything is `#[inline(always)]` into `plat_xdp` (plan §2.5 rule 5;
 //! `deploy/tests/xdp/obj-gate.py` checks the stack depth and instruction
 //! count, `check-object.py` the absence of back-edges).
@@ -39,7 +43,9 @@ use core::mem::{offset_of, size_of};
 use core::ptr::NonNull;
 
 use aya_ebpf::bindings::{bpf_fib_lookup as KernelFib, xdp_action, xdp_md};
-use aya_ebpf::helpers::generated::{bpf_fib_lookup, bpf_ktime_get_coarse_ns, bpf_xdp_adjust_head, bpf_xdp_adjust_tail};
+use aya_ebpf::helpers::generated::{
+    bpf_fib_lookup, bpf_ktime_get_coarse_ns, bpf_xdp_adjust_head, bpf_xdp_adjust_tail, bpf_xdp_get_buff_len,
+};
 use aya_ebpf::macros::xdp;
 use aya_ebpf::programs::XdpContext;
 use plat_xdp_core::abi::{
@@ -248,6 +254,28 @@ fn run(ctx: &XdpContext) -> u32 {
     }
 }
 
+/// Largest frame length the program trusts (a 16-bit IP total length plus
+/// the Ethernet header); `bpf_xdp_get_buff_len` returns an unbounded
+/// scalar to the verifier.
+const MAX_FRAME: usize = 0xffff + ETH;
+
+/// The frame's length in bytes, from `bpf_xdp_get_buff_len` (SEC-001: no
+/// packet pointer subtraction, so no CAP_PERFMON).
+///
+/// The program is never loaded with `BPF_F_XDP_HAS_FRAGS` (section `xdp`,
+/// not `xdp.frags`; `check-object.py` and the loader assert it), so the
+/// buffer is linear and the helper's result is exactly `data_end - data`.
+/// A value above [`MAX_FRAME`] (impossible for a linear buffer) becomes 0,
+/// which fails every decision's `end > frame_len` check, so the frame is
+/// passed (`bad_l3`).
+#[inline(always)]
+fn frame_len(ctx: &XdpContext) -> u32 {
+    // SAFETY: helper on the program's context; it only reads the buffer
+    // lengths (`gpl_only = false`, kernel 5.18+; see check-object.py).
+    let n = unsafe { bpf_xdp_get_buff_len(ctx.ctx) };
+    if n > MAX_FRAME as u64 { 0 } else { n as u32 }
+}
+
 /// This CPU's output header block (`SCRATCH`).
 ///
 /// PERF-002: fetched for every IPv4/IPv6 frame, also ones declined later,
@@ -280,8 +308,7 @@ fn v6_to_v4(ctx: &XdpContext) -> u32 {
     // and nothing writes the packet while `h` lives (the decision only
     // reads it).
     let h = unsafe { &*(data as *const [u8; HDR6]) };
-    // A scalar, never added to a packet pointer (plan §2.5 rule 1).
-    let frame_len = (end - data) as u32;
+    let frame_len = frame_len(ctx);
     let Some(o) = scratch().and_then(|s| s.first_chunk_mut::<HDR4>()) else {
         return pass(PassReason::Disabled);
     };
@@ -306,7 +333,7 @@ fn v4_to_v6(ctx: &XdpContext) -> u32 {
     }
     // SAFETY: as in `v6_to_v4`, for the HDR4 bytes at `data`.
     let h = unsafe { &*(data as *const [u8; HDR4]) };
-    let frame_len = (end - data) as u32;
+    let frame_len = frame_len(ctx);
     let Some(o) = scratch() else {
         return pass(PassReason::Disabled);
     };
@@ -368,7 +395,16 @@ fn transmit<const N: usize>(ctx: &XdpContext, env: &MapEnv, hdr: &[u8; N], head:
     }
     let data = ctx.data();
     let end = ctx.data_end();
-    if data + N > end || (end - data) as u32 != v.new_len {
+    // SEC-001: the length re-check compares scalars: the helper's frame
+    // length (after the adjusts) with the verdict's `new_len`. Neither a
+    // pointer difference (`end - data` needs `allow_ptr_leaks`) nor a
+    // bounded `data + new_len != end` works without CAP_PERFMON: for a
+    // caller without `bypass_spec_v1` the verifier refuses packet pointer +
+    // variable scalar outright ("pointer arithmetic with it prohibited for
+    // !root", `retrieve_ptr_limit` handles only stack and map values;
+    // measured on 6.8). The constant `data + N > end` check remains for the
+    // header copy.
+    if data + N > end || frame_len(ctx) != v.new_len {
         return aborted();
     }
     // SAFETY: the N bytes at `data` are in the packet (re-checked above);

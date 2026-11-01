@@ -18,7 +18,16 @@ crossbeam-channel.workspace = true
 crossbeam-utils.workspace = true
 parking_lot.workspace = true
 
+[features]
+default = []
+# SEC-008: `mirror::ModelMirror` (one model-wide mutex) is test support
+# only and absent from production builds. Integration tests and benches
+# enable it through the self dev-dependency below; plat-xdp-core's
+# differential tests enable it in their dev-dependency.
+model = []
+
 [dev-dependencies]
+plat-nat64 = { path = ".", features = ["model"] }
 criterion.workspace = true
 proptest.workspace = true
 

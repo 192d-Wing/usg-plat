@@ -49,7 +49,7 @@ test-deploy:
 	sh deploy/tests/deploy-scripts-test.sh
 
 bench:
-	cargo bench -p plat-xlat -p plat-nat64 -p plat-audit --bench xlat --bench nat64 --bench audit
+	cargo bench -p plat-xlat -p plat-nat64 -p plat-audit -p plat-xdp-core --bench xlat --bench nat64 --bench audit --bench decide
 
 # XDP fast path (POAM-016 Phase 1, plan §15). Not part of check/test: those need
 # no bpf-linker and no Linux VM. The crates arrive in later work units, so each
@@ -70,7 +70,7 @@ BPF_TARGET := bpfel-unknown-none
 BPF_STD := --target $(BPF_TARGET) -Z build-std=core
 # Kernel matrix for test-xdp (deploy/tests/xdp/kernels.conf); XDP_VNG_FLAGS=-m on
 # CI runners installs the kernel modules into /lib/modules.
-XDP_KERNELS ?= 6.1 6.6 6.12 latest
+XDP_KERNELS ?= 6.6 6.12 latest
 XDP_VNG_FLAGS ?=
 
 .PHONY: xdp check-xdp test-xdp bench-xdp xdp-env
@@ -104,6 +104,12 @@ ifneq ($(XDP_USER),)
 	@objs=$$(find target/release/build -path '*/out/plat-xdp-ebpf' -type f 2>/dev/null); \
 	[ -n "$$objs" ] || { echo "ERROR: plat-xdp built but no plat-xdp-ebpf object under target/release/build" >&2; exit 1; }; \
 	for o in $$objs; do python3 -I deploy/tests/xdp/check-object.py "$$o" || exit 1; done
+	@# SI-7: the embedded object (newest build-script output) must be the gated one.
+	@o=$$(ls -t $$(find target/release/build -path '*/out/plat-xdp-ebpf' -type f) | head -n 1); \
+	want=$$(cut -d' ' -f1 $(XDP_OBJ).sha256); got=$$(sha256sum "$$o" | cut -d' ' -f1); \
+	[ "$$want" = "$$got" ] || { echo "ERROR: embedded object $$o ($$got) differs from $(XDP_OBJ) ($$want)" >&2; exit 1; }; \
+	echo "xdp: embedded object = gated object ($$got)"
+	cargo build -p plat-xdp-loader --features xdp --release
 else
 	@echo "xdp: skipped plat-xdp object build (no crates/plat-xdp yet; WU3)"
 endif
@@ -146,17 +152,21 @@ endif
 # through the signed Debian chain, boot it, run deploy/tests/xdp/guest.sh.
 # With plat-xdp-ebpf, builds the object first (make xdp) and the guest runs
 # the stack/instruction gate and the level-2 smoke vectors on it
-# (obj-gate.py). WU3 adds the level-2 test_run binary as the guest's second
-# argument.
+# (obj-gate.py). With plat-xdp, the level-2 test_run binary (built here with
+# the xdp feature) runs in the guest's netns as root (vng-run.sh -l).
 # Prerequisites: virtme-ng, QEMU, gpgv and the Debian archive keyring
 # (`apt-get install debian-archive-keyring`, as the xdp-vm CI job does), or
 # XDP_DEBIAN_KEYRING=/path/to/debian-archive-keyring.gpg; without it
 # fetch-kernel.sh fails closed ("keyring not found").
+XDP_L2_JSON := python3 -I -c 'import json, sys; [print(m["executable"]) for m in map(json.loads, sys.stdin) if m.get("reason") == "compiler-artifact" and m.get("executable") and m["target"]["name"] == "test_run"]'
 test-xdp: xdp-env $(if $(XDP_EBPF),xdp)
 	@[ "$$(uname -s)" = Linux ] || { echo "ERROR: test-xdp needs Linux with virtme-ng and QEMU (plan §11)" >&2; exit 1; }
-	@for k in $(XDP_KERNELS); do \
+	@l2=; if [ -n "$(XDP_USER)" ]; then \
+	  l2=$$(cargo test -p plat-xdp --features xdp --release --test test_run --no-run --message-format=json | $(XDP_L2_JSON) | tail -n 1); \
+	  [ -n "$$l2" ] || { echo "ERROR: no plat-xdp test_run binary" >&2; exit 1; }; fi; \
+	for k in $(XDP_KERNELS); do \
 	  kimg=$$(deploy/tests/xdp/fetch-kernel.sh $$k) || exit 1; \
-	  deploy/tests/xdp/vng-run.sh $(XDP_VNG_FLAGS) $(if $(XDP_EBPF),-o $(CURDIR)/$(XDP_OBJ)) "$$kimg" || exit 1; \
+	  deploy/tests/xdp/vng-run.sh $(XDP_VNG_FLAGS) $(if $(XDP_EBPF),-o $(CURDIR)/$(XDP_OBJ)) $${l2:+-l $$l2} "$$kimg" || exit 1; \
 	done
 
 bench-xdp: xdp-env

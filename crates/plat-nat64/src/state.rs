@@ -13,10 +13,12 @@ use plat_audit::{
 };
 use plat_cluster::{MemberId, SliceId, SliceMap, SnapRecord, WireBib, WireBlock};
 use plat_common::config::{AuditMode, Config, Filtering, OverflowPolicy, SteeringMode};
-use plat_common::{Clock, Counter, Counters, DropReason, Ipv6Cidr};
+use plat_common::{Clock, Counter, Counters, DropReason, Ipv4Cidr, Ipv6Cidr};
 use plat_packet::proto;
+use plat_xlat::Prefix6052;
 
 use crate::held::{HeldBox, HeldCtx, HeldSlot, HeldSlots, HeldSynExpiry, SLOTS, SynMeta, expiry_of};
+use crate::mirror::{INSTALL_BACKOFF_MS, Mirror, MirrorEntry, MirrorFail, MirrorKeys, NO_SLOT};
 use crate::pool::{AllocFail, BlockRef, Pool, SliceState};
 use crate::repl::{AdoptInput, Directory, ReplProducer, ReplRecord};
 use crate::shard::{Map, Sharded, lower_due};
@@ -58,7 +60,21 @@ pub struct Mapped {
 pub struct Session {
     pub expires_ms: u64,
     pub tcp: Option<TcpState>,
+    /// Session mirror slot ([`NO_SLOT`]: not mirrored; always so without a
+    /// mirror).
+    pub slot: u32,
 }
+
+impl Session {
+    fn new(expires_ms: u64, tcp: Option<TcpState>) -> Self {
+        Self { expires_ms, tcp, slot: NO_SLOT }
+    }
+}
+
+// A session exists per flow (up to `nat64.max_sessions`): the mirror slot
+// fits in the padding after the one-byte `Option<TcpState>` (plan §4.4).
+const _: () = assert!(size_of::<Option<TcpState>>() == 1);
+const _: () = assert!(size_of::<Session>() == 16);
 
 #[derive(Debug)]
 pub struct Bib {
@@ -235,6 +251,9 @@ pub struct SweepStats {
     pub shards_visited: u64,
     /// Shard lock holds of the pass.
     pub holds: u64,
+    /// Mirrored sessions retired (removed from the session mirror) by the
+    /// pass.
+    pub mirror_retired: u64,
     /// Holds longer than 20 µs (preemption, or one BIB with very many
     /// sessions).
     pub long_holds: u64,
@@ -280,6 +299,15 @@ pub const SWEEP_CHUNK: usize = 1 << 16;
 /// Work units of one BIB or subscriber visit relative to one session or
 /// block.
 pub const SWEEP_ENTRY_COST: usize = 4;
+/// Extra work units of retiring one mirrored session (plan §5). PERF-003:
+/// with the XDP mirror a retire is a `DEAD` store and two
+/// `BPF_MAP_DELETE_ELEM` syscalls, measured at 0.62 µs mean, 0.92 µs p99
+/// (`plat-xdp` `tests/mirror_cost.rs`, 6.8 VM), against a work unit (one
+/// session visit) of the order of 10 ns (estimate): about 64 units. That
+/// is above `HOLD_CHECK_UNITS`, so every retire is followed by a clock
+/// check ([`Hold::charge`]). One BIB's retires still run in one hold
+/// (WU5 requirement: deferred deletes, fixes-wu34-round-1 PERF-001).
+pub const SWEEP_RETIRE_COST: usize = 64;
 /// Keys copied per hold, per work unit of the chunk, when a shard continues
 /// from a key snapshot.
 pub const SWEEP_KEYS_PER_UNIT: usize = 8;
@@ -444,6 +472,38 @@ pub struct State {
     /// Held-SYN settings, gauge and expiry ring; `None` while holding is
     /// off (POAM-008 closed).
     held: Option<Box<HeldCtx>>,
+    /// Session mirror (fast-path index); `None` without one.
+    mirror: Option<Box<MirrorCtx>>,
+}
+
+/// The attached session mirror and what the engine needs to build its keys.
+#[derive(Debug)]
+struct MirrorCtx {
+    m: Arc<dyn Mirror>,
+    prefix: Prefix6052,
+    /// Remotes never mirrored (the cluster pool: hairpins and the pool
+    /// source guard stay on the slow path). Scanned only just before an
+    /// install (PERF-007), not per packet.
+    exclude: Box<[Ipv4Cidr]>,
+    /// No install before this engine time (after any [`MirrorFail`]).
+    backoff_until: AtomicU64,
+    /// Install counters, written only on the cold install path.
+    stats: CachePadded<MirrorInstallStats>,
+}
+
+/// Session-mirror install counters ([`State::mirror_install_stats`]).
+#[derive(Debug, Default)]
+pub struct MirrorInstallStats {
+    /// Install calls that returned a slot.
+    pub installed: AtomicU64,
+    /// Install calls that failed (any [`MirrorFail`]); each starts a
+    /// back-off of [`INSTALL_BACKOFF_MS`].
+    pub failed: AtomicU64,
+    /// Installs retried on a slow-path hit of an existing session that is
+    /// not mirrored (after a failure, a back-off or a slice activation).
+    pub retries: AtomicU64,
+    /// Install attempts skipped inside a back-off.
+    pub backed_off: AtomicU64,
 }
 
 /// One bounded sweeper lock hold (POAM-012): full after `chunk` work
@@ -464,6 +524,17 @@ const HOLD_CHECK_UNITS: usize = 32;
 impl Hold {
     fn start(chunk: usize) -> Self {
         Self { t: Instant::now(), work: 0, entries: 0, chunk, check_at: HOLD_CHECK_UNITS, over: false }
+    }
+
+    /// Work without a new entry (mirror retires of the last entry); runs
+    /// the same clock check as [`Hold::add`] (PERF-003).
+    #[inline]
+    fn charge(&mut self, work: usize) {
+        self.work += work;
+        if self.work >= self.check_at {
+            self.check_at = self.work + HOLD_CHECK_UNITS;
+            self.over = self.t.elapsed() >= SWEEP_HOLD;
+        }
     }
 
     #[inline]
@@ -655,7 +726,175 @@ impl State {
             sweep_resumed: AtomicU64::new(0),
             cluster,
             held: HeldCtx::from_config(n),
+            mirror: None,
         }
+    }
+
+    /// Attaches a session mirror (call before workers start; WU5 wires the
+    /// XDP mirror here). `prefix` is the engine's RFC 6052 prefix, used for
+    /// the canonical `dst6` key. A mirror that is not [`Mirror::enabled`]
+    /// ([`crate::mirror::NoMirror`]) is ignored, so the engine behaves
+    /// exactly as without one.
+    ///
+    /// `exclude` (the cluster pool) lists remote IPv4 addresses whose
+    /// sessions are never mirrored (hairpins, pool source guard).
+    pub fn set_mirror(&mut self, m: Arc<dyn Mirror>, prefix: Prefix6052, exclude: &[Ipv4Cidr]) {
+        if !m.enabled() {
+            return;
+        }
+        self.pool.set_mirror(m.clone());
+        self.mirror = Some(Box::new(MirrorCtx {
+            m,
+            prefix,
+            exclude: exclude.into(),
+            backoff_until: AtomicU64::new(0),
+            stats: CachePadded::new(MirrorInstallStats::default()),
+        }));
+    }
+
+    /// The session-mirror install counters; `None` without a mirror.
+    pub fn mirror_install_stats(&self) -> Option<&MirrorInstallStats> {
+        self.mirror.as_deref().map(|mc| &*mc.stats)
+    }
+
+    /// A session mirror is attached.
+    #[inline]
+    pub fn mirror_on(&self) -> bool {
+        self.mirror.is_some()
+    }
+
+    /// The mirror slot of session `remote` of BIB `k4`: `None` without such
+    /// a session (expired or not), [`NO_SLOT`] when it is not mirrored. One
+    /// `bib4` shard lock (diagnostics and tests).
+    pub fn session_slot(&self, k4: Key4, remote: (u32, u16)) -> Option<u32> {
+        self.bib4.lock(&k4).get(&k4).and_then(|b| b.sessions.get(&remote)).map(|s| s.slot)
+    }
+
+    /// Mirrors session `remote` of `bib` (just created, or a slow-path hit
+    /// of a session not mirrored yet). Called with the `bib4` shard held,
+    /// after the session is in the table, so a usable mirror entry always
+    /// has its session (plan §4.2 I1). Only UDP and only in an Active slice
+    /// (I3); the caller has already applied the engine's eligibility (no
+    /// hairpin, no pool remote).
+    ///
+    /// `retry`: the session already existed (a slow-path hit), counted in
+    /// [`MirrorInstallStats::retries`].
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: AU-12, AU-10 - a session is mirrored only after
+    ///   `bib_for` returned, i.e. after its attributing record (block
+    ///   allocation, or `bib_create` in session mode) was handed to the
+    ///   audit sink; with `refuse_new_bindings` and no queue room no session
+    ///   exists (I4). Under `on_overflow = "drop_and_alert"` that record may
+    ///   have been dropped (and alerted) and the session is mirrored all the
+    ///   same, exactly as the slow path uses its mapping (CLAUDE.md rule 4
+    ///   exception; test `drop_and_alert_installs_even_when_the_record_is_lost`
+    ///   in `tests/mirror.rs`)
+    /// - NIST 800-53: SC-5 - any failed install (full, existing key, other
+    ///   error) backs installs off for `INSTALL_BACKOFF_MS`, so a failing
+    ///   mirror costs at most one attempt per back-off, not one per packet
+    ///   (PERF-002); the session stays on the slow path
+    /// - NIST 800-53: SC-7 - remotes in the cluster pool are never mirrored
+    #[cold]
+    #[inline(never)]
+    fn mirror_install(&self, k4: Key4, bib: &mut Bib, remote: (u32, u16), retry: bool) {
+        let Some(mc) = self.mirror.as_deref() else { return };
+        let now = self.clock.now_ms();
+        if k4.proto != proto::UDP {
+            return;
+        }
+        if mc.backoff_until.load(Ordering::Relaxed) > now {
+            mc.stats.backed_off.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        // PERF-007: the pool scan runs here, only for a session about to be
+        // mirrored, not for every UDP packet.
+        if mc.exclude.iter().any(|c| c.contains(remote.0)) {
+            return;
+        }
+        let Some(idx) = self.pool.index(k4.addr) else { return };
+        let slice = self.pool.slice_of_idx(idx).unwrap_or(0);
+        // Acquire (pool) pairs with the activation's Release, so the
+        // generation read next is this activation's or a later one.
+        if self.pool.is_sliced() && self.pool.slice_state(slice) != Some(SliceState::Active) {
+            return;
+        }
+        let generation = self.pool.slice_gen(slice);
+        let keys = MirrorKeys { k6: bib.k6, k4, remote, dst6: mc.prefix.embed(remote.0) };
+        let Some(s) = bib.sessions.get_mut(&remote) else { return };
+        if retry {
+            mc.stats.retries.fetch_add(1, Ordering::Relaxed);
+        }
+        match mc.m.install(&MirrorEntry { keys, slice, generation }, self.bib4.index_of(&k4)) {
+            Ok(slot) if slot != NO_SLOT => {
+                s.slot = slot;
+                mc.stats.installed.fetch_add(1, Ordering::Relaxed);
+            }
+            // PERF-002 / QA F3: every failure class backs off, not only
+            // `Full` (an implementation maps "no free slot" to `Full`).
+            Ok(_) | Err(MirrorFail::Full | MirrorFail::Exists | MirrorFail::Error) => {
+                mc.stats.failed.fetch_add(1, Ordering::Relaxed);
+                mc.backoff_until.store(now + INSTALL_BACKOFF_MS, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Removes session `remote` of BIB `k4` / `k6` from the mirror, with
+    /// the `bib4` shard held, in the critical section that removes it.
+    #[cold]
+    #[inline(never)]
+    fn mirror_retire(&self, k4: Key4, k6: Key6, remote: (u32, u16), slot: u32) {
+        if let Some(mc) = self.mirror.as_deref() {
+            mc.m.retire(slot, &MirrorKeys { k6, k4, remote, dst6: mc.prefix.embed(remote.0) });
+        }
+    }
+
+    /// Retires every mirrored session of a BIB being removed.
+    fn mirror_retire_bib(&self, k4: Key4, bib: &Bib) {
+        if self.mirror.is_none() {
+            return;
+        }
+        for (r, s) in &bib.sessions {
+            if s.slot != NO_SLOT {
+                self.mirror_retire(k4, bib.k6, *r, s.slot);
+            }
+        }
+    }
+
+    /// Seen read-back (plan §5): a mirrored session that looks expired is
+    /// live if the fast path used it within the UDP timeout; its expiry is
+    /// then extended to `seen + udp`. Raising an expiry never needs the due
+    /// hint lowered.
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - RFC 6146 §3.5.1, RFC 4787 REQ-6 - fast-path packets refresh the
+    ///   session (both directions)
+    /// - NIST 800-53: SC-10 - the session still ends one timeout after its
+    ///   last packet on either path
+    #[cold]
+    #[inline(never)]
+    fn revive(&self, s: &mut Session, now: u64) -> bool {
+        let Some(mc) = self.mirror.as_deref() else { return false };
+        // RFC-005: `to.udp` is the session's own timeout because only UDP
+        // sessions ever hold a slot: `mirror_install` returns before
+        // `install` for any other protocol (I3), and `s.slot` stays
+        // `NO_SLOT`. A TCP or ICMP mirror (Phase 2-3) must pass the
+        // session's protocol here.
+        let seen = mc.m.seen_ms(s.slot);
+        let until = seen.saturating_add(self.to.udp);
+        if seen != 0 && until > now {
+            s.expires_ms = until;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Is session `s` live at `now`, counting fast-path use? Without a
+    /// mirror this is the plain expiry test (`slot` is always `NO_SLOT`).
+    #[inline(always)]
+    fn live(&self, s: &mut Session, now: u64) -> bool {
+        s.expires_ms > now || (s.slot != NO_SLOT && self.revive(s, now))
     }
 
     /// Coarse monotonic milliseconds (the engine's clock).
@@ -1118,8 +1357,11 @@ impl State {
 
     /// Removes an expired session that the sweeper has not reached yet
     /// (RFC 6146 §3.5.4: a session ends when its lifetime expires).
-    fn drop_expired(&self, bib: &mut Bib, remote: (u32, u16)) {
-        if bib.sessions.remove(&remote).is_some() {
+    fn drop_expired(&self, k4: Key4, bib: &mut Bib, remote: (u32, u16)) {
+        if let Some(s) = bib.sessions.remove(&remote) {
+            if s.slot != NO_SLOT {
+                self.mirror_retire(k4, bib.k6, remote, s.slot);
+            }
             forget_remote(&mut bib.remotes, remote.0);
             self.sessions.fetch_sub(1, Ordering::Relaxed);
             bib.sub_sessions.fetch_sub(1, Ordering::Relaxed);
@@ -1128,20 +1370,38 @@ impl State {
 
     /// Outbound (v6→v4) session update/creation. `Err(NoBinding)` means the
     /// BIB vanished concurrently; the caller retries once.
+    #[inline]
     pub fn outbound(&self, k4: Key4, remote: (u32, u16), flags: u8, counters: &Counters) -> Result<(), DropReason> {
+        self.outbound_with(k4, remote, flags, false, counters)
+    }
+
+    /// [`State::outbound`] that also mirrors the session when `mirror` (the
+    /// engine found the flow eligible: UDP, remote outside the cluster
+    /// pool) and a mirror is attached.
+    #[inline]
+    pub fn outbound_with(
+        &self,
+        k4: Key4,
+        remote: (u32, u16),
+        flags: u8,
+        mirror: bool,
+        counters: &Counters,
+    ) -> Result<(), DropReason> {
         let now = self.clock.now_ms();
         // Declared before the guard so an emptied held-SYN array is freed
         // after `bib4` is released (PERF-006).
         let mut spill: HeldSlots = None;
         let (mut g, due) = self.bib4.lock_due(&k4);
         let bib = g.get_mut(&k4).ok_or(DropReason::NoBinding)?;
-        match bib.sessions.get_mut(&remote) {
-            Some(s) if s.expires_ms > now => {
+        if let Some(s) = bib.sessions.get_mut(&remote) {
+            if self.live(s, now) {
                 self.refresh(k4.proto, s, Side::V6, flags, now, due);
+                if mirror && s.slot == NO_SLOT {
+                    self.mirror_install(k4, bib, remote, true);
+                }
                 return Ok(());
             }
-            Some(_) => self.drop_expired(bib, remote),
-            None => {}
+            self.drop_expired(k4, bib, remote);
         }
         let (tcp, life) = if k4.proto == proto::TCP {
             match tcp::initial(Side::V6, flags) {
@@ -1160,9 +1420,12 @@ impl State {
             (None, self.timeout(k4.proto, None))
         };
         self.admit_session(bib)?;
-        bib.insert_session(remote, Session { expires_ms: now + life, tcp });
+        bib.insert_session(remote, Session::new(now + life, tcp));
         lower_due(due, now + life);
         counters.inc(Counter::SessionCreated);
+        if mirror {
+            self.mirror_install(k4, bib, remote, false);
+        }
         Ok(())
     }
 
@@ -1197,6 +1460,22 @@ impl State {
         self.inbound_or_hold(k4, remote, flags, None, counters)?.ok_or(DropReason::Filtered)
     }
 
+    /// [`State::inbound_or_hold`] that also mirrors the session when
+    /// `mirror` (the engine found the packet eligible: UDP, no hairpin,
+    /// remote outside the cluster pool) and a mirror is attached.
+    #[inline]
+    pub fn inbound_with(
+        &self,
+        k4: Key4,
+        remote: (u32, u16),
+        flags: u8,
+        syn: Option<SynMeta>,
+        mirror: bool,
+        counters: &Counters,
+    ) -> Result<Option<Key6>, DropReason> {
+        self.inbound_inner(k4, remote, flags, syn, mirror, counters)
+    }
+
     /// [`State::inbound`] that may hold a refused SYN: with `syn` (an
     /// unfragmented TCP SYN without ACK/RST) a packet the filter refuses
     /// on a bound port is held for simultaneous open and `Ok(None)` is
@@ -1210,18 +1489,34 @@ impl State {
         syn: Option<SynMeta>,
         counters: &Counters,
     ) -> Result<Option<Key6>, DropReason> {
+        self.inbound_inner(k4, remote, flags, syn, false, counters)
+    }
+
+    #[inline(always)]
+    fn inbound_inner(
+        &self,
+        k4: Key4,
+        remote: (u32, u16),
+        flags: u8,
+        syn: Option<SynMeta>,
+        mirror: bool,
+        counters: &Counters,
+    ) -> Result<Option<Key6>, DropReason> {
         let now = self.clock.now_ms();
         let (mut g, due) = self.bib4.lock_due(&k4);
         let bib = g.get_mut(&k4).ok_or(DropReason::NoBinding)?;
-        match bib.sessions.get_mut(&remote) {
-            Some(s) if s.expires_ms > now => {
+        if let Some(s) = bib.sessions.get_mut(&remote) {
+            if self.live(s, now) {
                 self.refresh(k4.proto, s, Side::V4, flags, now, due);
+                if mirror && s.slot == NO_SLOT {
+                    self.mirror_install(k4, bib, remote, true);
+                }
                 return Ok(Some(bib.k6));
             }
-            // RFC-102: an expired, not yet swept session neither passes the
-            // filter nor is revived.
-            Some(_) => self.drop_expired(bib, remote),
-            None => {}
+            // RFC-102: an expired, not yet swept session (and not used by
+            // the fast path either) neither passes the filter nor is
+            // revived.
+            self.drop_expired(k4, bib, remote);
         }
         // COMPLIANCE MAPPING:
         // - NIST 800-53: SC-7, SC-7(5) - deny unsolicited inbound by default
@@ -1247,9 +1542,12 @@ impl State {
         };
         self.admit_session(bib)?;
         let expires = now + self.timeout(k4.proto, tcp);
-        bib.insert_session(remote, Session { expires_ms: expires, tcp });
+        bib.insert_session(remote, Session::new(expires, tcp));
         lower_due(due, expires);
         counters.inc(Counter::SessionCreated);
+        if mirror {
+            self.mirror_install(k4, bib, remote, false);
+        }
         Ok(Some(bib.k6))
     }
 
@@ -1456,9 +1754,10 @@ impl State {
     /// - RFC 4787 REQ-8 / RFC 6146 §3.5.1.2 - same rule as `inbound`
     pub fn filter_inbound(&self, k4: Key4, remote: (u32, u16)) -> Result<Key6, DropReason> {
         let now = self.clock.now_ms();
-        let g = self.bib4.lock(&k4);
-        let bib = g.get(&k4).ok_or(DropReason::NoBinding)?;
-        if bib.sessions.get(&remote).is_some_and(|s| s.expires_ms > now) {
+        let mut g = self.bib4.lock(&k4);
+        let bib = g.get_mut(&k4).ok_or(DropReason::NoBinding)?;
+        // A fast-path-only flow is live through the seen read-back (plan §5).
+        if bib.sessions.get_mut(&remote).is_some_and(|s| self.live(s, now)) {
             return Ok(bib.k6);
         }
         let allowed = match self.filtering {
@@ -1484,14 +1783,19 @@ impl State {
     /// `Err(NoBinding)` without a BIB, `Err(Filtered)` without the session.
     pub fn lookup4_session(&self, k4: Key4, remote: Option<(u32, u16)>) -> Result<Key6, DropReason> {
         let now = self.clock.now_ms();
-        let g = self.bib4.lock(&k4);
-        let bib = g.get(&k4).ok_or(DropReason::NoBinding)?;
+        let mut g = self.bib4.lock(&k4);
+        let bib = g.get_mut(&k4).ok_or(DropReason::NoBinding)?;
         match remote {
             None => Ok(bib.k6),
-            Some(r) => match bib.sessions.get(&r) {
-                Some(s) if s.expires_ms > now => Ok(bib.k6),
-                _ => Err(DropReason::Filtered),
-            },
+            // The seen read-back keeps PMTUD working for fast-path-only
+            // flows (ICMPv4 Frag Needed is validated here, plan §5).
+            Some(r) => {
+                if bib.sessions.get_mut(&r).is_some_and(|s| self.live(s, now)) {
+                    Ok(bib.k6)
+                } else {
+                    Err(DropReason::Filtered)
+                }
+            }
         }
     }
 
@@ -1644,7 +1948,9 @@ impl State {
                 }
                 n += 1;
                 h.add(SWEEP_ENTRY_COST + bib.sessions.len());
+                let r0 = st.mirror_retired;
                 next = next.min(self.sweep_bib(*k4, bib, now, st, dead, spill));
+                h.charge(SWEEP_RETIRE_COST * (st.mirror_retired - r0) as usize);
             }
             lower_due(due, next);
             let removals = self.bib4.removals_index(i).unwrap_or(0);
@@ -1670,7 +1976,9 @@ impl State {
                     pos += 1;
                     let Some(bib) = g.get_mut(k4) else { continue };
                     h.add(SWEEP_ENTRY_COST + bib.sessions.len());
+                    let r0 = st.mirror_retired;
                     next = next.min(self.sweep_bib(*k4, bib, now, st, dead, spill));
+                    h.charge(SWEEP_RETIRE_COST * (st.mirror_retired - r0) as usize);
                 }
                 lower_due(due, next);
                 st.note_hold(h.t);
@@ -1718,16 +2026,25 @@ impl State {
     ) -> u64 {
         let before = bib.sessions.len();
         let mut next = u64::MAX;
-        let Bib { sessions, remotes, .. } = bib;
-        sessions.retain(|(addr, _), s| {
-            let keep = s.expires_ms > now;
+        let Bib { sessions, remotes, k6, .. } = bib;
+        let k6 = *k6;
+        let mut retired = 0;
+        sessions.retain(|&remote, s| {
+            // A mirrored session is revalidated or retired inside this hold
+            // (plan §5); without a mirror `slot` is always NO_SLOT.
+            let keep = self.live(s, now);
             if keep {
                 next = next.min(s.expires_ms);
             } else {
-                forget_remote(remotes, *addr);
+                forget_remote(remotes, remote.0);
+                if s.slot != NO_SLOT {
+                    self.mirror_retire(k4, k6, remote, s.slot);
+                    retired += 1;
+                }
             }
             keep
         });
+        st.mirror_retired += retired;
         let gone = (before - bib.sessions.len()) as u64;
         if gone > 0 {
             self.sessions.fetch_sub(gone, Ordering::Relaxed);
@@ -2223,7 +2540,13 @@ impl State {
                     g6.remove(&k6);
                 }
                 self.bib4.note_removal(&k4);
-                g4.remove(&k4)
+                let b = g4.remove(&k4);
+                // The slice is already fenced in the mirror; its entries
+                // also go with their sessions, in this critical section.
+                if let Some(b) = &b {
+                    self.mirror_retire_bib(k4, b);
+                }
+                b
             };
             let Some(mut bib) = removed else { continue };
             // The slice is no longer ours: held SYNs are dropped silently.
