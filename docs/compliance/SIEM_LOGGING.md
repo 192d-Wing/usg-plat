@@ -225,6 +225,7 @@ program may forward) or `disabled` (every packet goes to the slow path).
 | `object_mismatch` | disabled | The loader attached another object than this binary's (`/run/plat/xdp.state`) |
 | `link_mismatch` | disabled | The attached program changed while running (state file program id) |
 | `maps_unavailable` | disabled | Pins missing, of the wrong shape, replaced by a re-run loader, or the TUN or a thread could not be set up |
+| `stale_maps` | disabled | The pinned maps were already used by an earlier `platd` (`CONTROL` touched or a `SLOT` record present): a restart must re-run the loader for fresh maps (SEC-001) |
 | `unsupported_host` | disabled | `membarrier(MEMBARRIER_CMD_GLOBAL)` unavailable (`nohz_full`) or failing 10 times in a row: slots cannot be reused safely (decision Q5, SEC-007) |
 | `heartbeat_stalled` | disabled | The sweeper or a worker made no progress: heartbeats withheld, the dead-man deadline stops the fast path (SC-24) |
 | `heartbeat_resumed` | enabled | Progress again after a stall |
@@ -232,7 +233,7 @@ program may forward) or `disabled` (every packet goes to the slow path).
 
 Every reason except `start`, `heartbeat_resumed` and `shutdown` is a
 failure (`event.outcome:"failure"`, severity 4). After `config_mismatch`,
-`object_mismatch`, `link_mismatch`, `maps_unavailable` or
+`object_mismatch`, `link_mismatch`, `maps_unavailable`, `stale_maps` or
 `unsupported_host` the fast path stays off until `platd` restarts. Alert on
 any of them; correlate with `plat_xdp_*` metrics.
 
@@ -952,7 +953,8 @@ for `nat_port_block_release` (same address and range), `service_stop`,
   schema 8, decision Q7: separate families, the existing ones stay slow-path
   only, so a total is `plat_v6_to_v4_total + plat_xdp_packets_total{dir="v6_to_v4"}`):
   gauges `plat_xdp_enabled`, `plat_xdp_sessions`, `plat_xdp_slots_quarantined`,
-  `plat_xdp_slots_quarantined_max`; counters
+  `plat_xdp_slots_quarantined_max`, `plat_xdp_publish_queue_depth`,
+  `plat_xdp_publisher_last_pass_seconds`; counters
   `plat_xdp_packets_total{dir}` / `plat_xdp_bytes_total{dir}` (`v6_to_v4`,
   `v4_to_v6`), `plat_xdp_pass_total{reason}` (every pass reason of plan
   §4.7), `plat_xdp_aborted_total`, `plat_xdp_installs_total`,
@@ -960,7 +962,10 @@ for `nat_port_block_release` (same address and range), `service_stop`,
   `plat_xdp_retires_total`, `plat_xdp_retire_not_live_total`,
   `plat_xdp_retire_errors_total`, `plat_xdp_publish_retries_total`,
   `plat_xdp_revalidated_total`, `plat_xdp_gc_deleted_total`,
-  `plat_xdp_heartbeat_stalls_total`, `plat_xdp_grace_failures_total`.
+  `plat_xdp_heartbeat_stalls_total`, `plat_xdp_grace_failures_total`,
+  `plat_xdp_retire_leaked_total`. Pass reason `udp_csum_unverified`: frames
+  whose UDP checksum did not verify (RFC-001; `CHECKSUM_PARTIAL` senders)
+  went to the slow path.
 - Linux only: `plat_tun_rx_dropped_total{interface}` and
   `plat_tun_tx_dropped_total{interface}`, the kernel's drop counters for the
   TUN (`/sys/class/net/<if>/statistics/{rx,tx}_dropped`, read at scrape).

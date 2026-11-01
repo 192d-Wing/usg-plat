@@ -113,6 +113,45 @@ impl XdpControl {
     }
 }
 
+/// Why pinned maps are not fresh (SEC-001, `stale_maps`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum Stale {
+    /// `CONTROL` was enabled or claimed before: another `platd` used these
+    /// maps (the loader leaves it all zero).
+    #[error("CONTROL was already enabled or claimed by another process")]
+    ControlUsed,
+    /// `SLOT[slot]` is not all-zero: sessions of an earlier process may
+    /// still be reachable.
+    #[error("SLOT {0} holds a record of an earlier process")]
+    SlotUsed(u32),
+}
+
+/// SEC-001: claims freshly created maps for this process, or refuses.
+/// Fresh means `CONTROL` all zero (never enabled, never claimed) and every
+/// `SLOT` header zero (`FREE`, slice 0, generation 0), a bounded scan of
+/// `slots` words through the mmap at start. An all-`FREE` `SLOT` also
+/// proves `OUT6` / `IN4` empty: the loader inserts nothing and every
+/// writer install stores a non-zero header before any entry is published.
+/// On success `CONTROL.deadline_ns` becomes 1 (in the past: the program
+/// still passes everything), which marks the maps consumed, so a second
+/// `platd` on the same pins is refused even before this one installs.
+pub fn claim_fresh(control: &XdpControl, slot_mem: &dyn Words, slots: u32) -> Result<(), Stale> {
+    let c = control.read();
+    if c.enabled != 0 || c.deadline_ns != 0 || c.tun_ifindex != 0 || c.tun_mtu != 0 {
+        return Err(Stale::ControlUsed);
+    }
+    let w = slot_mem.words();
+    for i in 0..slots {
+        let at = (i as usize).saturating_mul(plat_xdp_core::abi::SLOT_WORDS);
+        if w.get(at).map_or(0, |a| a.load(Ordering::Acquire)) != 0 {
+            return Err(Stale::SlotUsed(i));
+        }
+    }
+    control.heartbeat(1);
+    fence(Ordering::SeqCst);
+    Ok(())
+}
+
 /// `CLOCK_MONOTONIC_COARSE` in nanoseconds: the clock of
 /// `bpf_ktime_get_coarse_ns` (deadline and `seen_ns`).
 #[cfg(target_os = "linux")]
@@ -144,6 +183,31 @@ pub fn probe_grace_period() -> io::Result<()> {
 pub fn after_grace_period(m: &XdpMirror) -> u64 {
     m.slot_allocator().advance_epoch();
     m.slot_allocator().recycle()
+}
+
+/// Progress of one source (sweeper passes, a worker's housekeeping, the
+/// publisher's passes) for the heartbeat's health check: healthy while
+/// its counter moved within `window_ns`.
+#[derive(Debug, Clone, Copy)]
+pub struct Watch {
+    last: u64,
+    at: u64,
+}
+
+impl Watch {
+    /// A watch started at `now_ns` (the first value counts as progress).
+    pub fn new(now_ns: u64) -> Self {
+        Self { last: u64::MAX, at: now_ns }
+    }
+
+    /// Records `value` at `now_ns`; `true` while the source made progress
+    /// within `window_ns`.
+    pub fn ok(&mut self, value: u64, now_ns: u64, window_ns: u64) -> bool {
+        if value != self.last {
+            (self.last, self.at) = (value, now_ns);
+        }
+        now_ns.saturating_sub(self.at) <= window_ns
+    }
 }
 
 /// Interval of the integrity check (plan §9).
@@ -394,6 +458,43 @@ pub fn engine_origin_ns(clock: &plat_common::Clock) -> u64 {
 mod tests {
     use super::*;
     use crate::maps::HeapWords;
+
+    /// SEC-001: fresh maps are claimed once; a second claim (another
+    /// `platd`, or a restart on the same pins) and maps with any slot
+    /// record are refused.
+    #[test]
+    fn maps_are_claimed_once_and_used_maps_are_refused() {
+        use plat_xdp_core::abi::{SLOT_DEAD, SLOT_WORDS, SlotRec};
+        let c = XdpControl::with_mem(Arc::new(HeapWords::new(3)));
+        let slots = HeapWords::new(8 * SLOT_WORDS);
+        assert_eq!(claim_fresh(&c, &slots, 8), Ok(()));
+        assert_eq!(c.read().deadline_ns, 1, "consumed mark");
+        assert_eq!(c.read().enabled, 0, "still disabled");
+        assert_eq!(claim_fresh(&c, &slots, 8), Err(Stale::ControlUsed), "attach twice");
+        let c2 = XdpControl::with_mem(Arc::new(HeapWords::new(3)));
+        if let Some(w) = slots.words().get(5 * SLOT_WORDS) {
+            w.store(SlotRec::hdr_word(SLOT_DEAD, 0, 1), Ordering::Relaxed);
+        }
+        assert_eq!(claim_fresh(&c2, &slots, 8), Err(Stale::SlotUsed(5)));
+        assert_eq!(c2.read().deadline_ns, 0, "a refused claim marks nothing");
+        let c3 = XdpControl::with_mem(Arc::new(HeapWords::new(3)));
+        assert!(c3.enable(7, 1500, 9));
+        c3.disable();
+        assert_eq!(claim_fresh(&c3, &HeapWords::new(8), 1), Err(Stale::ControlUsed), "enabled once");
+    }
+
+    /// SEC-002: a source that stops (a stuck or dead publisher thread)
+    /// turns the health check false after its window, and true again when
+    /// it moves.
+    #[test]
+    fn a_stalled_source_fails_the_health_check() {
+        let mut w = Watch::new(0);
+        assert!(w.ok(0, 0, 100));
+        assert!(w.ok(1, 50, 100));
+        assert!(w.ok(1, 150, 100), "within the window of the last change");
+        assert!(!w.ok(1, 151, 100), "stalled");
+        assert!(w.ok(2, 200, 100), "progress again");
+    }
 
     #[test]
     fn stall_resume_fault_transitions() {

@@ -1167,6 +1167,7 @@ mod tests {
             (XdpState::Disabled, XdpReason::ObjectMismatch, "failure", 4),
             (XdpState::Disabled, XdpReason::LinkMismatch, "failure", 4),
             (XdpState::Disabled, XdpReason::MapsUnavailable, "failure", 4),
+            (XdpState::Disabled, XdpReason::StaleMaps, "failure", 4),
             (XdpState::Disabled, XdpReason::UnsupportedHost, "failure", 4),
             (XdpState::Disabled, XdpReason::HeartbeatStalled, "failure", 4),
             (XdpState::Enabled, XdpReason::HeartbeatResumed, "success", 5),

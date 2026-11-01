@@ -374,6 +374,13 @@ mod linux {
             }
         }
 
+        /// SEC-001: claims these pins for this process if they are fresh
+        /// ([`crate::control::claim_fresh`]).
+        pub fn claim_fresh(&self) -> Result<(), crate::control::Stale> {
+            let control = crate::control::XdpControl::new(self);
+            crate::control::claim_fresh(&control, &*self.slot, self.slots)
+        }
+
         /// The frozen `CONFIG` record.
         pub fn config(&self) -> &ConfigRec {
             &self.config

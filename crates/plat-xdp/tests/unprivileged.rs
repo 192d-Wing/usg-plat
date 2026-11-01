@@ -39,8 +39,15 @@ fn platd_view_of_the_pins() {
     let dir = PathBuf::from(std::env::var("PLAT_XDP_UNPRIV_PIN_DIR").unwrap_or_else(|_| plat_xdp::PIN_DIR.into()));
     let cfg = ok(std::env::var("PLAT_XDP_UNPRIV_CONFIG"), "PLAT_XDP_UNPRIV_CONFIG");
     let c = ok(plat_common::Config::from_toml(&ok(std::fs::read_to_string(&cfg), &cfg)), "config");
-    let p = LoadParams::from_config(&c);
+    let mut p = LoadParams::from_config(&c);
+    // SEC-001: the attach's nonce from the loader's state file.
+    let state = PathBuf::from(std::env::var("PLAT_XDP_UNPRIV_STATE").unwrap_or_else(|_| plat_xdp::STATE_FILE.into()));
+    p.nonce = ok(plat_xdp::load::read_state(&state), "state file").nonce;
     let maps = ok(XdpMaps::open_pinned(&dir, &config_record(&p, &plat_xdp::object_sha256())), "open_pinned");
+    // SEC-001: the first claim of fresh maps succeeds, a second (another
+    // platd on the same pins) is refused.
+    ok(maps.claim_fresh(), "claim fresh maps");
+    assert_eq!(maps.claim_fresh(), Err(plat_xdp::control::Stale::ControlUsed), "attach twice");
     assert_eq!(maps.sessions(), p.xdp.max_sessions);
 
     // Root-only pins.

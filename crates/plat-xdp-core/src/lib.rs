@@ -48,7 +48,7 @@ pub mod rewrite;
 
 pub use abi::{PassReason, StatIdx};
 pub use classify::{V4Meta, V6Meta, classify_v4, classify_v6};
-pub use decide::{Action, Env, Verdict, decide_frame, decide_v4, decide_v6};
+pub use decide::{Action, Env, FrameEnv, Verdict, decide_frame, decide_v4, decide_v6, udp_csum_ok_in};
 pub use rewrite::{rewrite_v4_to_v6, rewrite_v6_to_v4};
 
 /// Ethernet header length.

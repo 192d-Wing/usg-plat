@@ -273,6 +273,10 @@ pub struct MirrorCounters {
     pub sessions: LaneCounter,
     /// Publishes retried after `EEXIST`.
     pub publish_retries: LaneCounter,
+    /// Retires whose deferred op could not be queued (unreachable with the
+    /// queue bound): the slot and its entries are leaked, never deleted
+    /// under the caller's lock (SEC-002).
+    pub retire_leaked: LaneCounter,
 }
 
 /// See the module documentation.
@@ -288,6 +292,13 @@ pub struct XdpMirror {
     counters: MirrorCounters,
     /// Deferred publish / delete state ([`XdpMirror::flush`]).
     publisher: parking_lot::Mutex<Publisher>,
+    /// Completed publisher passes and the time of the last one (ms since
+    /// `origin`), for health and metrics (SEC-002).
+    passes: AtomicU64,
+    last_pass_ms: AtomicU64,
+    /// Slots that turned FAILED, for the collector (PERF-005; bounded by
+    /// the slot count, preallocated).
+    failed: parking_lot::Mutex<Vec<u32>>,
     /// The engine clock and the `CLOCK_MONOTONIC_COARSE` reading (ns) of
     /// its origin, for [`XdpMirror::seen_ms`]; `None` until
     /// [`XdpMirror::with_clock`].
@@ -311,6 +322,9 @@ impl XdpMirror {
             slice_mem,
             slots: SlotAllocator::new(slots, partitions),
             publisher: parking_lot::Mutex::new(Publisher::new(slots)),
+            passes: AtomicU64::new(0),
+            last_pass_ms: AtomicU64::new(0),
+            failed: parking_lot::Mutex::new(Vec::with_capacity(slots as usize)),
             origin: Instant::now(),
             backoff_until: AtomicU64::new(0),
             counters: MirrorCounters::default(),
@@ -338,7 +352,10 @@ impl XdpMirror {
         if ns == 0 {
             return 0;
         }
-        (ns.saturating_sub(*origin) / 1_000_000).min(clock.now_ms()).max(1)
+        // RFC-002: rounded up, plus one coarse tick of slack (the coarse
+        // clock and the engine origin can differ by a tick), so a session
+        // never expires before one full timeout after its last packet.
+        ns.saturating_sub(*origin).div_ceil(1_000_000).saturating_add(SEEN_SLACK_MS).min(clock.now_ms()).max(1)
     }
 
     /// The writer over `platd`'s pins.
@@ -408,28 +425,24 @@ impl XdpMirror {
         if cur.state != SLICE_ACTIVE || cur.generation != generation {
             return Err(self.fail(shard, InstallError::Error));
         }
-        let Some(slot) = self.slots.alloc(shard) else {
+        let words = e.record(SLOT_PENDING, generation).to_words();
+        // PERF-006: slot, record and publish op under one partition lock.
+        // The record is unreachable while written: no hash entry points at
+        // the slot and its header still says FREE/DEAD from before.
+        let write = |slot: u32| {
+            let Some(w) = self.slot_words(slot) else { return false };
+            for (d, s) in w.iter().zip(words.iter()).skip(1) {
+                d.store(*s, Ordering::Relaxed);
+            }
+            fence(Ordering::Release);
+            if let (Some(h), Some(v)) = (w.get(SLOT_WORD_HDR), words.get(SLOT_WORD_HDR)) {
+                h.store(*v, Ordering::Release);
+            }
+            true
+        };
+        let Some(slot) = self.slots.alloc_publish(shard, write) else {
             return Err(self.fail(shard, InstallError::Slots));
         };
-        let Some(w) = self.slot_words(slot) else {
-            self.slots.retire(slot);
-            return Err(self.fail(shard, InstallError::Error));
-        };
-        let words = e.record(SLOT_PENDING, generation).to_words();
-        // Unreachable: no hash entry points here, and the header word still
-        // says FREE/DEAD from before.
-        for (d, s) in w.iter().zip(words.iter()).skip(1) {
-            d.store(*s, Ordering::Relaxed);
-        }
-        fence(Ordering::Release);
-        if let (Some(h), Some(v)) = (w.get(SLOT_WORD_HDR), words.get(SLOT_WORD_HDR)) {
-            h.store(*v, Ordering::Release);
-        }
-        if !self.slots.defer_publish(slot) {
-            self.mark(slot, SLOT_DEAD);
-            self.slots.retire(slot);
-            return Err(self.fail(shard, InstallError::Error));
-        }
         self.counters.sessions.add(slot as usize, 1);
         Ok(slot)
     }
@@ -489,15 +502,15 @@ impl XdpMirror {
             self.counters.sessions.sub(lane, 1);
             return Ok(());
         }
-        // Not reachable with the two-ops-per-slot bound; never leave the
-        // entries behind: delete synchronously.
-        let mut p = self.publisher.lock();
-        let r = self.delete_keys(&mut p, slot, e);
-        if self.slots.retire(slot) {
-            self.counters.retires.add(lane, 1);
-            self.counters.sessions.sub(lane, 1);
-        }
-        r
+        // Not reachable with the two-ops-per-slot bound. SEC-002: never
+        // take the publisher mutex (or make a syscall) under the caller's
+        // `bib4` lock: the record is DEAD, so the program no longer uses
+        // it; the slot and its entries are leaked and counted (an operator
+        // signal; the maps are recreated with the next attach).
+        self.counters.retire_leaked.add(lane, 1);
+        self.counters.retires.add(lane, 1);
+        self.counters.sessions.sub(lane, 1);
+        Ok(())
     }
 
     /// Deletes `slot`'s `OUT6` / `IN4` entries if this writer published
@@ -508,7 +521,12 @@ impl XdpMirror {
         }
         let r6 = self.tables.delete_out6(&e.key6().to_bytes());
         let r4 = self.tables.delete_in4(&e.key4().to_bytes());
-        r6.and(r4).map(drop)
+        let r = r6.and(r4).map(drop);
+        if r.is_err() {
+            // SEC-003: still published; the caller retries the deletes.
+            p.set_published(slot);
+        }
+        r
     }
 
     /// One publisher pass (the `plat-xdp-pub` thread; tests call it
@@ -533,32 +551,59 @@ impl XdpMirror {
         let p = &mut *guard;
         let mut ops = std::mem::take(&mut p.ops);
         ops.clear();
-        // Retries of the previous pass go first, in their original order.
-        for (slot, _) in p.retry.iter() {
-            ops.push(u64::from(*slot) << 1 | OP_PUBLISH);
+        // Retries of the previous pass go first: SEC-003 deletes that
+        // failed, then EEXIST publishes (attempts in `p.tries`, PERF-004).
+        for &slot in p.del_retry.iter() {
+            ops.push(u64::from(slot) << 1 | OP_RETIRE);
         }
-        let mut tries = std::mem::take(&mut p.retry_next);
-        tries.clear();
-        tries.append(&mut p.retry);
+        p.del_retry.clear();
+        for &slot in p.retry.iter() {
+            ops.push(u64::from(slot) << 1 | OP_PUBLISH);
+        }
+        p.retry.clear();
         self.slots.drain_ops(&mut ops);
         for &op in ops.iter().filter(|&&op| op & 1 == OP_RETIRE) {
             let slot = (op >> 1) as u32;
             if let Some(r) = self.record(slot)
                 && self.delete_keys(p, slot, &SessionEntry::from_record(&r)).is_err()
             {
+                // SEC-003: no orphan entries: the slot stays out of the
+                // quarantine and the deletes are retried next pass.
                 self.counters.retire_error.add(slot as usize, 1);
+                p.del_retry.push(slot);
+                continue;
             }
             self.slots.quarantine(slot);
         }
         for &op in ops.iter().filter(|&&op| op & 1 == OP_PUBLISH) {
             let slot = (op >> 1) as u32;
-            let tried = tries.iter().find(|(s, _)| *s == slot).map_or(0, |(_, n)| *n);
+            let tried = p.tries.get(slot as usize).copied().unwrap_or(0);
             self.publish(p, slot, tried);
         }
         let n = ops.len();
         p.ops = ops;
-        p.retry_next = tries;
+        self.passes.fetch_add(1, Ordering::Release);
+        self.last_pass_ms.store(self.now() / 1_000_000, Ordering::Relaxed);
         n
+    }
+
+    /// Completed publisher passes (SEC-002 liveness).
+    pub fn publisher_passes(&self) -> u64 {
+        self.passes.load(Ordering::Acquire)
+    }
+
+    /// Seconds since the last publisher pass (`plat_xdp_publisher_last_pass_seconds`).
+    pub fn publisher_idle_secs(&self) -> f64 {
+        let last = self.last_pass_ms.load(Ordering::Relaxed);
+        (self.now() / 1_000_000).saturating_sub(last) as f64 / 1000.0
+    }
+
+    /// PERF-005: slots whose publish failed, for the collector to take
+    /// first (moved into `out`, which the caller reuses).
+    pub fn take_failed(&self, out: &mut Vec<u32>, max: usize) {
+        let mut f = self.failed.lock();
+        let k = f.len().min(max);
+        out.extend(f.drain(..k));
     }
 
     fn publish(&self, p: &mut Publisher, slot: u32, tried: u8) {
@@ -567,6 +612,9 @@ impl XdpMirror {
         let Some(r) = self.record(slot) else { return };
         if r.state != SLOT_PENDING {
             // Retired before it was published: its retire op quarantines it.
+            if let Some(t) = p.tries.get_mut(slot as usize) {
+                *t = 0;
+            }
             return;
         }
         let pending = SlotRec::hdr_word(SLOT_PENDING, r.slice, r.generation);
@@ -591,8 +639,12 @@ impl XdpMirror {
                 }
             }
             Err(err) if err.raw_os_error() == Some(EEXIST) && tried < PUBLISH_RETRIES => {
-                p.retry.push((slot, tried + 1));
+                p.retry.push(slot);
+                if let Some(t) = p.tries.get_mut(slot as usize) {
+                    *t = tried + 1;
+                }
                 self.counters.publish_retries.add(lane, 1);
+                return;
             }
             Err(err) => {
                 let kind = if err.raw_os_error() == Some(E2BIG) {
@@ -604,8 +656,17 @@ impl XdpMirror {
                 };
                 self.fail(lane, kind);
                 let failed = SlotRec::hdr_word(SLOT_FAILED, r.slice, r.generation);
-                let _ = h.compare_exchange(pending, failed, Ordering::AcqRel, Ordering::Acquire);
+                if h.compare_exchange(pending, failed, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                    // PERF-005: the collector takes these first.
+                    let mut f = self.failed.lock();
+                    if f.len() < f.capacity() {
+                        f.push(slot);
+                    }
+                }
             }
+        }
+        if let Some(t) = p.tries.get_mut(slot as usize) {
+            *t = 0;
         }
     }
 
@@ -693,6 +754,10 @@ impl XdpMirror {
     }
 }
 
+/// Slack added to `seen_ms` (RFC-002): one `CLOCK_MONOTONIC_COARSE` tick
+/// at the lowest common `HZ` (100).
+pub const SEEN_SLACK_MS: u64 = 10;
+
 /// `E2BIG` (Linux and macOS agree on 7).
 const E2BIG: i32 = 7;
 /// `EEXIST` (Linux and macOS agree on 17).
@@ -712,10 +777,12 @@ struct Publisher {
     published: Box<[u64]>,
     /// The ops of the current pass (reused).
     ops: Vec<u64>,
-    /// `EEXIST` publishes for the next pass, with their attempt count.
-    retry: Vec<(u32, u8)>,
-    /// The previous pass's retries (attempt counts).
-    retry_next: Vec<(u32, u8)>,
+    /// `EEXIST` publishes for the next pass.
+    retry: Vec<u32>,
+    /// Publish attempts per slot (PERF-004 / SEC-006: no list search).
+    tries: Box<[u8]>,
+    /// Slots whose deferred deletes failed, retried next pass (SEC-003).
+    del_retry: Vec<u32>,
 }
 
 impl Publisher {
@@ -725,7 +792,8 @@ impl Publisher {
             published: vec![0u64; n.div_ceil(64)].into_boxed_slice(),
             ops: Vec::with_capacity(2 * n),
             retry: Vec::with_capacity(n),
-            retry_next: Vec::with_capacity(n),
+            tries: vec![0u8; n].into_boxed_slice(),
+            del_retry: Vec::with_capacity(n),
         }
     }
 
@@ -768,6 +836,8 @@ pub(crate) mod tests {
         pub fail_out6: std::sync::atomic::AtomicBool,
         /// Called inside every `OUT6` insert (races).
         pub on_out6: Mutex<Option<Box<dyn FnMut() + Send>>>,
+        /// Deletes fail with EIO while set (SEC-003).
+        pub fail_delete: std::sync::atomic::AtomicBool,
     }
 
     impl std::fmt::Debug for ModelTables {
@@ -803,6 +873,9 @@ pub(crate) mod tests {
             ins(&self.in4, self.cap, key, slot)
         }
         fn delete_out6(&self, key: &[u8; 40]) -> io::Result<bool> {
+            if self.fail_delete.load(Ordering::Relaxed) {
+                return Err(io::Error::from_raw_os_error(5));
+            }
             Ok(self.out6.lock().remove(key).is_some())
         }
         fn delete_in4(&self, key: &[u8; 12]) -> io::Result<bool> {
@@ -1187,5 +1260,45 @@ pub(crate) mod tests {
         m.slot_allocator().advance_epoch();
         assert_eq!(m.slot_allocator().recycle(), 8);
         assert!(m.install(&entry(40), 1, 0).is_ok());
+    }
+
+    /// SEC-003: a failed deferred delete keeps the slot out of the
+    /// quarantine and is retried until the entries are gone.
+    #[test]
+    fn failed_deletes_are_retried_and_never_orphaned() {
+        let (t, m) = mirror(16, 16);
+        let e = entry(40);
+        let s = m.install(&e, 1, 0).unwrap_or(u32::MAX);
+        m.flush();
+        t.fail_delete.store(true, Ordering::Relaxed);
+        assert!(m.retire(s, &e).is_ok());
+        m.flush();
+        m.flush();
+        assert_eq!(m.counters().retire_error.get(), 2, "counted per attempt");
+        assert_eq!(m.slot_allocator().quarantined(), 0, "not reusable while entries remain");
+        t.fail_delete.store(false, Ordering::Relaxed);
+        m.flush();
+        assert!(t.out6.lock().is_empty() && t.in4.lock().is_empty(), "no orphan entry");
+        assert_eq!(m.slot_allocator().quarantined(), 1);
+    }
+
+    /// PERF-005 / SEC-002: failed publishes are queued for the collector,
+    /// and every pass is counted (publisher liveness).
+    #[test]
+    fn failed_publishes_are_queued_and_passes_counted() {
+        let (_t, m) = mirror(1, 16);
+        let p0 = m.publisher_passes();
+        assert!(m.install(&entry(41), 1, 0).is_ok());
+        let s = m.install(&entry(42), 1, 1).unwrap_or(u32::MAX);
+        m.flush();
+        assert!(m.publisher_passes() > p0);
+        let mut f = Vec::new();
+        m.take_failed(&mut f, 16);
+        assert_eq!(m.record(f[0]).map(|r| r.state), Some(SLOT_FAILED));
+        assert!(f.len() == 1 && (f[0] == s || m.record(s).map(|r| r.state) == Some(SLOT_LIVE)));
+        m.take_failed(&mut f, 16);
+        assert_eq!(f.len(), 1, "taken once");
+        assert!(m.publisher_idle_secs() < 5.0);
+        assert_eq!(m.slot_allocator().queued_ops(), 0);
     }
 }

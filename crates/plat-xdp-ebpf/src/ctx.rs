@@ -44,15 +44,16 @@ use core::ptr::NonNull;
 
 use aya_ebpf::bindings::{bpf_fib_lookup as KernelFib, xdp_action, xdp_md};
 use aya_ebpf::helpers::generated::{
-    bpf_fib_lookup, bpf_ktime_get_coarse_ns, bpf_xdp_adjust_head, bpf_xdp_adjust_tail, bpf_xdp_get_buff_len,
+    bpf_csum_diff, bpf_fib_lookup, bpf_ktime_get_coarse_ns, bpf_xdp_adjust_head, bpf_xdp_adjust_tail,
+    bpf_xdp_get_buff_len, bpf_xdp_load_bytes,
 };
 use aya_ebpf::macros::xdp;
 use aya_ebpf::programs::XdpContext;
 use plat_xdp_core::abi::{
-    Control, EgressEnt, FibParams, FwdDir, IdentEnt, IfaceEnt, Key4, Key6, PassReason, SliceEnt, SlotRec, StatIdx,
-    XlatConfig, iface_slot,
+    CSUM_MAX_L4, Control, EgressEnt, FibParams, FwdDir, IdentEnt, IfaceEnt, Key4, Key6, PassReason, SliceEnt, SlotRec,
+    StatIdx, XlatConfig, iface_slot,
 };
-use plat_xdp_core::classify::{ETHERTYPE_IPV4, ETHERTYPE_IPV6};
+use plat_xdp_core::classify::{ETHERTYPE_IPV4, ETHERTYPE_IPV6, PROTO_UDP};
 use plat_xdp_core::ident::IdentKey;
 use plat_xdp_core::{ETH, Env, HDR4, HDR6, Verdict, decide_v4, decide_v6};
 
@@ -85,6 +86,15 @@ impl MapEnv {
     #[inline(always)]
     fn new(ctx: *mut xdp_md) -> Self {
         Self { ctx, slot: Cell::new(None) }
+    }
+
+    /// RFC-001: verifies the UDP checksum of the frame's datagram before
+    /// the decision runs ([`udp_csum_verify`], while few values are live);
+    /// [`Env::udp_csum_ok`] answers from this result.
+    #[inline(always)]
+    fn precompute_csum(&self, v6: bool, len: u32) {
+        let ok = udp_csum_verify(self.ctx, u32::from(v6), len) == 1;
+        set_csum_ok(if ok { CSUM_VERIFIED | len << 1 | u32::from(v6) } else { 0 });
     }
 
     /// Stores `now` in the matched record's `seen_ns`.
@@ -194,6 +204,129 @@ impl Env for MapEnv {
         // a CPU, so nothing else touches the element during `f`.
         Some(f(unsafe { &mut *p }))
     }
+
+    /// The result `precompute_csum` stored for exactly this datagram.
+    #[inline(always)]
+    fn udp_csum_ok(&self, v6: bool, len: u32) -> bool {
+        csum_ok() == CSUM_VERIFIED | len << 1 | u32::from(v6)
+    }
+}
+
+/// RFC-001: whether the UDP checksum of the frame's IPv6 (`v6`) or IPv4
+/// datagram of `len` bytes verifies (1) or not (0), as
+/// `plat_xdp_core::udp_csum_ok_in` computes it. Everything is read with
+/// `bpf_xdp_load_bytes` into this CPU's `SCRATCH` (no packet pointer
+/// arithmetic with a variable length, which the verifier refuses without
+/// CAP_PERFMON): the pseudo-header addresses (one constant-size load) and
+/// the datagram's whole 4-byte words, summed with `bpf_csum_diff` in four
+/// constant 512-byte windows (sizes bounded, multiples of 4); the 0-3 tail
+/// bytes come from the datagram's last 4 bytes (one constant-size load)
+/// and are added in network order with the length and protocol. The
+/// kernel's sum is in host byte order: folded and byte-swapped on a
+/// little-endian target it is the network-order sum (RFC 1071 §2(B)).
+///
+/// Stack (measured on 6.8): it reads only through the helpers (reading the
+/// addresses through the caller's packet pointers kept those loads live
+/// across the helper calls), runs before the decision, and `SCRATCH.hdr`
+/// stays at offset 0 (at offset 2048 the frame grew from 336 to 496 B);
+/// inlined, the program's one frame is 344 B (budget 384). As a separate
+/// bpf-to-bpf subprogram the chain was 344 + 48 B.
+#[inline(always)]
+fn udp_csum_verify(ctx: *mut xdp_md, v6: u32, len: u32) -> u32 {
+    u32::from(udp_csum_verify_inner(ctx, v6 != 0, len).unwrap_or(false))
+}
+
+#[inline(always)]
+fn csum_add(buf: *mut u8, n: u32, acc: u32) -> Option<u32> {
+    // The data goes in as `to`: the helper complements every `from` word
+    // (it computes a checksum difference), and sums `to` as is.
+    // SAFETY: callers pass a pointer into this CPU's SCRATCH value with
+    // `n` (a multiple of 4, ≤ 512) bytes inside it.
+    let r = unsafe { bpf_csum_diff(core::ptr::null_mut(), 0, buf.cast(), n, acc) };
+    if r < 0 { None } else { Some(r as u32) }
+}
+
+#[inline(always)]
+fn udp_csum_verify_inner(ctx: *mut xdp_md, v6: bool, len: u32) -> Option<bool> {
+    // A UDP datagram has at least its 8-byte header (classify checked
+    // it).
+    if !(8..=CSUM_MAX_L4).contains(&len) {
+        return None;
+    }
+    let s = SCRATCH.get_ptr_mut(0)?;
+    // SAFETY: this CPU's element (see `scratch`); only the helpers below
+    // write `l4` and `addrs`, through these pointers.
+    let (buf, addrs): (*mut u8, *mut u8) = unsafe { ((&raw mut (*s).l4).cast(), (&raw mut (*s).addrs).cast()) };
+    // Pseudo-header addresses: IPv6 src + dst (32 bytes at ETH + 8),
+    // IPv4 src + dst (8 bytes at ETH + 12).
+    let mut acc: u32 = 0;
+    if v6 {
+        // SAFETY: helper on the program's context, 32 bytes into `addrs`.
+        if unsafe { bpf_xdp_load_bytes(ctx, (ETH + 8) as u32, addrs.cast(), 32) } != 0 {
+            return None;
+        }
+        acc = csum_add(addrs, 32, acc)?;
+    } else {
+        // SAFETY: as above, 8 bytes.
+        if unsafe { bpf_xdp_load_bytes(ctx, (ETH + 12) as u32, addrs.cast(), 8) } != 0 {
+            return None;
+        }
+        acc = csum_add(addrs, 8, acc)?;
+    }
+    let off = (ETH + if v6 { 40 } else { 20 }) as u32;
+    // The whole words, a multiple of 4: 8 ≤ main ≤ CSUM_MAX_L4 at run
+    // time. Written as mask-then-add so the verifier sees a non-zero
+    // minimum (`len & !3` loses it; `bpf_xdp_load_bytes` needs one) and a
+    // maximum of 2052 (`0x7fc + 8`), inside the SCRATCH value; LLVM cannot
+    // fold it back into a mask. (len ≤ 1536 here, so the mask never cuts.)
+    const _: () = assert!(
+        CSUM_MAX_L4 <= 1536
+            && core::mem::offset_of!(crate::maps::Scratch, l4) + 2052 <= core::mem::size_of::<crate::maps::Scratch>()
+    );
+    let main = ((len - 8) & 0x7fc) + 8;
+    // SAFETY: helper on the program's context; it writes `main` bytes into
+    // `buf` and fails if they are not all in the packet (gpl_only = false).
+    if unsafe { bpf_xdp_load_bytes(ctx, off, buf.cast(), main) } != 0 {
+        return None;
+    }
+    // Three windows, explicitly: each stops the chain once the words are
+    // summed, so the verifier walks 3 paths, not 2^3 (least-privilege
+    // instruction budget).
+    const _: () = assert!(CSUM_MAX_L4 == 3 * CSUM_CHUNK);
+    if main <= CSUM_CHUNK {
+        acc = csum_add(buf, main, acc)?;
+    } else {
+        acc = csum_add(buf, CSUM_CHUNK, acc)?;
+        // SAFETY: offsets inside `l4` (main > 512).
+        let b1 = unsafe { buf.add(CSUM_CHUNK as usize) };
+        if main <= 2 * CSUM_CHUNK {
+            acc = csum_add(b1, main - CSUM_CHUNK, acc)?;
+        } else {
+            acc = csum_add(b1, CSUM_CHUNK, acc)?;
+            // SAFETY: as above (main > 1024).
+            let b2 = unsafe { buf.add(2 * CSUM_CHUNK as usize) };
+            acc = csum_add(b2, main - 2 * CSUM_CHUNK, acc)?;
+        }
+    }
+    let f = plat_xdp_core::csum::fold(u64::from(acc));
+    let mut sum = u64::from(if cfg!(target_endian = "little") { f.swap_bytes() } else { f });
+    sum += u64::from(len) + u64::from(PROTO_UDP);
+    let tail = len & 3;
+    if tail != 0 {
+        let mut w = [0u8; 4];
+        // SAFETY: helper on the program's context; 4 bytes into the stack
+        // word (len ≥ 8, so the last 4 bytes are in the datagram).
+        if unsafe { bpf_xdp_load_bytes(ctx, off + len - 4, w.as_mut_ptr().cast(), 4) } != 0 {
+            return None;
+        }
+        let [_, b1, b2, b3] = w;
+        sum += match tail {
+            1 => u64::from(b3) << 8,
+            2 => u64::from(u16::from_be_bytes([b2, b3])),
+            _ => u64::from(u16::from_be_bytes([b1, b2])) + (u64::from(b3) << 8),
+        };
+    }
+    Some(plat_xdp_core::csum::fold(sum) == 0xffff)
 }
 
 /// Adds `n` to this CPU's `STATS` counter `idx`.
@@ -289,9 +422,36 @@ fn scratch() -> Option<&'static mut [u8; HDR6]> {
     let p = SCRATCH.get_ptr_mut(0)?;
     // SAFETY: this CPU's element of a per-CPU array (see `with_ident`);
     // only this run uses it, and every byte a redirect copies out is
-    // written by the core's rewrite first.
-    Some(unsafe { &mut *p })
+    // written by the core's rewrite first. The `l4` part is touched only
+    // through raw pointers by the helpers in `l4_sum`, never while this
+    // reference is used to read.
+    Some(unsafe { &mut (*p).hdr })
 }
+
+/// Flag of a verified `SCRATCH.csum_ok` (lengths are ≤ CSUM_MAX_L4).
+const CSUM_VERIFIED: u32 = 1 << 31;
+
+/// Stores this frame's checksum result, `CSUM_VERIFIED | len << 1 | v6`
+/// or 0, in this CPU's `SCRATCH` (map memory, not the stack: the verifier
+/// does not track it, so the decision's paths are verified once, not once
+/// per checksum outcome, which kept least-privilege verification inside
+/// the instruction budget).
+#[inline(always)]
+fn set_csum_ok(v: u32) {
+    if let Some(p) = SCRATCH.get_ptr_mut(0) {
+        // SAFETY: this CPU's element (see `scratch`).
+        unsafe { core::ptr::write_volatile(&raw mut (*p).csum_ok, v) };
+    }
+}
+
+#[inline(always)]
+fn csum_ok() -> u32 {
+    // SAFETY: this CPU's element (see `scratch`).
+    SCRATCH.get_ptr_mut(0).map_or(0, |p| unsafe { core::ptr::read_volatile(&raw const (*p).csum_ok) })
+}
+
+/// `bpf_csum_diff`'s per-call limit (`sizeof(sp->diff)`, 128 words).
+const CSUM_CHUNK: u32 = 512;
 
 /// IPv6 → IPv4. Inlined like everything else: one frame, no subprograms.
 /// (As separate bpf-to-bpf subprograms the two directions measured 8 + 336
@@ -313,6 +473,13 @@ fn v6_to_v4(ctx: &XdpContext) -> u32 {
         return pass(PassReason::Disabled);
     };
     let env = MapEnv::new(ctx.ctx);
+    // RFC-001: UDP only (anything else passes anyway); `payload_len` is
+    // the UDP length the decision checks.
+    if h[ETH + 6] == PROTO_UDP {
+        env.precompute_csum(true, u32::from(u16::from_be_bytes([h[ETH + 4], h[ETH + 5]])));
+    } else {
+        set_csum_ok(0);
+    }
     match decide_v6(&env, ctx.ingress_ifindex() as u32, h, frame_len, o) {
         Verdict::Pass(r) => pass(r),
         Verdict::Redirect { ifindex, new_len, trim, touch, .. } => {
@@ -338,6 +505,13 @@ fn v4_to_v6(ctx: &XdpContext) -> u32 {
         return pass(PassReason::Disabled);
     };
     let env = MapEnv::new(ctx.ctx);
+    // RFC-001: UDP without options only (anything else passes anyway).
+    let total = u32::from(u16::from_be_bytes([h[ETH + 2], h[ETH + 3]]));
+    if h[ETH] == 0x45 && h[ETH + 9] == PROTO_UDP && total >= 28 {
+        env.precompute_csum(false, total - 20);
+    } else {
+        set_csum_ok(0);
+    }
     match decide_v4(&env, ctx.ingress_ifindex() as u32, h, frame_len, o) {
         Verdict::Pass(r) => pass(r),
         Verdict::Redirect { ifindex, new_len, trim, touch, .. } => {

@@ -278,6 +278,12 @@ impl Env for HostEnv {
         Some(&self.ident_key)
     }
 
+    /// No frame here: the harness decides through `FrameEnv`, whose
+    /// `udp_csum_ok` reads the frame.
+    fn udp_csum_ok(&self, _v6: bool, _len: u32) -> bool {
+        false
+    }
+
     fn with_ident<F: FnOnce(&mut IdentEnt) -> u16>(&self, idx: u32, f: F) -> Option<u16> {
         self.ident.borrow_mut().get_mut(idx as usize).map(f)
     }

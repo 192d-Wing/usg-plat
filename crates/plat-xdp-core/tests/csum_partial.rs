@@ -190,3 +190,31 @@ fn old6() -> u64 {
 fn new4() -> u64 {
     sum(&POOL4) + sum(&DST4)
 }
+
+/// RFC-001 fix: the fast path verifies the full UDP checksum before it
+/// takes a frame (`Env::udp_csum_ok`, the reference `udp_csum_ok_in`), so
+/// the partial field above never reaches the rewrite: the decision
+/// declines it with `udp_csum_unverified` (`qa_gaps.rs` checks the reason
+/// through `decide_frame`), and the complete one passes the check.
+#[test]
+fn decision_declines_partial_and_accepts_full() {
+    use plat_xdp_core::abi::PassReason;
+    use plat_xdp_core::udp_csum_ok_in;
+    let frame6 = |c: u16| {
+        let mut f = v6_block(c).to_vec();
+        f.extend_from_slice(PAYLOAD);
+        f
+    };
+    let frame4 = |c: u16| {
+        let mut f = v4_block(c).to_vec();
+        f.extend_from_slice(PAYLOAD);
+        f
+    };
+    let len = u32::from(ulen());
+    assert!(udp_csum_ok_in(&frame6(full(pseudo6(&SRC6, &DST6), SPORT6, DPORT)), true, len));
+    assert!(!udp_csum_ok_in(&frame6(partial(pseudo6(&SRC6, &DST6))), true, len));
+    assert!(udp_csum_ok_in(&frame4(full(pseudo4(&DST4, &POOL4), DPORT, POOL_PORT)), false, len));
+    assert!(!udp_csum_ok_in(&frame4(partial(pseudo4(&DST4, &POOL4))), false, len));
+    assert!(!udp_csum_ok_in(&frame6(0), true, len + 1), "past the frame");
+    assert_eq!(PassReason::UdpCsumUnverified.as_str(), "udp_csum_unverified");
+}

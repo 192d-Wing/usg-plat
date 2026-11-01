@@ -40,8 +40,9 @@ pub const BIB4_MAX_SHARDS: u64 = 1 << 16;
 pub const RAM_PERCENT: u64 = 90;
 /// `platd`-side bytes per XDP `SLOT`, all preallocated (upper bound): free
 /// stack 4, quarantine 16, partition op queue 16, the publisher's op buffer
-/// 16 and retry lists 16, live and published bits.
-pub const XDP_SLOT_USER_BYTES: u64 = 72;
+/// 16, retry lists 8 + 1 and failed-publish list 4, live and published
+/// bits.
+pub const XDP_SLOT_USER_BYTES: u64 = 80;
 /// Kernel bytes per `xdp.max_sessions` entry of the preallocated `OUT6` and
 /// `IN4` hash maps (element header, 40 + 12 B keys, 4 B values, rounding;
 /// upper bound).

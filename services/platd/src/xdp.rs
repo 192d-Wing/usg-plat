@@ -84,7 +84,7 @@ mod imp {
     use plat_common::{Clock, Config, Counters};
     use plat_nat64::Nat64;
     use plat_xdp::control::{
-        self, ControlCounters, ControlHooks, ControlTiming, Fault, GC_SCAN_PER_TICK, Transition, XdpControl,
+        self, ControlCounters, ControlHooks, ControlTiming, Fault, GC_SCAN_PER_TICK, Transition, Watch, XdpControl,
     };
     use plat_xdp::load::{AttachedState, LoadParams, config_record, read_state};
     use plat_xdp::maps::{OpenError, XdpMaps};
@@ -153,12 +153,24 @@ mod imp {
                 format!("attached object {} is not this binary's {mine}", state.object_sha256),
             );
         }
-        let expected = config_record(&LoadParams::from_config(cfg), &plat_xdp::object_sha256());
+        // The digest binds this attach's nonce (SEC-001): only the maps
+        // the state file describes match.
+        let mut lp = LoadParams::from_config(cfg);
+        lp.nonce = state.nonce;
+        let expected = config_record(&lp, &plat_xdp::object_sha256());
         let maps = match XdpMaps::open_pinned(pins, &expected) {
             Ok(m) => Arc::new(m),
             Err(e @ OpenError::ConfigMismatch) => return refuse(XdpReason::ConfigMismatch, e.to_string()),
             Err(e) => return refuse(XdpReason::MapsUnavailable, e.to_string()),
         };
+        // SEC-001: only maps no earlier process used (a platd restart
+        // without a new attach would otherwise revive its LIVE records).
+        if let Err(s) = maps.claim_fresh() {
+            return refuse(
+                XdpReason::StaleMaps,
+                format!("pinned maps already used ({s}); restart plat-xdp.service to attach fresh maps"),
+            );
+        }
         let mirror =
             Arc::new(XdpMirror::new(&maps, PARTITIONS).with_clock(clock.clone(), control::engine_origin_ns(clock)));
         nat.set_mirror(mirror.clone());
@@ -194,32 +206,25 @@ mod imp {
     struct Health {
         sweeps: Arc<AtomicU64>,
         workers: Vec<Arc<Counters>>,
-        last_sweeps: u64,
-        sweep_at: u64,
-        last_alive: Vec<u64>,
-        alive_at: Vec<u64>,
+        mirror: Arc<XdpMirror>,
+        sweep: Watch,
+        alive: Vec<Watch>,
+        publisher: Watch,
         sweep_window: u64,
         worker_window: u64,
     }
 
     impl Health {
+        /// Every source moved within its window: the sweeper, each worker
+        /// and (SEC-002) the publisher thread, whose stall would leave new
+        /// sessions unpublished and retired entries undeleted.
         fn check(&mut self) -> bool {
             let now = control::coarse_now_ns();
-            let s = self.sweeps.load(Ordering::Relaxed);
-            if s != self.last_sweeps {
-                (self.last_sweeps, self.sweep_at) = (s, now);
+            let mut ok = self.sweep.ok(self.sweeps.load(Ordering::Relaxed), now, self.sweep_window);
+            for (w, watch) in self.workers.iter().zip(self.alive.iter_mut()) {
+                ok &= watch.ok(w.alive(), now, self.worker_window);
             }
-            let mut ok = now.saturating_sub(self.sweep_at) <= self.sweep_window;
-            for (i, w) in self.workers.iter().enumerate() {
-                let a = w.alive();
-                if let (Some(l), Some(t)) = (self.last_alive.get_mut(i), self.alive_at.get_mut(i)) {
-                    if a != *l {
-                        (*l, *t) = (a, now);
-                    }
-                    ok &= now.saturating_sub(*t) <= self.worker_window;
-                }
-            }
-            ok
+            ok & self.publisher.ok(self.mirror.publisher_passes(), now, self.worker_window)
         }
     }
 
@@ -242,7 +247,11 @@ mod imp {
             let mut threads = Vec::new();
             match control::spawn_publisher(mirror.clone(), stop.clone()) {
                 Ok(t) => threads.push(t),
-                Err(e) => tracing::error!("plat-xdp-pub: {e}"),
+                Err(e) => {
+                    // SEC-002: audited below (maps_unavailable) with the
+                    // fast path left off.
+                    tracing::error!("plat-xdp-pub: {e}");
+                }
             }
             let fail = |threads| Running { threads, metrics: None };
             let control = XdpControl::new(&maps);
@@ -251,7 +260,12 @@ mod imp {
                 heartbeat: Duration::from_millis(u64::from(cfg.xdp.heartbeat_ms)),
                 deadline: Duration::from_millis(u64::from(cfg.xdp.deadline_ms)),
             };
+            let Progress { sweeps, workers, mut cap } = progress;
+            // SEC-005: the first deadline is capped by the HA lease too
+            // (a lease not yet held gives a deadline in the past: nothing
+            // is forwarded until the first capped heartbeat).
             let first = control::coarse_now_ns().saturating_add(timing.deadline.as_nanos() as u64);
+            let first = cap().map_or(first, |c| first.min(c));
             let ok = match (plat_io::netdev::index(tun), plat_io::netdev::mtu(tun)) {
                 (Ok(i), Ok(m)) => control.enable(i, m, first),
                 (Err(e), _) | (_, Err(e)) => {
@@ -267,17 +281,16 @@ mod imp {
             emit(&sink, XdpState::Enabled, XdpReason::Start);
 
             let counters = Arc::new(ControlCounters::default());
-            let Progress { sweeps, workers, cap } = progress;
             let n = workers.len();
             let beat = u64::from(cfg.xdp.heartbeat_ms) * 1_000_000;
             let start = control::coarse_now_ns();
             let mut health = Health {
                 sweeps,
                 workers,
-                last_sweeps: u64::MAX,
-                sweep_at: start,
-                last_alive: vec![u64::MAX; n],
-                alive_at: vec![start; n],
+                mirror: mirror.clone(),
+                sweep: Watch::new(start),
+                alive: vec![Watch::new(start); n],
+                publisher: Watch::new(start),
                 // The sweeper sleeps one interval, then sweeps for at most
                 // half of one; workers housekeep at least every poll
                 // (100 ms) or 64 packets.

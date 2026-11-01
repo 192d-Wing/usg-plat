@@ -96,7 +96,10 @@ fn engine(s: &Setup, mirror: bool, clock: &Clock) -> (Arc<Nat64>, Option<Arc<Xdp
     std::thread::spawn(move || while rx.recv().is_ok() {});
     let mut nat = Nat64::new(&s.cfg, plat_cluster::owned(&s.cfg), sink.clone(), clock.clone()).unwrap();
     let m = mirror.then(|| {
-        let exp = config_record(&LoadParams::from_config(&s.cfg), &plat_xdp::object_sha256());
+        let mut lp = LoadParams::from_config(&s.cfg);
+        let st = std::env::var("PLAT_XDP_GATE_STATE").unwrap_or_else(|_| plat_xdp::STATE_FILE.into());
+        lp.nonce = plat_xdp::load::read_state(st.as_ref()).unwrap().nonce;
+        let exp = config_record(&lp, &plat_xdp::object_sha256());
         let maps = XdpMaps::open_pinned(&s.pins, &exp).unwrap();
         let m = Arc::new(
             XdpMirror::new(&maps, plat_xdp::slots::PARTITIONS)

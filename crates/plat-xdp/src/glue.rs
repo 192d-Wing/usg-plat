@@ -131,6 +131,16 @@ pub fn gc_step(
     buf: &mut Vec<(u32, SessionEntry)>,
 ) -> (u32, u64) {
     buf.clear();
+    // PERF-005: failed publishes first, then the round-robin scan.
+    let mut failed = Vec::new();
+    m.take_failed(&mut failed, budget as usize);
+    for s in failed {
+        if let Some(r) = m.record(s)
+            && r.state == SLOT_FAILED
+        {
+            buf.push((s, SessionEntry::from_record(&r)));
+        }
+    }
     let next = m.stale_scan(cursor, budget, buf);
     let mut n = 0;
     for (slot, e) in buf.iter() {
@@ -187,32 +197,36 @@ mod tests {
     /// (engine milliseconds, sub-millisecond `seen_ns` rounded down).
     #[test]
     fn expiry_is_one_timeout_after_the_last_fast_path_packet() {
+        use crate::mirror::SEEN_SLACK_MS;
         let (mut fx, m) = setup(64);
         let (k4, slot) = flow(&mut fx, 1000);
         assert_ne!(slot, NO_SLOT);
         let st = fx.nat.state();
-        // The fast path carries the flow from here on.
+        // The fast path carries the flow from here on. The true packet
+        // time is `last` ms plus 0.999999 ms.
         fx.clock.advance(Duration::from_millis(UDP_MS - 1_000));
         let last = st.now_ms();
         m.touch_ns(slot, ns_at(last) + 999_999);
-        assert_eq!(m.seen_ms(slot), last);
-        fx.clock.advance(Duration::from_millis(UDP_MS - 1 - (st.now_ms() - last)));
-        assert_eq!(st.now_ms(), last + UDP_MS - 1);
-        assert!(st.has_session(k4, (SERVER, 53)), "live 1 ms before the timeout");
+        assert_eq!(m.seen_ms(slot), last, "never in the future");
+        // RFC-002: never before one full timeout after the true time.
+        fx.clock.advance(Duration::from_millis(UDP_MS));
+        assert_eq!(st.now_ms(), last + UDP_MS);
+        assert!(st.has_session(k4, (SERVER, 53)), "live one timeout after the (rounded-down) packet time");
         let s = st.sweep();
         assert_eq!((s.sessions_expired, s.mirror_retired), (0, 0));
+        // Rounded up plus one coarse tick of slack: live through
+        // last + 1 + slack + timeout - 1, expired right after.
+        fx.clock.advance(Duration::from_millis(SEEN_SLACK_MS));
+        assert!(st.has_session(k4, (SERVER, 53)), "within the slack");
         fx.clock.advance(Duration::from_millis(1));
-        assert_eq!(st.now_ms(), last + UDP_MS);
-        assert!(!st.has_session(k4, (SERVER, 53)), "expired exactly one timeout after the last packet");
+        assert_eq!(st.now_ms(), last + 1 + SEEN_SLACK_MS + UDP_MS);
+        assert!(!st.has_session(k4, (SERVER, 53)), "expired at the bound");
         let s = st.sweep();
         assert_eq!((s.sessions_expired, s.mirror_retired), (1, 1));
         assert_eq!(m.counters().sessions.get(), 0);
         assert_eq!(m.counters().retires.get(), 1);
     }
 
-    /// A publish that failed (here: map full) is collected like a stale
-    /// entry: the engine forgets the slot, so a later hit can mirror the
-    /// session again.
     #[test]
     fn failed_publish_is_collected_and_the_session_forgets_the_slot() {
         let mut fx = fixture(&[]);
@@ -260,7 +274,7 @@ mod tests {
         m.touch_ns(slot, ns_at(now + 5_000));
         assert_eq!(m.seen_ms(slot), now, "a use is never in the future");
         m.touch_ns(slot, ORIGIN_NS - 1);
-        assert_eq!(m.seen_ms(slot), 1, "before the engine origin: still a use");
+        assert_eq!(m.seen_ms(slot), crate::mirror::SEEN_SLACK_MS, "before the engine origin: still a use (0 + slack)");
         // Without the clock: no conversion, no revival.
         let (_t, bare) = crate::mirror::tests::mirror(4, 4);
         assert_eq!(bare.seen_ms(0), 0);

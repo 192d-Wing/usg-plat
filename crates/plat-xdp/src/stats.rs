@@ -108,6 +108,9 @@ pub fn render(out: &mut String, enabled: bool, s: &Snapshot, m: &XdpMirror, c: &
     fam("plat_xdp_retire_errors_total", "counter", "Deferred deletes that failed");
     fam("plat_xdp_grace_failures_total", "counter", "Forced RCU grace periods (membarrier) that failed");
     fam("plat_xdp_slots_quarantined_max", "gauge", "Highest quarantined slot count seen by the control thread");
+    fam("plat_xdp_publish_queue_depth", "gauge", "Deferred publish and delete ops not yet taken by the publisher");
+    fam("plat_xdp_publisher_last_pass_seconds", "gauge", "Seconds since the publisher thread's last pass");
+    fam("plat_xdp_retire_leaked_total", "counter", "Retires whose deferred deletes could not be queued (leaked)");
     let k = m.counters();
     let ld = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
     let _ = writeln!(out, "plat_xdp_enabled {}", u8::from(enabled));
@@ -136,6 +139,9 @@ pub fn render(out: &mut String, enabled: bool, s: &Snapshot, m: &XdpMirror, c: &
     let _ = writeln!(out, "plat_xdp_retire_errors_total {}", k.retire_error.get());
     let _ = writeln!(out, "plat_xdp_grace_failures_total {}", ld(&c.grace_failures));
     let _ = writeln!(out, "plat_xdp_slots_quarantined_max {}", ld(&c.quarantined_high));
+    let _ = writeln!(out, "plat_xdp_publish_queue_depth {}", m.slot_allocator().queued_ops());
+    let _ = writeln!(out, "plat_xdp_publisher_last_pass_seconds {:.3}", m.publisher_idle_secs());
+    let _ = writeln!(out, "plat_xdp_retire_leaked_total {}", k.retire_leaked.get());
 }
 
 #[cfg(test)]
@@ -173,7 +179,7 @@ mod tests {
         for r in PassReason::ALL {
             assert!(out.contains(&format!("reason=\"{}\"", r.as_str())));
         }
-        assert_eq!(out.matches("# TYPE").count(), 18);
+        assert_eq!(out.matches("# TYPE").count(), 21);
         assert!(out.contains("plat_xdp_slots_quarantined_max 0\n"));
         assert!(out.contains("plat_xdp_retire_not_live_total 0\n"));
     }

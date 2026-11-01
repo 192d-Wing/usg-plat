@@ -505,7 +505,10 @@ struct MirrorCtx {
     /// No install before this engine time (after any [`MirrorFail`]), per
     /// back-off lane (`bib4` shard modulo [`MIRROR_BACKOFF_LANES`], the
     /// XDP slot partitions): a full partition backs off its own shards,
-    /// not every install (NEW-2). Written only on a failure.
+    /// not every install (NEW-2). Written only on a failure. PERF-008:
+    /// deliberately not padded (eight lanes share a line): written only
+    /// after a failed install and read only on the cold install path, so
+    /// sharing costs nothing measurable, unlike the padded `stats`.
     backoff_until: Box<[AtomicU64]>,
     /// Install counters per lane (`bib4` shard modulo [`MIRROR_STAT_LANES`],
     /// each lane on its own cache line, NEW-1), written only on the cold
@@ -896,6 +899,12 @@ impl State {
         }
     }
 
+    /// Lock order (NIST-003): mirror calls run under one `bib4` shard (or a
+    /// slice mutex) and take only the mirror's leaf locks: the XDP writer's
+    /// slot-partition mutex (`bib4 → xslot`). The writer's publisher and
+    /// the control thread never hold a partition lock or the publisher
+    /// mutex while they take `bib4` (`mirror_gc`), `bib6` or `subs`.
+    ///
     /// Removes session `remote` of BIB `k4` / `k6` from the mirror, with
     /// the `bib4` shard held, in the critical section that removes it.
     #[cold]
@@ -1326,7 +1335,10 @@ impl State {
             return Err(DropReason::AuditUnavailable);
         }
         let (mut g4, due) = self.bib4.lock_due(&k4);
-        hold_probe!();
+        // PERF-001: an explicit probe, ended with the guard below (the
+        // macro's binding would live to the end of the function).
+        #[cfg(feature = "hold-probe")]
+        let hold = crate::probe::Probe::start(crate::probe::Holder::Worker);
         g4.insert(
             k4,
             Bib {
@@ -1344,6 +1356,8 @@ impl State {
         );
         // A new BIB has no session yet: the sweeper must see it (POAM-012).
         lower_due(due, self.clock.now_ms());
+        #[cfg(feature = "hold-probe")]
+        drop(hold);
         drop(g4);
         g6.insert(k6, Mapped { k4, idx: ai });
         counters.inc(Counter::BibCreated);

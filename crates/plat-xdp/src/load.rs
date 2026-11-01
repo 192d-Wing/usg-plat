@@ -91,6 +91,11 @@ pub struct LoadParams {
     pub prefix_len: u8,
     /// `translation.allow_non_global_destinations` (SC-7).
     pub allow_non_global: bool,
+    /// The loader's per-attach nonce (SEC-001): random at every attach,
+    /// written to the state file and bound into the `CONFIG` digest, so
+    /// `platd` can only accept the maps of the attach that state file
+    /// describes. All zero in a configuration-only value.
+    pub nonce: [u8; 16],
 }
 
 impl LoadParams {
@@ -111,6 +116,7 @@ impl LoadParams {
             prefix: t.nat64_prefix.network(),
             prefix_len: t.nat64_prefix.prefix_len(),
             allow_non_global: t.allow_non_global_destinations,
+            nonce: [0; 16],
         }
     }
 }
@@ -120,7 +126,9 @@ impl LoadParams {
 /// v2 (RFC-004): adds the RFC 6052 prefix, its length and
 /// `allow_non_global_destinations`, so `platd` refuses pins set up for
 /// another prefix or SC-7 policy.
-const DIGEST_TAG: &[u8] = b"usg-plat xdp CONFIG v2\0";
+///
+/// v3 (SEC-001): adds the loader's per-attach nonce.
+const DIGEST_TAG: &[u8] = b"usg-plat xdp CONFIG v3\0";
 
 /// The `CONFIG` digest over `object_sha256` and `p` (module docs).
 pub fn digest(p: &LoadParams, object_sha256: &[u8; 32]) -> [u8; 32] {
@@ -133,6 +141,7 @@ pub fn digest(p: &LoadParams, object_sha256: &[u8; 32]) -> [u8; 32] {
     h.update([u8::from(p.copy_tos), u8::from(p.sliced)]);
     h.update(p.prefix.to_be_bytes());
     h.update([p.prefix_len, u8::from(p.allow_non_global)]);
+    h.update(p.nonce);
     h.update(p.xdp.max_sessions.to_le_bytes());
     h.update([p.xdp.mode as u8]);
     h.update((p.xdp.interfaces.len() as u32).to_le_bytes());
@@ -175,6 +184,8 @@ pub fn ident_seed(r: &[u8; 10]) -> plat_xdp_core::abi::IdentEnt {
 pub struct AttachedState {
     pub object_sha256: String,
     pub prog_id: u32,
+    /// The attach's nonce ([`LoadParams::nonce`]).
+    pub nonce: [u8; 16],
 }
 
 /// Largest state file `platd` reads (SC-5: a bounded read of a root-owned
@@ -185,7 +196,7 @@ pub const STATE_MAX_BYTES: u64 = 16 << 10;
 /// `None` without both keys or with a malformed value.
 pub fn parse_state(text: &str) -> Option<AttachedState> {
     let mut st = AttachedState::default();
-    let (mut obj, mut prog) = (false, false);
+    let (mut obj, mut prog, mut nonce) = (false, false, false);
     for l in text.lines() {
         if let Some(v) = l.strip_prefix("object_sha256=") {
             if v.len() != 64 || !v.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -196,9 +207,13 @@ pub fn parse_state(text: &str) -> Option<AttachedState> {
         } else if let Some(v) = l.strip_prefix("prog_id=") {
             st.prog_id = v.parse().ok()?;
             prog = true;
+        } else if let Some(v) = l.strip_prefix("nonce=") {
+            let b = hex::decode(v).ok()?;
+            st.nonce = b.try_into().ok()?;
+            nonce = true;
         }
     }
-    (obj && prog).then_some(st)
+    (obj && prog && nonce).then_some(st)
 }
 
 /// Reads and parses the state file at `path` (bounded, not following a
@@ -314,6 +329,8 @@ mod linux {
         pub prog_tag: String,
         pub mode: Mode,
         pub interfaces: Vec<AttachedIface>,
+        /// The attach's nonce (state file `nonce=`, `CONFIG` digest).
+        pub nonce: [u8; 16],
     }
 
     impl AttachReport {
@@ -325,6 +342,7 @@ mod linux {
             let _ = writeln!(s, "prog_id={}", self.prog_id);
             let _ = writeln!(s, "prog_tag={}", self.prog_tag);
             let _ = writeln!(s, "mode={}", self.mode.as_str());
+            let _ = writeln!(s, "nonce={}", hex::encode(self.nonce));
             for i in &self.interfaces {
                 let _ = writeln!(s, "interface={} {} {}", i.name, i.ifindex, i.role.as_str());
             }
@@ -566,6 +584,10 @@ mod linux {
             check_bpffs(dir)?;
             check_no_frags(object)?;
             let state = state_file.map(StateDir::open).transpose()?;
+            // SEC-001: a fresh nonce per attach, bound into CONFIG.
+            let mut fresh = p.clone();
+            fresh.nonce = random()?;
+            let p = &fresh;
             let ifaces = resolve(p)?;
 
             let sessions = p.xdp.max_sessions;
@@ -625,6 +647,7 @@ mod linux {
                 prog_tag: format!("{:016x}", info.tag()),
                 mode: p.xdp.mode,
                 interfaces: attached,
+                nonce: p.nonce,
             };
             // QA F2: an attach whose state file cannot be written is rolled
             // back, so a failed unit never leaves the fast path live.
@@ -990,6 +1013,9 @@ mod tests {
         q.prefix_len = if q.prefix_len == 96 { 64 } else { 96 };
         assert_ne!(a.digest, config_record(&q, &[1; 32]).digest, "prefix length");
         let mut q = p.clone();
+        q.nonce = [9; 16];
+        assert_ne!(a.digest, config_record(&q, &[1; 32]).digest, "nonce");
+        let mut q = p.clone();
         q.allow_non_global = !q.allow_non_global;
         assert_ne!(a.digest, config_record(&q, &[1; 32]).digest, "allow_non_global_destinations");
         assert_eq!(
@@ -1034,12 +1060,18 @@ mod tests {
     #[test]
     fn state_file_parses_strictly() {
         let h = "ab".repeat(32);
-        let t = format!("object_sha256={h}\nprog_id=97806\nprog_tag=x\nmode=native\ninterface=acc0 3 access\n");
-        assert_eq!(parse_state(&t), Some(AttachedState { object_sha256: h.clone(), prog_id: 97806 }));
+        let n = "0f".repeat(16);
+        let t =
+            format!("object_sha256={h}\nprog_id=97806\nprog_tag=x\nmode=native\nnonce={n}\ninterface=acc0 3 access\n");
+        assert_eq!(
+            parse_state(&t),
+            Some(AttachedState { object_sha256: h.clone(), prog_id: 97806, nonce: [0x0f; 16] })
+        );
         assert_eq!(parse_state("prog_id=1\n"), None);
-        assert_eq!(parse_state(&format!("object_sha256={h}\n")), None);
-        assert_eq!(parse_state(&format!("object_sha256=zz{}\nprog_id=1\n", &h[2..])), None);
-        assert_eq!(parse_state(&format!("object_sha256={h}\nprog_id=-1\n")), None);
+        assert_eq!(parse_state(&format!("object_sha256={h}\nprog_id=1\n")), None, "no nonce");
+        assert_eq!(parse_state(&format!("object_sha256={h}\nprog_id=1\nnonce=0f\n")), None, "short nonce");
+        assert_eq!(parse_state(&format!("object_sha256=zz{}\nprog_id=1\nnonce={n}\n", &h[2..])), None);
+        assert_eq!(parse_state(&format!("object_sha256={h}\nprog_id=-1\nnonce={n}\n")), None);
     }
 
     #[test]

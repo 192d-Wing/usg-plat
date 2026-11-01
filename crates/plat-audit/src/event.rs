@@ -839,6 +839,9 @@ pub enum XdpReason {
     LinkMismatch,
     /// The pins are missing, of the wrong shape, or were replaced.
     MapsUnavailable,
+    /// The pinned maps were already used by an earlier process (SEC-001):
+    /// the loader must attach fresh maps.
+    StaleMaps,
     /// `membarrier(MEMBARRIER_CMD_GLOBAL)` is unavailable (`nohz_full`) or
     /// keeps failing: no safe slot reuse, so the fast path stays off.
     UnsupportedHost,
@@ -859,6 +862,7 @@ impl XdpReason {
             Self::ObjectMismatch => "object_mismatch",
             Self::LinkMismatch => "link_mismatch",
             Self::MapsUnavailable => "maps_unavailable",
+            Self::StaleMaps => "stale_maps",
             Self::UnsupportedHost => "unsupported_host",
             Self::HeartbeatStalled => "heartbeat_stalled",
             Self::HeartbeatResumed => "heartbeat_resumed",

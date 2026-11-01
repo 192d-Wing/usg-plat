@@ -4,7 +4,8 @@ Version 0.1.0 plus branch `feat/fips-tls` (unreleased), branch `fix/linux-valida
 (unreleased) and branch `feat/cluster-ha` (unreleased, uncommitted working tree on
 `main` @ `ca471c2`) and branch `feat/protocol-completeness` (unreleased, uncommitted, stacked on
 `feat/cluster-ha` @ `071c619`; fragments, ICMP generation, IPv4 ID; `make test` 557 passed, 0 failed, 0 ignored
-after its fix round 2 on macOS), SIEM log schema 7 (`plat_audit::LOG_SCHEMA_VERSION`). Cluster HA
+after its fix round 2 on macOS), and branch `feat/xdp-wu5` (XDP fast path wiring, POAM-016 Phase 1;
+`[xdp]` off by default), SIEM log schema 8 (`plat_audit::LOG_SCHEMA_VERSION`). Cluster HA
 evidence is in-process only (loopback mTLS, simulated clocks and links): the
 multi-VM checks L19–L23 are authored but **not run**. Linux
 evidence: [`LINUX_VERIFICATION.md`](LINUX_VERIFICATION.md) (Lima VM, Ubuntu 24.04.5 aarch64, kernel 6.8,
@@ -76,6 +77,17 @@ Paths are relative to `crates/` unless they start with `services/`,
 | SI-11 Error Handling | Implemented | Drops are counted reasons, never panics; operational (`tracing`) logs and audit records carry no packet payload or attacker-controlled text. | `counters.rs`; `hardening.rs::traffic_for_another_nodes_pool_address_counts_wrong_node`; `ip.rs::parsers_never_panic`; absence of packet data by code inspection of `format.rs` |
 | SR-3 Supply Chain Controls and Processes | Implemented | `cargo deny` (advisories with yanked = deny; bans with wildcards denied; sources limited to known registries, unknown git denied); `cargo audit`; `Cargo.lock` committed with the workspace; internal crates `publish = false` with versioned path dependencies; CI actions pinned by commit SHA, tool versions pinned, `make security` run in CI; Dependabot weekly updates for Actions and Cargo. | `deny.toml`; `Cargo.toml`; `.github/workflows/ci.yml`; `.github/dependabot.yml`; gate `make security` (exit 0 after fix round 3: advisories, bans, licenses, sources ok) |
 
+### XDP fast path (POAM-016 Phase 1, branch `feat/xdp-wu5`; only with `[xdp] enabled = true`)
+
+| Control | Status | Implementation | Evidence |
+|---|---|---|---|
+| AU-2, AU-3, AU-12 (XDP) | Implemented | `service_start` records `plat.xdp.mode` and, when enabled, `plat.xdp.object_sha256` and `plat.xdp.interfaces`; every fast-path state change is an `xdp_fastpath_state` record (`start`, `config_mismatch`, `object_mismatch`, `link_mismatch`, `maps_unavailable`, `stale_maps`, `unsupported_host`, `heartbeat_stalled`, `heartbeat_resumed`, `shutdown`). Sessions are mirrored only after their attributing record was handed to the sink (I4; `drop_and_alert` exception tested). No per-packet or per-session record from the fast path. | `crates/plat-audit/src/format.rs::xdp_records_schema_8`; `crates/plat-audit/tests/qa_schema.rs::xdp_schema_8_keys`; `services/platd/src/xdp.rs`; `crates/plat-nat64/tests/mirror.rs::drop_and_alert_installs_even_when_the_record_is_lost`; `deploy/tests/xdp/e2e.sh run` (audit checks) |
+| SC-24 (XDP) | Implemented (VM-verified) | Dead-man deadline refreshed only while the sweeper, every worker and the publisher thread make progress, capped by the HA lease self-fence instant (also the first deadline); slice generation fencing (`SLICE`, never more permissive than the engine); stale-generation and failed-publish collection under the entry's `bib4` shard (`State::mirror_gc`); 10 s integrity check (pins, frozen `CONFIG`, state-file object and program id); fresh-map claim at start (`stale_maps`). | `crates/plat-xdp/src/control.rs` tests `stall_resume_fault_transitions`, `a_stalled_source_fails_the_health_check`, `maps_are_claimed_once_and_used_maps_are_refused`; `crates/plat-xdp/src/glue.rs` tests `stale_generation_gc_retires_and_forgets_the_slot`, `failed_publish_is_collected_and_the_session_forgets_the_slot`; `crates/plat-xdp/tests/unprivileged.rs` (claim twice refused); `crates/plat-nat64/tests/mirror.rs` (fencing and generations) |
+| CM-6 (XDP) | Implemented | `[xdp]` with `deny_unknown_fields`: 1..=32 interfaces with names and roles, not the TUN, no duplicates; `generic` only with `allow_generic`; `max_sessions` 4096..=`nat64.max_sessions`; `heartbeat_ms` 50..=1000; `deadline_ms` ≥ 4 × heartbeat and ≤ the HA self-fence time; nothing checked while off. `[xdp]` is per node by design and not in the cluster config digest (NIST-006): the dead-man deadline ≤ the self-fence instant bounds SC-24 on each node independently. | `crates/plat-common/src/config.rs` `validate_xdp`; `crates/plat-common/tests/config_edges.rs` `xdp_*`; `services/platd/tests/qa_check_config.rs::xdp_check_config_end_to_end` |
+| SC-5 (XDP) | Implemented | Fixed map and slot sizes from `xdp.max_sessions`; preallocated slot partitions, op queues (two per slot), publisher buffers and failed-publish list; per-partition install back-off; no map syscall under a `bib4` lock (WU5 gate). | `crates/plat-xdp/src/slots.rs`; `crates/plat-xdp/src/mirror.rs` tests; `crates/plat-xdp/tests/hold_gate.rs` (VM) |
+| SI-4 (XDP) | Implemented | Separate `plat_xdp_*` families: forwarded packets and bytes per direction, every pass reason (incl. `udp_csum_unverified`), aborts, sessions, installs and failures, retires, revalidations, GC, heartbeat stalls, grace failures, quarantine and its high-water mark, publish queue depth and publisher idle time; `dataplane_counter` value `xdp_aborted`. | `crates/plat-xdp/src/stats.rs::metric_text_has_every_family_and_reason` |
+| SI-7 (XDP) | Implemented | The fast path is enabled only when the loader's state file names this binary's embedded object and the frozen `CONFIG` digest (object SHA-256, translation parameters, map sizes, interfaces, per-attach nonce) equals this configuration's; re-checked every 10 s. RFC-001: frames whose UDP checksum does not verify are declined to the slow path. | `crates/plat-xdp/src/load.rs::digest_binds_object_and_parameters`, `state_file_parses_strictly`; `services/platd/src/xdp.rs` `attach_at`; `crates/plat-xdp-core/tests/qa_gaps.rs`; level-2 vectors `v6_udp_csum_partial`, `v4_udp_csum_bad` |
+
 ## NIAP NDcPP cross-reference (indicative)
 
 | NIST | NDcPP SFR | Status |
@@ -93,4 +105,8 @@ Paths are relative to `crates/` unless they start with `services/`,
 | SC-12, SC-13 | FCS_CKM.1/.2, FCS_COP.1 | Partial: implemented through AWS-LC-FIPS 4.2.0 (`aws-lc-fips-sys` ~0.14.4), CMVP Modules In Process, not validated, no certificate (#5298/#5314 = v3.1, #4816/#5429 = v2.0 do not cover this build; POAM-026). **Evaluated configuration must set `tls.pq_hybrid = false`** (NIST-008): the default offers X25519MLKEM768, which the NDcPP does not list |
 | SC-5 (mgmt per-IP cap, ClientHello deadline) | No direct SFR (supports FTA/FPT) | Implemented |
 | SI-7 | FPT_TST_EXT.1, FPT_TUD_EXT.1 | Partial (FIPS module status checked at start; no other self-tests; no signed updates) |
+| AU-2, AU-3, AU-12 (XDP) | FAU_GEN.1 | Implemented: `xdp_fastpath_state`, `service_start` XDP fields |
+| SC-24 (XDP) | FPT_FLS.1 | Implemented: dead-man deadline, generation fencing, fresh-map claim, integrity check |
+| SI-7 (XDP) | FPT_TST_EXT.1, FPT_TUD_EXT.1 | Partial: object and `CONFIG` digest checked at start and every 10 s; no signed object updates |
+| CM-6 (XDP) | FMT_SMF.1 | Implemented: `[xdp]` validated, off by default |
 | AC-6 | No direct SFR (process separation) | Not tested on Linux |

@@ -37,11 +37,12 @@
 //!   fragments or sends Packet Too Big / Fragmentation Needed
 
 use crate::abi::{
-    AF_INET, AF_INET6, Control, EgressEnt, FIB_RET_FRAG_NEEDED, FIB_RET_FWD_DISABLED, FIB_RET_NO_NEIGH,
+    AF_INET, AF_INET6, CSUM_MAX_L4, Control, EgressEnt, FIB_RET_FRAG_NEEDED, FIB_RET_FWD_DISABLED, FIB_RET_NO_NEIGH,
     FIB_RET_SUCCESS, FibParams, IdentEnt, IfaceEnt, Key4, Key6, PassReason, ROLE_ACCESS, ROLE_UPSTREAM,
     SEEN_GRANULARITY_NS, SLICE_ACTIVE, SLOT_LIVE, SliceEnt, SlotRec, XlatConfig,
 };
 use crate::classify::{self, ETHERTYPE_IPV4, ETHERTYPE_IPV6, PROTO_UDP};
+use crate::csum;
 use crate::ident::{self, IdentKey};
 use crate::rewrite;
 use crate::take;
@@ -83,6 +84,95 @@ pub trait Env {
     /// `None` when the entry is missing. Called only for DF = 0 packets
     /// that will be forwarded.
     fn with_ident<F: FnOnce(&mut IdentEnt) -> u16>(&self, idx: u32, f: F) -> Option<u16>;
+    /// RFC-001: the UDP checksum of the frame's IPv6 (`v6`) or IPv4
+    /// datagram verifies: RFC 1071 sum of the pseudo-header (addresses of
+    /// the L3 header at `ETH`, UDP length `len`, protocol 17) and of the
+    /// `len` bytes at `ETH + IP6` / `ETH + IP4` folds to `0xffff`. `false`
+    /// when it does not, when `len` exceeds [`CSUM_MAX_L4`] or the bytes
+    /// cannot be read. Asked once per frame that passed every check before
+    /// routing. The program computes it before the decision
+    /// (`bpf_xdp_load_bytes` + `bpf_csum_diff`); hosts use [`FrameEnv`].
+    fn udp_csum_ok(&self, v6: bool, len: u32) -> bool;
+}
+
+/// An [`Env`] whose [`Env::udp_csum_ok`] reads `frame` (host harnesses and
+/// [`decide_frame`]); every other call goes to `env`.
+pub struct FrameEnv<'a, E: Env> {
+    pub env: &'a E,
+    pub frame: &'a [u8],
+}
+
+impl<E: Env> core::fmt::Debug for FrameEnv<'_, E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("FrameEnv").field("frame_len", &self.frame.len()).finish_non_exhaustive()
+    }
+}
+
+impl<'a, E: Env> FrameEnv<'a, E> {
+    pub fn new(env: &'a E, frame: &'a [u8]) -> Self {
+        Self { env, frame }
+    }
+}
+
+impl<E: Env> Env for FrameEnv<'_, E> {
+    fn iface(&self, ifindex: u32) -> Option<&IfaceEnt> {
+        self.env.iface(ifindex)
+    }
+    fn control(&self) -> Option<&Control> {
+        self.env.control()
+    }
+    fn config(&self) -> Option<XlatConfig> {
+        self.env.config()
+    }
+    fn now_ns(&self) -> u64 {
+        self.env.now_ns()
+    }
+    fn out6(&self, key: &Key6) -> Option<u32> {
+        self.env.out6(key)
+    }
+    fn in4(&self, key: &Key4) -> Option<u32> {
+        self.env.in4(key)
+    }
+    fn slot(&self, idx: u32) -> Option<&SlotRec> {
+        self.env.slot(idx)
+    }
+    fn slice(&self, idx: u16) -> Option<&SliceEnt> {
+        self.env.slice(idx)
+    }
+    fn fib(&self, p: &mut FibParams) -> i64 {
+        self.env.fib(p)
+    }
+    fn egress(&self, ifindex: u32) -> Option<&EgressEnt> {
+        self.env.egress(ifindex)
+    }
+    fn ident_key(&self) -> Option<&IdentKey> {
+        self.env.ident_key()
+    }
+    fn with_ident<F: FnOnce(&mut IdentEnt) -> u16>(&self, idx: u32, f: F) -> Option<u16> {
+        self.env.with_ident(idx, f)
+    }
+    fn udp_csum_ok(&self, v6: bool, len: u32) -> bool {
+        udp_csum_ok_in(self.frame, v6, len)
+    }
+}
+
+/// RFC 768 / RFC 8200 §8.1: whether the UDP checksum of the datagram in
+/// `frame` verifies (see [`Env::udp_csum_ok`]); the reference for every
+/// environment, and the eBPF program's arithmetic on its precomputed sum.
+pub fn udp_csum_ok_in(frame: &[u8], v6: bool, len: u32) -> bool {
+    if len > CSUM_MAX_L4 {
+        return false;
+    }
+    let (addrs, l4) = if v6 { (ETH + 8..ETH + 40, ETH + IP6) } else { (ETH + 12..ETH + 20, ETH + IP4) };
+    let (Some(a), Some(b)) = (frame.get(addrs), frame.get(l4..l4 + len as usize)) else { return false };
+    let pseudo = csum::sum_slice(a) + u64::from(len) + u64::from(PROTO_UDP);
+    csum::fold(pseudo + csum::sum_slice(b)) == 0xffff
+}
+
+/// RFC-001: a `CHECKSUM_PARTIAL` field, or a corrupt one, does not verify.
+#[inline(always)]
+fn check_udp_csum<E: Env>(env: &E, v6: bool, ulen: u32) -> Result<(), PassReason> {
+    if env.udp_csum_ok(v6, ulen) { Ok(()) } else { Err(PassReason::UdpCsumUnverified) }
 }
 
 /// Result of a decision for one direction.
@@ -128,6 +218,7 @@ impl Action {
 /// `not_ip`.
 #[inline(always)]
 pub fn decide_frame<E: Env>(env: &E, ingress: u32, frame: &[u8], out: &mut [u8; HDR6]) -> Action {
+    let env = &FrameEnv::new(env, frame);
     let Ok(frame_len) = u32::try_from(frame.len()) else {
         return Action::Pass(PassReason::BadL3);
     };
@@ -262,6 +353,7 @@ fn try_v6<E: Env>(
         return Err(PassReason::TooBig);
     }
     let tos = if cfg.copy_tos { m.traffic_class } else { 0 };
+    check_udp_csum(env, true, u32::from(m.payload_len))?;
 
     let mut fib = FibParams {
         family: AF_INET,
@@ -337,6 +429,7 @@ fn try_v4<E: Env>(
         return Err(PassReason::TooBig);
     }
     let tc = if cfg.copy_tos { m.tos } else { 0 };
+    check_udp_csum(env, false, payload)?;
 
     let mut fib = FibParams {
         family: AF_INET6,

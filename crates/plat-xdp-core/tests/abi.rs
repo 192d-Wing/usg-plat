@@ -68,6 +68,7 @@ fn pass_reasons_are_stable() {
         "fib_other",
         "egress_not_allowed",
         "headroom",
+        "udp_csum_unverified",
     ];
     assert_eq!(PassReason::ALL.len(), names.len());
     for (i, (r, n)) in PassReason::ALL.iter().zip(names).enumerate() {

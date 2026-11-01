@@ -30,10 +30,13 @@
 # Environment: PLATD, PLAT_XDP_LOADER: the binaries to test (`make xdp`
 # builds both under target/release); without them `run` skips (exit 77), so
 # the virtme-ng guests of `make test-xdp` skip level 4 unless given them.
-# E2E_MODE=native|generic (default native), E2E_TX_OFFLOAD=on (QA repro:
-# the senders keep TX checksum offload, so the fast path sees
-# CHECKSUM_PARTIAL; expected to fail), E2E_ECHOES (default 150),
-# E2E_PCAP=1 (captures), E2E_KEEP=1 (keep the work directory).
+# E2E_MODE=native|generic (default native), E2E_TX_OFFLOAD=on|off (default
+# off; on: the senders emit CHECKSUM_PARTIAL frames, which the fast path
+# declines since the WU5 fix (udp_csum_unverified) and the slow path
+# translates; off: complete checksums as from a wire, taken by the fast
+# path), E2E_SKIP_IDLE=1 (skip the 125 s idle_expiry wait),
+# E2E_ECHOES (default 150), E2E_KEEP=1 (keep the work directory with the
+# receiver captures s0.pcap / c0.pcap).
 # Exit: 0 pass; 1 failure; 2 usage; 77 skipped (prerequisites missing).
 set -eu
 
@@ -108,7 +111,7 @@ run() {
     fi
     [ -x "$platd" ] || die "no platd at $platd" 2
     [ -x "$loader" ] || die "no plat-xdp-loader at $loader" 2
-    for t in python3 curl ethtool; do
+    for t in python3 curl ethtool tcpdump; do
         command -v "$t" >/dev/null || skip "$t missing"
     done
     [ ! -e /run/plat/bpf ] || [ ! -e /run/plat/xdp.state ] || die "/run/plat in use (a loader is attached); refusing"
@@ -122,8 +125,8 @@ run() {
     # checksum holds only the pseudo-header sum), which no wire delivers:
     # the fast path's RFC 1624 update of such a sum yields a wrong checksum.
     # Full checksums, as from a real NIC.
-    # E2E_TX_OFFLOAD=on (QA repro) keeps TX checksum offload on, so
-    # the senders emit CHECKSUM_PARTIAL and the fast-path echoes are lost.
+    # E2E_TX_OFFLOAD=on keeps TX checksum offload on, so the senders emit
+    # CHECKSUM_PARTIAL frames: the fast path must decline them (RFC-001).
     tx=${E2E_TX_OFFLOAD:-off}
     case $tx in on | off) ;; *) die "E2E_TX_OFFLOAD must be on or off" 2 ;; esac
     nsx "$NS_C" ethtool -K c0 gro on tx "$tx" >/dev/null || die "ethtool -K c0"
@@ -219,50 +222,92 @@ print(ok)
 ' "$1"
     }
 
-    if [ -n "${E2E_PCAP:-}" ]; then
-        nsenter --net="/run/netns/$NS_S" tcpdump -s 200 -U -ni s0 -w "$work/s0.pcap" udp >/dev/null 2>&1 </dev/null &
-        pcap_s=$!
-        nsenter --net="/run/netns/$NS_C" tcpdump -s 200 -U -ni c0 -w "$work/c0.pcap" udp >/dev/null 2>&1 </dev/null &
-        pcap_c=$!
-        sleep 1
-    fi
+    # Captures at both receivers, to check every delivered checksum.
+    nsenter --net="/run/netns/$NS_S" tcpdump -s 200 -U -ni s0 -w "$work/s0.pcap" udp >/dev/null 2>&1 </dev/null &
+    pcap_s=$!
+    nsenter --net="/run/netns/$NS_C" tcpdump -s 200 -U -ni c0 -w "$work/c0.pcap" udp >/dev/null 2>&1 </dev/null &
+    pcap_c=$!
+    sleep 1
+    n=${E2E_ECHOES:-150}
     s64a=$(metric plat_v6_to_v4_total)
     s46a=$(metric plat_v4_to_v6_total)
-    # udp_both_directions + first_packet_slow_path + fast_path_keepalive:
-    # 150 one-second echoes, longer than udp_secs = 120.
-    got=$(client "${E2E_ECHOES:-150}")
+    # The first datagram creates the session on the slow path. Its entries
+    # are published by plat-xdp-pub about a millisecond later (WU5
+    # deferred publish), so its echo may take either path: wait for the
+    # publish before the rest (QA flake).
+    got=$(client 1)
+    i=0
+    until [ "$(metric plat_xdp_installs_total)" -ge 1 ]; do
+        i=$((i + 1))
+        [ $i -lt 50 ] || die "first_packet_slow_path: the session was never published"
+        sleep 0.1
+    done
+    # udp_both_directions + fast_path_keepalive: one-second echoes, longer
+    # than udp_secs = 120 with the default 150.
+    got=$((got + $(client $((n - 1)))))
     s64=$(($(metric plat_v6_to_v4_total) - s64a))
     s46=$(($(metric plat_v4_to_v6_total) - s46a))
     f64=$(metric 'plat_xdp_packets_total{dir="v6_to_v4"}')
     f46=$(metric 'plat_xdp_packets_total{dir="v4_to_v6"}')
+    unv=$(metric 'plat_xdp_pass_total{reason="udp_csum_unverified"}')
     sess=$(metric plat_sessions)
     xs=$(metric plat_xdp_sessions)
-    [ -z "${pcap_s:-}" ] || kill "$pcap_s" "$pcap_c" 2>/dev/null || true
-    echo "e2e: echoes $got/${E2E_ECHOES:-150}; slow path v6->v4 $s64, v4->v6 $s46; fast path v6->v4 $f64, v4->v6 $f46; sessions $sess, xdp $xs" >&2
-    [ "$got" -ge 148 ] || { dump; die "udp_both_directions: only $got/150 echoes"; }
-    if [ "$f64" -lt 145 ] || [ "$f46" -lt 145 ]; then
-        die "udp_both_directions: fast path counters did not move ($f64 / $f46)"
+    sleep 1
+    kill "$pcap_s" "$pcap_c" 2>/dev/null || true
+    wait "$pcap_s" "$pcap_c" 2>/dev/null || true
+    pcap_s=
+    echo "e2e: mode $xmode, tx offload $tx: echoes $got/$n; slow path v6->v4 $s64, v4->v6 $s46; fast path v6->v4 $f64, v4->v6 $f46; udp_csum_unverified $unv; sessions $sess, xdp $xs" >&2
+    [ "$got" -ge $((n - 2)) ] || { dump; die "udp_both_directions: only $got/$n echoes"; }
+    # RFC-001: every datagram that reached a receiver carries a correct
+    # UDP checksum (tcpdump -vv verifies both families).
+    bad=$(
+        {
+            tcpdump -nvv -r "$work/s0.pcap" 2>/dev/null | grep '192\.0\.2\.[0-9]*\.[0-9]* > 198\.51\.100\.2\.7:'
+            tcpdump -nvv -r "$work/c0.pcap" 2>/dev/null | grep '64:ff9b:1::c633:6402\.7 > 2001:db8:c::2\.40000:'
+        } | grep -c 'bad udp cksum' || true
+    )
+    okc=$(
+        {
+            tcpdump -nvv -r "$work/s0.pcap" 2>/dev/null | grep '192\.0\.2\.[0-9]*\.[0-9]* > 198\.51\.100\.2\.7:'
+            tcpdump -nvv -r "$work/c0.pcap" 2>/dev/null | grep '64:ff9b:1::c633:6402\.7 > 2001:db8:c::2\.40000:'
+        } | grep -c 'udp sum ok' || true
+    )
+    echo "e2e: receiver captures: $okc datagrams with a verified UDP checksum, $bad bad" >&2
+    [ "$bad" -eq 0 ] || die "udp_checksum: $bad delivered datagrams with a bad UDP checksum"
+    [ "$okc" -ge $((2 * n - 4)) ] || die "udp_checksum: only $okc verified checksums at the receivers"
+    if [ "$tx" = on ]; then
+        # The senders' frames are CHECKSUM_PARTIAL: the fast path declines
+        # them (udp_csum_unverified) and the slow path translates them.
+        if [ "$unv" -lt $((2 * n - 4)) ] || [ "$f64" -ne 0 ] || [ "$f46" -ne 0 ]; then
+            die "udp_csum_unverified: partial frames not declined ($unv declined, fast path $f64 / $f46)"
+        fi
+        echo "e2e: PASS udp_both_directions udp_checksum udp_csum_unverified (tx offload on: slow path, correct checksums)" >&2
+    else
+        if [ "$f64" -lt $((n - 5)) ] || [ "$f46" -lt $((n - 5)) ]; then
+            die "udp_both_directions: fast path counters did not move ($f64 / $f46)"
+        fi
+        # The first datagram is translated by platd; its echo by either path.
+        if [ "$s64" -ne 1 ] || [ "$s46" -gt 1 ]; then
+            die "first_packet_slow_path: slow path translated $s64 / $s46 (expected 1 / 0-1)"
+        fi
+        if [ "$sess" -ne 1 ] || [ "$xs" -ne 1 ]; then
+            die "fast_path_keepalive: session gone after fast-path-only traffic ($sess / $xs)"
+        fi
+        echo "e2e: PASS udp_both_directions udp_checksum first_packet_slow_path fast_path_keepalive" >&2
     fi
-    # The first datagram and its echo are translated by platd, the rest by
-    # the fast path.
-    if [ "$s64" -ne 1 ] || [ "$s46" -ne 1 ]; then
-        die "first_packet_slow_path: slow path translated $s64 / $s46 (expected 1 / 1)"
-    fi
-    if [ "$sess" -ne 1 ] || [ "$xs" -ne 1 ]; then
-        die "fast_path_keepalive: session gone after 150 s of fast-path-only traffic ($sess / $xs)"
-    fi
-    echo "e2e: PASS udp_both_directions first_packet_slow_path fast_path_keepalive" >&2
 
-    # idle_expiry: silence for udp_secs plus two sweeps.
-    sleep 125
-    sess=$(metric plat_sessions)
-    xs=$(metric plat_xdp_sessions)
-    ret=$(metric plat_xdp_retires_total)
-    echo "e2e: after 125 s idle: sessions $sess, xdp sessions $xs, retires $ret" >&2
-    if [ "$sess" -ne 0 ] || [ "$xs" -ne 0 ] || [ "$ret" -lt 1 ]; then
-        die "idle_expiry: session not expired ($sess / $xs / $ret)"
+    if [ -z "${E2E_SKIP_IDLE:-}" ]; then
+        # idle_expiry: silence for udp_secs plus two sweeps.
+        sleep 125
+        sess=$(metric plat_sessions)
+        xs=$(metric plat_xdp_sessions)
+        ret=$(metric plat_xdp_retires_total)
+        echo "e2e: after 125 s idle: sessions $sess, xdp sessions $xs, retires $ret" >&2
+        if [ "$sess" -ne 0 ] || [ "$xs" -ne 0 ] || [ "$ret" -lt "$(metric plat_xdp_installs_total)" ]; then
+            die "idle_expiry: session not expired ($sess / $xs / $ret)"
+        fi
+        echo "e2e: PASS idle_expiry" >&2
     fi
-    echo "e2e: PASS idle_expiry" >&2
 
     kill "$echo_pid" 2>/dev/null || true
     kill -TERM "$platd_pid"
@@ -284,6 +329,7 @@ cleanup() {
         wait "$platd_pid" 2>/dev/null || true
     fi
     [ -z "${echo_pid:-}" ] || kill "$echo_pid" 2>/dev/null || true
+    [ -z "${pcap_s:-}" ] || kill "$pcap_s" "$pcap_c" 2>/dev/null || true
     [ -z "${loader:-}" ] || nsx "$NS_P" "$loader" detach >/dev/null 2>&1 || true
     ! mountpoint -q /run/plat/bpf || umount /run/plat/bpf
     rmdir /run/plat/bpf 2>/dev/null || true
