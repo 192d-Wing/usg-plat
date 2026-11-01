@@ -119,6 +119,136 @@ about 0.7%, with no futex or slow-path samples, so locks are negligible at TUN
 rates (about 0.45–0.62 Mpps per worker). Further throughput needs a different
 I/O backend (POAM-016), not lock changes (POAM-015).
 
+### XDP fast path (POAM-016 Phase 1, `[xdp]`, off by default)
+
+An optional eBPF/XDP program on the physical NICs forwards packets of
+**established UDP sessions** in both directions without entering the TUN.
+`platd` stays the only creator of state; every other packet goes to the
+slow path above, unchanged. Without `[xdp]` (or with `enabled = false`, or
+a `platd` built without the `xdp` cargo feature) the data plane is TUN-only
+and none of this runs. Minimum kernel: **Linux 6.6 LTS** (the loader
+refuses older kernels, `plat_xdp::load::check_kernel`). Status: code
+complete except the deploy units (WU6); the speed-up is not measured
+(POAM-016).
+
+<!-- pending WU6 reconciliation: unit names and ordering below follow plan §7 -->
+
+```mermaid
+flowchart TD
+    nic["access / upstream NIC<br/>(XDP plat_xdp, native mode)"]
+    nic --> fp{"fixed-layout UDP?<br/>checksum verifies?<br/>OUT6 / IN4 hit, slot LIVE, echo,<br/>slice Active + gen, deadline,<br/>TTL > 2, size, FIB, egress"}
+    fp -- "all yes: rewrite (plat-xdp-core),<br/>XDP_REDIRECT (devmap TX)" --> out["other NIC TX"]
+    fp -- "any no: XDP_PASS, frame unmodified" --> kern["kernel rx → nft inet plat → route → TUN plat0"]
+    kern --> platd["platd worker (unchanged)"]
+    platd -- "session create / slow-path hit:<br/>slot PENDING under bib4" --> pub["plat-xdp-pub:<br/>insert IN4, OUT6; PENDING → LIVE"]
+```
+
+- **Crates.** `plat-xdp-core` (`no_std`, `forbid(unsafe_code)`): ABI types,
+  the fixed-layout classifier, the rewrite and the RFC 1624 arithmetic,
+  shared by the program and the host tests. `plat-xdp-ebpf`: the program
+  (Aya); all `unsafe` is in `src/ctx.rs`. `plat-xdp`
+  (`forbid(unsafe_code)`): loader library, pinned-map writer
+  (`XdpMirror`), slot allocator, publisher and control threads, stats.
+  `services/plat-xdp-loader`: the privileged `attach` / `detach` /
+  `status` binary. `plat-io` adds `bpf_obj.rs` (pin open and map syscalls),
+  `bpf_mmap.rs` (shared views of mmapable arrays) and `netdev.rs` (ifindex
+  and MTU).
+- **What the program forwards.** Ethernet + IPv6 or IPv4 (IHL 5, not a
+  fragment) + UDP with fixed offsets, destination MAC of the ingress
+  interface, ingress role allowing the direction, UDP length consistent,
+  non-zero checksum, TTL / hop limit > 2 (output = input − 2, the same as
+  the two kernel hops of the TUN path), an exact `OUT6` / `IN4` key whose
+  `SLOT` record is `LIVE` and echoes the packet's addresses and ports, the
+  record's slice `Active` with the same generation, `CONTROL` enabled and
+  its dead-man deadline in the future, the translated size within the MTU
+  limits, `bpf_fib_lookup` from the TUN's ifindex returning `SUCCESS`
+  (so `FWD_DISABLED` from `plat-fwguard` stops the fast path) and the
+  egress interface in `EGRESS`. Anything else is passed with a counted
+  reason (`plat_xdp_pass_total{reason}`). TCP, ICMP, fragments, IPv4
+  options, IPv6 extension headers, VLAN, multicast and hairpins never take
+  the fast path. The program writes nothing before its last decline
+  point; a failed bounds re-check after the head adjustment is
+  `XDP_ABORTED` (`plat_xdp_aborted_total`).
+- **Checksum verification.** The rewrite updates the UDP checksum
+  incrementally, which is only correct for a complete checksum. The
+  program therefore verifies the full UDP checksum (pseudo-header, header,
+  payload) before it takes a frame and passes frames that do not verify
+  (`udp_csum_unverified`), such as `CHECKSUM_PARTIAL` frames from local or
+  container senders with TX checksum offload. UDP datagrams longer than
+  1536 B (`CSUM_MAX_L4`) always take the slow path.
+- **Maps** are created by the loader, sized from `xdp.max_sessions`
+  (`SLOT` is ⌈1.25 × max_sessions⌉) and pinned under the dedicated bpffs at
+  `/run/plat/bpf`: `OUT6`, `IN4`, `SLOT`, `SLICE`, `CONTROL` read-write for
+  group `plat`; `CONFIG` (frozen), `STATS`, `FWD`, `IFACES`, `EGRESS`
+  read-only; `TX`, the program and the links root only; `IDENT`,
+  `IDENT_KEY` and `SCRATCH` not pinned (`plat-xdp` `maps.rs`,
+  `pin_access_is_least_privilege`).
+- **Slot states** (`plat-xdp-core::abi`): `FREE` (0), `LIVE` (1, the only
+  state the program forwards), `DEAD` (2), `PENDING` (3) and `FAILED` (4).
+  - Install, under the `bib4` shard lock of the session, after its
+    attribution record was queued (rule 4): take a slot from its partition,
+    write the record, store `PENDING`, queue a publish op. No syscall.
+  - Publish, on `plat-xdp-pub` (1 ms idle period): insert `IN4` and
+    `OUT6` with `BPF_NOEXIST`, then compare-and-swap `PENDING → LIVE`. A
+    retire that won the race makes the publisher delete what it inserted;
+    any failure stores `FAILED` (map full also sets a global 1 s
+    back-off).
+  - Retire, under `bib4` (expiry, `drop_expired`, BIB removal, slice
+    release): store `DEAD` and queue a retire op. The publisher deletes
+    the entries it published (failed deletes are retried each pass) and
+    quarantines the slot.
+  - Reuse: `plat-xdp-ctl` runs `membarrier(MEMBARRIER_CMD_GLOBAL)` every
+    100 ms (a forced RCU grace period) and a quarantined slot returns to
+    its free stack only after two epochs. A program run that read a reused
+    hash element finds a key echo that does not match and passes.
+    `MEMBARRIER_CMD_GLOBAL` is unavailable on `nohz_full` hosts: there
+    `platd` keeps the fast path off (`unsupported_host`).
+  - `FAILED` slots and entries of a stale slice generation are collected
+    under their `bib4` shard (`State::mirror_gc`), so the engine forgets
+    the slot and may mirror the session again.
+- **Consistency model.** `plat-nat64` is authoritative for every session,
+  its attribution and its expiry; the maps are a copy that can only be
+  less permissive.
+  - Session existence: written only from inside the `bib4` critical
+    section that creates or removes the session (invariants I1–I4,
+    `plat-nat64` `tests/mirror.rs` and `tests/mirror_qa.rs`).
+  - Expiry: the program stores `SLOT.seen_ns` at most once a second; when
+    a mirrored session looks expired, the engine reads it back (one mmap
+    load), rounds up and adds one coarse tick, so a session lives until one
+    timeout after its last packet on either path, then the sweeper
+    reclaims it (SC-10).
+  - Slice ownership: on a change to a less permissive state `SLICE` is
+    written first, then the engine; on a change to `Active` the engine
+    first, then `SLICE` with a new generation.
+  - Liveness: `plat-xdp-ctl` refreshes `CONTROL.deadline_ns` every
+    `heartbeat_ms` only while the sweeper, every worker and the publisher
+    make progress, capped by the HA lease self-fence instant. A hung or dead
+    `platd` stops the fast path within `deadline_ms`.
+  - Configuration: the loader writes `CONFIG` and freezes it; its digest
+    binds the object SHA-256, the translation parameters (including the
+    RFC 6052 prefix), the map sizes, the interfaces and a per-attach nonce.
+    `platd` enables the fast path only when the digest equals its own
+    configuration's and the state file `/run/plat/xdp.state` names its
+    embedded object; it re-checks pins, `CONFIG` and the program id every
+    10 s.
+- **Stale-map refusal.** `platd` claims only fresh pins: `CONTROL` all
+  zero and every `SLOT` header `FREE`, then it marks `CONTROL` used. A
+  `platd` restarted without re-running the loader is refused
+  (`xdp_fastpath_state` reason `stale_maps`) and stays TUN-only, so
+  `platd` and the loader must restart together.
+- **Threads.** `plat-xdp-pub` (all map syscalls) and `plat-xdp-ctl`
+  (heartbeat, grace periods, GC, integrity check). Neither is on the packet
+  path; workers and the sweeper make no `bpf()` syscall.
+- **Privilege split** (plan §7). The loader holds `CAP_BPF` and
+  `CAP_NET_ADMIN` only while it attaches; it refuses unless
+  `kernel.unprivileged_bpf_disabled` is 1 or 2. `platd` keeps no
+  capabilities and needs the `bpf` syscall only to open the pins its group
+  can reach. It cannot create maps, load or attach programs, or change
+  `CONFIG`, `IFACES` or `EGRESS`.
+- **Not seen by the host filters.** Fast-path packets bypass netfilter,
+  `rp_filter` and tc (POAM-037); egress drops of redirected packets are not
+  visible to `platd` (POAM-039).
+
 ## State
 
 | Table | Key | Value | Lock |
@@ -179,6 +309,13 @@ Lock order: `bib6 → subs (→ aggs)` (released) `→ bib4`; sweeper `bib6 → 
 (released) then `subs (→ aggs)`. Nothing acquires `bib6` or `subs` while holding `bib4`.
 `aggs` is a leaf: taken briefly only while a `subs` shard is held (or alone),
 and holds no other lock.
+
+With the XDP fast path, the slot-partition mutexes (`xslot`, 1024 of them)
+are leaves below `bib4`: `bib4 → xslot` (install, retire, `mirror_gc`),
+`publisher → xslot`, or `xslot` alone. Nothing takes `bib4`, `bib6` or
+`subs` while holding a partition lock or the publisher mutex. The program
+takes no locks; kernel hash-bucket locks exist only inside a `bpf()`
+syscall on `plat-xdp-pub`.
 
 ## SIEM logging
 
@@ -381,6 +518,7 @@ flowchart LR
 | PLAT → IPv4 Internet | never-translatable destinations always denied; RFC 6890 non-global destinations denied by default under every prefix (`translation.allow_non_global_destinations`; the cluster pool is exempt) |
 | IPv4 Internet → PLAT | pool ownership check, filtering, never-translatable and (by default) non-global data sources refused, unexpired source routes dropped; pool-sourced packets refused (own slice always, other slices unless `translation.cross_node_hairpin`, which needs the host `plat-pool-source-guard` rule limiting them to `translation.cluster_interfaces`; POAM-024) |
 | Host forwarding | nftables `inet plat` forward chain, default drop, installed by `plat-tun-setup.sh` before forwarding is enabled, persisted in `/etc/nftables.d/plat.nft` (glob include), and guarded by `plat-fwguard` (forwarding off if the table is missing or modified; residual window for direct `nft` changes, POAM-019). Verified on Linux (LINUX_VERIFICATION.md L5, L15) |
+| XDP fast path (`[xdp]`, off by default) | runs before netfilter: forwards only exact matches of sessions `platd` created (key echo, `LIVE` slot, slice `Active` and generation, dead-man deadline, FIB result incl. `FWD_DISABLED`, egress allow-list, ingress role); everything else passes unmodified into the host policy above. Host filters other than `inet plat` and the forwarding sysctl, `rp_filter` and tc do not see fast-path packets (POAM-037). Pins reachable only by root and group `plat`; `CONFIG` frozen and digest-checked |
 | Cluster peers (HA) | mutual TLS 1.3 with a dedicated peer CA, typed identity bound to the claimed member id, source address pinned on the accepting side, config digest cross-check, duplicate-id refusal, replication accepted only from the slice owner; one trust domain (POAM-032); operator socket limited to uid 0 or the daemon uid |
 | Management | read-only metrics and health; plaintext only on loopback, otherwise mutual TLS 1.3 with client certificate, full-chain revocation and typed allow-list, per-IP and global connection caps; every mTLS connection audited |
 | Revocation sources (OCSP responders, CRL distribution points) | plaintext HTTP of signed objects; strict DER and HTTP parsing, size caps, per-chain time budget; `hard_fail` by default; DNS has no timeout (POAM-025) |

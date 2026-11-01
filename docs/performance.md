@@ -6,6 +6,76 @@ See [Architecture](architecture.md) for the run-to-completion worker model and
 the [POA&M](compliance/POAM.md) for the tracked scaling items (POAM-015,
 POAM-016; POAM-018 is closed).
 
+## XDP fast path (POAM-016 Phase 1): measured so far
+
+> **No speed-up is claimed.** Phase 0 (bare-metal x86 with a real NIC and
+> an external generator) has not been run, so the throughput gain of the
+> fast path over the TUN path is **not measured**. Everything below comes
+> from the Lima VM `plat-linux` (Apple M2 Max host, 6 vCPU shared with the
+> host and other VMs, aarch64, kernel 6.8) or from virtme-ng guests, and is
+> indicative only. x86_64 has not been measured.
+
+Per-packet cost of the program, `BPF_PROG_TEST_RUN` with repeat 2 000 000
+on 6.8 in the level-2 namespace (2026-11-01, WU5 fix round 1). bpftool sets
+no ingress ifindex, so these frames stop at the interface-role check, after
+the UDP checksum verification; the cost of a forwarded packet (hash lookup,
+FIB lookup, rewrite, redirect) is not in these numbers.
+
+| Frame | ns per packet |
+| --- | --- |
+| Non-UDP (ARP) | 8 |
+| UDP, 67 B frame | 97–105 |
+| UDP, 1362 B frame | 305 |
+
+The checksum verification costs about 0.16 ns per byte (about 205 ns for
+1295 extra bytes) and runs for every UDP frame on an `[xdp]` interface,
+including frames without a session.
+
+Host bench of the shared decision code (`plat-xdp-core` `benches/decide.rs`,
+development host): v6→v4 decide and rewrite 17.7 ns before the checksum
+verification was added and 23.3 ns after it (5 B payload); v4→v6 11.0 ns
+and the pass path 4.85 ns (both before it).
+
+Verifier statistics of the shipped object (obj-gate, 2026-11-01; budget:
+stack 384 B, 12 000 processed instructions with least privilege):
+
+| Kernel | Instructions, root | Instructions, `CAP_BPF` + `CAP_NET_ADMIN` | Stack (raw / rounded) |
+| --- | --- | --- | --- |
+| 6.6.13 (vng) | 8567 | 10167 | 336 / 352 B |
+| 6.12.107 (vng) | 3609 | 3837 | 336 / 352 B |
+| 7.2.14 (vng) | 4160 | 4462 | 336 / 352 B |
+| 6.8.0-147 (VM, root) | 3609 | not run | 336 / 352 B |
+
+6.6 leaves about 15% instruction headroom with least privilege; Phase 2
+(TCP) must budget for it.
+
+Slow-path cost of mirroring (`crates/plat-xdp/tests/hold_gate.rs`, root, VM
+6.8, program attached by the loader, 4 workers creating 150 000 UDP flows
+each on distinct shards plus the sweeper, median of 5 rounds; the
+`plat-nat64` `hold-probe` feature times every `bib4` hold):
+
+| Measurement | Result |
+| --- | --- |
+| Mirror calls under `bib4` (install and retire), p50 / p99 / p99.9 | 0.26–0.30 / 0.92–1.13 / 2.1–4.7 µs |
+| Worker `bib4` hold p99, mirror off vs on | 3.63 vs 3.34 µs (gate: on − off ≤ 1.5 µs; pass) |
+| Worker `bib4` hold maximum | not measurable in the VM: 0.3–0.9 ms **with the mirror off** too (vCPU preemption); the ≤ 20 µs criterion is open in POAM-016 |
+| Sweep, per expired one-session BIB, off / on | 176–217 / 432–503 ns (`sweep_cost`) |
+
+Before the redesign that moved every map syscall to `plat-xdp-pub`, the
+mirror calls added a p99 of 3.9–4.9 µs to their holds and failed the gate.
+
+Mirror-off default path (`cargo bench -p plat-nat64 --bench nat64 --
+existing_session`, development host, back to back): the branch was within
+`main`'s own run-to-run variance (v6→v4 existing session 55.4 ns against
+52.8–55.3 ns on `main`; v4→v6 44.8 ns on both).
+
+Estimated, not measured: one publisher thread does every `IN4` / `OUT6`
+insert and delete, so flow churn (new plus expired UDP flows) above about
+0.7–1 M per second per node would outrun it (watch
+`plat_xdp_publish_queue_depth`). A new flow stays on the slow path for
+about 1 ms plus the publisher's current pass; the end-to-end test saw
+exactly one slow-path datagram per direction per flow.
+
 ## Port-block sizing
 
 Each subscriber gets port blocks of `nat64.port_block_size` ports, up to

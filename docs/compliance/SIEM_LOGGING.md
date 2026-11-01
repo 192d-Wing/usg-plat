@@ -22,7 +22,7 @@ never limits forwarding.
 | 5 | TLS (branch `feat/fips-tls`). `service_start` gains `plat.fips` / `plat.fips_provider` (CEF `cn2`/`cs1`). `audit_remote_loss` gains optional `plat.reason` (`io`, `tls_handshake`, `tls_verify`, `tls_revocation`; CEF `reason`); TCP losses now carry `io`. New records `management_connection`, `management_connection_suppressed`, `tls_revocation_check`, `revocation_source_refresh`. First records that carry peer-supplied text (certificate subject, SANs, issuer DN, serial, URLs), sanitised and capped (see Injection safety). |
 | 6 | Branch `fix/linux-validation` (unreleased). New record `audit_recovery` (`plat.reason` `empty_file`/`missing_header`/`truncated_tail`, `plat.audit.last_checkpoint_seq`, `plat.audit.max_seq`, `plat.audit.lease_state` `ok`/`absent`/`corrupt`/`inflated`/`high`; CEF `reason`, `cn3` `lastCheckpointSeq`, `cn2` `maxSeq`, `cs4` `leaseState`). `audit_output_failure` may carry `plat.reason` (`truncate_failed`, `seq_lease_failed`, `seq_exhausted`; CEF `reason`). New lease file `.<name>.seq`. `verify-log` exit 3 and `--allow-recovery`. |
 | 7 | Branch `feat/cluster-ha` (unreleased). Cluster high availability. New records `cluster_view_change`, `cluster_member_state`, `cluster_slice_acquire`, `cluster_slice_release`, `nat_port_block_adopt`, `cluster_peer_rejected`, `cluster_peer_suppressed`, `cluster_replication_gap`, `cluster_hook`, `cluster_operator_command`. `nat_port_block_release` may carry `plat.release_reason` (`handover`; CEF `reason`). `service_start` may carry `cluster.node_id`, `cluster.mode`, `cluster.config_digest`, `cluster.slices`, `cluster.slice_count`, `cluster.member_count` (CEF `cs2`/`cs3`/`cs4`/`cn3`). `tls_revocation_check` gains roles `cluster_peer_client` / `cluster_peer_server`. Additive within schema 7 (branch `fix/poams-020-024-013`): `nat_resource_limit` `event.reason` value `aggregate_subscriber_limit` (POAM-013); `cluster.config_digest` now also covers `cross_node_hairpin`, `aggregate_prefix_len` and `max_subscribers_per_aggregate` (value changes, field unchanged). Chain format unchanged. |
-| 8 | Branch `feat/xdp-wu5` (unreleased). XDP fast path for established UDP sessions (POAM-016 Phase 1). `service_start` gains `plat.xdp.mode` (`off` / `native` / `generic`, always present when written by `platd`) and, with `[xdp]` enabled, `plat.xdp.object_sha256` (SHA-256 of the embedded eBPF object) and `plat.xdp.interfaces` (configured names, space-separated); CEF `cs5` (`xdpMode`), `flexString1` (`xdpObjectSha256`), `flexString2` (`xdpInterfaces`). New record `xdp_fastpath_state` (`plat.xdp.state` `enabled` / `disabled`, `event.reason`; CEF `cs1` `xdpState`, `reason`). `dataplane_counter` gains the `plat.counter.name` value `xdp_aborted`. No per-packet or per-session record from the fast path; attribution records unchanged. Chain format unchanged. |
+| 8 | Branch `feat/xdp-wu5`, merged on `main` @ `9a9c752` (unreleased). XDP fast path for established UDP sessions (POAM-016 Phase 1). `service_start` gains `plat.xdp.mode` (`off` / `native` / `generic`, always present when written by `platd`) and, with `[xdp]` enabled, `plat.xdp.object_sha256` (SHA-256 of the embedded eBPF object) and `plat.xdp.interfaces` (configured names, space-separated); CEF `cs5` (`xdpMode`), `flexString1` (`xdpObjectSha256`), `flexString2` (`xdpInterfaces`). New record `xdp_fastpath_state` (`plat.xdp.state` `enabled` / `disabled`, `event.reason`; CEF `cs1` `xdpState`, `reason`). `dataplane_counter` gains the `plat.counter.name` value `xdp_aborted`. No per-packet or per-session record from the fast path; attribution records unchanged. Chain format unchanged. |
 
 Branch `feat/protocol-completeness` (unreleased) adds drop reasons, counters
 and one gauge but changes no record type or field name, so the schema stays
@@ -227,19 +227,39 @@ program may forward) or `disabled` (every packet goes to the slow path).
 | `maps_unavailable` | disabled | Pins missing, of the wrong shape, replaced by a re-run loader, or the TUN or a thread could not be set up |
 | `stale_maps` | disabled | The pinned maps were already used by an earlier `platd` (`CONTROL` touched or a `SLOT` record present): a restart must re-run the loader for fresh maps (SEC-001) |
 | `unsupported_host` | disabled | `membarrier(MEMBARRIER_CMD_GLOBAL)` unavailable (`nohz_full`) or failing 10 times in a row: slots cannot be reused safely (decision Q5, SEC-007) |
-| `heartbeat_stalled` | disabled | The sweeper or a worker made no progress: heartbeats withheld, the dead-man deadline stops the fast path (SC-24) |
+| `heartbeat_stalled` | disabled | The sweeper, a worker or the publisher thread (`plat-xdp-pub`) made no progress: heartbeats withheld, the dead-man deadline stops the fast path (SC-24) |
 | `heartbeat_resumed` | enabled | Progress again after a stall |
 | `shutdown` | disabled | `platd` is stopping (`CONTROL` disabled) |
 
 Every reason except `start`, `heartbeat_resumed` and `shutdown` is a
 failure (`event.outcome:"failure"`, severity 4). After `config_mismatch`,
 `object_mismatch`, `link_mismatch`, `maps_unavailable`, `stale_maps` or
-`unsupported_host` the fast path stays off until `platd` restarts. Alert on
-any of them; correlate with `plat_xdp_*` metrics.
+`unsupported_host` the fast path stays off until `platd` restarts (after
+`stale_maps`, `object_mismatch` or `config_mismatch` the loader must be
+re-run too, because only a fresh attach gives fresh, matching maps). Alert
+on any of them; correlate with `plat_xdp_*` metrics.
 
 ```json
 {"@timestamp":"2026-11-01T14:00:00.120000Z","plat.schema":8,"event.sequence":2,"event.kind":"event","event.category":"network","event.action":"xdp_fastpath_state","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"success","plat.xdp.state":"enabled","event.reason":"start"}
+{"@timestamp":"2026-11-01T14:00:10.000000Z","plat.schema":8,"event.sequence":3,"event.kind":"event","event.category":"network","event.action":"xdp_fastpath_state","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","plat.xdp.state":"disabled","event.reason":"heartbeat_stalled"}
 ```
+
+The same failure record in CEF (syslog severity 4, CEF severity 7):
+
+```text
+<132>1 2026-11-01T14:00:10.000000Z plat-01 platd 4242 xdp_fastpath_state - CEF:0|USG|usg-plat|0.1.0|xdp_fastpath_state|xdp_fastpath_state|7|rt=1793541610000 dvchost=plat-01 cn1=3 cn1Label=sequence cn4=0 cn4Label=nodeId cs6=8 cs6Label=schema outcome=failure cs1=disabled cs1Label=xdpState reason=heartbeat_stalled
+```
+
+SIEM correlation: a `heartbeat_stalled` without a later
+`heartbeat_resumed` means every packet is on the slow path; expect
+`plat_xdp_pass_total{reason="deadline"}` to rise and `plat_xdp_packets_total`
+to stop. Compare `plat.xdp.object_sha256` across nodes and releases to detect
+an unexpected object (SI-7).
+
+Examples elsewhere in this document that show `plat.schema` 7 (or CEF
+`cs6=7`) are records whose fields schema 8 did not change. A current build
+writes `plat.schema` 8 on every record, and its `service_start` always
+carries `plat.xdp.mode`.
 
 ### Cluster records (schema 7)
 
