@@ -3,6 +3,11 @@
 //! the full `plat-nat64` engine between the modelled kernel hops, compared
 //! byte for byte (IPv4 ID substituted, plan §2.4).
 //!
+//! The `Env` records come from the engine's own mirror hook: every
+//! reference engine has a `plat_nat64::ModelMirror` attached ([`Mirrored`]),
+//! and a session's record is the one the engine installed, so the
+//! eligibility rules (plan §4.2 I3) are the engine's, not the harness's.
+//!
 //! Properties (`PROPTEST_CASES`, default 10 000; CI sets 1 000 000):
 //! - safety: a candidate redirect implies the reference emits exactly that
 //!   frame;
@@ -19,11 +24,14 @@ mod support;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
 
-use plat_nat64::SliceState;
+use plat_nat64::{ModelMirror, SliceState};
 use plat_packet::{L4, parse_l4, parse_v4, parse_v6};
 use plat_xdp_core::abi::{
-    ROLE_BOTH, SLICE_ACTIVE, SLICE_ADOPTING, SLICE_FENCED, SLICE_INACTIVE, SLOT_DEAD, SlotRec, iface_slot,
+    ROLE_BOTH, SLICE_ACTIVE, SLICE_ADOPTING, SLICE_FENCED, SLICE_INACTIVE, SLOT_DEAD, SLOT_LIVE, SliceEnt, SlotRec,
+    iface_slot,
 };
 use plat_xdp_core::decide::{Action, Verdict};
 use plat_xdp_core::{HDR4, HDR6, PassReason, classify_v4, classify_v6};
@@ -33,8 +41,94 @@ use support::*;
 // ---------------------------------------------------------------------
 // Fixtures
 
+/// The reference with a `ModelMirror` attached to its engine (WU4). It
+/// derefs to the [`Reference`]; [`Mirrored::install`] shadows
+/// `Reference::install`.
+struct Mirrored {
+    r: Reference,
+    m: Arc<ModelMirror>,
+}
+
+impl Deref for Mirrored {
+    type Target = Reference;
+
+    fn deref(&self) -> &Reference {
+        &self.r
+    }
+}
+
+impl DerefMut for Mirrored {
+    fn deref_mut(&mut self) -> &mut Reference {
+        &mut self.r
+    }
+}
+
+impl Mirrored {
+    fn new(k: &Knobs) -> Self {
+        let mut r = Reference::new(k);
+        // Room for every session of a fixture's lifetime (FIXTURE_USES).
+        let m = Arc::new(ModelMirror::new(1 << 16));
+        r.nat.set_mirror(m.clone());
+        Self { r, m }
+    }
+
+    /// Copies the engine-installed record of `(src6, sport) → (dst4,
+    /// dport)` and its slice entry from the model into `env`. `None` when
+    /// the engine mirrored no usable entry for the session.
+    fn install(&self, env: &mut HostEnv, src6: u128, sport: u16, dst4: u32, dport: u16) -> Option<u32> {
+        let slot = self.m.lookup_out(src6, sport, self.r.prefix.embed(dst4), dport)?;
+        if !self.m.usable(slot) {
+            return None;
+        }
+        let rec = self.m.slot(slot)?;
+        let (st, generation) = self.m.slice(rec.entry.slice)?;
+        let i = usize::from(rec.entry.slice);
+        if env.slices.len() <= i {
+            env.slices.resize(i + 1, SliceEnt::default());
+        }
+        env.slices[i] = SliceEnt { state: st as u8, pad: [0; 3], generation };
+        let k = rec.entry.keys;
+        Some(env.install(SlotRec {
+            state: SLOT_LIVE,
+            slice: rec.entry.slice,
+            generation: rec.entry.generation,
+            seen_ns: 0,
+            src6: k.k6.addr.to_be_bytes(),
+            dst6: k.dst6.to_be_bytes(),
+            sport6: k.k6.port.to_be_bytes(),
+            dport: k.remote.1.to_be_bytes(),
+            pool_port4: k.k4.port.to_be_bytes(),
+            pool4: k.k4.addr.to_be_bytes(),
+            dst4: k.remote.0.to_be_bytes(),
+            ..SlotRec::default()
+        }))
+    }
+}
+
+/// Creates the session `(src6, sport) → (dst4, dport)` through the
+/// reference and copies the record its mirror hook installed into `env`
+/// (shadows `support::establish`).
+fn establish(
+    r: &mut Mirrored,
+    env: &mut HostEnv,
+    src6: u128,
+    sport: u16,
+    dst4: u32,
+    dport: u16,
+) -> Result<Session, String> {
+    let dst6 = r.prefix.embed(dst4);
+    let create = eth(ACCESS_MAC, CLIENT_MAC, ETH6, &udp6(&U6::new(src6, sport, dst6, dport), b"create"));
+    let net = env.net;
+    if let RefOut::Not(why) = r.wire(&create, ACCESS_IF, &net) {
+        return Err(format!("creating packet not forwarded: {why}"));
+    }
+    let slot = r.install(env, src6, sport, dst4, dport).ok_or("not mirrored by the engine")?;
+    let (pool4, pool_port) = r.mapping(src6, sport).ok_or("no mapping")?;
+    Ok(Session { src6, sport, dst4, dport, pool4, pool_port, slot })
+}
+
 thread_local! {
-    static FX: RefCell<HashMap<(usize, bool), Reference>> = RefCell::new(HashMap::new());
+    static FX: RefCell<HashMap<(usize, bool), Mirrored>> = RefCell::new(HashMap::new());
 }
 
 fn knobs(prefix: usize, copy_tos: bool) -> Knobs {
@@ -43,12 +137,12 @@ fn knobs(prefix: usize, copy_tos: bool) -> Knobs {
 
 /// Runs `f` on the cached reference for `(prefix, copy_tos)`, rebuilt
 /// after [`FIXTURE_USES`] packets.
-fn with_fx<R>(prefix: usize, copy_tos: bool, f: impl FnOnce(&mut Reference) -> R) -> R {
+fn with_fx<R>(prefix: usize, copy_tos: bool, f: impl FnOnce(&mut Mirrored) -> R) -> R {
     FX.with(|m| {
         let mut m = m.borrow_mut();
-        let r = m.entry((prefix, copy_tos)).or_insert_with(|| Reference::new(&knobs(prefix, copy_tos)));
+        let r = m.entry((prefix, copy_tos)).or_insert_with(|| Mirrored::new(&knobs(prefix, copy_tos)));
         if r.uses > FIXTURE_USES {
-            *r = Reference::new(&knobs(prefix, copy_tos));
+            *r = Mirrored::new(&knobs(prefix, copy_tos));
         }
         f(r)
     })
@@ -135,7 +229,7 @@ const MAX_PAYLOAD: usize = 1452;
 /// Largest DF = 0 inbound payload: lowest_ipv6_mtu 1280 − 48.
 const MAX_PAYLOAD_DF0: usize = 1232;
 
-fn establish_flow(r: &mut Reference, env: &mut HostEnv, f: &Flow) -> Result<Session, String> {
+fn establish_flow(r: &mut Mirrored, env: &mut HostEnv, f: &Flow) -> Result<Session, String> {
     establish(r, env, client(f.host), f.sport, server(f.net, f.srv), f.dport)
 }
 
@@ -204,7 +298,7 @@ const MTU_PROFILES: [(u16, u16, u16); 5] =
 const NET_MTUS: [u32; 7] = [1280, 1281, 1300, 1400, 1460, 1499, 1500];
 
 thread_local! {
-    static FXM: RefCell<HashMap<usize, Reference>> = RefCell::new(HashMap::new());
+    static FXM: RefCell<HashMap<usize, Mirrored>> = RefCell::new(HashMap::new());
 }
 
 fn mtu_knobs(profile: usize) -> Knobs {
@@ -213,12 +307,12 @@ fn mtu_knobs(profile: usize) -> Knobs {
 }
 
 /// [`with_fx`] for the MTU profiles (prefix 0, `copy_tos` on).
-fn with_mtu_fx<R>(profile: usize, f: impl FnOnce(&mut Reference) -> R) -> R {
+fn with_mtu_fx<R>(profile: usize, f: impl FnOnce(&mut Mirrored) -> R) -> R {
     FXM.with(|m| {
         let mut m = m.borrow_mut();
-        let r = m.entry(profile).or_insert_with(|| Reference::new(&mtu_knobs(profile)));
+        let r = m.entry(profile).or_insert_with(|| Mirrored::new(&mtu_knobs(profile)));
         if r.uses > FIXTURE_USES {
-            *r = Reference::new(&mtu_knobs(profile));
+            *r = Mirrored::new(&mtu_knobs(profile));
         }
         f(r)
     })
@@ -453,13 +547,13 @@ proptest! {
 // Never redirect
 
 struct Fx {
-    r: Reference,
+    r: Mirrored,
     env: HostEnv,
     s: Session,
 }
 
 fn fx_with(k: &Knobs, net: Net) -> Fx {
-    let mut r = Reference::new(k);
+    let mut r = Mirrored::new(k);
     let mut env = HostEnv::new(&r.cfg, net);
     let s = ok(establish(&mut r, &mut env, client(0x5_0000_0000_0001), 40_000, server(1, 5), 53));
     Fx { r, env, s }
@@ -620,7 +714,7 @@ fn zero_udp_checksum_never_redirects() {
 
 #[test]
 fn hairpin_is_never_installed() {
-    let mut r = Reference::new(&Knobs::default());
+    let mut r = Mirrored::new(&Knobs::default());
     let mut env = HostEnv::new(&r.cfg, Net::default());
     let (src6, pool_dst) = (client(0x77_0000_0000_0001), POOL_NET | 200);
     let frame =
@@ -633,6 +727,7 @@ fn hairpin_is_never_installed() {
         r.nat.state().has_session(plat_nat64::state::Key4 { proto: 17, addr: pool4, port: pool_port }, (pool_dst, 53))
     );
     assert_eq!(r.install(&mut env, src6, 1000, pool_dst, 53), None, "I3 refuses hairpins");
+    assert_eq!(r.m.installs(), 0, "the engine never mirrored the hairpin");
     assert_eq!(ok(differential(&mut r, &mut env, &frame, ACCESS_IF)), Some(PassReason::NoSession));
 }
 
@@ -825,7 +920,7 @@ fn run_case(outbound: bool, name: &str, f: &HashMap<String, String>) -> Result<(
     }
     let link = num(f, "link_mtu", 1500u32);
     let net = Net { tun_mtu: num(f, "tun_mtu", 1500), link_mtu4: link, link_mtu6: link, ..Net::default() };
-    let mut r = Reference::new(&k);
+    let mut r = Mirrored::new(&k);
     let mut env = HostEnv::new(&r.cfg, net);
     let s = establish(&mut r, &mut env, client(0x9_0000_0000_0042), 40_000, server(1, 5), 53)?;
     let p = Pkt {

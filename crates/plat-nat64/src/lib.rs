@@ -30,6 +30,7 @@ pub mod engine;
 pub mod frag;
 pub mod held;
 pub mod ident;
+pub mod mirror;
 pub mod pool;
 pub mod repl;
 pub mod shard;
@@ -38,6 +39,7 @@ pub mod tcp;
 
 pub use engine::{Nat64, Verdict, WorkerCtx};
 pub use held::{HeldSynExpiry, SynMeta};
+pub use mirror::{Mirror, MirrorEntry, MirrorFail, MirrorKeys, ModelMirror, NoMirror};
 pub use pool::{AllocFail, SliceState};
 pub use repl::{AdoptInput, Directory, Home, ReplHub, ReplProducer, ReplRecord, Shadow, ShadowError};
 pub use state::{

@@ -1,21 +1,25 @@
 //! Steady-state per-packet cost through the full engine (existing session),
-//! single thread and contended multi-thread; flow setup with HA off and on.
+//! single thread and contended multi-thread; flow setup with HA off and on;
+//! the session mirror hook off (every group above) versus on with a no-op
+//! mirror (`nat64_mirror`).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 #[path = "../tests/common/mod.rs"]
 mod common;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use common::{Fx, config, fixture, fixture_q, l4_sum4, l4_sum6, run, run_all, sub, synth, tcp4, tcp6, udp4, udp6};
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use plat_audit::{AcquireReason, AuditSink};
+use plat_cluster::SliceId;
 use plat_cluster::SliceMap;
 use plat_common::config::SteeringMode;
 use plat_common::{Clock, Counters};
-use plat_nat64::{AdoptInput, AdoptMeta, ClusterSetup, Directory, Nat64, ReplHub, WorkerCtx};
+use plat_nat64::mirror::{Mirror, MirrorEntry, MirrorFail, MirrorKeys};
+use plat_nat64::{AdoptInput, AdoptMeta, ClusterSetup, Directory, Nat64, ReplHub, SliceState, WorkerCtx};
 use plat_xlat::HEADROOM;
 use plat_xlat::siit::write_v4_header;
 use std::hint::black_box;
@@ -540,5 +544,63 @@ fn bench_block_layouts(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, bench, bench_flows, bench_block_layouts);
+/// A mirror that accepts every install and keeps nothing: measures the
+/// engine side of the hook (eligibility, install call, slot store) without
+/// any map cost.
+#[derive(Debug, Default)]
+struct NullMirror {
+    next: AtomicU32,
+}
+
+impl Mirror for NullMirror {
+    fn install(&self, _: &MirrorEntry, _: usize) -> Result<u32, MirrorFail> {
+        Ok(self.next.fetch_add(1, Ordering::Relaxed) & 0x7fff_ffff)
+    }
+
+    fn retire(&self, _: u32, _: &MirrorKeys) {}
+
+    fn seen_ms(&self, _: u32) -> u64 {
+        0
+    }
+
+    fn slice_state(&self, _: SliceId, _: SliceState, _: u32) {}
+}
+
+fn mirrored_fixture() -> Fx {
+    let mut fx = fixture(&[]);
+    fx.nat.set_mirror(Arc::new(NullMirror::default()));
+    fx
+}
+
+/// Mirror on (no-op mirror) versus the `nat64` group's mirror-off figures
+/// of the same names (plan §8: within noise when off; the on figures show
+/// the hook's engine-side cost).
+fn bench_mirror(c: &mut Criterion) {
+    let mut fx = mirrored_fixture();
+    let pkt = udp6(sub(1, 1), 5000, 0xc633_6407, 53, &[0u8; 512]);
+    let out = run(&mut fx, &pkt).unwrap();
+    let (ia, ip) = (plat_packet::be32(&out, 12), plat_packet::be16(&out, 20));
+    let reply = udp4(0xc633_6407, 53, ia, ip, &[0u8; 512]);
+    assert!(run(&mut fx, &reply).is_ok(), "reply translates");
+    let mut g = c.benchmark_group("nat64_mirror");
+    g.throughput(Throughput::Elements(1));
+    let mut buf = vec![0u8; HEADROOM + 2048];
+    g.bench_function("v6_to_v4_udp_existing_session", |b| {
+        b.iter(|| {
+            buf[HEADROOM..HEADROOM + pkt.len()].copy_from_slice(&pkt);
+            black_box(fx.nat.process(&mut buf, HEADROOM, pkt.len(), &mut fx.ctx));
+        })
+    });
+    g.bench_function("v4_to_v6_udp_existing_session", |b| {
+        b.iter(|| {
+            buf[HEADROOM..HEADROOM + reply.len()].copy_from_slice(&reply);
+            black_box(fx.nat.process(&mut buf, HEADROOM, reply.len(), &mut fx.ctx));
+        })
+    });
+    let pkts = flow_pkts();
+    g.bench_function("flow_create_v6_to_v4", |b| b.iter_custom(|n| timed_flows(n, &pkts, || (mirrored_fixture(), ()))));
+    g.finish();
+}
+
+criterion_group!(benches, bench, bench_flows, bench_block_layouts, bench_mirror);
 criterion_main!(benches);
