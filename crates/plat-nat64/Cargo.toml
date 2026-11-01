@@ -25,6 +25,9 @@ default = []
 # enable it through the self dev-dependency below; plat-xdp-core's
 # differential tests enable it in their dev-dependency.
 model = []
+# `bib4` hold-time histograms (`probe`): measurement builds only (the
+# POAM-016 WU5 lock-hold gate, plat-xdp `tests/hold_gate.rs`).
+hold-probe = []
 
 [dev-dependencies]
 plat-nat64 = { path = ".", features = ["model"] }

@@ -38,6 +38,20 @@ pub struct Key6 {
     pub port: u16,
 }
 
+/// `bib4` hold-time probe (feature `hold-probe`, measurement builds only;
+/// expands to nothing otherwise). Declared right after the guard, so it is
+/// dropped just before it.
+#[cfg(feature = "hold-probe")]
+macro_rules! hold_probe {
+    () => {
+        let _hold_probe = crate::probe::Probe::start(crate::probe::Holder::Worker);
+    };
+}
+#[cfg(not(feature = "hold-probe"))]
+macro_rules! hold_probe {
+    () => {};
+}
+
 /// IPv4 transport address in the pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Key4 {
@@ -299,15 +313,18 @@ pub const SWEEP_CHUNK: usize = 1 << 16;
 /// Work units of one BIB or subscriber visit relative to one session or
 /// block.
 pub const SWEEP_ENTRY_COST: usize = 4;
-/// Extra work units of retiring one mirrored session (plan §5). PERF-003:
-/// with the XDP mirror a retire is a `DEAD` store and two
-/// `BPF_MAP_DELETE_ELEM` syscalls, measured at 0.62 µs mean, 0.92 µs p99
-/// (`plat-xdp` `tests/mirror_cost.rs`, 6.8 VM), against a work unit (one
-/// session visit) of the order of 10 ns (estimate): about 64 units. That
-/// is above `HOLD_CHECK_UNITS`, so every retire is followed by a clock
-/// check ([`Hold::charge`]). One BIB's retires still run in one hold
-/// (WU5 requirement: deferred deletes, fixes-wu34-round-1 PERF-001).
-pub const SWEEP_RETIRE_COST: usize = 64;
+/// Extra work units of retiring one mirrored session (plan §5). With the
+/// XDP writer's deferred deletes (WU5) a retire under the hold is a key-echo
+/// read of the `SLOT` record, one `DEAD` store and a push onto its slot
+/// partition's queue; the two `BPF_MAP_DELETE_ELEM` run later on the
+/// publisher thread. Measured (plat-xdp `tests/hold_gate.rs` `sweep_cost`,
+/// 6.8 VM, 20 000 expired one-session BIBs): 215 ns per session without the
+/// mirror, i.e. about 43 ns per work unit (`SWEEP_ENTRY_COST` + 1), and
+/// 360-400 ns more per retired session, i.e. 8-9 units: 10 with margin.
+/// Below `HOLD_CHECK_UNITS`, so the clock is read about every third retire
+/// ([`Hold::charge`]). It was 64 while the deletes ran under the hold
+/// (PERF-003, 0.62 µs mean).
+pub const SWEEP_RETIRE_COST: usize = 10;
 /// Keys copied per hold, per work unit of the chunk, when a shard continues
 /// from a key snapshot.
 pub const SWEEP_KEYS_PER_UNIT: usize = 8;
@@ -485,25 +502,48 @@ struct MirrorCtx {
     /// source guard stay on the slow path). Scanned only just before an
     /// install (PERF-007), not per packet.
     exclude: Box<[Ipv4Cidr]>,
-    /// No install before this engine time (after any [`MirrorFail`]).
-    backoff_until: AtomicU64,
-    /// Install counters, written only on the cold install path.
-    stats: CachePadded<MirrorInstallStats>,
+    /// No install before this engine time (after any [`MirrorFail`]), per
+    /// back-off lane (`bib4` shard modulo [`MIRROR_BACKOFF_LANES`], the
+    /// XDP slot partitions): a full partition backs off its own shards,
+    /// not every install (NEW-2). Written only on a failure. PERF-008:
+    /// deliberately not padded (eight lanes share a line): written only
+    /// after a failed install and read only on the cold install path, so
+    /// sharing costs nothing measurable, unlike the padded `stats`.
+    backoff_until: Box<[AtomicU64]>,
+    /// Install counters per lane (`bib4` shard modulo [`MIRROR_STAT_LANES`],
+    /// each lane on its own cache line, NEW-1), written only on the cold
+    /// install path and summed on read.
+    stats: Box<[CachePadded<MirrorLaneStats>]>,
 }
 
-/// Session-mirror install counters ([`State::mirror_install_stats`]).
+/// Install back-off lanes: the same partitioning as the XDP slot
+/// allocator (`plat_xdp::slots::PARTITIONS`, `shard % 1024`).
+pub const MIRROR_BACKOFF_LANES: usize = 1024;
+/// Install counter lanes (cache-line padded).
+pub const MIRROR_STAT_LANES: usize = 64;
+
 #[derive(Debug, Default)]
+struct MirrorLaneStats {
+    installed: AtomicU64,
+    failed: AtomicU64,
+    retries: AtomicU64,
+    backed_off: AtomicU64,
+}
+
+/// Session-mirror install counters ([`State::mirror_install_stats`]), summed
+/// over the lanes.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct MirrorInstallStats {
     /// Install calls that returned a slot.
-    pub installed: AtomicU64,
+    pub installed: u64,
     /// Install calls that failed (any [`MirrorFail`]); each starts a
-    /// back-off of [`INSTALL_BACKOFF_MS`].
-    pub failed: AtomicU64,
+    /// back-off of [`INSTALL_BACKOFF_MS`] on its lane.
+    pub failed: u64,
     /// Installs retried on a slow-path hit of an existing session that is
     /// not mirrored (after a failure, a back-off or a slice activation).
-    pub retries: AtomicU64,
+    pub retries: u64,
     /// Install attempts skipped inside a back-off.
-    pub backed_off: AtomicU64,
+    pub backed_off: u64,
 }
 
 /// One bounded sweeper lock hold (POAM-012): full after `chunk` work
@@ -730,8 +770,8 @@ impl State {
         }
     }
 
-    /// Attaches a session mirror (call before workers start; WU5 wires the
-    /// XDP mirror here). `prefix` is the engine's RFC 6052 prefix, used for
+    /// Attaches a session mirror (call before workers start; `platd`
+    /// attaches the XDP writer here with `[xdp]` enabled). `prefix` is the engine's RFC 6052 prefix, used for
     /// the canonical `dst6` key. A mirror that is not [`Mirror::enabled`]
     /// ([`crate::mirror::NoMirror`]) is ignored, so the engine behaves
     /// exactly as without one.
@@ -747,20 +787,33 @@ impl State {
             m,
             prefix,
             exclude: exclude.into(),
-            backoff_until: AtomicU64::new(0),
-            stats: CachePadded::new(MirrorInstallStats::default()),
+            backoff_until: (0..MIRROR_BACKOFF_LANES).map(|_| AtomicU64::new(0)).collect(),
+            stats: (0..MIRROR_STAT_LANES).map(|_| CachePadded::new(MirrorLaneStats::default())).collect(),
         }));
     }
 
-    /// The session-mirror install counters; `None` without a mirror.
-    pub fn mirror_install_stats(&self) -> Option<&MirrorInstallStats> {
-        self.mirror.as_deref().map(|mc| &*mc.stats)
+    /// The session-mirror install counters (summed over the lanes); `None`
+    /// without a mirror. Control path only.
+    pub fn mirror_install_stats(&self) -> Option<MirrorInstallStats> {
+        let mc = self.mirror.as_deref()?;
+        let ld = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        Some(mc.stats.iter().fold(MirrorInstallStats::default(), |t, l| MirrorInstallStats {
+            installed: t.installed.wrapping_add(ld(&l.installed)),
+            failed: t.failed.wrapping_add(ld(&l.failed)),
+            retries: t.retries.wrapping_add(ld(&l.retries)),
+            backed_off: t.backed_off.wrapping_add(ld(&l.backed_off)),
+        }))
     }
 
     /// A session mirror is attached.
     #[inline]
     pub fn mirror_on(&self) -> bool {
         self.mirror.is_some()
+    }
+
+    /// The `bib4` shard index of `k4` (the `shard` a mirror install gets).
+    pub fn bib4_shard_of(&self, k4: Key4) -> usize {
+        self.bib4.index_of(&k4)
     }
 
     /// The mirror slot of session `remote` of BIB `k4`: `None` without such
@@ -803,8 +856,14 @@ impl State {
         if k4.proto != proto::UDP {
             return;
         }
-        if mc.backoff_until.load(Ordering::Relaxed) > now {
-            mc.stats.backed_off.fetch_add(1, Ordering::Relaxed);
+        let shard = self.bib4.index_of(&k4);
+        let (Some(backoff), Some(stats)) =
+            (mc.backoff_until.get(shard % MIRROR_BACKOFF_LANES), mc.stats.get(shard % MIRROR_STAT_LANES))
+        else {
+            return;
+        };
+        if backoff.load(Ordering::Relaxed) > now {
+            stats.backed_off.fetch_add(1, Ordering::Relaxed);
             return;
         }
         // PERF-007: the pool scan runs here, only for a session about to be
@@ -823,22 +882,29 @@ impl State {
         let keys = MirrorKeys { k6: bib.k6, k4, remote, dst6: mc.prefix.embed(remote.0) };
         let Some(s) = bib.sessions.get_mut(&remote) else { return };
         if retry {
-            mc.stats.retries.fetch_add(1, Ordering::Relaxed);
+            stats.retries.fetch_add(1, Ordering::Relaxed);
         }
-        match mc.m.install(&MirrorEntry { keys, slice, generation }, self.bib4.index_of(&k4)) {
+        match mc.m.install(&MirrorEntry { keys, slice, generation }, shard) {
             Ok(slot) if slot != NO_SLOT => {
                 s.slot = slot;
-                mc.stats.installed.fetch_add(1, Ordering::Relaxed);
+                stats.installed.fetch_add(1, Ordering::Relaxed);
             }
             // PERF-002 / QA F3: every failure class backs off, not only
-            // `Full` (an implementation maps "no free slot" to `Full`).
+            // `Full` (an implementation maps "no free slot" to `Full`);
+            // NEW-2: only this lane's shards.
             Ok(_) | Err(MirrorFail::Full | MirrorFail::Exists | MirrorFail::Error) => {
-                mc.stats.failed.fetch_add(1, Ordering::Relaxed);
-                mc.backoff_until.store(now + INSTALL_BACKOFF_MS, Ordering::Relaxed);
+                stats.failed.fetch_add(1, Ordering::Relaxed);
+                backoff.store(now + INSTALL_BACKOFF_MS, Ordering::Relaxed);
             }
         }
     }
 
+    /// Lock order (NIST-003): mirror calls run under one `bib4` shard (or a
+    /// slice mutex) and take only the mirror's leaf locks: the XDP writer's
+    /// slot-partition mutex (`bib4 → xslot`). The writer's publisher and
+    /// the control thread never hold a partition lock or the publisher
+    /// mutex while they take `bib4` (`mirror_gc`), `bib6` or `subs`.
+    ///
     /// Removes session `remote` of BIB `k4` / `k6` from the mirror, with
     /// the `bib4` shard held, in the critical section that removes it.
     #[cold]
@@ -859,6 +925,45 @@ impl State {
                 self.mirror_retire(k4, bib.k6, *r, s.slot);
             }
         }
+    }
+
+    /// Stale-generation collection of one mirrored entry (plan §4.3
+    /// slice-wide invalidation): a mirror found `slot`, installed for
+    /// session `remote` of BIB `k4` / `k6`, under a slice generation that
+    /// is no longer current. Under the `bib4` shard of `k4` (the shard
+    /// every install and retire of that entry runs in) `still_stale` is
+    /// asked again, so a slot retired and re-installed for the same keys
+    /// since the scan is never collected; then the entry is retired and the
+    /// session (if it still holds the slot) is marked not mirrored, so a
+    /// later slow-path hit can mirror it again under the current
+    /// generation. Returns whether the entry was retired.
+    ///
+    /// Lock order: `bib4` alone, then the mirror's leaf locks (rule 5).
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: SC-24, SC-5 - entries unusable since a slice changed
+    ///   hands are removed from the bounded fast-path maps
+    pub fn mirror_gc(
+        &self,
+        k4: Key4,
+        k6: Key6,
+        remote: (u32, u16),
+        slot: u32,
+        still_stale: impl FnOnce() -> bool,
+    ) -> bool {
+        if self.mirror.is_none() || slot == NO_SLOT {
+            return false;
+        }
+        let mut g = self.bib4.lock(&k4);
+        if !still_stale() {
+            return false;
+        }
+        if let Some(s) = g.get_mut(&k4).and_then(|b| b.sessions.get_mut(&remote)).filter(|s| s.slot == slot) {
+            s.slot = NO_SLOT;
+        }
+        self.mirror_retire(k4, k6, remote, slot);
+        drop(g);
+        true
     }
 
     /// Seen read-back (plan §5): a mirrored session that looks expired is
@@ -1230,6 +1335,10 @@ impl State {
             return Err(DropReason::AuditUnavailable);
         }
         let (mut g4, due) = self.bib4.lock_due(&k4);
+        // PERF-001: an explicit probe, ended with the guard below (the
+        // macro's binding would live to the end of the function).
+        #[cfg(feature = "hold-probe")]
+        let hold = crate::probe::Probe::start(crate::probe::Holder::Worker);
         g4.insert(
             k4,
             Bib {
@@ -1247,6 +1356,8 @@ impl State {
         );
         // A new BIB has no session yet: the sweeper must see it (POAM-012).
         lower_due(due, self.clock.now_ms());
+        #[cfg(feature = "hold-probe")]
+        drop(hold);
         drop(g4);
         g6.insert(k6, Mapped { k4, idx: ai });
         counters.inc(Counter::BibCreated);
@@ -1392,6 +1503,7 @@ impl State {
         // after `bib4` is released (PERF-006).
         let mut spill: HeldSlots = None;
         let (mut g, due) = self.bib4.lock_due(&k4);
+        hold_probe!();
         let bib = g.get_mut(&k4).ok_or(DropReason::NoBinding)?;
         if let Some(s) = bib.sessions.get_mut(&remote) {
             if self.live(s, now) {
@@ -1504,6 +1616,7 @@ impl State {
     ) -> Result<Option<Key6>, DropReason> {
         let now = self.clock.now_ms();
         let (mut g, due) = self.bib4.lock_due(&k4);
+        hold_probe!();
         let bib = g.get_mut(&k4).ok_or(DropReason::NoBinding)?;
         if let Some(s) = bib.sessions.get_mut(&remote) {
             if self.live(s, now) {
@@ -1956,6 +2069,8 @@ impl State {
             let removals = self.bib4.removals_index(i).unwrap_or(0);
             let rest = (more || start > 0).then(|| Resume::after(&g, removals, start, n));
             st.note_hold(h.t);
+            #[cfg(feature = "hold-probe")]
+            crate::probe::record(crate::probe::Holder::Sweeper, h.t.elapsed().as_nanos() as u64);
             drop(g);
             spill.clear();
             rest
@@ -1982,6 +2097,8 @@ impl State {
                 }
                 lower_due(due, next);
                 st.note_hold(h.t);
+                #[cfg(feature = "hold-probe")]
+                crate::probe::record(crate::probe::Holder::Sweeper, h.t.elapsed().as_nanos() as u64);
                 drop(g);
                 spill.clear();
             }

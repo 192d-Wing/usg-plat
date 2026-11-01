@@ -3,7 +3,7 @@
 
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use parking_lot::RwLock;
@@ -61,6 +61,9 @@ pub fn worker<Q: PacketQueue>(
         since_housekeep += 1;
         if since_housekeep >= 64 {
             since_housekeep = 0;
+            // Liveness for the XDP heartbeat (plan §9): one relaxed add per
+            // housekeeping pass.
+            counters.tick_alive();
             if nat.housekeep(&mut ctx) > 0 {
                 for f in ctx.fragments() {
                     transmit(&mut q, f, &counters);
@@ -127,7 +130,7 @@ fn worker_count(cfg: &Config) -> usize {
 /// AU-12: every exit after start is recorded). Callers drop every other
 /// `AuditSink` clone (including the engine's) first.
 fn stop_audit(sink: AuditSink, hooks: &HookSink, logger: LoggerHandle) {
-    sink.emit(Event::Lifecycle { ts_us: Clock::wall_us(), kind: LifecycleKind::Stop, fips: None, cluster: None });
+    sink.emit(Event::Lifecycle { ts_us: Clock::wall_us(), kind: LifecycleKind::Stop, fips: None, start: None });
     drop(sink);
     // The revocation checker (held by the syslog senders' TLS configs)
     // reaches the queue only through this slot; empty it so the logger
@@ -244,6 +247,11 @@ pub fn run(cfg: Config) -> ExitCode {
         }
     };
     tracing::info!(fips = fips.active, provider = fips.provider, "FIPS status");
+    // CM-7: `[xdp]` this build or OS cannot run refuses the start.
+    if let Err(e) = crate::xdp::preflight(&cfg) {
+        tracing::error!("{e}");
+        return ExitCode::FAILURE;
+    }
     // SC-7(5), AC-4 (POAM-024): cross-node hairpin only behind the host
     // pool-source guard; fail closed before anything is started.
     if let Err(e) = crate::hairpin_guard::check(&cfg, std::path::Path::new(crate::hairpin_guard::SNAPSHOT)) {
@@ -273,10 +281,15 @@ pub fn run(cfg: Config) -> ExitCode {
     // Audit first: nothing may be translated before attribution logging is up (AU-12).
     let node = NodeIdent { name: cfg.node.name.clone(), id: cfg.node.id, pid: std::process::id() };
     let summary_src = counters.clone();
+    // XDP `aborted` (schema 8 `dataplane_counter` value `xdp_aborted`),
+    // refreshed by the XDP control thread; stays 0 without the fast path.
+    let xdp_aborted = Arc::new(AtomicU64::new(0));
+    let aborted_src = xdp_aborted.clone();
     let logger = Logger::new(cfg.audit.clone(), node, rx, sink.stats().clone()).with_counters(Box::new(move || {
         DropReason::ALL
             .iter()
             .map(|r| (r.as_str(), summary_src.iter().map(|c| c.drops(*r)).sum()))
+            .chain(std::iter::once(("xdp_aborted", aborted_src.load(Ordering::Relaxed))))
             .filter(|(_, v)| *v > 0)
             .collect()
     }));
@@ -293,11 +306,24 @@ pub fn run(cfg: Config) -> ExitCode {
         ts_us: Clock::wall_us(),
         kind: LifecycleKind::Start,
         fips: Some(fips),
-        cluster: Some(crate::cluster::cluster_start(&cfg)),
+        start: Some(Arc::new(plat_audit::StartInfo {
+            cluster: Some(crate::cluster::cluster_start(&cfg)),
+            xdp: Some(crate::xdp::start_fields(&cfg)),
+        })),
     });
 
     let clock = Clock::new();
+    #[cfg(all(feature = "xdp", target_os = "linux"))]
+    let mut xdp;
     let (nat, repl) = match build_engine(&cfg, n, &sink, &clock) {
+        // `[xdp]`: the session mirror is attached before any worker runs
+        // (or the fast path stays off, audited).
+        #[cfg(all(feature = "xdp", target_os = "linux"))]
+        Ok((mut nat, repl)) => {
+            xdp = crate::xdp::attach(&cfg, &mut nat, &clock, &sink);
+            (Arc::new(nat), repl)
+        }
+        #[cfg(not(all(feature = "xdp", target_os = "linux")))]
         Ok((nat, repl)) => (Arc::new(nat), repl),
         Err(e) => {
             tracing::error!("{e}");
@@ -354,8 +380,10 @@ pub fn run(cfg: Config) -> ExitCode {
             }
         }));
     }
+    // Completed sweeper passes (liveness for the XDP heartbeat).
+    let sweeps = Arc::new(AtomicU64::new(0));
     {
-        let (nat, stop) = (nat.clone(), stop.clone());
+        let (nat, stop, sweeps) = (nat.clone(), stop.clone(), sweeps.clone());
         let every = Duration::from_millis(cfg.dataplane.sweep_interval_ms);
         // COMPLIANCE MAPPING:
         // - NIST 800-53: SC-5, SC-10 - each pass is budgeted to half the
@@ -365,6 +393,7 @@ pub fn run(cfg: Config) -> ExitCode {
             while !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(every);
                 let s = nat.state().sweep_budget(sweep_repl.as_ref(), budget);
+                sweeps.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(?s, "sweep");
             }
         }));
@@ -393,6 +422,27 @@ pub fn run(cfg: Config) -> ExitCode {
     // L17: kernel-side TUN drops (back-pressure) are otherwise invisible.
     let mut extra = extra;
     extra.push(metrics::tun_section(cfg.dataplane.interface.clone()));
+    // `[xdp]`: enable the fast path now that the TUN exists and the
+    // workers and sweeper run (their progress drives the heartbeat).
+    #[cfg(all(feature = "xdp", target_os = "linux"))]
+    if let Some(a) = xdp.take() {
+        #[cfg(feature = "tls")]
+        let cap: Box<dyn FnMut() -> Option<u64> + Send> = match cluster.as_ref() {
+            Some(c) => {
+                let sh = c.shared.clone();
+                Box::new(move || Some(sh.lease_fence_ns()))
+            }
+            None => Box::new(|| None),
+        };
+        #[cfg(not(feature = "tls"))]
+        let cap: Box<dyn FnMut() -> Option<u64> + Send> = Box::new(|| None);
+        let progress = crate::xdp::Progress { sweeps: sweeps.clone(), workers: counters.clone(), cap };
+        let r = a.enable(&cfg, nat.clone(), progress, sink.clone(), stop.clone(), xdp_aborted.clone());
+        threads.extend(r.threads.into_iter().map(Ok));
+        extra.extend(r.metrics);
+    }
+    #[cfg(not(all(feature = "xdp", target_os = "linux")))]
+    let _ = (&sweeps, &xdp_aborted);
     #[cfg(feature = "tls")]
     let cluster_src = cluster.as_ref().map(|c| {
         let (m, j, h) = (c.shared.clone(), c.shared.clone(), c.shared.clone());

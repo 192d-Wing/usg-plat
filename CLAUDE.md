@@ -90,7 +90,7 @@ chain, 1 on a verification failure, an unverified tail (unless
    mapping, (b)(1) path/status validation, (b)(2) revocation cache). Never cite
    SC-17 on code: it is an organisational control.
 8. **Log schema is an interface.** Any change to SIEM field names bumps
-   `plat_audit::LOG_SCHEMA_VERSION` (currently 7) and
+   `plat_audit::LOG_SCHEMA_VERSION` (currently 8) and
    `docs/compliance/SIEM_LOGGING.md`. Audit fields carry no attacker-controlled
    text except certificate-derived strings, which must go through
    `plat_audit::AuditText` (sanitised, length-capped, escaped for JSON/CEF).

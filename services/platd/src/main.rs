@@ -10,6 +10,7 @@ mod run;
 mod test_pki;
 #[cfg(feature = "tls")]
 mod tls;
+mod xdp;
 
 use std::io::BufReader;
 use std::net::Ipv4Addr;
@@ -169,7 +170,22 @@ fn render_env(cfg: &Config, owned: &[u32], fips: bool) -> Result<String, String>
     // SC-5 (POAM-021): memory this config needs with this host's workers.
     let req = plat_common::memory::required_bytes(cfg, plat_common::memory::worker_count(cfg));
     let _ = writeln!(o, "PLAT_MEMORY_REQUIRED_BYTES={req}");
+    // `[xdp]` (plan §4.5): the loader unit's interfaces and MemoryMax
+    // (the kernel map memory is charged to the loader's cgroup).
+    let _ = writeln!(o, "PLAT_XDP={}", u8::from(cfg.xdp.enabled));
+    let _ = writeln!(o, "PLAT_XDP_IFACES={}", if cfg.xdp.enabled { cfg.xdp.interface_names() } else { String::new() });
+    let _ = writeln!(o, "PLAT_XDP_MAP_BYTES={}", plat_common::memory::xdp_map_bytes(cfg, possible_cpus()));
     Ok(o)
+}
+
+/// Possible CPUs (the per-CPU BPF maps are sized by them); the available
+/// parallelism where `/sys/devices/system/cpu/possible` cannot be read.
+fn possible_cpus() -> u64 {
+    #[cfg(target_os = "linux")]
+    if let Ok(n) = plat_io::bpf_obj::possible_cpus() {
+        return n as u64;
+    }
+    std::thread::available_parallelism().map_or(1, |n| n.get() as u64)
 }
 
 /// Whether the FIPS module is active in this process (`PLAT_FIPS`).
@@ -226,6 +242,16 @@ fn memory_summary(cfg: &Config, unit: Option<&std::path::Path>) -> String {
     let workers = memory::worker_count(cfg);
     let req = memory::required_bytes(cfg, workers);
     let mut o = format!("memory required: {req} bytes ({workers} workers; SC-5, see platd.service)\n");
+    if cfg.xdp.enabled {
+        o.push_str(&format!(
+            "xdp: {} on {}; platd-side {} bytes (in the figure above), kernel maps {} bytes \
+             (charged to plat-xdp.service, PLAT_XDP_MAP_BYTES)\n",
+            cfg.xdp.mode.as_str(),
+            cfg.xdp.interface_names(),
+            memory::xdp_user_bytes(cfg),
+            memory::xdp_map_bytes(cfg, possible_cpus())
+        ));
+    }
     let path = unit
         .map(std::path::Path::to_path_buf)
         .or_else(|| UNIT_PATHS.iter().rev().map(PathBuf::from).find(|p| p.is_file()));
@@ -675,7 +701,7 @@ mod tests {
              PLAT_CLIENT_PREFIXES=2001:db8:100::/40\nPLAT_OWNED_POOL=192.0.2.0/24\nPLAT_FIPS=1\nPLAT_MGMT_TLS=0\n\
              PLAT_CLUSTER_HA=0\nPLAT_POOL_ALL=192.0.2.0/24\n\
              PLAT_CROSS_NODE_HAIRPIN=0\nPLAT_CLUSTER_IFACES=\n\
-             PLAT_MEMORY_REQUIRED_BYTES={}\n",
+             PLAT_MEMORY_REQUIRED_BYTES={}\nPLAT_XDP=0\nPLAT_XDP_IFACES=\nPLAT_XDP_MAP_BYTES=0\n",
                 plat_common::memory::required_bytes(&cfg, plat_common::memory::worker_count(&cfg))
             )
         );
@@ -715,7 +741,7 @@ mod tests {
         let node = NodeIdent { name: "plat-test".into(), id: 1, pid: 1 };
         let h = Logger::new(cfg, node, rx, sink.stats().clone()).spawn().unwrap();
         for _ in 0..3 {
-            sink.emit(Event::Lifecycle { ts_us: 0, kind: LifecycleKind::Start, fips: None, cluster: None });
+            sink.emit(Event::Lifecycle { ts_us: 0, kind: LifecycleKind::Start, fips: None, start: None });
         }
         drop(sink);
         h.join();
@@ -754,7 +780,7 @@ mod tests {
         let node = NodeIdent { name: "plat-test".into(), id: 1, pid: 1 };
         let h = Logger::new(cfg, node, rx, sink.stats().clone()).spawn().unwrap();
         for _ in 0..3 {
-            sink.emit(Event::Lifecycle { ts_us: 0, kind: LifecycleKind::Start, fips: None, cluster: None });
+            sink.emit(Event::Lifecycle { ts_us: 0, kind: LifecycleKind::Start, fips: None, start: None });
         }
         drop(sink);
         h.join();
@@ -812,7 +838,7 @@ mod tests {
         let node = NodeIdent { name: "plat-test".into(), id: 1, pid: 1 };
         let h = Logger::new(cfg, node, rx, sink.stats().clone()).spawn().unwrap();
         for _ in 0..n {
-            sink.emit(Event::Lifecycle { ts_us: 0, kind: LifecycleKind::Start, fips: None, cluster: None });
+            sink.emit(Event::Lifecycle { ts_us: 0, kind: LifecycleKind::Start, fips: None, start: None });
         }
         drop(sink);
         h.join();

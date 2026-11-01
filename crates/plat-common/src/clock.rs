@@ -37,6 +37,13 @@ impl Clock {
         self.inner.now_ms.load(Ordering::Relaxed)
     }
 
+    /// The instant [`Clock::now_ms`] counts from (to convert another
+    /// monotonic clock, such as the XDP fast path's `seen_ns`, into engine
+    /// milliseconds).
+    pub fn origin(&self) -> Instant {
+        self.inner.origin
+    }
+
     /// Refreshes the cached time. Called by the ticker thread.
     pub fn tick(&self) {
         let ms = self.inner.origin.elapsed().as_millis() as u64;

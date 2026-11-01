@@ -221,6 +221,7 @@ mod attach {
             prefix: 0x0064_ff9b_u128 << 96,
             prefix_len: 96,
             allow_non_global: false,
+            nonce: [0; 16],
         }
     }
 

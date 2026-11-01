@@ -17,6 +17,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 const SIOCGIFHWADDR: libc::Ioctl = 0x8927;
 const SIOCGIFINDEX: libc::Ioctl = 0x8933;
+const SIOCGIFMTU: libc::Ioctl = 0x8921;
 /// `ARPHRD_ETHER`.
 const ARPHRD_ETHER: u16 = 1;
 
@@ -53,7 +54,8 @@ fn socket() -> io::Result<OwnedFd> {
 fn ioctl(req: libc::Ioctl, r: &mut IfReq) -> io::Result<()> {
     let s = socket()?;
     // SAFETY: `r` is a valid, writable `struct ifreq` for the duration of
-    // the call; both requests read the name and write the union only.
+    // the call; every request used here (SIOCGIFINDEX, SIOCGIFHWADDR,
+    // SIOCGIFMTU) reads the name and writes the union only.
     let rc = unsafe { libc::ioctl(s.as_raw_fd(), req, std::ptr::from_mut(r)) };
     if rc < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
 }
@@ -64,6 +66,15 @@ pub fn index(name: &str) -> io::Result<u32> {
     ioctl(SIOCGIFINDEX, &mut r)?;
     let (i, _) = r.data.split_first_chunk::<4>().ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
     u32::try_from(i32::from_ne_bytes(*i)).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))
+}
+
+/// The MTU of `name` (`platd`: the TUN MTU the fast path checks against,
+/// `CONTROL.tun_mtu`).
+pub fn mtu(name: &str) -> io::Result<u32> {
+    let mut r = ifreq(name)?;
+    ioctl(SIOCGIFMTU, &mut r)?;
+    let (m, _) = r.data.split_first_chunk::<4>().ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
+    u32::try_from(i32::from_ne_bytes(*m)).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))
 }
 
 /// The Ethernet address of `name`; an error for non-Ethernet devices.
@@ -85,6 +96,7 @@ mod tests {
     #[test]
     fn loopback() {
         assert_eq!(index("lo").ok(), Some(1));
+        assert!(mtu("lo").is_ok_and(|m| m >= 1280));
         // Loopback is ARPHRD_LOOPBACK, not Ethernet.
         assert!(hw_addr("lo").is_err());
     }
@@ -94,5 +106,6 @@ mod tests {
         assert!(index("").is_err());
         assert!(index("a-name-longer-than-15").is_err());
         assert!(index("plat-nonexist0").is_err());
+        assert!(mtu("plat-nonexist0").is_err());
     }
 }

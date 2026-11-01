@@ -14,7 +14,8 @@ use std::cell::RefCell;
 use std::collections::BTreeSet;
 
 use plat_xdp_core::abi::{
-    SLICE_ACTIVE, SLICE_ADOPTING, SLICE_FENCED, SLICE_INACTIVE, SLOT_DEAD, SLOT_LIVE, SliceEnt, iface_slot,
+    SLICE_ACTIVE, SLICE_ADOPTING, SLICE_FENCED, SLICE_INACTIVE, SLOT_DEAD, SLOT_FAILED, SLOT_LIVE, SLOT_PENDING,
+    SliceEnt, iface_slot,
 };
 
 use plat_xdp_core::PassReason;
@@ -129,6 +130,23 @@ fn every_pass_reason_is_reachable_and_exact() {
     o[60] = 0;
     o[61] = 0;
     check("zero csum v6", f.diff(&o, ACCESS_IF), PassReason::UdpZeroCsum);
+    // RFC-001: a checksum that does not verify (here: one bit flipped in
+    // the payload; a CHECKSUM_PARTIAL field looks the same) is declined to
+    // the slow path, both directions.
+    let mut o = f.out();
+    let n = o.len() - 1;
+    o[n] ^= 1;
+    check("csum v6", f.diff(&o, ACCESS_IF), PassReason::UdpCsumUnverified);
+    let mut i = f.inb();
+    let n = i.len() - 1;
+    i[n] ^= 1;
+    check("csum v4", f.diff(&i, UPSTREAM_IF), PassReason::UdpCsumUnverified);
+    // A CHECKSUM_PARTIAL field (the folded pseudo-header sum only).
+    let mut o = f.out();
+    let ulen = u16::from_be_bytes([o[58], o[59]]);
+    let p = plat_xdp_core::csum::fold(plat_xdp_core::csum::sum_slice(&o[22..54]) + u64::from(ulen) + 17);
+    o[60..62].copy_from_slice(&p.to_be_bytes());
+    check("partial csum v6", f.diff(&o, ACCESS_IF), PassReason::UdpCsumUnverified);
     let o = f.out_with(b"x", |h| h.hop = 2);
     check("hop 2", f.diff(&o, ACCESS_IF), PassReason::HopLimit);
     let o = f.out_with(b"x", |h| h.sport = 40_001);
@@ -138,10 +156,14 @@ fn every_pass_reason_is_reachable_and_exact() {
 
     // Table-state reasons, both directions.
     type Mutator = fn(&mut Fx);
-    let cases: [(&str, Mutator, PassReason); 10] = [
+    let cases: [(&str, Mutator, PassReason); 12] = [
         ("disabled", |f| f.env.control.enabled = 0, PassReason::Disabled),
         ("deadline", |f| f.env.now = f.env.control.deadline_ns + 1, PassReason::Deadline),
         ("dead slot", |f| f.env.slots[f.s.slot as usize].state = SLOT_DEAD, PassReason::SlotDead),
+        // WU5 redesign: only LIVE is forwarded; PENDING (publish not yet
+        // done) and FAILED (publish failed, awaiting gc) pass.
+        ("pending slot", |f| f.env.slots[f.s.slot as usize].state = SLOT_PENDING, PassReason::SlotDead),
+        ("failed slot", |f| f.env.slots[f.s.slot as usize].state = SLOT_FAILED, PassReason::SlotDead),
         ("fenced", |f| f.env.slices[0].state = SLICE_FENCED, PassReason::SliceInactive),
         ("tun mtu", |f| f.env.control.tun_mtu = 10, PassReason::TooBig),
         ("forwarding", |f| f.env.net.forwarding = false, PassReason::FibFwdDisabled),

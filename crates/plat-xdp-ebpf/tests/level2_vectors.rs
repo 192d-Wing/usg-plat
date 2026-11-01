@@ -186,6 +186,12 @@ impl Env for NsEnv {
     fn ident_key(&self) -> Option<&IdentKey> {
         Some(&self.key)
     }
+    /// No frame here: the harness decides through `FrameEnv`, whose
+    /// `udp_csum_ok` reads the frame.
+    fn udp_csum_ok(&self, _v6: bool, _len: u32) -> bool {
+        false
+    }
+
     fn with_ident<F: FnOnce(&mut IdentEnt) -> u16>(&self, idx: u32, f: F) -> Option<u16> {
         assert!(idx < ident::TABLE);
         let mut used = self.ident.borrow_mut();
@@ -483,6 +489,22 @@ fn generate() -> String {
         Want::Pass(PassReason::TooBig),
         Ovr::Mtu4(1280),
     )];
+    // RFC-001 frames: the UDP checksum field replaced by the folded
+    // pseudo-header sum only (what a CHECKSUM_PARTIAL sender leaves), and
+    // one payload byte flipped (checksum no longer matches).
+    let csum_partial6 = {
+        let mut f = spike5.clone();
+        let ulen = u16::from_be_bytes([f[58], f[59]]);
+        let p = plat_xdp_core::csum::fold(plat_xdp_core::csum::sum_slice(&f[22..54]) + u64::from(ulen) + 17);
+        f[60..62].copy_from_slice(&p.to_be_bytes());
+        f
+    };
+    let csum_bad4 = {
+        let mut f = in5.clone();
+        let tot = usize::from(u16::from_be_bytes([f[16], f[17]]));
+        f[14 + tot - 1] ^= 0x01;
+        f
+    };
     let frames: Vec<(&str, u32, Vec<u8>, Want)> = vec![
         ("v4_fragment_mf", UP, v4_mf, Want::Pass(PassReason::Fragment)),
         ("v4_fragment_offset", UP, v4_offset, Want::Pass(PassReason::Fragment)),
@@ -503,6 +525,10 @@ fn generate() -> String {
         ("arp_not_ip", ACC, arp, Want::Pass(PassReason::NotIp)),
         ("v6_short_bad_l3", ACC, spike5[..40].to_vec(), Want::Pass(PassReason::BadL3)),
         ("v6_multicast_not_for_us", ACC, not_for_us, Want::Pass(PassReason::NotForUs)),
+        // RFC-001: a CHECKSUM_PARTIAL field (veth / generic mode senders
+        // with TX offload) and a corrupt datagram are declined.
+        ("v6_udp_csum_partial", ACC, csum_partial6, Want::Pass(PassReason::UdpCsumUnverified)),
+        ("v4_udp_csum_bad", UP, csum_bad4, Want::Pass(PassReason::UdpCsumUnverified)),
     ];
     let frames = frames
         .into_iter()
@@ -633,6 +659,8 @@ fn vectors_cover_both_directions_and_declines() {
         ("v6_above_mtu4", "too_big"),
         ("v4_ttl_2", "hop_limit"),
         ("v4_ttl_1", "hop_limit"),
+        ("v6_udp_csum_partial", "udp_csum_unverified"),
+        ("v4_udp_csum_bad", "udp_csum_unverified"),
     ] {
         assert!(v.lines().any(|l| l.starts_with(&format!("frame {f} ")) && l.contains(&format!(" pass {r} "))), "{f}");
     }

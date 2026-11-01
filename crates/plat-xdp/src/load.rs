@@ -2,10 +2,8 @@
 //! `CONFIG` record with its digest, and (Linux) [`Loader`], the privileged
 //! one-shot step `plat-xdp-loader` runs.
 //!
-//! `[xdp]` is not yet part of `plat_common::Config` (WU5 adds it there);
-//! until then [`split_config`] takes the `[xdp]` table out of the `platd`
-//! configuration file and validates the rest with `plat_common`, so the
-//! loader and `platd` read one file with the same validation.
+//! `[xdp]` is part of `plat_common::Config` (`cfg.xdp`), so the loader and
+//! `platd` read one file with the same validation.
 //!
 //! **Digest.** `CONFIG.digest` is SHA-256 over a version tag, the embedded
 //! object's SHA-256, the translation parameters, the map sizes and the
@@ -30,7 +28,6 @@
 //! - RFC 7739 §5.3 - `IDENT_KEY` and every per-CPU `IDENT` counter and step
 //!   generator seeded from `getrandom` (generators never zero)
 
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use plat_common::config::{Config, Partition};
@@ -59,188 +56,20 @@ pub fn kernel_supported(release: &str) -> bool {
     parse_kernel_release(release).is_some_and(|v| v >= MIN_KERNEL)
 }
 
-/// Most interfaces in `[xdp]` (plan §4.5).
-pub const MAX_INTERFACES: usize = 32;
-/// `xdp.max_sessions` range floor.
-pub const MIN_SESSIONS: u32 = 4096;
+/// `[xdp]` lives in `plat_common::config` (validated with the rest of the
+/// configuration, `deny_unknown_fields`); these are its names here.
+pub use plat_common::config::{
+    XDP_MAX_INTERFACES as MAX_INTERFACES, XDP_MIN_SESSIONS as MIN_SESSIONS, XdpConfig as XdpSettings, XdpInterface,
+    XdpMode as Mode, XdpRole as Role,
+};
 
-/// Attach mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum Mode {
-    /// Driver XDP.
-    #[default]
-    Native,
-    /// SKB-mode XDP (testing only; needs `allow_generic`).
-    Generic,
-}
-
-impl Mode {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Native => "native",
-            Self::Generic => "generic",
-        }
+/// `ROLE_*` bits of an interface role (`IFACES.role`, the digest).
+pub const fn role_bits(r: Role) -> u8 {
+    match r {
+        Role::Access => ROLE_ACCESS,
+        Role::Upstream => ROLE_UPSTREAM,
+        Role::Both => ROLE_BOTH,
     }
-}
-
-/// Interface role (decision Q3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Role {
-    /// IPv6 → IPv4 only.
-    Access,
-    /// IPv4 → IPv6 only.
-    Upstream,
-    Both,
-}
-
-impl Role {
-    /// `ROLE_*` bits.
-    pub const fn bits(self) -> u8 {
-        match self {
-            Self::Access => ROLE_ACCESS,
-            Self::Upstream => ROLE_UPSTREAM,
-            Self::Both => ROLE_BOTH,
-        }
-    }
-
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Access => "access",
-            Self::Upstream => "upstream",
-            Self::Both => "both",
-        }
-    }
-}
-
-/// One `[[xdp.interfaces]]` entry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct XdpInterface {
-    pub name: String,
-    pub role: Role,
-}
-
-/// `[xdp]` (plan §4.5).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct XdpSettings {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub mode: Mode,
-    #[serde(default)]
-    pub allow_generic: bool,
-    #[serde(default = "d_sessions")]
-    pub max_sessions: u32,
-    #[serde(default = "d_heartbeat")]
-    pub heartbeat_ms: u32,
-    #[serde(default = "d_deadline")]
-    pub deadline_ms: u32,
-    #[serde(default)]
-    pub interfaces: Vec<XdpInterface>,
-}
-
-fn d_sessions() -> u32 {
-    1 << 20
-}
-fn d_heartbeat() -> u32 {
-    250
-}
-fn d_deadline() -> u32 {
-    1000
-}
-
-impl Default for XdpSettings {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            mode: Mode::Native,
-            allow_generic: false,
-            max_sessions: d_sessions(),
-            heartbeat_ms: d_heartbeat(),
-            deadline_ms: d_deadline(),
-            interfaces: Vec::new(),
-        }
-    }
-}
-
-/// A rejected `[xdp]` section or configuration file.
-#[derive(Debug, thiserror::Error)]
-pub enum SettingsError {
-    #[error("xdp: {0}")]
-    Invalid(String),
-    #[error(transparent)]
-    Config(#[from] plat_common::config::ConfigError),
-    #[error("parsing config: {0}")]
-    Toml(String),
-}
-
-fn invalid<T>(m: impl Into<String>) -> Result<T, SettingsError> {
-    Err(SettingsError::Invalid(m.into()))
-}
-
-fn valid_ifname(n: &str) -> bool {
-    (1..=15).contains(&n.len()) && n.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
-}
-
-impl XdpSettings {
-    /// The plan §4.5 rules against the rest of the configuration.
-    pub fn validate(&self, cfg: &Config) -> Result<(), SettingsError> {
-        if !self.enabled {
-            return Ok(());
-        }
-        if self.interfaces.is_empty() || self.interfaces.len() > MAX_INTERFACES {
-            return invalid(format!("interfaces: 1..={MAX_INTERFACES} entries required"));
-        }
-        for (i, f) in self.interfaces.iter().enumerate() {
-            if !valid_ifname(&f.name) {
-                return invalid(format!("interfaces[{i}].name must be 1..=15 chars [A-Za-z0-9_.-]"));
-            }
-            if f.name == cfg.dataplane.interface {
-                return invalid(format!("interfaces[{i}].name must not be the TUN (dataplane.interface)"));
-            }
-            if self.interfaces.iter().take(i).any(|g| g.name == f.name) {
-                return invalid(format!("interfaces[{i}].name {} is listed twice", f.name));
-            }
-        }
-        if self.mode == Mode::Generic && !self.allow_generic {
-            return invalid("mode = \"generic\" needs allow_generic = true (testing only)");
-        }
-        let cap = u32::try_from(cfg.nat64.max_sessions).unwrap_or(u32::MAX);
-        if self.max_sessions < MIN_SESSIONS || self.max_sessions > cap {
-            return invalid(format!("max_sessions must be {MIN_SESSIONS}..=nat64.max_sessions ({cap})"));
-        }
-        if !(50..=1000).contains(&self.heartbeat_ms) {
-            return invalid("heartbeat_ms must be 50..=1000");
-        }
-        if u64::from(self.deadline_ms) < 4 * u64::from(self.heartbeat_ms) {
-            return invalid("deadline_ms must be >= 4 x heartbeat_ms");
-        }
-        if let Some(ha) = cfg.cluster.ha.as_ref().filter(|h| h.enabled) {
-            let cap = ha.lease_ms.saturating_mul(100 - u64::from(ha.drift_margin_pct.min(100))) / 100;
-            if u64::from(self.deadline_ms) > cap {
-                return invalid(format!("deadline_ms must be <= lease_ms x (1 - drift_margin_pct/100) = {cap}"));
-            }
-        }
-        Ok(())
-    }
-}
-
-/// Splits a `platd` configuration file into the validated
-/// `plat_common::Config` and the validated `[xdp]` section (default when
-/// absent). Interim until WU5 moves `[xdp]` into `plat_common`.
-pub fn split_config(text: &str) -> Result<(Config, XdpSettings), SettingsError> {
-    let mut t: toml::Table = toml::from_str(text).map_err(|e| SettingsError::Toml(e.to_string()))?;
-    let xdp = match t.remove("xdp") {
-        Some(v) => v.try_into::<XdpSettings>().map_err(|e| SettingsError::Toml(format!("[xdp]: {e}")))?,
-        None => XdpSettings::default(),
-    };
-    let rest = toml::to_string(&t).map_err(|e| SettingsError::Toml(e.to_string()))?;
-    let cfg = Config::from_toml(&rest)?;
-    xdp.validate(&cfg)?;
-    Ok((cfg, xdp))
 }
 
 /// What the loader and `platd` derive from the configuration.
@@ -262,9 +91,19 @@ pub struct LoadParams {
     pub prefix_len: u8,
     /// `translation.allow_non_global_destinations` (SC-7).
     pub allow_non_global: bool,
+    /// The loader's per-attach nonce (SEC-001): random at every attach,
+    /// written to the state file and bound into the `CONFIG` digest, so
+    /// `platd` can only accept the maps of the attach that state file
+    /// describes. All zero in a configuration-only value.
+    pub nonce: [u8; 16],
 }
 
 impl LoadParams {
+    /// The parameters of `cfg` (its `[xdp]` section included).
+    pub fn from_config(cfg: &Config) -> Self {
+        Self::new(cfg, cfg.xdp.clone())
+    }
+
     pub fn new(cfg: &Config, xdp: XdpSettings) -> Self {
         let t = &cfg.translation;
         Self {
@@ -277,6 +116,7 @@ impl LoadParams {
             prefix: t.nat64_prefix.network(),
             prefix_len: t.nat64_prefix.prefix_len(),
             allow_non_global: t.allow_non_global_destinations,
+            nonce: [0; 16],
         }
     }
 }
@@ -286,7 +126,9 @@ impl LoadParams {
 /// v2 (RFC-004): adds the RFC 6052 prefix, its length and
 /// `allow_non_global_destinations`, so `platd` refuses pins set up for
 /// another prefix or SC-7 policy.
-const DIGEST_TAG: &[u8] = b"usg-plat xdp CONFIG v2\0";
+///
+/// v3 (SEC-001): adds the loader's per-attach nonce.
+const DIGEST_TAG: &[u8] = b"usg-plat xdp CONFIG v3\0";
 
 /// The `CONFIG` digest over `object_sha256` and `p` (module docs).
 pub fn digest(p: &LoadParams, object_sha256: &[u8; 32]) -> [u8; 32] {
@@ -299,13 +141,14 @@ pub fn digest(p: &LoadParams, object_sha256: &[u8; 32]) -> [u8; 32] {
     h.update([u8::from(p.copy_tos), u8::from(p.sliced)]);
     h.update(p.prefix.to_be_bytes());
     h.update([p.prefix_len, u8::from(p.allow_non_global)]);
+    h.update(p.nonce);
     h.update(p.xdp.max_sessions.to_le_bytes());
     h.update([p.xdp.mode as u8]);
     h.update((p.xdp.interfaces.len() as u32).to_le_bytes());
     for f in &p.xdp.interfaces {
         h.update([f.name.len() as u8]);
         h.update(f.name.as_bytes());
-        h.update([f.role.bits()]);
+        h.update([role_bits(f.role)]);
     }
     h.finalize().into()
 }
@@ -333,6 +176,57 @@ pub fn ident_seed(r: &[u8; 10]) -> plat_xdp_core::abi::IdentEnt {
     }
     let counter = c.first_chunk::<2>().map_or(0, |b| u16::from_ne_bytes(*b));
     plat_xdp_core::abi::IdentEnt { rng, counter, pad: [0; 6] }
+}
+
+/// What `platd` reads back from the loader's state file
+/// ([`crate::STATE_FILE`], 0644 root): the attached object and program.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AttachedState {
+    pub object_sha256: String,
+    pub prog_id: u32,
+    /// The attach's nonce ([`LoadParams::nonce`]).
+    pub nonce: [u8; 16],
+}
+
+/// Largest state file `platd` reads (SC-5: a bounded read of a root-owned
+/// file; the loader writes well under 4 KiB).
+pub const STATE_MAX_BYTES: u64 = 16 << 10;
+
+/// Parses the state file text ([`AttachReport::state_text`] on Linux).
+/// `None` without both keys or with a malformed value.
+pub fn parse_state(text: &str) -> Option<AttachedState> {
+    let mut st = AttachedState::default();
+    let (mut obj, mut prog, mut nonce) = (false, false, false);
+    for l in text.lines() {
+        if let Some(v) = l.strip_prefix("object_sha256=") {
+            if v.len() != 64 || !v.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return None;
+            }
+            st.object_sha256 = v.to_ascii_lowercase();
+            obj = true;
+        } else if let Some(v) = l.strip_prefix("prog_id=") {
+            st.prog_id = v.parse().ok()?;
+            prog = true;
+        } else if let Some(v) = l.strip_prefix("nonce=") {
+            let b = hex::decode(v).ok()?;
+            st.nonce = b.try_into().ok()?;
+            nonce = true;
+        }
+    }
+    (obj && prog && nonce).then_some(st)
+}
+
+/// Reads and parses the state file at `path` (bounded, not following a
+/// final symlink).
+pub fn read_state(path: &std::path::Path) -> std::io::Result<AttachedState> {
+    use std::io::Read as _;
+    let mut f = std::fs::OpenOptions::new().read(true).open(path)?;
+    if !f.metadata()?.is_file() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "state file is not a regular file"));
+    }
+    let mut t = String::new();
+    (&mut f).take(STATE_MAX_BYTES).read_to_string(&mut t)?;
+    parse_state(&t).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed state file"))
 }
 
 #[cfg(target_os = "linux")]
@@ -435,6 +329,8 @@ mod linux {
         pub prog_tag: String,
         pub mode: Mode,
         pub interfaces: Vec<AttachedIface>,
+        /// The attach's nonce (state file `nonce=`, `CONFIG` digest).
+        pub nonce: [u8; 16],
     }
 
     impl AttachReport {
@@ -446,6 +342,7 @@ mod linux {
             let _ = writeln!(s, "prog_id={}", self.prog_id);
             let _ = writeln!(s, "prog_tag={}", self.prog_tag);
             let _ = writeln!(s, "mode={}", self.mode.as_str());
+            let _ = writeln!(s, "nonce={}", hex::encode(self.nonce));
             for i in &self.interfaces {
                 let _ = writeln!(s, "interface={} {} {}", i.name, i.ifindex, i.role.as_str());
             }
@@ -687,6 +584,10 @@ mod linux {
             check_bpffs(dir)?;
             check_no_frags(object)?;
             let state = state_file.map(StateDir::open).transpose()?;
+            // SEC-001: a fresh nonce per attach, bound into CONFIG.
+            let mut fresh = p.clone();
+            fresh.nonce = random()?;
+            let p = &fresh;
             let ifaces = resolve(p)?;
 
             let sessions = p.xdp.max_sessions;
@@ -746,6 +647,7 @@ mod linux {
                 prog_tag: format!("{:016x}", info.tag()),
                 mode: p.xdp.mode,
                 interfaces: attached,
+                nonce: p.nonce,
             };
             // QA F2: an attach whose state file cannot be written is rolled
             // back, so a failed unit never leaves the fast path live.
@@ -925,7 +827,7 @@ mod linux {
         let tx = handle(e, "TX")?;
         for f in ifaces {
             let slot = iface_slot(f.ifindex).to_ne_bytes();
-            let role = f.role.bits();
+            let role = super::role_bits(f.role);
             ifm.update(&slot, &IfaceEnt { ifindex: f.ifindex, mac: f.mac, role, pad: 0 }.to_bytes(), BPF_ANY)
                 .map_err(io_err("IFACES"))?;
             // An interface's role is also the direction whose output may
@@ -1037,6 +939,12 @@ mod tests {
 
     const BASE: &str = include_str!("../../../config/platd.example.toml");
 
+    fn split_config(text: &str) -> Result<(Config, XdpSettings), plat_common::config::ConfigError> {
+        let c = Config::from_toml(text)?;
+        let x = c.xdp.clone();
+        Ok((c, x))
+    }
+
     fn xdp(extra: &str) -> String {
         format!(
             "{BASE}\n[xdp]\nenabled = true\nmax_sessions = 4096\n{extra}\n[[xdp.interfaces]]\nname = \"eth0\"\nrole = \"access\"\n[[xdp.interfaces]]\nname = \"eth1\"\nrole = \"upstream\"\n"
@@ -1105,6 +1013,9 @@ mod tests {
         q.prefix_len = if q.prefix_len == 96 { 64 } else { 96 };
         assert_ne!(a.digest, config_record(&q, &[1; 32]).digest, "prefix length");
         let mut q = p.clone();
+        q.nonce = [9; 16];
+        assert_ne!(a.digest, config_record(&q, &[1; 32]).digest, "nonce");
+        let mut q = p.clone();
         q.allow_non_global = !q.allow_non_global;
         assert_ne!(a.digest, config_record(&q, &[1; 32]).digest, "allow_non_global_destinations");
         assert_eq!(
@@ -1147,9 +1058,26 @@ mod tests {
     }
 
     #[test]
+    fn state_file_parses_strictly() {
+        let h = "ab".repeat(32);
+        let n = "0f".repeat(16);
+        let t =
+            format!("object_sha256={h}\nprog_id=97806\nprog_tag=x\nmode=native\nnonce={n}\ninterface=acc0 3 access\n");
+        assert_eq!(
+            parse_state(&t),
+            Some(AttachedState { object_sha256: h.clone(), prog_id: 97806, nonce: [0x0f; 16] })
+        );
+        assert_eq!(parse_state("prog_id=1\n"), None);
+        assert_eq!(parse_state(&format!("object_sha256={h}\nprog_id=1\n")), None, "no nonce");
+        assert_eq!(parse_state(&format!("object_sha256={h}\nprog_id=1\nnonce=0f\n")), None, "short nonce");
+        assert_eq!(parse_state(&format!("object_sha256=zz{}\nprog_id=1\nnonce={n}\n", &h[2..])), None);
+        assert_eq!(parse_state(&format!("object_sha256={h}\nprog_id=-1\nnonce={n}\n")), None);
+    }
+
+    #[test]
     fn roles() {
-        assert_eq!(Role::Access.bits(), ROLE_ACCESS);
-        assert_eq!(Role::Upstream.bits(), ROLE_UPSTREAM);
-        assert_eq!(Role::Both.bits(), ROLE_BOTH);
+        assert_eq!(role_bits(Role::Access), ROLE_ACCESS);
+        assert_eq!(role_bits(Role::Upstream), ROLE_UPSTREAM);
+        assert_eq!(role_bits(Role::Both), ROLE_BOTH);
     }
 }

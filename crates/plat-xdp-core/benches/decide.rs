@@ -15,7 +15,7 @@ use plat_xdp_core::abi::{
 };
 use plat_xdp_core::decide::{Env, Verdict};
 use plat_xdp_core::ident::IdentKey;
-use plat_xdp_core::{HDR4, HDR6, decide_v4, decide_v6};
+use plat_xdp_core::{FrameEnv, HDR4, HDR6, decide_v4, decide_v6};
 
 const VECTORS: &str = include_str!("../../../deploy/tests/xdp/level2-vectors.txt");
 const ACC: u32 = 1;
@@ -116,6 +116,12 @@ impl Env for BenchEnv {
     fn ident_key(&self) -> Option<&IdentKey> {
         Some(&self.key)
     }
+    /// No frame here: the harness decides through `FrameEnv`, whose
+    /// `udp_csum_ok` reads the frame.
+    fn udp_csum_ok(&self, _v6: bool, _len: u32) -> bool {
+        false
+    }
+
     fn with_ident<F: FnOnce(&mut IdentEnt) -> u16>(&self, _idx: u32, f: F) -> Option<u16> {
         let mut e = self.ident.get();
         let id = f(&mut e);
@@ -137,29 +143,31 @@ fn frame(name: &str) -> Vec<u8> {
 }
 
 fn bench(c: &mut Criterion) {
-    let env = BenchEnv::new();
+    let base = BenchEnv::new();
     let v6 = frame("v6_spike_5b_payload_df0");
     let v4 = frame("v4_in_5b_payload");
     let miss = frame("v6_no_session");
+    // RFC-001: the decision verifies the UDP checksum over the frame.
+    let (e6, e4, em) = (FrameEnv::new(&base, &v6), FrameEnv::new(&base, &v4), FrameEnv::new(&base, &miss));
     let h6: &[u8; HDR6] = v6.first_chunk().unwrap_or_else(|| panic!("short frame"));
     let h4: &[u8; HDR4] = v4.first_chunk().unwrap_or_else(|| panic!("short frame"));
     let hm: &[u8; HDR6] = miss.first_chunk().unwrap_or_else(|| panic!("short frame"));
     let mut o4 = [0u8; HDR4];
     let mut o6 = [0u8; HDR6];
-    assert!(matches!(decide_v6(&env, ACC, h6, v6.len() as u32, &mut o4), Verdict::Redirect { .. }));
-    assert!(matches!(decide_v4(&env, UP, h4, v4.len() as u32, &mut o6), Verdict::Redirect { .. }));
-    assert!(matches!(decide_v6(&env, ACC, hm, miss.len() as u32, &mut o4), Verdict::Pass(_)));
+    assert!(matches!(decide_v6(&e6, ACC, h6, v6.len() as u32, &mut o4), Verdict::Redirect { .. }));
+    assert!(matches!(decide_v4(&e4, UP, h4, v4.len() as u32, &mut o6), Verdict::Redirect { .. }));
+    assert!(matches!(decide_v6(&em, ACC, hm, miss.len() as u32, &mut o4), Verdict::Pass(_)));
 
     let mut g = c.benchmark_group("xdp_decide");
     g.throughput(Throughput::Elements(1));
     g.bench_function("v6_to_v4_redirect_df0", |b| {
-        b.iter(|| black_box(decide_v6(&env, ACC, black_box(h6), v6.len() as u32, &mut o4)))
+        b.iter(|| black_box(decide_v6(&e6, ACC, black_box(h6), v6.len() as u32, &mut o4)))
     });
     g.bench_function("v4_to_v6_redirect", |b| {
-        b.iter(|| black_box(decide_v4(&env, UP, black_box(h4), v4.len() as u32, &mut o6)))
+        b.iter(|| black_box(decide_v4(&e4, UP, black_box(h4), v4.len() as u32, &mut o6)))
     });
     g.bench_function("v6_pass_no_session", |b| {
-        b.iter(|| black_box(decide_v6(&env, ACC, black_box(hm), miss.len() as u32, &mut o4)))
+        b.iter(|| black_box(decide_v6(&em, ACC, black_box(hm), miss.len() as u32, &mut o4)))
     });
     g.finish();
 }

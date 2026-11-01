@@ -46,6 +46,13 @@ pub const SLOT_FREE: u8 = 0;
 pub const SLOT_LIVE: u8 = 1;
 /// Retired; waiting in quarantine for an RCU grace period.
 pub const SLOT_DEAD: u8 = 2;
+/// Written, its `OUT6` / `IN4` entries not yet published (WU5 deferred
+/// publish): the program passes it like any state other than `LIVE`.
+pub const SLOT_PENDING: u8 = 3;
+/// Publishing failed (map full, key exists): never reachable; the engine
+/// forgets the slot through the stale-entry collector and may mirror the
+/// session again.
+pub const SLOT_FAILED: u8 = 4;
 
 /// `SLICE` states. The values equal `plat_nat64::SliceState` (asserted by
 /// the host tests).
@@ -676,11 +683,26 @@ pub enum PassReason {
     EgressNotAllowed = 21,
     /// `bpf_xdp_adjust_head` failed (no headroom; eBPF program only).
     Headroom = 22,
+    /// The full UDP checksum (pseudo-header, header and payload) does not
+    /// verify, the UDP datagram is longer than [`CSUM_MAX_L4`], or the
+    /// program could not read it (RFC-001 / SEC-004). Covers
+    /// `CHECKSUM_PARTIAL` frames (a local or container sender with TX
+    /// checksum offload on veth / tap, or generic mode), whose checksum
+    /// field holds only the pseudo-header sum: the incremental RFC 1624
+    /// update would forward a wrong checksum. The slow path (TUN) gets the
+    /// frame with its checksum completed by the kernel.
+    UdpCsumUnverified = 23,
 }
+
+/// Longest UDP datagram (header and payload) the fast path verifies the
+/// checksum of; longer ones pass ([`PassReason::UdpCsumUnverified`]).
+/// Covers a 1500-byte MTU (UDP ≤ 1480 B); larger datagrams (jumbo
+/// frames) take the slow path. Three `bpf_csum_diff` windows of 512 B.
+pub const CSUM_MAX_L4: u32 = 1536;
 
 impl PassReason {
     /// Number of reasons.
-    pub const COUNT: u32 = 23;
+    pub const COUNT: u32 = 24;
 
     /// Every reason in index order.
     pub const ALL: [PassReason; Self::COUNT as usize] = [
@@ -707,6 +729,7 @@ impl PassReason {
         Self::FibOther,
         Self::EgressNotAllowed,
         Self::Headroom,
+        Self::UdpCsumUnverified,
     ];
 
     /// The `reason` label of `plat_xdp_pass_total` (plan §4.7).
@@ -735,6 +758,7 @@ impl PassReason {
             Self::FibOther => "fib_other",
             Self::EgressNotAllowed => "egress_not_allowed",
             Self::Headroom => "headroom",
+            Self::UdpCsumUnverified => "udp_csum_unverified",
         }
     }
 

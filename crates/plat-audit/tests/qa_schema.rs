@@ -1,4 +1,4 @@
-//! QA: schema v5 record formatting under hostile certificate text
+//! QA: schema v5 (and v8 XDP) record formatting under hostile certificate text
 //! (AU-3, SI-10): JSON stays one valid object per line and round-trips the
 //! (sanitised) value; CEF extension values cannot introduce a new key,
 //! a line break, or an unescaped `=`.
@@ -295,6 +295,39 @@ fn cap_never_splits_utf8_and_trailing_backslash_is_escaped() {
 }
 
 #[test]
-fn schema_version_is_7() {
-    assert_eq!(plat_audit::LOG_SCHEMA_VERSION, 7);
+fn schema_version_is_8() {
+    assert_eq!(plat_audit::LOG_SCHEMA_VERSION, 8);
+}
+
+/// Schema 8 (POAM-016): the XDP fields of `service_start` and every
+/// `xdp_fastpath_state` render as one valid flat JSON object and a CEF line
+/// with exactly the documented keys (SIEM_LOGGING.md).
+#[test]
+fn xdp_schema_8_keys() {
+    use plat_audit::event::{LifecycleKind, StartInfo, XdpReason, XdpStart, XdpState};
+    let start = Event::Lifecycle {
+        ts_us: 1,
+        kind: LifecycleKind::Start,
+        fips: None,
+        start: Some(Arc::new(StartInfo {
+            cluster: None,
+            xdp: Some(XdpStart { mode: "generic", object_sha256: Some([7; 32]), interfaces: "acc0 up0".into() }),
+        })),
+    };
+    let (jk, ck) = expected_keys(&start);
+    for k in ["plat.xdp.mode", "plat.xdp.object_sha256", "plat.xdp.interfaces"] {
+        assert!(jk.iter().any(|x| x == k), "{k} missing: {jk:?}");
+    }
+    for k in ["cs5", "cs5Label", "flexString1", "flexString1Label", "flexString2", "flexString2Label", "cs6"] {
+        assert!(ck.iter().any(|x| x == k), "CEF {k} missing: {ck:?}");
+    }
+    let ev = Event::XdpFastpathState { ts_us: 1, state: XdpState::Disabled, reason: XdpReason::HeartbeatStalled };
+    let (j, _) = render(&ev);
+    let kv = parse_flat_json(j.trim_end()).unwrap();
+    let get = |k: &str| kv.iter().find(|(x, _)| x == k).map(|(_, v)| v.as_str());
+    assert_eq!(get("event.action"), Some("xdp_fastpath_state"));
+    assert_eq!(get("plat.xdp.state"), Some("disabled"));
+    assert_eq!(get("event.reason"), Some("heartbeat_stalled"));
+    assert_eq!(get("event.outcome"), Some("failure"));
+    assert_eq!(get("plat.schema"), Some("8"));
 }

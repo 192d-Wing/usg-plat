@@ -1,7 +1,8 @@
 //! PERF-001 / PERF-006: the cost of a real [`XdpMirror::install`] and
-//! [`XdpMirror::retire`] against kernel `OUT6` / `IN4` hash maps (two
-//! `BPF_MAP_UPDATE_ELEM` / two `BPF_MAP_DELETE_ELEM` syscalls), which WU5
-//! will call inside the `bib4` shard critical section.
+//! [`XdpMirror::retire`] (the part under the caller's `bib4` lock: shared
+//! memory and a queue push since WU5) and of the publisher's deferred work
+//! for them ([`XdpMirror::flush`]: two `BPF_MAP_UPDATE_ELEM` / two
+//! `BPF_MAP_DELETE_ELEM` syscalls) against kernel `OUT6` / `IN4` hash maps.
 //!
 //! Root, Linux, `bpftool` (the maps are created with `bpftool map create`
 //! on the default bpffs; `SLOT` / `SLICE` are heap words, whose cost is a
@@ -14,7 +15,8 @@
 //!
 //! COMPLIANCE MAPPING:
 //! - NIST 800-53: SA-11 (Developer Testing) - measured lock-hold input for
-//!   the WU5 decision on publishing hash entries outside `bib4`
+//!   the WU5 decision on publishing hash entries outside `bib4` (the gate
+//!   itself is `tests/hold_gate.rs`)
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -111,23 +113,32 @@ fn install_and_retire_cost() {
         slots,
         1024,
     );
+    assert!(m.set_slice(0, plat_xdp_core::abi::SLICE_ACTIVE, 1));
     // Half full, as under steady load.
     let mut live = Vec::new();
     for n in 0..SESSIONS / 2 {
         let e = entry(n);
-        live.push((m.install(&e, n as usize).unwrap(), e));
+        live.push((m.install(&e, 1, n as usize).unwrap(), e));
     }
+    m.flush();
     let (mut ins, mut ret) = (Vec::with_capacity(OPS), Vec::with_capacity(OPS));
+    let (mut publ, mut del) = (Vec::with_capacity(OPS), Vec::with_capacity(OPS));
     for i in 0..OPS {
         let n = SESSIONS / 2 + i as u32;
         let e = entry(n);
         let t = Instant::now();
-        let s = m.install(&e, n as usize).unwrap();
+        let s = m.install(&e, 1, n as usize).unwrap();
         ins.push(t.elapsed().as_nanos() as u64);
+        let t = Instant::now();
+        assert_eq!(m.flush(), 1);
+        publ.push(t.elapsed().as_nanos() as u64);
         let (os, oe) = live.swap_remove(i % live.len());
         let t = Instant::now();
         m.retire(os, &oe).unwrap();
         ret.push(t.elapsed().as_nanos() as u64);
+        let t = Instant::now();
+        assert_eq!(m.flush(), 1);
+        del.push(t.elapsed().as_nanos() as u64);
         live.push((s, e));
         // Recycle quarantined slots now and then (no program is attached,
         // so no grace period is needed for this measurement).
@@ -137,7 +148,9 @@ fn install_and_retire_cost() {
             m.slot_allocator().recycle();
         }
     }
-    report("install (SLOT + IN4 + OUT6)", ins);
-    report("retire (DEAD + OUT6 + IN4 deletes)", ret);
+    report("install under bib4 (SLOT PENDING + queue)", ins);
+    report("publish, publisher thread (IN4 + OUT6 + LIVE)", publ);
+    report("retire under bib4 (DEAD + queue)", ret);
+    report("deferred delete, publisher thread (OUT6 + IN4 + quarantine)", del);
     std::fs::remove_dir_all(&dir).unwrap();
 }

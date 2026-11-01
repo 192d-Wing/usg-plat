@@ -15,10 +15,11 @@
 //!
 //! COMPLIANCE MAPPING:
 //! - NIST 800-53: AC-6 (Least Privilege), AC-3 (Access Enforcement) -
-//!   designed for: `platd` gets write access only to the session, slice and
-//!   control maps; interface roles, egress allow-list, counters and
-//!   `CONFIG` are read-only pins (CM-6). Enforced once `platd` opens the
-//!   pins (WU5) under the WU6 units; backed now by the pin-mode tests
+//!   `platd` gets write access only to the session, slice and control
+//!   maps; interface roles, egress allow-list, counters and `CONFIG` are
+//!   read-only pins (CM-6). `platd` opens the pins this way since WU5
+//!   (`services/platd/src/xdp.rs`; the WU6 units add the sandbox); backed
+//!   by the pin-mode tests
 //!   (`tests::pin_access_is_least_privilege`, `tests/unprivileged.rs`) and
 //!   by `XdpMaps::open_pinned` opening each pin with its [`MapSpec`]
 //!   access only
@@ -257,9 +258,12 @@ mod linux {
         pub(crate) control: Arc<MmapRegion>,
         pub(crate) stats: BpfMap,
         pub(crate) fwd: BpfMap,
+        config_map: BpfMap,
         config: ConfigRec,
         slots: u32,
         sessions: u32,
+        /// Kernel map ids of the pins as opened (integrity check).
+        ids: [(&'static str, u32); 5],
     }
 
     impl XdpMaps {
@@ -317,6 +321,13 @@ mod linux {
             }
 
             let slots = slot.info().max_entries;
+            let ids = [
+                ("OUT6", out6.info().id),
+                ("IN4", in4.info().id),
+                ("SLOT", slot.info().id),
+                ("CONTROL", control.info().id),
+                ("CONFIG", config.info().id),
+            ];
             let map = |name: &'static str, m: &BpfMap, len: usize| {
                 MmapRegion::from_fd(m.as_fd(), len).map_err(|e| OpenError::Mmap(name, e))
             };
@@ -331,10 +342,43 @@ mod linux {
                 control: Arc::new(control_mm),
                 stats,
                 fwd,
+                config_map: config,
                 config: got,
                 slots,
                 sessions,
+                ids,
             })
+        }
+
+        /// The periodic integrity check (plan §9, every 10 s): every pin
+        /// `platd` writes or relies on still names the map it opened (a
+        /// re-run loader creates fresh maps, so writes into the old ones
+        /// would no longer reach the program: `maps_unavailable`), and the
+        /// frozen `CONFIG` still holds `expected` (`config_mismatch`).
+        /// Control path only (one `BPF_OBJ_GET` and one info call per pin).
+        pub fn verify(&self, dir: &Path, expected: &ConfigRec) -> Result<(), crate::control::Fault> {
+            use crate::control::Fault;
+            for (name, id) in self.ids {
+                let access = super::MAPS.iter().find(|m| m.name == name).map(|m| m.access);
+                let access = if access == Some(PinAccess::ReadOnly) { Access::ReadOnly } else { Access::ReadWrite };
+                match BpfMap::open(&dir.join(name), access) {
+                    Ok(m) if m.info().id == id => {}
+                    _ => return Err(Fault::MapsUnavailable),
+                }
+            }
+            let mut b = [0u8; 40];
+            match self.config_map.lookup(&0u32.to_ne_bytes(), &mut b) {
+                Ok(true) if ConfigRec::from_bytes(&b) == *expected => Ok(()),
+                Ok(_) => Err(Fault::ConfigMismatch),
+                Err(_) => Err(Fault::MapsUnavailable),
+            }
+        }
+
+        /// SEC-001: claims these pins for this process if they are fresh
+        /// ([`crate::control::claim_fresh`]).
+        pub fn claim_fresh(&self) -> Result<(), crate::control::Stale> {
+            let control = crate::control::XdpControl::new(self);
+            crate::control::claim_fresh(&control, &*self.slot, self.slots)
         }
 
         /// The frozen `CONFIG` record.

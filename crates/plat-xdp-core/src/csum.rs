@@ -54,6 +54,21 @@ pub fn sum_at<const N: usize>(b: &[u8; N], off: usize, len: usize) -> u64 {
 /// `0xffff`. Every caller stays far below the bound: a sum of the 62-byte
 /// header block is under `2^21`, and [`adjust`] adds two 16-bit values to
 /// one (PERF-003).
+/// The RFC 1071 sum of `b` as big-endian 16-bit words (a trailing odd byte
+/// padded with zero), unfolded. Host side (the eBPF program sums the
+/// packet with `bpf_csum_diff`).
+pub fn sum_slice(b: &[u8]) -> u64 {
+    let (pairs, rest) = b.as_chunks::<2>();
+    let mut acc: u64 = 0;
+    for p in pairs {
+        acc += u64::from(u16::from_be_bytes(*p));
+    }
+    if let [last] = rest {
+        acc += u64::from(*last) << 8;
+    }
+    acc
+}
+
 #[inline(always)]
 pub fn fold(s: u64) -> u16 {
     let s = (s & 0xffff) + (s >> 16);

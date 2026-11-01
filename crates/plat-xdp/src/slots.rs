@@ -22,26 +22,43 @@
 //!   by every worker, PERF-005); [`SlotAllocator::quarantined`] sums them.
 //!
 //! Lock order: each partition mutex is a leaf (`bib4 → xslot`, or `xslot`
-//! alone); nothing is called while it is held.
+//! alone; the publisher takes `publisher → xslot`); nothing is called while
+//! it is held. NIST-003: never take `bib4`, `bib6` or `subs` while holding
+//! a partition lock or the publisher mutex (the publisher and the control
+//! thread call the engine, `State::mirror_gc`, only with neither held).
 //!
 //! COMPLIANCE MAPPING:
 //! - NIST 800-53: SC-5 (Denial-of-Service Protection) - fixed number of
 //!   slots (⌈1.25 × `xdp.max_sessions`⌉), preallocated; exhaustion fails
-//!   closed to the slow path
+//!   closed to the slow path; the deferred publish / retire op queues are
+//!   preallocated too (two ops per slot, the most a slot can have
+//!   outstanding), so they never grow (NIST-004)
 //! - NIST 800-53: SC-24 (Fail in Known State) - no slot is reused before an
 //!   RCU grace period (with the key echo of plan §4.3, a packet is never
 //!   translated with another session's mapping)
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 
 /// Default number of partitions (plan §4.3: `xslot[shard % 1024]`).
 pub const PARTITIONS: usize = 1024;
 
+/// Deferred hash work of a slot (WU5, plan §4.3 publish-after-unlock):
+/// [`OP_PUBLISH`] after an install wrote the record, [`OP_RETIRE`] after a
+/// retire marked it `DEAD`. Encoded `slot << 1 | kind`.
+pub const OP_PUBLISH: u64 = 0;
+/// See [`OP_PUBLISH`].
+pub const OP_RETIRE: u64 = 1;
+
 #[derive(Debug)]
 struct Part {
+    /// Deferred hash work, drained by the publisher. At most one publish
+    /// and one retire per slot are outstanding (a slot is reused only
+    /// after its retire was drained and its grace period passed), so the
+    /// preallocated capacity of two per slot is never exceeded.
+    ops: Vec<u64>,
     free: Vec<u32>,
     /// `(slot, epoch stamp)`, stamps non-decreasing (read under the lock).
     quarantine: VecDeque<(u32, u64)>,
@@ -60,6 +77,13 @@ impl Part {
 #[derive(Debug)]
 pub struct SlotAllocator {
     parts: Box<[Mutex<Part>]>,
+    /// PERF-002: partition `i` has queued ops (set under its lock on every
+    /// push, cleared by the publisher before it drains), so a publisher
+    /// pass locks only partitions with work.
+    has_ops: Box<[AtomicBool]>,
+    /// PERF-003: ops queued and not yet drained, per partition lane
+    /// (`plat_xdp_publish_queue_depth`).
+    queued: Box<[AtomicU64]>,
     epoch: AtomicU64,
     slots: u32,
 }
@@ -76,9 +100,16 @@ impl SlotAllocator {
             // Highest index on top: lower slots are handed out first.
             let free: Vec<u32> = mine.rev().collect();
             let live = vec![0u64; cap.div_ceil(64)].into_boxed_slice();
-            parts.push(Mutex::new(Part { free, quarantine: VecDeque::with_capacity(cap), live }));
+            parts.push(Mutex::new(Part {
+                ops: Vec::with_capacity(2 * cap),
+                free,
+                quarantine: VecDeque::with_capacity(cap),
+                live,
+            }));
         }
-        Self { parts: parts.into_boxed_slice(), epoch: AtomicU64::new(0), slots }
+        let has_ops = (0..n).map(|_| AtomicBool::new(false)).collect();
+        let queued = (0..n).map(|_| AtomicU64::new(0)).collect();
+        Self { parts: parts.into_boxed_slice(), has_ops, queued, epoch: AtomicU64::new(0), slots }
     }
 
     /// Number of slots managed.
@@ -92,6 +123,48 @@ impl SlotAllocator {
 
     fn part_of(&self, slot: u32) -> Option<&Mutex<Part>> {
         self.parts.get(slot as usize % self.parts.len())
+    }
+
+    /// PERF-006: a free slot from partition `shard % partitions`, written by
+    /// `write` and queued for publishing, all under one partition lock.
+    /// `write` stores the record (shared memory only, no lock, no call
+    /// into anything else); when it returns `false` the slot goes back to
+    /// the free stack. `None`: no free slot, `write` refused, or a full
+    /// queue (ruled out by the two-ops-per-slot bound).
+    pub fn alloc_publish(&self, shard: usize, write: impl FnOnce(u32) -> bool) -> Option<u32> {
+        let n = self.parts.len();
+        let i = shard % n;
+        let mut g = self.parts.get(i)?.lock();
+        if g.ops.len() >= g.ops.capacity() {
+            return None;
+        }
+        let slot = g.free.pop()?;
+        if !write(slot) {
+            g.free.push(slot);
+            return None;
+        }
+        if let Some((w, m)) = g.bit(slot as usize / n) {
+            *w |= m;
+        }
+        g.ops.push(u64::from(slot) << 1 | OP_PUBLISH);
+        self.mark(i);
+        Some(slot)
+    }
+
+    /// Partition `i` got an op (call with its lock held).
+    #[inline]
+    fn mark(&self, i: usize) {
+        if let Some(q) = self.queued.get(i) {
+            q.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(f) = self.has_ops.get(i) {
+            f.store(true, Ordering::Release);
+        }
+    }
+
+    /// Ops queued and not yet drained (control path).
+    pub fn queued_ops(&self) -> u64 {
+        self.queued.iter().map(|q| q.load(Ordering::Relaxed)).sum()
     }
 
     /// A free slot from partition `shard % partitions`, or `None` when that
@@ -130,6 +203,91 @@ impl SlotAllocator {
         let stamp = self.epoch.load(Ordering::Acquire);
         g.quarantine.push_back((slot, stamp));
         true
+    }
+
+    /// Queues `op` ([`OP_PUBLISH`] / [`OP_RETIRE`]) for `slot` under its
+    /// partition lock; `false` (nothing queued) only if the preallocated
+    /// queue is full, which the two-per-slot bound rules out.
+    fn push_op(g: &mut Part, slot: u32, op: u64) -> bool {
+        if g.ops.len() >= g.ops.capacity() {
+            return false;
+        }
+        g.ops.push(u64::from(slot) << 1 | op);
+        true
+    }
+
+    /// Queues the publish of a slot handed out by [`SlotAllocator::alloc`]
+    /// whose record is written (`PENDING`).
+    pub fn defer_publish(&self, slot: u32) -> bool {
+        let i = slot as usize % self.parts.len();
+        self.part_of(slot).is_some_and(|p| {
+            let mut g = p.lock();
+            let ok = Self::push_op(&mut g, slot, OP_PUBLISH);
+            if ok {
+                self.mark(i);
+            }
+            ok
+        })
+    }
+
+    /// Ends `slot`'s life as [`SlotAllocator::retire`] does, but queues the
+    /// hash deletes and the quarantine for the publisher
+    /// ([`SlotAllocator::quarantine`] after the deletes). `false`, changing
+    /// nothing, for a slot that is not live or a full queue.
+    pub fn defer_retire(&self, slot: u32) -> bool {
+        if slot >= self.slots {
+            return false;
+        }
+        let n = self.parts.len();
+        let Some(p) = self.part_of(slot) else { return false };
+        let mut g = p.lock();
+        if g.ops.len() >= g.ops.capacity() {
+            return false;
+        }
+        match g.bit(slot as usize / n) {
+            Some((w, m)) if *w & m != 0 => *w &= !m,
+            _ => return false,
+        }
+        let ok = Self::push_op(&mut g, slot, OP_RETIRE);
+        if ok {
+            self.mark(slot as usize % n);
+        }
+        ok
+    }
+
+    /// Moves every queued op of every partition to `out` (in queue order
+    /// per partition), each partition under its own lock. `out` is the
+    /// publisher's reusable buffer.
+    pub fn drain_ops(&self, out: &mut Vec<u64>) -> usize {
+        let before = out.len();
+        for (i, p) in self.parts.iter().enumerate() {
+            // PERF-002: skip partitions without ops (no lock, no line
+            // bounced from the workers). Cleared before the drain, so a
+            // push racing it sets the flag again for the next pass.
+            if !self.has_ops.get(i).is_some_and(|f| f.swap(false, Ordering::AcqRel)) {
+                continue;
+            }
+            let mut g = p.lock();
+            let k = g.ops.len() as u64;
+            out.append(&mut g.ops);
+            if let Some(q) = self.queued.get(i) {
+                q.fetch_sub(k, Ordering::Relaxed);
+            }
+        }
+        out.len() - before
+    }
+
+    /// Quarantines a slot whose deferred retire was drained (its hash
+    /// entries are gone): stamped with the current epoch, like
+    /// [`SlotAllocator::retire`].
+    pub fn quarantine(&self, slot: u32) {
+        if slot >= self.slots {
+            return;
+        }
+        if let Some(p) = self.part_of(slot) {
+            let stamp = self.epoch.load(Ordering::Acquire);
+            p.lock().quarantine.push_back((slot, stamp));
+        }
     }
 
     /// The grace-period epoch.

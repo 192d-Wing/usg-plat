@@ -797,6 +797,89 @@ pub struct OperatorCommand {
     pub refused: Option<OperatorRefusal>,
 }
 
+/// XDP fast-path fields of `service_start` (schema 8; CM-2, CM-6, SI-7).
+/// `interfaces` are configuration names (validated `[A-Za-z0-9_.-]`,
+/// operator-supplied, not attacker text) joined by spaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XdpStart {
+    /// `off` | `native` | `generic`.
+    pub mode: &'static str,
+    /// SHA-256 of the embedded eBPF object (`None` while the fast path is
+    /// off).
+    pub object_sha256: Option<[u8; 32]>,
+    pub interfaces: String,
+}
+
+/// `plat.xdp.state` of `xdp_fastpath_state` (schema 8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XdpState {
+    Enabled,
+    Disabled,
+}
+
+impl XdpState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
+/// `event.reason` of `xdp_fastpath_state` (schema 8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XdpReason {
+    /// Enabled at start-up.
+    Start,
+    /// The frozen `CONFIG` was set up for another configuration.
+    ConfigMismatch,
+    /// The loaded object is not this binary's.
+    ObjectMismatch,
+    /// The attached program changed while running.
+    LinkMismatch,
+    /// The pins are missing, of the wrong shape, or were replaced.
+    MapsUnavailable,
+    /// The pinned maps were already used by an earlier process (SEC-001):
+    /// the loader must attach fresh maps.
+    StaleMaps,
+    /// `membarrier(MEMBARRIER_CMD_GLOBAL)` is unavailable (`nohz_full`) or
+    /// keeps failing: no safe slot reuse, so the fast path stays off.
+    UnsupportedHost,
+    /// Heartbeats withheld (sweeper or workers made no progress): the
+    /// dead-man deadline stops the fast path.
+    HeartbeatStalled,
+    /// Progress again: heartbeats resumed.
+    HeartbeatResumed,
+    /// The daemon is stopping.
+    Shutdown,
+}
+
+impl XdpReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::ConfigMismatch => "config_mismatch",
+            Self::ObjectMismatch => "object_mismatch",
+            Self::LinkMismatch => "link_mismatch",
+            Self::MapsUnavailable => "maps_unavailable",
+            Self::StaleMaps => "stale_maps",
+            Self::UnsupportedHost => "unsupported_host",
+            Self::HeartbeatStalled => "heartbeat_stalled",
+            Self::HeartbeatResumed => "heartbeat_resumed",
+            Self::Shutdown => "shutdown",
+        }
+    }
+}
+
+/// The optional parts of `service_start`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StartInfo {
+    /// Cluster identity, digest and slices (schema 7).
+    pub cluster: Option<ClusterStart>,
+    /// XDP fast-path mode, object and interfaces (schema 8).
+    pub xdp: Option<XdpStart>,
+}
+
 /// Cluster fields of `service_start` (schema 7; CM-2, CM-3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterStart {
@@ -846,9 +929,14 @@ pub enum Event {
         kind: LifecycleKind,
         /// FIPS module state; set on `Start` (schema 5).
         fips: Option<FipsMark>,
-        /// Cluster identity, digest and slices; set on `Start` (schema 7).
-        cluster: Option<Arc<ClusterStart>>,
+        /// Cluster (schema 7) and XDP (schema 8) fields; set on `Start` by
+        /// `platd` (one `Arc` keeps the event small).
+        start: Option<Arc<StartInfo>>,
     },
+    /// The XDP fast path was enabled or disabled (schema 8). At most a few
+    /// per process: start, a fault (then off for good), heartbeat stall and
+    /// resume, shutdown. Never per packet or per session.
+    XdpFastpathState { ts_us: u64, state: XdpState, reason: XdpReason },
     /// Counter snapshot (drops etc.), emitted by the logger itself.
     Counter { ts_us: u64, name: &'static str, value: u64 },
     /// Records lost because the queue was full (AU-5 alert).
@@ -954,7 +1042,8 @@ impl Event {
             | Event::ClusterPeerSuppressed { ts_us, .. }
             | Event::ClusterReplicationGap { ts_us, .. }
             | Event::ClusterHook { ts_us, .. }
-            | Event::ClusterOperatorCommand { ts_us, .. } => ts_us,
+            | Event::ClusterOperatorCommand { ts_us, .. }
+            | Event::XdpFastpathState { ts_us, .. } => ts_us,
         }
     }
 
@@ -989,6 +1078,7 @@ impl Event {
             Event::ClusterReplicationGap { .. } => "cluster_replication_gap",
             Event::ClusterHook { .. } => "cluster_hook",
             Event::ClusterOperatorCommand { .. } => "cluster_operator_command",
+            Event::XdpFastpathState { .. } => "xdp_fastpath_state",
         }
     }
 
@@ -1014,6 +1104,8 @@ impl Event {
                 4
             }
             Event::ClusterOperatorCommand { .. } => 5,
+            Event::XdpFastpathState { state: XdpState::Disabled, reason, .. } if *reason != XdpReason::Shutdown => 4,
+            Event::XdpFastpathState { .. } => 5,
             Event::ClusterPeerRejected { .. }
             | Event::ClusterPeerSuppressed { .. }
             | Event::ClusterReplicationGap { .. } => 4,
@@ -1080,6 +1172,10 @@ impl Event {
             Event::ClusterPeerRejected { .. }
             | Event::ClusterPeerSuppressed { .. }
             | Event::ClusterReplicationGap { .. } => Some("failure"),
+            Event::XdpFastpathState { state: XdpState::Disabled, reason, .. } if *reason != XdpReason::Shutdown => {
+                Some("failure")
+            }
+            Event::XdpFastpathState { .. } => Some("success"),
             Event::Counter { .. } => None,
         }
     }

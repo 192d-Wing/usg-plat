@@ -22,7 +22,7 @@ use std::path::PathBuf;
 
 use plat_io::bpf_obj::{Access, BPF_ANY, BpfMap};
 use plat_xdp::control::{XdpControl, coarse_now_ns};
-use plat_xdp::load::{LoadParams, config_record, split_config};
+use plat_xdp::load::{LoadParams, config_record};
 use plat_xdp::maps::XdpMaps;
 use plat_xdp::mirror::{SessionEntry, XdpMirror};
 use plat_xdp::stats::XdpStats;
@@ -38,9 +38,16 @@ fn platd_view_of_the_pins() {
     assert_ne!(rustix_uid(), 0, "must run unprivileged");
     let dir = PathBuf::from(std::env::var("PLAT_XDP_UNPRIV_PIN_DIR").unwrap_or_else(|_| plat_xdp::PIN_DIR.into()));
     let cfg = ok(std::env::var("PLAT_XDP_UNPRIV_CONFIG"), "PLAT_XDP_UNPRIV_CONFIG");
-    let (c, x) = ok(split_config(&ok(std::fs::read_to_string(&cfg), &cfg)), "config");
-    let p = LoadParams::new(&c, x);
+    let c = ok(plat_common::Config::from_toml(&ok(std::fs::read_to_string(&cfg), &cfg)), "config");
+    let mut p = LoadParams::from_config(&c);
+    // SEC-001: the attach's nonce from the loader's state file.
+    let state = PathBuf::from(std::env::var("PLAT_XDP_UNPRIV_STATE").unwrap_or_else(|_| plat_xdp::STATE_FILE.into()));
+    p.nonce = ok(plat_xdp::load::read_state(&state), "state file").nonce;
     let maps = ok(XdpMaps::open_pinned(&dir, &config_record(&p, &plat_xdp::object_sha256())), "open_pinned");
+    // SEC-001: the first claim of fresh maps succeeds, a second (another
+    // platd on the same pins) is refused.
+    ok(maps.claim_fresh(), "claim fresh maps");
+    assert_eq!(maps.claim_fresh(), Err(plat_xdp::control::Stale::ControlUsed), "attach twice");
     assert_eq!(maps.sessions(), p.xdp.max_sessions);
 
     // Root-only pins.
@@ -57,7 +64,9 @@ fn platd_view_of_the_pins() {
 
     let m = XdpMirror::new(&maps, 4);
     let ctl = XdpControl::new(&maps);
-    assert_eq!(m.activate_slice(0).map(|g| g > 0), Some(true));
+    let generation = m.activate_slice(0);
+    assert_eq!(generation.map(|g| g > 0), Some(true));
+    let generation = generation.unwrap_or(1);
     let e = SessionEntry {
         src6: [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x99],
         sport6: 41000,
@@ -68,9 +77,15 @@ fn platd_view_of_the_pins() {
         pool_port4: 62000,
         slice: 0,
     };
-    let slot = ok(m.install(&e, 0), "install");
+    let slot = ok(m.install(&e, generation, 0), "install");
     assert_eq!(m.record(slot).map(|r| SessionEntry::from_record(&r)), Some(e));
+    // The deferred publish and delete run unprivileged too.
+    m.flush();
+    assert_eq!(m.counters().installs.get(), 1, "published by an unprivileged writer");
+    assert_eq!(m.record(slot).map(|r| r.state), Some(plat_xdp_core::abi::SLOT_LIVE));
     ok(m.retire(slot, &e), "retire");
+    m.flush();
+    assert_eq!(m.counters().retire_error.get(), 0, "deferred deletes succeeded");
     assert!(m.deactivate_slice(0, SLICE_FENCED));
     assert!(ctl.enable(1, 1500, coarse_now_ns() + 1_000_000_000));
     ctl.disable();

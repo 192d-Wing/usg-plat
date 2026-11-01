@@ -15,8 +15,9 @@
 #      netns (obj-gate.py testrun, level2-vectors.txt);
 #   6. level 2: the plat-xdp test_run suite inside that netns, when its test
 #      binary is passed (make test-xdp builds it; vng-run.sh -l);
-#   7. level 4: the e2e topology, then e2e.sh run (skips, exit 77, until
-#      platd and plat-xdp-loader with the xdp feature exist, WU5/WU6).
+#   7. level 4: the e2e topology, then e2e.sh run (skips, exit 77, unless
+#      PLATD and PLAT_XDP_LOADER name the binaries; it runs on the host VM
+#      today, WU5; the units come with WU6).
 #
 # Usage: guest.sh [-o OBJECT] KVER [LEVEL2_TEST_BIN]
 set -eu

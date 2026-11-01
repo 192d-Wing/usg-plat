@@ -12,9 +12,9 @@
 //! - [`slots`]: the `SLOT` allocator (partitioned free stacks, RCU
 //!   quarantine by grace-period epoch).
 //! - [`mirror`]: the session writer: install / retire / `seen` read with
-//!   the plan §4.3 ordering, slice state and generation writes. Inherent
-//!   methods only; `impl Mirror for XdpMirror` (the `plat-nat64` trait) is
-//!   WU5's glue.
+//!   the plan §4.3 ordering, slice state and generation writes.
+//! - [`glue`]: `impl plat_nat64::Mirror for XdpMirror` and the
+//!   stale-generation collector.
 //! - [`control`]: the `CONTROL` record (enable, TUN ifindex/MTU, dead-man deadline)
 //!   and the grace-period / heartbeat step.
 //! - [`stats`]: per-CPU `STATS` / `FWD` sums and the `plat_xdp_*` metric
@@ -24,10 +24,10 @@
 //! `plat-io` helpers (`bpf_obj`, `bpf_mmap`, `netdev`) hold it.
 //!
 //! COMPLIANCE MAPPING:
-//! - NIST 800-53: AC-6 (Least Privilege) - designed for: privileged
-//!   loading is a separate one-shot step, and `platd` only opens pins
-//!   (read-only where it only reads). Enforced once wired (WU5 `platd`,
-//!   WU6 units); until then backed by the pin-mode tests
+//! - NIST 800-53: AC-6 (Least Privilege) - privileged loading is a
+//!   separate one-shot step, and `platd` only opens pins (read-only where
+//!   it only reads; wired in WU5, `services/platd/src/xdp.rs`; the units
+//!   are WU6). Backed by the pin-mode tests
 //!   (`maps::tests::pin_access_is_least_privilege`, `tests/unprivileged.rs`,
 //!   `tests/refusals.rs`)
 //! - NIST 800-53: SI-7 (Software, Firmware, and Information Integrity) -
@@ -37,11 +37,18 @@
 #![forbid(unsafe_code)]
 
 pub mod control;
+pub mod glue;
 pub mod load;
 pub mod maps;
 pub mod mirror;
 pub mod slots;
 pub mod stats;
+
+/// The `plat-nat64` engine test fixtures (packet builders, `Fx`), shared
+/// with the `glue` tests.
+#[cfg(test)]
+#[path = "../../plat-nat64/tests/common/mod.rs"]
+mod nat64_fixtures;
 
 use sha2::{Digest, Sha256};
 

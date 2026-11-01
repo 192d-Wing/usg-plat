@@ -96,5 +96,25 @@ pub(crate) static FWD: PerCpuArray<FwdCounters> = PerCpuArray::with_max_entries(
 /// stack headroom under the 384 B budget (plan §2.5 rule 5; the brief's
 /// PERF-001 fallback). Created by the loader, never pinned; nothing reads it
 /// outside one program run.
+///
+/// RFC-001: it also holds the copy of the UDP datagram whose checksum the
+/// program verifies (`l4`, filled by `bpf_xdp_load_bytes`, summed with
+/// `bpf_csum_diff`), so the check costs no stack.
 #[map(name = "SCRATCH")]
-pub(crate) static SCRATCH: PerCpuArray<[u8; HDR6]> = PerCpuArray::with_max_entries(1, 0);
+pub(crate) static SCRATCH: PerCpuArray<Scratch> = PerCpuArray::with_max_entries(1, 0);
+
+/// One CPU's scratch block.
+#[repr(C)]
+pub(crate) struct Scratch {
+    /// The output header block. First: with it at a large offset the
+    /// program's frame grew by 152 B (measured, 6.8).
+    pub hdr: [u8; HDR6],
+    /// The UDP header and payload being verified (at most CSUM_MAX_L4
+    /// bytes; sized to the verifier's bound of the load length, 2052,
+    /// with the `addrs` that follow).
+    pub l4: [u8; 2048],
+    /// The pseudo-header addresses being verified.
+    pub addrs: [u8; 32],
+    /// This frame's checksum result (`ctx.rs` `set_csum_ok`).
+    pub csum_ok: u32,
+}

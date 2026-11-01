@@ -253,7 +253,7 @@ fn install_rollback_and_back_off() {
     fx.clock.advance(Duration::from_millis(plat_nat64::mirror::INSTALL_BACKOFF_MS));
     run(&mut fx, &udp6(s, 1000, SERVER, 53, b"x")).unwrap();
     assert_ne!(k(&fx), Some(NO_SLOT));
-    let retries = fx.nat.state().mirror_install_stats().map(|s| s.retries.load(std::sync::atomic::Ordering::Relaxed));
+    let retries = fx.nat.state().mirror_install_stats().map(|s| s.retries);
     assert_eq!(retries, Some(1), "one retry on an existing session");
 
     // Full: no install for INSTALL_BACKOFF_MS, then the next hit installs.
@@ -302,6 +302,20 @@ fn drop_and_alert_installs_even_when_the_record_is_lost() {
     run(&mut fx, &udp6(sub(1, 1), 1000, SERVER, 53, b"x")).unwrap();
     run(&mut fx, &udp6(sub(2, 1), 1000, SERVER, 53, b"x")).unwrap();
     assert_eq!(m.len(), 2);
+    // R1-002: the second subscriber's block record really was lost (the
+    // queue holds one record, never drained) and its session is mirrored
+    // all the same.
+    let lost = fx.nat.state().audit().stats().lost.load(Ordering::Relaxed);
+    assert!(lost >= 1, "no record was lost: the test would not show the exception");
+    let queued: Vec<_> = fx.rx.try_iter().collect();
+    assert_eq!(queued.len(), 1, "only the first block record fits");
+    let k4b = k4_of(&fx, sub(2, 1), 1000);
+    assert!(
+        !queued.iter().any(|e| matches!(e, Event::PortBlockAlloc { v4, port_lo, port_hi, .. }
+            if *v4 == k4b.addr && (*port_lo..=*port_hi).contains(&k4b.port))),
+        "the second block record must be the lost one"
+    );
+    assert_ne!(fx.nat.state().session_slot(k4b, (SERVER, 53)), Some(NO_SLOT), "mirrored without its record");
 }
 
 #[test]

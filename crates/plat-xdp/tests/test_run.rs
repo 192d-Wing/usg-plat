@@ -135,6 +135,7 @@ fn params() -> LoadParams {
         prefix: 0x0064_ff9b_u128 << 96,
         prefix_len: 96,
         allow_non_global: false,
+        nonce: [0; 16],
     }
 }
 
@@ -150,8 +151,10 @@ fn setup() -> Fx {
     assert!(!plat_xdp::object().is_empty(), "built with AYA_BUILD_SKIP: no object to test");
     let dir = PathBuf::from(std::env::var("PLAT_XDP_L2_PIN_DIR").unwrap_or_else(|_| "/sys/fs/bpf/plat-l2".into()));
     ok(std::fs::create_dir_all(&dir), "pin dir");
-    let p = params();
+    let mut p = params();
     let r = ok(Loader::attach(&p, &dir, None), "Loader::attach");
+    // SEC-001: the attach's nonce is in the CONFIG digest.
+    p.nonce = r.nonce;
     eprintln!("level2: attached prog {} tag {} ({} interfaces)", r.prog_id, r.prog_tag, r.interfaces.len());
     let maps = ok(XdpMaps::open_pinned(&dir, &config_record(&p, &plat_xdp::object_sha256())), "open_pinned");
     let mirror = XdpMirror::new(&maps, 4);
@@ -195,7 +198,9 @@ fn setup() -> Fx {
         retired: false,
     };
     assert_eq!(fx.mirror.activate_slice(0), Some(1), "fresh SLICE starts at generation 0");
-    fx.slot = ok(fx.mirror.install(&fx.entry, 0), "install");
+    fx.slot = ok(fx.mirror.install(&fx.entry, 1, 0), "install");
+    // Publish the entries (the publisher thread in platd).
+    fx.mirror.flush();
     fx
 }
 
@@ -207,7 +212,8 @@ fn base_state(fx: &mut Fx) {
     if fx.retired {
         // The writer retired it (keys deleted, slot quarantined): install
         // afresh, in another slot.
-        fx.slot = ok(fx.mirror.install(&fx.entry, 1), "re-install");
+        fx.slot = ok(fx.mirror.install(&fx.entry, 1, 1), "re-install");
+        fx.mirror.flush();
         fx.retired = false;
     } else {
         // Undo raw overrides of the record (keys still in OUT6 / IN4).
@@ -397,7 +403,7 @@ fn apply_override(fx: &Fx, f: &[&str]) -> bool {
 /// Verdict counts of `deploy/tests/xdp/level2-vectors.txt` (WU3 run: 6
 /// redirects, 27 passes; see `vector_counts_match_the_file` for frozen).
 const L2_REDIRECTS: usize = 6;
-const L2_PASSES: usize = 27;
+const L2_PASSES: usize = 29;
 const L2_FROZEN: usize = 1;
 
 /// The constants above match the vector file (host check, no VM).
@@ -593,6 +599,12 @@ fn writer_transitions_stop_the_fast_path() {
     let e = fx.entry;
     assert!(fx.mirror.retire(fx.slot, &e).is_ok());
     fx.retired = true;
+    // WU5: the retire under the lock is the DEAD store only; the entries
+    // still lead to the slot, which the program refuses.
+    expect_pass(&fx, v6, PassReason::SlotDead);
+    expect_pass(&fx, v4, PassReason::SlotDead);
+    // The publisher's deferred deletes: no entry any more.
+    fx.mirror.flush();
     expect_pass(&fx, v6, PassReason::NoSession);
     expect_pass(&fx, v4, PassReason::NoSession);
     base_state(&mut fx);

@@ -39,8 +39,8 @@ pub use event::{
     FipsMark, HookKind, HookRun, LeaseState, LifecycleKind, LimitKind, MemberState, MgmtConnection, MgmtPath,
     MgmtReason, OperatorCommand, OperatorCommandKind, OperatorRefusal, OutputFailureReason, PeerRejectReason,
     PeerRejected, PruneState, RecoveryReason, RefreshKind, RefreshTransition, RemoteLossReason, RevocationCheck,
-    RevocationRefresh, RevocationSource, RevocationStatus, SliceAcquire, SliceCidr, SliceReleaseReason, StorageState,
-    TlsRole, ViewReason,
+    RevocationRefresh, RevocationSource, RevocationStatus, SliceAcquire, SliceCidr, SliceReleaseReason, StartInfo,
+    StorageState, TlsRole, ViewReason, XdpReason, XdpStart, XdpState,
 };
 pub use logger::{Logger, LoggerHandle, NodeIdent};
 pub use sink::{AuditSink, AuditStats, RemoteStats, TryEmit};
@@ -85,4 +85,12 @@ pub use sink::{AuditSink, AuditStats, RemoteStats, TryEmit};
 /// `nat_port_block_release` may carry `plat.release_reason` (`handover`).
 /// `service_start` may carry `cluster.node_id`, `cluster.mode`,
 /// `cluster.config_digest`, `cluster.slices` and `cluster.member_count`.
-pub const LOG_SCHEMA_VERSION: u32 = 7;
+///
+/// 8: XDP fast path (POAM-016 Phase 1). `service_start` carries
+/// `plat.xdp.mode` (`off`|`native`|`generic`), and with the fast path
+/// configured `plat.xdp.object_sha256` and `plat.xdp.interfaces` (CEF
+/// `cs5`, `flexString1`, `flexString2`). New record `xdp_fastpath_state`:
+/// `plat.xdp.state` (`enabled`|`disabled`) and `event.reason` (CEF `cs1`,
+/// `reason`). `dataplane_counter` gains the `plat.counter.name` value
+/// `xdp_aborted`.
+pub const LOG_SCHEMA_VERSION: u32 = 8;

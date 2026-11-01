@@ -51,6 +51,13 @@ ALLOWED_HELPERS = {
     # needs CAP_PERFMON). gpl_only = false at v6.1 (net/core/filter.c:3798-3803)
     # and v7.2 (filter.c:4044-4049); available since 5.18.
     188: "bpf_xdp_get_buff_len",
+    # RFC-001: copies the UDP datagram into SCRATCH for the full checksum
+    # check (with bpf_csum_diff, 28). gpl_only = false at v6.6
+    # (net/core/filter.c:3998-4006, BPF_CALL_4 :3981, xdp func_proto case
+    # :8124), v6.8 (:4032-4040, :4015, :8222) and v7.2 (:4190-4198, :4173,
+    # :8621); available since 5.18. bpf_csum_diff gpl_only = false at v6.6
+    # :2030-2032, v6.8 :2037-2039, v7.2 :2057-2059.
+    189: "bpf_xdp_load_bytes",
 }
 NAMED_FORBIDDEN = {
     6: "bpf_trace_printk",

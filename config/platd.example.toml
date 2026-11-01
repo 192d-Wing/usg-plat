@@ -297,3 +297,21 @@ max_bytes = 10485760
 cache_bytes = 67108864
 max_crls = 64
 refresh_margin_secs = 3600
+
+# XDP fast path for established UDP sessions (POAM-016 Phase 1). Off by
+# default: without this section, or with enabled = false, the data plane is
+# TUN-only and nothing below is checked. Needs a platd built with the `xdp`
+# feature, Linux 6.6 or later, the plat-xdp.service loader (which reads this
+# same file and attaches the program) and the dedicated bpffs at
+# /run/plat/bpf. Not supported on nohz_full hosts (platd keeps the fast
+# path off and records xdp_fastpath_state reason=unsupported_host).
+# [xdp]
+# enabled = false
+# mode = "native"            # "native" (driver XDP) | "generic" (SKB mode, testing only)
+# allow_generic = false      # mode = "generic" is refused unless true (CM-7)
+# max_sessions = 1048576     # fast-path capacity, 4096..=nat64.max_sessions (~250 B kernel memory each)
+# heartbeat_ms = 250         # dead-man deadline refresh, 50..=1000
+# deadline_ms = 1000         # >= 4 x heartbeat_ms; with HA <= lease_ms x (1 - drift_margin_pct/100)
+# [[xdp.interfaces]]
+# name = "eth0"              # 1..=15 chars [A-Za-z0-9_.-], unique, not dataplane.interface
+# role = "access"            # "access" (IPv6->IPv4), "upstream" (IPv4->IPv6) or "both"

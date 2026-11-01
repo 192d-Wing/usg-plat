@@ -102,7 +102,7 @@ tests in the rows above.
    other limit reasons still answer, and legacy pools answer 1/3.
 8. **IPv4 Identification uniqueness** (RFC 6864): unique per counter for at
    least 8192 packets (65536 / maximum step 8), not tracked per flow. With
-   the XDP fast path (POAM-016 Phase 1, not wired yet), the fast path
+   the XDP fast path (POAM-016 Phase 1, wired in WU5, `[xdp]` off by default), the fast path
    (per-CPU `IDENT` table, `crates/plat-xdp-core/src/ident.rs`) and the slow
    path (per-worker table) draw IDs independently, so a flow that switches
    paths has only probabilistic uniqueness across the switch (POAM-038).
@@ -144,6 +144,38 @@ bit is ignored and it is re-split); an IPv6 fragment whose IPv4 translation
 exceeds `ipv4_mtu` is split as IPv4 fragments (DF=0) rather than answered
 with Packet Too Big; a hairpinned ≤ 1280-byte packet above `ipv4_mtu` is
 looped back whole.
+
+## XDP fast path (POAM-016 Phase 1, `[xdp]`; WU5)
+
+- **UDP checksum (RFC 768, RFC 8200 §8.1, RFC 7915 §4.5 / §5.1, RFC
+  1624).** The fast path updates the UDP checksum incrementally (RFC 1624),
+  which is correct only for a complete checksum. Before it takes a frame it
+  verifies the full checksum (pseudo-header, header, payload; datagrams up
+  to 1536 B, `bpf_xdp_load_bytes` + `bpf_csum_diff`) and passes anything
+  that does not verify to the slow path (`udp_csum_unverified`). That
+  covers `CHECKSUM_PARTIAL` frames, whose field holds only the
+  pseudo-header sum: local or container senders with TX checksum offload
+  on a veth or tap, and generic (SKB) mode; on the TUN the kernel completes
+  their checksum and `platd` translates them correctly. Larger datagrams
+  (jumbo frames) and IPv4 UDP with checksum 0 also take the slow path.
+  Evidence: `plat-xdp-core/tests/qa_gaps.rs`, `tests/csum_partial.rs`,
+  level-2 vectors `v6_udp_csum_partial` / `v4_udp_csum_bad`,
+  `deploy/tests/xdp/e2e.sh run` with `E2E_TX_OFFLOAD=on` (every delivered
+  checksum verified in the receiver captures).
+- **Session refresh (RFC 6146 §3.5.1, RFC 4787 REQ-6).** Fast-path packets
+  refresh the session through `SLOT.seen_ns`, read back by the engine when
+  its own timer runs out; rounded up plus one coarse-clock tick, so a
+  session never expires before one timeout after its last packet
+  (RFC-002; `plat-xdp` `glue::tests::expiry_is_one_timeout_after_the_last_fast_path_packet`).
+- **Reordering at the publish switch (RFC-003).** A flow's first packets go
+  through the TUN; once its entries are published (about 1 ms later) later
+  packets take the fast path, so a packet still queued on the TUN can
+  leave after a newer fast-path packet. Allowed for UDP; to be bounded
+  before TCP or ICMP use the fast path (Phases 2-3).
+- **In flight after retire (RFC-005).** A program run that read a `LIVE`
+  record just before the `DEAD` store may still forward its one packet, a
+  few microseconds after the session expired (at most one packet per CPU,
+  within one RCU grace period).
 
 ## NAT behaviour (RFC 4787, RFC 5382, RFC 7857, RFC 6056, RFC 6888, RFC 7422)
 
