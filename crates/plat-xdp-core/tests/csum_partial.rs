@@ -20,6 +20,8 @@
 //! - RFC 1624 eqn. 3, RFC 768, RFC 7915 §4.5 / §5.1 - L4 checksum update
 //! - NIST 800-53: SA-11 - developer testing
 
+mod support;
+
 use plat_xdp_core::abi::{FibParams, SlotRec};
 use plat_xdp_core::{HDR4, HDR6, csum, rewrite_v4_to_v6, rewrite_v6_to_v4};
 
@@ -217,4 +219,42 @@ fn decision_declines_partial_and_accepts_full() {
     assert!(!udp_csum_ok_in(&frame4(partial(pseudo4(&DST4, &POOL4))), false, len));
     assert!(!udp_csum_ok_in(&frame6(0), true, len + 1), "past the frame");
     assert_eq!(PassReason::UdpCsumUnverified.as_str(), "udp_csum_unverified");
+}
+
+/// RFC-007: the decision itself (`decide_frame`, as the program runs it)
+/// returns `Pass(UdpCsumUnverified)` (`decide_v6` / `decide_v4` return
+/// `Err(PassReason::UdpCsumUnverified)`) for a `CHECKSUM_PARTIAL` field in
+/// both directions, and the same frame with its complete checksum
+/// redirects, so the decline is the checksum and nothing else.
+#[test]
+fn decide_frame_returns_udp_csum_unverified_for_partial() {
+    use plat_xdp_core::PassReason;
+    use plat_xdp_core::decide::{Action, Verdict};
+    use support::*;
+    let mut r = Reference::new(&Knobs::default());
+    let mut env = HostEnv::new(&r.cfg, Net::default());
+    let s = ok(establish(&mut r, &mut env, client(0x5_0000_0000_0001), 40_000, server(1, 5), 53));
+    let full6 = eth(
+        ACCESS_MAC,
+        CLIENT_MAC,
+        [0x86, 0xdd],
+        &udp6(&U6::new(s.src6, s.sport, r.prefix.embed(s.dst4), s.dport), PAYLOAD),
+    );
+    let full4 =
+        eth(UPSTREAM_MAC, SERVER_MAC, [0x08, 0x00], &udp4(&U4::new(s.dst4, s.dport, s.pool4, s.pool_port), PAYLOAD));
+    // The field a CHECKSUM_PARTIAL sender leaves: the folded pseudo-header
+    // sum (addresses, UDP length, protocol), uncomplemented.
+    let mut part6 = full6.clone();
+    let p6 = csum::fold(csum::sum_slice(&part6[22..54]) + u64::from(ulen()) + 17);
+    part6[60..62].copy_from_slice(&p6.to_be_bytes());
+    let mut part4 = full4.clone();
+    let p4 = csum::fold(csum::sum_slice(&part4[26..34]) + u64::from(ulen()) + 17);
+    part4[40..42].copy_from_slice(&p4.to_be_bytes());
+
+    assert!(matches!(decide(&env, ACCESS_IF, &full6).action, Action::V6ToV4(Verdict::Redirect { .. })), "full v6");
+    assert!(matches!(decide(&env, UPSTREAM_IF, &full4).action, Action::V4ToV6(Verdict::Redirect { .. })), "full v4");
+    let d6 = decide(&env, ACCESS_IF, &part6).action;
+    assert!(matches!(d6, Action::V6ToV4(Verdict::Pass(PassReason::UdpCsumUnverified))), "partial v6: {d6:?}");
+    let d4 = decide(&env, UPSTREAM_IF, &part4).action;
+    assert!(matches!(d4, Action::V4ToV6(Verdict::Pass(PassReason::UdpCsumUnverified))), "partial v4: {d4:?}");
 }

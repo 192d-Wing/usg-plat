@@ -14,7 +14,8 @@ ExecStart=/usr/libexec/plat/plat-fwguard.sh
 # nft(8) needs CAP_NET_ADMIN on its netlink socket. Writing
 # /proc/sys/net/ipv{4,6}/... needs uid 0 (file owner, mode 0644; no
 # CAP_DAC_OVERRIDE) and, for net sysctls, CAP_NET_ADMIN in the network
-# namespace. Nothing else.
+# namespace. Detaching an XDP program (`ip link set ... xdp... off`) also
+# needs only CAP_NET_ADMIN. Nothing else.
 CapabilityBoundingSet=CAP_NET_ADMIN
 AmbientCapabilities=
 NoNewPrivileges=yes
@@ -25,6 +26,11 @@ ProtectHome=yes
 ProtectSystem=strict
 # ProtectKernelTunables= must stay off: it makes /proc/sys read-only.
 ReadWritePaths=/proc/sys/net
+# XDP fast path (only when plat-xdp.service is used): unpinning the
+# loader's link pins detaches a program that is not the one it attached.
+# uid 0 owns the pins and the 2750 mount root, so no capability is needed;
+# "-": absent without [xdp].
+ReadWritePaths=-/run/plat/bpf
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
 ProtectControlGroups=yes

@@ -66,6 +66,10 @@ each item.
 | L23 | Cluster HA replication back-pressure and mis-steer (F8, F13) | SC-5, SI-4, SC-7 | POAM-017(b), POAM-029 | PASS (three-VM run, round 6). F8: worker rate within noise (3596 vs 3533 pps), no replication loss, B in sync. F13 fresh /64 (2001:db8:100:336b::/64): mis-steer counted and dropped (13), no block on the non-home node, in steady state and after a platd restart of that node |
 | L24 | Multiqueue TUN keeps every fragment of a datagram on one queue (Q2) | SC-5(2), SC-5 | POAM-035 | PASS (2026-10-29, performance review of `feat/protocol-completeness`): 0/64 IPv4 and 0/64 IPv6 datagrams split across 4 queues |
 | L25 | Pool-source guard rule and `cross_node_hairpin` start gate on real nftables | SC-7, SC-7(5), AC-4, CM-6 | POAM-024 | PASS (2026-10-29, kernel 6.8, nftables 1.0.9, three network namespaces): pool sources dropped from the external interface in both modes, accepted from the cluster interface only with the switch on; gate passes on real `nft list` output, refuses 4 broken snapshots |
+| L26 | XDP loader and `platd` privileges and sandbox under the units (`plat-xdp.service`, `run-plat-bpf.mount`, `platd.service.d/xdp.conf`) | AC-6, AC-6(1), AC-6(10), CM-7, SC-39, SC-5 | POAM-016 | PASS (2026-11-01, WU6, kernel 6.8, systemd 255): verify clean; exposure `plat-xdp` 1.6, `platd` with the drop-in 1.6 (1.5 without), `plat-fwguard` 2.1; loader CapEff/CapPrm/CapBnd/CapAmb `0000008000001000` (CAP_BPF + CAP_NET_ADMIN), uid 0 gid plat, NoNewPrivs 1, Seccomp 2; pins root:plat with the `MAPS` modes, mount root 2750 root:plat, `/run/plat` 0755 root, state 0644; `platd` (no capabilities, `ProtectProc=invisible`, `ProcSubset=pid`) opens the pins; `MemoryMax` bounds map creation (8M: ENOMEM, 64M: attach) |
+| L27 | End-to-end through the units, native and generic mode (veth) | SC-7, SC-24, AU-12 | POAM-016 | PARTIAL (2026-11-01, WU6, veth only, not real or virtio NICs): `e2e.sh run` with `E2E_UNITS=1` PASS native and generic: 150/150 echoes, 149/150 datagrams per direction on the fast path, 300 receiver checksums verified; `systemctl restart platd` and SIGKILL (`Restart=on-failure`) each re-run the loader (new program id, no `stale_maps`); stop detaches (no pins, no state file, no program) |
+| L28 | `plat-fwguard` stops a swapped XDP program | SC-7, SC-24, SI-7 | POAM-016, POAM-037 | PASS (2026-11-01, WU6, veth): another program attached to an `[xdp]` interface through netlink is reported `xdp-program-swapped`, detached and forwarding turned off by `plat-fwguard.service` in its sandbox (CAP_NET_ADMIN only); a program on a foreign bpf_link cannot be detached (exit 1, residual in `plat-fwguard.sh`) |
+| L31 | Fast-path-only session lifetime and idle expiry under the units | SC-10, SC-5 | POAM-016 | PASS (2026-11-01, WU6, veth): session alive after 150 s of fast-path-only traffic (`udp_secs` 120), expired after 125 s idle (`plat_sessions` 0, `plat_xdp_sessions` 0, 1 retire) |
 
 ## Procedures, pass criteria and results
 
@@ -533,3 +537,52 @@ pool-source guard"; it now reads "has no matching pool-source guard rule"
 (`hairpin_guard.rs::missing_guard_is_reported_as_missing_not_shadowed`).
 Not covered: `plat-fwguard` live-table sync and a start under the systemd
 unit.
+
+### L26, L27, L28, L31 — XDP fast path under the systemd units (POAM-016, WU6)
+
+Numbering: the plan's L25–L31 for the XDP fast path follow the existing
+L25 here, so they are L26–L32 (plan L25 privileges = L26, L26 end-to-end =
+L27, L27 `fwguard` = L28, L30 fast-path-only lifetime = L31). L29 (`kill
+-STOP` / `kill -9` deadline), L30 (HA fence and takeover) and L32 (map-full
+fallback) are not run here.
+
+- Install (as root, Lima VM `plat-linux`, Ubuntu 24.04, kernel
+  6.8.0-147 aarch64, systemd 255): `make xdp` binaries to `/usr/bin/platd`
+  and `/usr/libexec/plat/plat-xdp-loader`; `platd.service`,
+  `plat-xdp.service`, `run-plat-bpf.mount`, `plat-fwguard.service` and
+  `.timer` to `/etc/systemd/system`; `plat-xdp.tmpfiles.conf` to
+  `/usr/lib/tmpfiles.d/plat-xdp.conf`;
+  `platd.service.d.example/xdp.conf` to
+  `/etc/systemd/system/platd.service.d/xdp.conf`.
+- L26: `systemd-analyze verify` on the four units (no output) and
+  `systemd-analyze security` for each; `deploy/tests/xdp/e2e.sh run` with
+  `E2E_UNITS=1` (cases `loader_privileges`, `pins_root_plat`), whose
+  test-only drop-in adds `ExecStartPre=/usr/bin/id` and a
+  `grep ^Cap… /proc/self/status` to the loader unit, so they run with the
+  loader's exact credentials and sandbox. `MemoryMax`: the loader unit with
+  `MemoryMax=8M` fails to create `SLOT` (ENOMEM), with 64M it attaches
+  (65536 sessions, `PLAT_XDP_MAP_BYTES` 20365312 on 6 CPUs). After the
+  loader exits the unit has no process, systemd removes its cgroup and the
+  charge moves to the parent slice (`MemoryCurrent` `[not set]`).
+- L27, L28, L31: `E2E_UNITS=1 deploy/tests/xdp/e2e.sh run`, with
+  `E2E_MODE=native` and `E2E_MODE=generic` (all cases, including the 125 s
+  idle wait). Runtime drop-ins in `/run/systemd/system` put the units in
+  the PLAT namespace with the test config and clear `platd`'s
+  `ExecStartPre`/`Post` (`plat-tun-setup.sh` writes the host's nftables
+  files; the test creates the TUN owned by plat). `fwguard_swapped`
+  unpins the loader's links, attaches a second program (a second loader
+  attach into a scratch bpffs, its links unpinned) to `p6` through netlink,
+  and starts `plat-fwguard.service` in the namespace.
+
+Result (2026-11-01, WU6): **PASS** for L26, L28 and L31; **PARTIAL** for
+L27 (veth only, no real or virtio NIC). Both modes: 150/150 echoes, the
+slow path translated the first datagram, the fast path the rest, every
+receiver checksum verified; `restart_reattach` and
+`auto_restart_reattach` saw a new program id each time and the audit file
+has no `stale_maps`; `stop_detaches` left no pin, no state file and no
+program; `fwguard_swapped` logged
+`XDP fast path not as attached (xdp-program-swapped): p6 (ifindex 2) runs
+program id 12096, the loader attached id 12093 tag eef266ef8d7d1b35; fast
+path detached`, the program was gone and forwarding was off. The guard
+sees only the program id (the tag needs CAP_SYS_ADMIN, which it does not
+have). Not covered: x86_64, real NICs, a `.deb` / `.rpm` install (L18).

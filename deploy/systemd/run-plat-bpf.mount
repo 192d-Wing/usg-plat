@@ -1,0 +1,29 @@
+# Dedicated bpffs instance for the usg-plat XDP fast path (plan §7).
+# Install as /usr/lib/systemd/system/run-plat-bpf.mount (the unit name must
+# be the escaped mount point). Pulled in by plat-xdp.service
+# (RequiresMountsFor=/run/plat/bpf); nothing enables it on its own.
+#
+# A product-owned instance instead of opening up the host-wide
+# /sys/fs/bpf (systemd mounts that 0700; making it traversable would expose
+# every other tool's pins): plat objects stay out of the shared bpffs
+# namespace, its root is group-restricted, and stopping this unit removes
+# every pin at once. Mounted by PID 1, so the loader needs no
+# CAP_SYS_ADMIN. plat-xdp.service then applies plat-xdp.tmpfiles.conf
+# (2750 root:plat), so pins inherit group plat through setgid.
+#
+# COMPLIANCE MAPPING:
+# - NIST 800-53: AC-6 (Least Privilege) - the loader mounts nothing;
+#   platd reaches the pins only through group plat
+# - NIST 800-53: CM-7 (Least Functionality), SC-39 (Process Isolation) -
+#   no change to the host-wide /sys/fs/bpf
+[Unit]
+Description=usg-plat XDP fast path bpffs (/run/plat/bpf)
+Documentation=man:systemd.mount(5)
+
+[Mount]
+What=bpffs
+Where=/run/plat/bpf
+Type=bpf
+# Mode of the mount root before tmpfiles adds setgid and group plat.
+Options=mode=0750,nosuid,nodev,noexec
+DirectoryMode=0755

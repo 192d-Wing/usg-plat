@@ -326,7 +326,9 @@ mod imp {
                 }),
                 notify: Box::new(move |t| match t {
                     Transition::Stalled => {
-                        tracing::warn!("XDP heartbeat withheld: sweeper or a worker made no progress");
+                        tracing::warn!(
+                            "XDP heartbeat withheld: the sweeper, a worker or the mirror publisher made no progress"
+                        );
                         emit(&ns, XdpState::Disabled, XdpReason::HeartbeatStalled);
                     }
                     Transition::Resumed => emit(&ns, XdpState::Enabled, XdpReason::HeartbeatResumed),

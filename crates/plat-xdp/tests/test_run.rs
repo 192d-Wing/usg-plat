@@ -401,9 +401,10 @@ fn apply_override(fx: &Fx, f: &[&str]) -> bool {
 }
 
 /// Verdict counts of `deploy/tests/xdp/level2-vectors.txt` (WU3 run: 6
-/// redirects, 27 passes; see `vector_counts_match_the_file` for frozen).
-const L2_REDIRECTS: usize = 6;
-const L2_PASSES: usize = 29;
+/// redirects, 27 passes; RFC-008 added 6 odd-length redirects and 6
+/// corrupt passes; see `vector_counts_match_the_file` for frozen).
+const L2_REDIRECTS: usize = 12;
+const L2_PASSES: usize = 35;
 const L2_FROZEN: usize = 1;
 
 /// The constants above match the vector file (host check, no VM).

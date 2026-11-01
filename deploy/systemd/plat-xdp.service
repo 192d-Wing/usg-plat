@@ -1,0 +1,113 @@
+# usg-plat XDP fast path loader (POAM-016 Phase 1, plan §7). One-shot: it
+# creates fresh maps, loads, pins and attaches the embedded eBPF program
+# under the dedicated bpffs /run/plat/bpf (run-plat-bpf.mount), writes
+# /run/plat/xdp.state and exits. Nothing privileged keeps running; platd
+# then opens the pins without capabilities. ExecStop detaches (unpins every
+# link and map, removes the state file).
+#
+# Used only with [xdp] enabled = true and the platd drop-in
+# platd.service.d/xdp.conf (shipped as an example), which pulls this unit
+# in. Do not enable it on its own.
+#
+# Bound to platd in both directions:
+# - platd.service.d/xdp.conf: Requires= + After= this unit, so platd starts
+#   only after a successful attach (and stops if this unit is stopped);
+# - here: PartOf= + BindsTo= platd.service, so every platd stop, restart
+#   or failure (including Restart=on-failure cycles and a start-limit
+#   failure) stops this unit first (detach), and the next platd start
+#   re-runs the attach. platd refuses maps another platd has used
+#   (stale_maps, SEC-001), so a platd start must never reuse the maps of an
+#   earlier attach.
+#
+# COMPLIANCE MAPPING:
+# - NIST 800-53: AC-6 (Least Privilege), AC-6(1) - loading kernel code
+#   needs CAP_BPF and CAP_NET_ADMIN; they are held only by this short-lived
+#   binary with no network input, never by platd
+# - NIST 800-53: AC-6(9) - every attach, detach and refusal is logged to
+#   the journal (stderr)
+# - NIST 800-53: AC-6(10) - the loader refuses unless
+#   kernel.unprivileged_bpf_disabled >= 1
+# - NIST 800-53: CM-7 (Least Functionality), SC-39 (Process Isolation) -
+#   sandboxed as tightly as attaching allows
+# - NIST 800-53: SC-5 - the maps' kernel memory is charged to this unit's
+#   cgroup and capped by MemoryMax
+# - NIST 800-53: SI-7 - the embedded object's SHA-256 is logged and written
+#   to the state file, which plat-fwguard and platd check
+[Unit]
+Description=usg-plat XDP fast path loader (one-shot)
+Wants=network-online.target
+After=network-online.target
+# The pin directory: the dedicated bpffs (pulls in run-plat-bpf.mount).
+RequiresMountsFor=/run/plat/bpf
+Before=platd.service
+PartOf=platd.service
+BindsTo=platd.service
+# A failed attach is not retried in a loop by platd's restarts.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# The one fixed privileged step ('+': outside the sandbox): /run/plat
+# 0755 root:root and the bpffs root 2750 root:plat (plat-xdp.tmpfiles.conf),
+# after the mount and before every attach.
+ExecStartPre=+/usr/bin/systemd-tmpfiles --create /usr/lib/tmpfiles.d/plat-xdp.conf
+ExecStart=/usr/libexec/plat/plat-xdp-loader attach --config /etc/plat/platd.toml
+ExecStop=/usr/libexec/plat/plat-xdp-loader detach
+# uid 0 owns the pins and the state file (plat_xdp::load::StateDir
+# requires /run/plat to be owned by the loader's user); Group=plat with the
+# setgid mount root makes every pin group plat. The loader chmods the pins
+# as their owner (no CAP_CHOWN, no CAP_DAC_OVERRIDE, no CAP_SYS_ADMIN).
+User=root
+Group=plat
+CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN
+AmbientCapabilities=CAP_BPF CAP_NET_ADMIN
+NoNewPrivileges=yes
+SecureBits=noroot-locked
+UMask=0027
+ProtectSystem=strict
+# Pins (BPF_OBJ_PIN) and the state file are created here; the rest of the
+# file system is read-only.
+ReadWritePaths=/run/plat
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateIPC=yes
+# The loader reads /proc/sys/kernel/{osrelease,unprivileged_bpf_disabled},
+# so no ProcSubset=pid; it never looks at other processes.
+ProtectProc=invisible
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+# Interface lookups use ioctls on an AF_UNIX socket (plat_io::netdev); no
+# IP socket. The host network namespace is needed to attach (no
+# PrivateNetwork=).
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+IPAddressDeny=any
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+# bpf is in @privileged; it is the only call re-added.
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallFilter=bpf
+SystemCallErrorNumber=EPERM
+# SC-5: the maps are preallocated and charged to the memory cgroup of the
+# creating process, this unit, when they are created, so MemoryMax bounds
+# what one attach can create. (Once the loader has exited the unit has no
+# process and systemd removes its cgroup; the kernel then moves the charge
+# to the parent slice, so MemoryCurrent shows "[not set]".)
+# `platd check-config --format env` prints PLAT_XDP_MAP_BYTES for the
+# configured [xdp] max_sessions and CPU count (per-CPU maps); set MemoryMax
+# to at least that plus 64 MiB for the loader. 1G covers the default
+# max_sessions = 1048576 (about 290 MB).
+MemoryMax=1G
+TasksMax=16
+DevicePolicy=closed
