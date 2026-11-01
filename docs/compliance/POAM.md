@@ -22,7 +22,7 @@ Code markers at the time of writing:
 | POAM-034 | `crates/plat-nat64/src/engine.rs:1470` (`outbound_nonfirst`, `Fwd::To4` pass-through arm) |
 | POAM-035 | `crates/plat-nat64/src/frag.rs:17` (module header) |
 | POAM-036 | `crates/plat-nat64/src/pool.rs:815` (`Pool::release` doc comment; the marker is `/// POAM-036:`, not `// POAM:`, so a search for `// POAM:` does not find it) |
-| POAM-037 | `deploy/systemd/plat-fwguard.sh:39` (`# POAM:` shell marker, foreign `bpf_link` residual) |
+| POAM-037 | `deploy/systemd/plat-fwguard.sh:52` (`# POAM:` shell marker, foreign `bpf_link` residual) |
 | POAM-038 | `crates/plat-xdp-core/src/ident.rs:24` (module header) |
 
 Line numbers were re-checked on `main` @ `9a9c752` (2026-11-01) and move as
