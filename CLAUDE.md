@@ -45,7 +45,11 @@ conversation acts as orchestrator and delegates to the subagents in
 | `crates/plat-tls` | FIPS provider and start gate, TLS 1.3 policy, key/cert loading, mTLS identity allow-list, OCSP/CRL revocation |
 | `crates/plat-io` | `PacketQueue` trait, Linux multiqueue TUN, in-memory queue |
 | `crates/plat-cluster` | Deterministic pool partitioning, CIDR cover, rendezvous hashing; HA (sans-IO): fixed slices with weighted rendezvous, lease-based membership/views, config digest, strict peer wire codec |
-| `services/platd` | Daemon: FIPS gate, workers, sweeper, clock, mTLS management/metrics, revocation refresher, `check-config`, `verify-log` |
+| `crates/plat-xdp-core` | `no_std`, no `unsafe`: XDP fast-path ABI (map keys, slot/CONTROL/SLICE/CONFIG layouts), fixed-layout classifier, rewrite, RFC 1624 arithmetic and `decide` over an `Env` trait; shared by the eBPF program and the level-1 differential harness |
+| `crates/plat-xdp-ebpf` | The XDP program (Aya, `bpfel-unknown-none`; `MIT OR GPL-2.0-only`, object "Dual MIT/GPL"); `unsafe` only in `src/ctx.rs` |
+| `crates/plat-xdp` | Userspace XDP (feature `xdp`): loader library, pinned-map writer `XdpMirror` (`impl Mirror`), slot partitions, `plat-xdp-pub` publisher and `plat-xdp-ctl` control threads, stats/metrics |
+| `services/platd` | Daemon: FIPS gate, workers, sweeper, clock, mTLS management/metrics, revocation refresher, `check-config`, `verify-log`; with feature `xdp`, the fast-path attach (`src/xdp.rs`) |
+| `services/plat-xdp-loader` | Privileged oneshot (`CAP_BPF` + `CAP_NET_ADMIN`): `attach` / `detach` / `status`; creates and pins the maps under `/run/plat/bpf`, refuses kernels below 6.6 |
 
 ## Development Commands
 
@@ -69,10 +73,18 @@ chain, 1 on a verification failure, an unverified tail (unless
 
 1. **Packets are hostile.** Parse only through `plat-packet`. No `unwrap`,
    `expect`, or unchecked indexing on packet bytes; malformed input becomes a
-   counted `DropReason`, never a panic.
+   counted `DropReason`, never a panic. The XDP fast path is the one parser
+   outside `plat-packet`: `plat-xdp-core`'s fixed-layout classifier accepts a
+   strict subset of what `plat-packet` accepts (property-tested) and passes
+   everything else to the slow path (`XDP_PASS`, counted reason). Its controls
+   are the differential harness (levels 1–4, which gate every change) and the
+   verifier; no `bpf_printk` or `aya-log` in the object.
 2. **Hot path budget.** No heap allocation, no blocking I/O, no global lock on
    the steady-state path. At most one shard lock per table. Audit hand-off is
-   `AuditSink::emit` (non-blocking `try_send`).
+   `AuditSink::emit` (non-blocking `try_send`). With `[xdp]`, workers and the
+   sweeper make no `bpf()` syscall: install/retire only touch the slot record
+   under `bib4`; map syscalls run on `plat-xdp-pub` and `plat-xdp-ctl`, off the
+   packet path. The program takes no locks and does not allocate.
 3. **Bounded everything (SC-5).** Every table, queue and per-subscriber resource
    has a configured limit (including `nat64.max_subscribers`); locally
    generated ICMP errors use a per-worker token bucket
@@ -83,7 +95,13 @@ chain, 1 on a verification failure, an unverified tail (unless
    Records the caller retries use `AuditSink::try_emit` (not counted as lost).
 5. **Lock order.** `bib6 → subs (→ aggs, leaf) (released) → bib4`; sweeper
    `bib6 → bib4`, then `subs (→ aggs)`. Never take `bib6` or `subs` while holding `bib4`.
-6. **`unsafe` only in `plat-io`**, each block with a `// SAFETY:` comment.
+   XDP adds the leaf edge `bib4 → xslot` (slot-partition mutex; also
+   `publisher → xslot` and `xslot` alone); never take `bib4`, `bib6` or `subs`
+   while holding a partition lock or the publisher mutex.
+6. **`unsafe` only in `plat-io`** (TUN, credentials, and for XDP `bpf_obj.rs`,
+   `bpf_mmap.rs`, `netdev.rs`) **and in `plat-xdp-ebpf/src/ctx.rs`** (packet
+   and helper access), each block with a `// SAFETY:` comment. `plat-xdp-core`
+   and `plat-xdp` forbid `unsafe_code`.
 7. **Annotate controls and RFC sections** with `// COMPLIANCE MAPPING:`; mark
    known gaps `// POAM:` and list them in `docs/compliance/POAM.md`. Cite
    IA-5(2) with its Rev 5 sub-item ((a)(1) key protection, (a)(2) identity
@@ -126,6 +144,9 @@ chain, 1 on a verification failure, an unverified tail (unless
 | AU-2/AU-12/AU-5 cluster | schema 7 `cluster_*` records and `nat_port_block_adopt` queued before a slice is Active (retried under `refuse_new_bindings`); `cluster_operator_command` for every takeover/restore and refusal |
 | SC-8/IA-3/AC-3 cluster | peer channel mTLS 1.3 via `plat_tls::peer_configs`, identity bound to member id, accept-side IP pinning (dialer not pinned, POAM-031), replication only from the slice owner, one trust domain (POAM-032); operator socket admits uid 0 or the daemon uid via peer credentials (`plat_io::cred`) |
 | SC-24 cluster | lease self-fence, minority never takes over, unsynced takeover holds back unseen blocks |
+| SC-7/SC-24/SC-10 XDP | fast path (`[xdp]`, off by default, kernel ≥ 6.6) forwards only exact `LIVE` session matches with slice generation, dead-man deadline, FIB (`FWD_DISABLED`) and egress checks; host filters bypassed (POAM-037); fast-path refresh read back by the sweeper |
+| AU-12/SI-4/SI-7 XDP | schema 8 `xdp_fastpath_state` and `service_start` XDP fields; `plat_xdp_*` metrics; object SHA-256 and frozen `CONFIG` digest checked at start and every 10 s; stale pins refused (`stale_maps`) |
+| AC-6/SC-39 XDP | `plat-xdp.service` oneshot loader alone holds `CAP_BPF`/`CAP_NET_ADMIN` (`Group=plat`, bound to `platd` so both restart together); `platd` stays capability-free, its drop-in adds only the `bpf` syscall and read-only `/run/plat`; bpffs at `/run/plat/bpf` via `run-plat-bpf.mount`; `plat-fwguard` detaches a swapped program (verified on one Ubuntu 24.04 / 6.8 VM, L26/L28) |
 | CM-6/CM-7 | `deny_unknown_fields`, validated ranges, management is loopback-only plaintext or mTLS (never plaintext off-host) |
 | CM-3/SA-11/SR-3 | CI (fmt, clippy host + aarch64, tests on Linux, cargo-audit/deny) is a required check on `main`; actions pinned by SHA |
 | AC-6/SC-39 | systemd unit grants no capabilities and sandboxes the unprivileged `plat` user (not yet verified on Linux, `docs/compliance/LINUX_VERIFICATION.md`) |
