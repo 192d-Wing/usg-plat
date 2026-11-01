@@ -8,10 +8,12 @@
 # --disable-kvm), on x86_64 with --disable-microvm (microvm wants KVM).
 # Expect about 15 s per kernel under TCG (spike: 6.1.176, 15.5 s).
 #
-# Usage: vng-run.sh [-m] [-c CPUS] [-M MEMORY] [-o OBJECT] KERNEL_IMAGE [-- GUEST_CMD [ARG...]]
+# Usage: vng-run.sh [-m] [-c CPUS] [-M MEMORY] [-o OBJECT] [-l LEVEL2_BIN] KERNEL_IMAGE [-- GUEST_CMD [ARG...]]
 #   KERNEL_IMAGE  .../boot/vmlinuz-KVER as printed by fetch-kernel.sh
 #   -o            the plat-xdp-ebpf object (absolute path, not under /tmp):
 #                 the default guest command becomes guest.sh -o OBJECT KVER
+#   -l            the plat-xdp level-2 test_run binary (absolute, not under
+#                 /tmp): passed to guest.sh, which runs it in the netns
 #   -m            install the image's lib/modules/KVER into /lib/modules when
 #                 absent (root or sudo; CI runners only). The guest sees the
 #                 host's /lib/modules when vng cannot read the version from a
@@ -28,16 +30,18 @@ here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/../../.." && pwd)
 
 die() { echo "vng-run: $1" >&2; exit "${2:-1}"; }
-usage() { die "usage: vng-run.sh [-m] [-c CPUS] [-M MEMORY] [-o OBJECT] KERNEL_IMAGE [-- GUEST_CMD [ARG...]]" 2; }
+usage() { die "usage: vng-run.sh [-m] [-c CPUS] [-M MEMORY] [-o OBJECT] [-l LEVEL2_BIN] KERNEL_IMAGE [-- GUEST_CMD [ARG...]]" 2; }
 
 install_mods=no
 cpus=4
 mem=2G
 object=
-while getopts mc:M:o: opt; do
+level2=
+while getopts mc:M:o:l: opt; do
     case "$opt" in
         m) install_mods=yes ;;
         o) object=$OPTARG ;;
+        l) level2=$OPTARG ;;
         c) cpus=$OPTARG ;;
         M) mem=$OPTARG ;;
         *) usage ;;
@@ -83,12 +87,17 @@ if [ -n "$object" ]; then
     case "$object" in /tmp/*) die "object under /tmp is hidden from the guest" 2 ;; *) ;; esac
     [ -f "$object" ] || die "no object $object (make xdp)" 2
 fi
+if [ -n "$level2" ]; then
+    case "$level2" in /tmp/*) die "level-2 binary under /tmp is hidden from the guest" 2 ;; /*) ;; *) die "-l needs an absolute path: $level2" 2 ;; esac
+    [ -x "$level2" ] || die "no executable $level2" 2
+fi
 if [ $# -eq 0 ]; then
     if [ -n "$object" ]; then
         set -- "$here/guest.sh" -o "$object" "$kver"
     else
         set -- "$here/guest.sh" "$kver"
     fi
+    [ -z "$level2" ] || set -- "$@" "$level2"
 fi
 for a do
     case "$a" in

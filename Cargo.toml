@@ -12,7 +12,10 @@ members = [
     "crates/plat-xdp-core",
     # bpfel-unknown-none program; on the host a stub main (plan §15).
     "crates/plat-xdp-ebpf",
+    # Userspace XDP: `xdp` feature off by default, so no bpf-linker needed.
+    "crates/plat-xdp",
     "services/platd",
+    "services/plat-xdp-loader",
 ]
 
 [workspace.package]
@@ -36,6 +39,7 @@ plat-io = { path = "crates/plat-io", version = "0.1.0" }
 plat-cluster = { path = "crates/plat-cluster", version = "0.1.0" }
 plat-tls = { path = "crates/plat-tls", version = "0.1.0" }
 plat-xdp-core = { path = "crates/plat-xdp-core", version = "0.1.0" }
+plat-xdp = { path = "crates/plat-xdp", version = "0.1.0" }
 
 ahash = "0.8"
 clap = { version = "4", features = ["derive"] }
