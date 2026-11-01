@@ -356,4 +356,51 @@ mod tests {
         assert_eq!(link_pin(7), "link_7");
         assert!(MAPS.iter().all(|m| !m.name.contains('.')), "bpffs refuses dots");
     }
+
+    // ---- QA (WU3): pin table ----
+
+    #[test]
+    fn pin_access_is_least_privilege() {
+        let acc = |n: &str| MAPS.iter().find(|m| m.name == n).map(|m| m.access);
+        // platd writes only the session, slot, slice and control maps.
+        let rw: Vec<_> = MAPS.iter().filter(|m| m.access == PinAccess::ReadWrite).map(|m| m.name).collect();
+        assert_eq!(rw, ["OUT6", "IN4", "SLOT", "SLICE", "CONTROL"]);
+        for n in ["CONFIG", "STATS", "FWD", "IFACES", "EGRESS"] {
+            assert_eq!(acc(n), Some(PinAccess::ReadOnly), "{n}");
+        }
+        assert_eq!(acc("TX"), Some(PinAccess::RootOnly));
+        for n in ["IDENT", "IDENT_KEY", "SCRATCH"] {
+            assert_eq!(acc(n), Some(PinAccess::Unpinned), "{n} (secret or per-CPU scratch must never be pinned)");
+        }
+        // No pin is world-accessible.
+        for m in MAPS {
+            if let Some(mode) = m.access.mode() {
+                assert_eq!(mode & 0o007, 0, "{} world bits", m.name);
+                assert_eq!(mode & 0o111, 0, "{} exec bits", m.name);
+            }
+        }
+        assert!(!MAPS.iter().any(|m| m.name == PROG_PIN || m.name.starts_with(LINK_PIN_PREFIX)));
+    }
+
+    #[test]
+    fn slot_sizing_saturates_and_link_pins_are_unique() {
+        assert_eq!(slot_count(0), 0);
+        assert_eq!(slot_count(1), 2, "ceil(1.25)");
+        assert_eq!(slot_count(4), 5);
+        assert_eq!(slot_count(u32::MAX), u32::MAX, "saturates, never wraps");
+        assert!(slot_count(u32::MAX - 3) >= u32::MAX - 3);
+        assert_eq!(slot_bytes(1), 64, "SlotRec is one cache line");
+        let mut pins: Vec<String> = [1u32, 10, 100, 65, 129].iter().map(|&i| link_pin(i)).collect();
+        pins.sort();
+        pins.dedup();
+        assert_eq!(pins.len(), 5);
+        assert!(pins.iter().all(|p| !p.contains('.') && !p.contains('/') && p.len() < 64));
+    }
+
+    #[test]
+    fn heap_words_are_zeroed_and_sized() {
+        let w = HeapWords::new(17);
+        assert_eq!(w.words().len(), 17);
+        assert!(w.words().iter().all(|x| x.load(std::sync::atomic::Ordering::Relaxed) == 0));
+    }
 }

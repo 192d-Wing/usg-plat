@@ -199,4 +199,182 @@ mod tests {
         let c = SlotAllocator::new(0, 4);
         assert_eq!(c.alloc(0), None);
     }
+
+    // ---- QA (WU3): reuse epochs ----
+
+    #[test]
+    fn each_slot_waits_for_its_own_stamp_fifo_per_partition() {
+        let a = SlotAllocator::new(4, 1);
+        let s: Vec<u32> = (0..4).filter_map(|_| a.alloc(0)).collect();
+        assert_eq!(s, vec![0, 1, 2, 3]);
+        a.retire(0); // stamp 0
+        a.advance_epoch(); // 1
+        a.retire(1); // stamp 1
+        a.advance_epoch(); // 2
+        assert_eq!(a.recycle(), 1, "only the stamp-0 slot is past two epochs");
+        assert_eq!(a.alloc(0), Some(0));
+        assert_eq!(a.alloc(0), None, "slot 1 is still quarantined");
+        a.advance_epoch(); // 3
+        assert_eq!(a.recycle(), 1);
+        assert_eq!(a.alloc(0), Some(1));
+        assert_eq!(a.quarantined(), 0);
+        // Recycle is idempotent.
+        assert_eq!(a.recycle(), 0);
+    }
+
+    #[test]
+    fn retire_stamps_with_the_current_epoch_not_the_alloc_epoch() {
+        let a = SlotAllocator::new(1, 1);
+        let s = a.alloc(0).unwrap_or(u32::MAX);
+        for _ in 0..10 {
+            a.advance_epoch();
+        }
+        a.retire(s); // stamp 10
+        assert_eq!(a.recycle(), 0, "allocated long ago, retired now: still needs two epochs");
+        a.advance_epoch();
+        assert_eq!(a.recycle(), 0);
+        a.advance_epoch();
+        assert_eq!(a.recycle(), 1);
+    }
+
+    /// Deterministic model check: across many partitions and a random mix
+    /// of alloc / retire / advance / recycle, a slot is never handed out
+    /// while live, never before two epochs after its retire, always from
+    /// the caller's partition, and the counters stay exact.
+    #[test]
+    fn model_check_no_early_reuse() {
+        let (slots, parts) = (61u32, 7usize);
+        let a = SlotAllocator::new(slots, parts);
+        let mut live = std::collections::HashSet::new();
+        let mut retired_at: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..200_000 {
+            let r = next();
+            match r % 10 {
+                0..=4 => {
+                    let shard = (r >> 8) as usize;
+                    if let Some(s) = a.alloc(shard) {
+                        assert_eq!(s as usize % parts, shard % parts, "partition ownership");
+                        assert!(s < slots);
+                        assert!(live.insert(s), "slot {s} handed out twice");
+                        if let Some(st) = retired_at.remove(&s) {
+                            assert!(st + 2 <= a.epoch(), "slot {s} reused at epoch {} (retired at {st})", a.epoch());
+                        }
+                    }
+                }
+                5..=7 => {
+                    if let Some(&s) = live.iter().nth((r >> 8) as usize % live.len().max(1)) {
+                        live.remove(&s);
+                        retired_at.insert(s, a.epoch());
+                        a.retire(s);
+                    }
+                }
+                8 => {
+                    a.advance_epoch();
+                }
+                _ => {
+                    a.recycle();
+                }
+            }
+            assert_eq!(
+                a.quarantined() as usize,
+                retired_at.len() - {
+                    // retired slots already recycled into free are not quarantined
+                    let mut in_free = 0;
+                    for p in a.parts.iter() {
+                        in_free += p.lock().free.iter().filter(|s| retired_at.contains_key(s)).count();
+                    }
+                    in_free
+                }
+            );
+        }
+    }
+
+    /// Concurrent alloc/retire from many threads with a grace-period
+    /// thread: no slot is ever held by two threads at once, and every slot
+    /// comes back.
+    #[test]
+    fn concurrent_alloc_retire_with_grace_periods() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU8};
+        let slots = 256u32;
+        let a = Arc::new(SlotAllocator::new(slots, 16));
+        let owner: Arc<Vec<AtomicU8>> = Arc::new((0..slots).map(|_| AtomicU8::new(0)).collect());
+        let stop = Arc::new(AtomicBool::new(false));
+        let gc = {
+            let (a, stop) = (a.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    a.advance_epoch();
+                    a.recycle();
+                    std::thread::yield_now();
+                }
+            })
+        };
+        let hs: Vec<_> = (0..8usize)
+            .map(|t| {
+                let (a, owner) = (a.clone(), owner.clone());
+                std::thread::spawn(move || {
+                    let mut mine = Vec::new();
+                    for i in 0..20_000usize {
+                        if i % 3 != 2 {
+                            if let Some(s) = a.alloc(t * 31 + i) {
+                                let prev = owner[s as usize].swap(t as u8 + 1, Ordering::AcqRel);
+                                assert_eq!(prev, 0, "slot {s} already owned by {prev}");
+                                mine.push(s);
+                            }
+                        } else if let Some(s) = mine.pop() {
+                            owner[s as usize].store(0, Ordering::Release);
+                            a.retire(s);
+                        }
+                    }
+                    for s in mine {
+                        owner[s as usize].store(0, Ordering::Release);
+                        a.retire(s);
+                    }
+                })
+            })
+            .collect();
+        for h in hs {
+            h.join().unwrap_or_else(|_| panic!("worker panicked"));
+        }
+        stop.store(true, Ordering::Relaxed);
+        gc.join().unwrap_or_else(|_| panic!("gc panicked"));
+        a.advance_epoch();
+        a.advance_epoch();
+        a.recycle();
+        assert_eq!(a.quarantined(), 0);
+        let mut all: Vec<u32> = a.parts.iter().flat_map(|p| p.lock().free.clone()).collect();
+        all.sort_unstable();
+        assert_eq!(all, (0..slots).collect::<Vec<_>>(), "every slot back exactly once");
+    }
+
+    /// QA finding (WU3): a second retire of the same slot (a caller bug, or
+    /// a retire racing a rollback) quarantines it twice, so after the grace
+    /// period it is on the free stack twice and two sessions can be given
+    /// the same `SLOT` record. The allocator does not guard against it.
+    /// Ignored until the allocator (or `XdpMirror::retire`) refuses a slot
+    /// that is not live.
+    #[test]
+    #[ignore = "QA finding: double retire duplicates a slot"]
+    fn double_retire_does_not_duplicate_a_slot() {
+        let a = SlotAllocator::new(2, 1);
+        let s = a.alloc(0).unwrap_or(u32::MAX);
+        a.retire(s);
+        a.retire(s);
+        a.advance_epoch();
+        a.advance_epoch();
+        a.recycle();
+        let x = a.alloc(0);
+        let y = a.alloc(0);
+        let z = a.alloc(0);
+        assert!(!(x == y || y == z || x == z) || x.is_none(), "duplicate slot: {x:?} {y:?} {z:?}");
+        assert_eq!(z, None, "only 2 slots exist");
+    }
 }

@@ -573,4 +573,63 @@ pub(crate) mod tests {
         assert_eq!(m.install(&e, 0), Err(InstallError::Error));
         assert_eq!(m.record(15).map(|r| r.state), Some(SLOT_FREE));
     }
+
+    // ---- QA (WU3): writer edge cases ----
+
+    #[test]
+    fn rollback_after_in4_failure_leaves_nothing_and_quarantines() {
+        let (t, m) = mirror(16, 16);
+        assert_eq!(m.activate_slice(0), Some(1));
+        // IN4 insert fails because the key already exists (another entry).
+        let e = entry(20);
+        let s = m.install(&e, 0).unwrap_or(u32::MAX);
+        let mut dup = entry(21);
+        dup.pool_port4 = e.pool_port4; // same IN4 key, other OUT6 key
+        dup.pool4 = e.pool4;
+        dup.dst4 = e.dst4;
+        dup.dport = e.dport;
+        let q = m.slot_allocator().quarantined();
+        assert_eq!(m.install(&dup, 0), Err(InstallError::Error));
+        assert_eq!(m.slot_allocator().quarantined(), q + 1);
+        assert_eq!(t.out6.lock().len(), 1, "no OUT6 entry for the failed install");
+        assert_eq!(t.in4.lock().get(&e.key4().to_bytes()), Some(&s), "the existing IN4 entry is kept");
+        assert_eq!(m.counters().sessions.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn retire_of_an_absent_entry_is_harmless_and_counted_once() {
+        let (t, m) = mirror(16, 16);
+        let e = entry(22);
+        let s = m.install(&e, 0).unwrap_or(u32::MAX);
+        // Keys already gone (e.g. the GC deleted them): retire still marks
+        // DEAD and quarantines; the sessions gauge never underflows.
+        t.out6.lock().clear();
+        t.in4.lock().clear();
+        assert!(m.retire(s, &e).is_ok());
+        assert_eq!(m.record(s).map(|r| r.state), Some(SLOT_DEAD));
+        assert_eq!(m.counters().sessions.load(Ordering::Relaxed), 0);
+        // Out-of-range slot: no write, no quarantine, no panic.
+        let q = m.slot_allocator().quarantined();
+        assert!(m.retire(u32::MAX, &e).is_ok());
+        assert_eq!(m.slot_allocator().quarantined(), q);
+        assert_eq!(m.counters().sessions.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn install_takes_the_generation_from_slice_and_never_reuses_early() {
+        let (_t, m) = mirror(64, 4);
+        assert_eq!(m.activate_slice(0), Some(1));
+        assert!(m.deactivate_slice(0, SLICE_FENCED));
+        assert_eq!(m.activate_slice(0), Some(2));
+        let e = entry(23);
+        let s = m.install(&e, 2).unwrap_or(u32::MAX);
+        assert_eq!(m.record(s).map(|r| r.generation), Some(2));
+        assert_eq!(s % 4, 2, "partition of shard 2");
+        assert!(m.retire(s, &e).is_ok());
+        m.slot_allocator().advance_epoch();
+        m.slot_allocator().recycle();
+        // Partition 2 holds only slot 2 of 4: no slot until two epochs.
+        assert_eq!(m.install(&entry(24), 2), Err(InstallError::Slots));
+        assert_eq!(m.counters().install_slots.load(Ordering::Relaxed), 1);
+    }
 }
