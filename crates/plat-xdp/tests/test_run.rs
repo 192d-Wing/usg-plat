@@ -50,6 +50,7 @@ use plat_xdp::mirror::{SessionEntry, XdpMirror};
 use plat_xdp_core::abi::{
     EgressEnt, IdentEnt, IfaceEnt, PassReason, SLICE_ACTIVE, SLICE_FENCED, SlotRec, StatIdx, iface_slot,
 };
+use plat_xdp_core::ident::IdentKey;
 
 const VECTORS: &str = include_str!("../../../deploy/tests/xdp/level2-vectors.txt");
 const XDP_ABORTED: u32 = 0;
@@ -130,6 +131,10 @@ fn params() -> LoadParams {
         frag6: 1280,
         copy_tos: true,
         sliced: false,
+        // RFC 6052 well-known prefix 64:ff9b::/96.
+        prefix: 0x0064_ff9b_u128 << 96,
+        prefix_len: 96,
+        allow_non_global: false,
     }
 }
 
@@ -271,6 +276,75 @@ fn substitute_id(expected: &mut [u8], got: &[u8]) {
     expected[24..26].copy_from_slice(&c.to_be_bytes());
 }
 
+/// The unpinned `IDENT_KEY` value and an `IDENT` handle, through the
+/// program's map ids (RFC-003).
+fn ident_maps(fx: &Fx) -> (IdentKey, BpfMap) {
+    let info = ok(fx.prog.info(), "prog info");
+    let (mut key, mut ident) = (None, None);
+    for id in ok(info.map_ids(), "map ids").unwrap_or_default() {
+        let md = ok(aya::maps::MapData::from_id(id), "map by id");
+        let name = ok(md.info(), "map info").name_as_str().unwrap_or_default().to_string();
+        let fd = ok(std::os::fd::AsFd::as_fd(md.fd()).try_clone_to_owned(), "dup");
+        match name.as_str() {
+            "IDENT_KEY" => {
+                let m = ok(BpfMap::from_fd(fd, Access::ReadOnly), "IDENT_KEY");
+                let mut k = [0u8; 16];
+                assert!(ok(m.lookup(&0u32.to_ne_bytes(), &mut k), "IDENT_KEY"));
+                key = Some(IdentKey::from_bytes(&k));
+            }
+            "IDENT" => ident = Some(ok(BpfMap::from_fd(fd, Access::ReadOnly), "IDENT")),
+            _ => {}
+        }
+    }
+    (key.unwrap_or_else(|| panic!("IDENT_KEY")), ident.unwrap_or_else(|| panic!("IDENT")))
+}
+
+/// Every CPU's `IDENT[idx]`.
+fn ident_row(m: &BpfMap, idx: u32) -> Vec<IdentEnt> {
+    let mut v = vec![0u8; m.value_len()];
+    assert!(ok(m.lookup(&idx.to_ne_bytes(), &mut v), "IDENT"));
+    v.as_chunks::<16>().0.iter().map(IdentEnt::from_bytes).collect()
+}
+
+/// RFC-003: a redirect of an IPv6 → IPv4 DF = 0 frame advanced exactly one
+/// CPU's `IDENT` entry of the flow's index by one generator step, and the
+/// packet's ID is that step's ID (RFC 7739 §5.3, the same `ident::next`
+/// the core computes).
+struct IdentCheck {
+    m: u64,
+    idx: u32,
+    before: Vec<IdentEnt>,
+    map: BpfMap,
+}
+
+impl IdentCheck {
+    /// `None` unless `want` is an IPv4 DF = 0 output of IPv6 `input`.
+    fn before(fx: &Fx, input: &[u8], want: &[u8]) -> Option<Self> {
+        if input.len() < 54 || want.len() < 34 || input[12..14] != [0x86, 0xdd] || want[12..14] != [0x08, 0x00] {
+            return None;
+        }
+        if want[20] & 0x40 != 0 {
+            return None;
+        }
+        let (key, map) = ident_maps(fx);
+        let src6: [u8; 16] = input[22..38].try_into().unwrap_or_default();
+        let dst4: [u8; 4] = want[30..34].try_into().unwrap_or_default();
+        let m = key.mix(&src6, &dst4, 17);
+        let idx = plat_xdp_core::ident::index(m);
+        Some(Self { m, idx, before: ident_row(&map, idx), map })
+    }
+
+    fn after(self, name: &str, got: &[u8]) {
+        let after = ident_row(&self.map, self.idx);
+        let changed: Vec<usize> = (0..after.len()).filter(|&c| after[c] != self.before[c]).collect();
+        assert_eq!(changed.len(), 1, "{name}: exactly one CPU's IDENT[{}] advances", self.idx);
+        let mut e = self.before[changed[0]];
+        let id = plat_xdp_core::ident::next(&mut e, self.m);
+        assert_eq!(e, after[changed[0]], "{name}: one generator step");
+        assert_eq!(&got[18..20], &id.to_be_bytes(), "{name}: DF = 0 ID is the per-CPU step's ID");
+    }
+}
+
 fn devname(fx: &Fx, n: &str) -> u32 {
     match n {
         "acc0" => fx.acc,
@@ -320,6 +394,27 @@ fn apply_override(fx: &Fx, f: &[&str]) -> bool {
     true
 }
 
+/// Verdict counts of `deploy/tests/xdp/level2-vectors.txt` (WU3 run: 6
+/// redirects, 27 passes; see `vector_counts_match_the_file` for frozen).
+const L2_REDIRECTS: usize = 6;
+const L2_PASSES: usize = 27;
+const L2_FROZEN: usize = 1;
+
+/// The constants above match the vector file (host check, no VM).
+#[test]
+fn vector_counts_match_the_file() {
+    let frames: Vec<Vec<&str>> =
+        VECTORS.lines().filter(|l| l.starts_with("frame ")).map(|l| l.split_whitespace().collect()).collect();
+    let frozen: std::collections::BTreeSet<&str> = VECTORS
+        .lines()
+        .filter_map(|l| l.strip_prefix("with "))
+        .filter(|l| l.split_whitespace().nth(1) == Some("map") && l.split_whitespace().nth(2) == Some("CONFIG"))
+        .filter_map(|l| l.split_whitespace().next())
+        .collect();
+    let live = |v: &str| frames.iter().filter(|f| f[3] == v && !frozen.contains(f[1])).count();
+    assert_eq!((live("redirect"), live("pass"), frozen.len()), (L2_REDIRECTS, L2_PASSES, L2_FROZEN));
+}
+
 const fn libc_eperm() -> i32 {
     1
 }
@@ -328,7 +423,7 @@ const fn libc_eperm() -> i32 {
 #[ignore = "root, Linux VM, netns.sh namespace (plan §11 level 2)"]
 fn level2_vectors() {
     let mut fx = fixture();
-    let (mut redirects, mut passes, mut frozen) = (0, 0, 0);
+    let (mut redirects, mut passes, mut frozen, mut df0) = (0, 0, 0, 0);
     let mut seen_checked = false;
     let names: Vec<&str> = VECTORS.lines().filter(|l| l.starts_with("frame ")).collect();
     for line in names {
@@ -351,8 +446,13 @@ fn level2_vectors() {
             "redirect" => {
                 let input = hex(f[6]);
                 let mut want = hex(f[7]);
+                let check = IdentCheck::before(&fx, &input, &want);
                 let (act, got) = run(&fx, &input, ingress);
                 assert_eq!(act, XDP_REDIRECT, "{name}: action");
+                if let Some(c) = check {
+                    c.after(name, &got);
+                    df0 += 1;
+                }
                 substitute_id(&mut want, &got);
                 assert_eq!(hex_of(&got), hex_of(&want), "{name}: output");
                 if !seen_checked {
@@ -374,8 +474,13 @@ fn level2_vectors() {
             v => panic!("{name}: verdict {v}"),
         }
     }
-    eprintln!("level2: vectors ok: {redirects} redirects, {passes} passes, {frozen} CONFIG-frozen checks");
-    assert!(redirects >= 6 && passes >= 20);
+    eprintln!(
+        "level2: vectors ok: {redirects} redirects ({df0} DF = 0 ID checks), {passes} passes, {frozen} CONFIG-frozen checks"
+    );
+    // RFC-003: exact counts of level2-vectors.txt, so a vector that silently
+    // stops being exercised fails the run.
+    assert_eq!((redirects, passes, frozen), (L2_REDIRECTS, L2_PASSES, L2_FROZEN));
+    assert!(df0 >= 1, "at least one DF = 0 ID checked against IDENT");
 }
 
 fn hex_of(b: &[u8]) -> String {

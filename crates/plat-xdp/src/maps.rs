@@ -15,9 +15,13 @@
 //!
 //! COMPLIANCE MAPPING:
 //! - NIST 800-53: AC-6 (Least Privilege), AC-3 (Access Enforcement) -
-//!   `platd` gets write access only to the session, slice and control maps;
-//!   interface roles, egress allow-list, counters and `CONFIG` are
-//!   read-only pins (CM-6)
+//!   designed for: `platd` gets write access only to the session, slice and
+//!   control maps; interface roles, egress allow-list, counters and
+//!   `CONFIG` are read-only pins (CM-6). Enforced once `platd` opens the
+//!   pins (WU5) under the WU6 units; backed now by the pin-mode tests
+//!   (`tests::pin_access_is_least_privilege`, `tests/unprivileged.rs`) and
+//!   by `XdpMaps::open_pinned` opening each pin with its [`MapSpec`]
+//!   access only
 //! - NIST 800-53: SI-7 (Software, Firmware, and Information Integrity) -
 //!   shape checks on every pin; `CONFIG` digest check (object SHA-256 and
 //!   translation parameters) before the fast path may be enabled
@@ -145,7 +149,9 @@ mod linux {
         Access, BPF_F_MMAPABLE, BPF_F_RDONLY_PROG, BPF_F_ZERO_SEED, BPF_NOEXIST, BpfMap, MAP_TYPE_ARRAY, MAP_TYPE_HASH,
         MAP_TYPE_PERCPU_ARRAY,
     };
-    use plat_xdp_core::abi::{ConfigRec, Control, FwdCounters, MAX_SLICES, SliceEnt, SlotRec};
+    use plat_xdp_core::abi::{ConfigRec, Control, FWD_DIRS, FwdCounters, MAX_SLICES, STATS_LEN, SliceEnt, SlotRec};
+
+    use super::PinAccess;
 
     use crate::mirror::SessionTables;
 
@@ -175,9 +181,21 @@ mod linux {
         set: u32,
         /// Flags that must be clear.
         clear: u32,
+        /// `max_entries`, when fixed by the object.
+        entries: Option<u32>,
     }
 
-    fn open(dir: &Path, name: &'static str, access: Access, s: &Shape) -> Result<BpfMap, OpenError> {
+    /// SEC-009: opens `name` with the access its [`super::MapSpec`] grants
+    /// `platd` (a root-only or unpinned map is never opened) and checks it
+    /// against `s`.
+    fn open(dir: &Path, name: &'static str, s: &Shape) -> Result<BpfMap, OpenError> {
+        let shape = |what: &str| OpenError::Shape { name, what: what.into() };
+        let access = match super::MAPS.iter().find(|m| m.name == name).map(|m| m.access) {
+            Some(PinAccess::ReadWrite) => Access::ReadWrite,
+            Some(PinAccess::ReadOnly) => Access::ReadOnly,
+            Some(PinAccess::RootOnly | PinAccess::Unpinned) => return Err(shape("not a platd pin")),
+            None => return Err(shape("not in MAPS")),
+        };
         let p = dir.join(name);
         let m = BpfMap::open(&p, access).map_err(|e| OpenError::Pin(p, e))?;
         check(name, &m, s)?;
@@ -195,6 +213,11 @@ mod linux {
         }
         if i.map_flags & s.set != s.set || i.map_flags & s.clear != 0 {
             return bad(format!("flags {:#x}", i.map_flags));
+        }
+        if let Some(n) = s.entries
+            && i.max_entries != n
+        {
+            return bad(format!("max_entries {} (want {n})", i.max_entries));
         }
         Ok(())
     }
@@ -245,30 +268,44 @@ mod linux {
         /// `expected` (built with [`crate::load::config_record`] from the
         /// same configuration and this binary's object).
         pub fn open_pinned(dir: &Path, expected: &ConfigRec) -> Result<Self, OpenError> {
-            let rw = Access::ReadWrite;
-            let ro = Access::ReadOnly;
-            let hash = |key, clear| Shape { map_type: MAP_TYPE_HASH, key, value: 4, set: 0, clear };
-            let mm = |value| Shape { map_type: MAP_TYPE_ARRAY, key: 4, value, set: BPF_F_MMAPABLE, clear: 0 };
-            let out6 = open(dir, "OUT6", rw, &hash(40, BPF_F_ZERO_SEED))?;
-            let in4 = open(dir, "IN4", rw, &hash(12, BPF_F_ZERO_SEED))?;
-            if out6.info().max_entries != in4.info().max_entries {
-                return Err(OpenError::Shape { name: "IN4", what: "max_entries differs from OUT6".into() });
-            }
-            let slot = open(dir, "SLOT", rw, &mm(sz::<SlotRec>()))?;
-            let slice = open(dir, "SLICE", rw, &mm(sz::<SliceEnt>()))?;
-            let control = open(dir, "CONTROL", rw, &mm(sz::<Control>()))?;
-            if slice.info().max_entries != MAX_SLICES || control.info().max_entries != 1 {
-                return Err(OpenError::Shape { name: "SLICE", what: "entries".into() });
-            }
+            let hash =
+                |key| Shape { map_type: MAP_TYPE_HASH, key, value: 4, set: 0, clear: BPF_F_ZERO_SEED, entries: None };
+            let mm = |value, entries| Shape {
+                map_type: MAP_TYPE_ARRAY,
+                key: 4,
+                value,
+                set: BPF_F_MMAPABLE,
+                clear: 0,
+                entries,
+            };
+            let out6 = open(dir, "OUT6", &hash(40))?;
+            let sessions = out6.info().max_entries;
+            let in4 = open(dir, "IN4", &Shape { entries: Some(sessions), ..hash(12) })?;
+            let slot = open(dir, "SLOT", &mm(sz::<SlotRec>(), Some(crate::maps::slot_count(sessions))))?;
+            let slice = open(dir, "SLICE", &mm(sz::<SliceEnt>(), Some(MAX_SLICES)))?;
+            let control = open(dir, "CONTROL", &mm(sz::<Control>(), Some(1)))?;
             let config = open(
                 dir,
                 "CONFIG",
-                ro,
-                &Shape { map_type: MAP_TYPE_ARRAY, key: 4, value: sz::<ConfigRec>(), set: BPF_F_RDONLY_PROG, clear: 0 },
+                &Shape {
+                    map_type: MAP_TYPE_ARRAY,
+                    key: 4,
+                    value: sz::<ConfigRec>(),
+                    set: BPF_F_RDONLY_PROG,
+                    clear: 0,
+                    entries: Some(1),
+                },
             )?;
-            let pcpu = |value| Shape { map_type: MAP_TYPE_PERCPU_ARRAY, key: 4, value, set: 0, clear: 0 };
-            let stats = open(dir, "STATS", ro, &pcpu(8))?;
-            let fwd = open(dir, "FWD", ro, &pcpu(sz::<FwdCounters>()))?;
+            let pcpu = |value, entries| Shape {
+                map_type: MAP_TYPE_PERCPU_ARRAY,
+                key: 4,
+                value,
+                set: 0,
+                clear: 0,
+                entries: Some(entries),
+            };
+            let stats = open(dir, "STATS", &pcpu(8, STATS_LEN))?;
+            let fwd = open(dir, "FWD", &pcpu(sz::<FwdCounters>(), FWD_DIRS))?;
 
             let mut b = [0u8; 40];
             if !config.lookup(&0u32.to_ne_bytes(), &mut b).map_err(OpenError::Config)? {
@@ -280,7 +317,6 @@ mod linux {
             }
 
             let slots = slot.info().max_entries;
-            let sessions = out6.info().max_entries;
             let map = |name: &'static str, m: &BpfMap, len: usize| {
                 MmapRegion::from_fd(m.as_fd(), len).map_err(|e| OpenError::Mmap(name, e))
             };

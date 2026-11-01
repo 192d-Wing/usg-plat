@@ -99,6 +99,7 @@ pub fn render(out: &mut String, enabled: bool, s: &Snapshot, m: &XdpMirror, c: &
     fam("plat_xdp_installs_total", "counter", "Fast-path session installs");
     fam("plat_xdp_install_failures_total", "counter", "Fast-path install failures, by reason");
     fam("plat_xdp_retires_total", "counter", "Fast-path session retires");
+    fam("plat_xdp_retire_not_live_total", "counter", "Retires refused because the slot was not live");
     fam("plat_xdp_revalidated_total", "counter", "Slow-path expiries extended by fast-path activity");
     fam("plat_xdp_slots_quarantined", "gauge", "Slots waiting for an RCU grace period");
     fam("plat_xdp_gc_deleted_total", "counter", "Stale-generation entries deleted");
@@ -116,15 +117,16 @@ pub fn render(out: &mut String, enabled: bool, s: &Snapshot, m: &XdpMirror, c: &
             writeln!(out, "plat_xdp_pass_total{{reason=\"{}\"}} {}", r.as_str(), s.pass.get(r as usize).unwrap_or(&0));
     }
     let _ = writeln!(out, "plat_xdp_aborted_total {}", s.aborted);
-    let _ = writeln!(out, "plat_xdp_sessions {}", ld(&k.sessions));
-    let _ = writeln!(out, "plat_xdp_installs_total {}", ld(&k.installs));
+    let _ = writeln!(out, "plat_xdp_sessions {}", k.sessions.get());
+    let _ = writeln!(out, "plat_xdp_installs_total {}", k.installs.get());
     for (r, v) in [("map_full", &k.install_map_full), ("slots", &k.install_slots), ("error", &k.install_error)] {
-        let _ = writeln!(out, "plat_xdp_install_failures_total{{reason=\"{r}\"}} {}", ld(v));
+        let _ = writeln!(out, "plat_xdp_install_failures_total{{reason=\"{r}\"}} {}", v.get());
     }
-    let _ = writeln!(out, "plat_xdp_retires_total {}", ld(&k.retires));
-    let _ = writeln!(out, "plat_xdp_revalidated_total {}", ld(&k.revalidated));
+    let _ = writeln!(out, "plat_xdp_retires_total {}", k.retires.get());
+    let _ = writeln!(out, "plat_xdp_retire_not_live_total {}", k.retire_not_live.get());
+    let _ = writeln!(out, "plat_xdp_revalidated_total {}", k.revalidated.get());
     let _ = writeln!(out, "plat_xdp_slots_quarantined {}", m.slot_allocator().quarantined());
-    let _ = writeln!(out, "plat_xdp_gc_deleted_total {}", ld(&k.gc_deleted));
+    let _ = writeln!(out, "plat_xdp_gc_deleted_total {}", k.gc_deleted.get());
     let _ = writeln!(out, "plat_xdp_heartbeat_stalls_total {}", ld(&c.heartbeat_stalls));
 }
 
@@ -163,6 +165,7 @@ mod tests {
         for r in PassReason::ALL {
             assert!(out.contains(&format!("reason=\"{}\"", r.as_str())));
         }
-        assert_eq!(out.matches("# TYPE").count(), 13);
+        assert_eq!(out.matches("# TYPE").count(), 14);
+        assert!(out.contains("plat_xdp_retire_not_live_total 0\n"));
     }
 }

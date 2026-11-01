@@ -15,6 +15,12 @@
 //!   (`synchronize_rcu`), and the grace period that produced `stamp + 2`
 //!   started after `stamp + 1` was published, so after the delete.
 //!
+//! - Each partition keeps a live bit per slot: [`SlotAllocator::retire`]
+//!   of a slot that is not live (a double retire, or one racing a
+//!   rollback) is refused, so a slot is never on a free stack twice (QA F1).
+//! - Counters are per partition, under its lock (no shared atomic written
+//!   by every worker, PERF-005); [`SlotAllocator::quarantined`] sums them.
+//!
 //! Lock order: each partition mutex is a leaf (`bib4 → xslot`, or `xslot`
 //! alone); nothing is called while it is held.
 //!
@@ -39,6 +45,15 @@ struct Part {
     free: Vec<u32>,
     /// `(slot, epoch stamp)`, stamps non-decreasing (read under the lock).
     quarantine: VecDeque<(u32, u64)>,
+    /// Bit `slot / partitions`: handed out by `alloc` and not yet retired.
+    live: Box<[u64]>,
+}
+
+impl Part {
+    /// Word and mask of the live bit of the partition's `local`-th slot.
+    fn bit(&mut self, local: usize) -> Option<(&mut u64, u64)> {
+        Some((self.live.get_mut(local / 64)?, 1u64 << (local % 64)))
+    }
 }
 
 /// See the module documentation.
@@ -46,7 +61,6 @@ struct Part {
 pub struct SlotAllocator {
     parts: Box<[Mutex<Part>]>,
     epoch: AtomicU64,
-    quarantined: AtomicU64,
     slots: u32,
 }
 
@@ -61,9 +75,10 @@ impl SlotAllocator {
             let cap = mine.len();
             // Highest index on top: lower slots are handed out first.
             let free: Vec<u32> = mine.rev().collect();
-            parts.push(Mutex::new(Part { free, quarantine: VecDeque::with_capacity(cap) }));
+            let live = vec![0u64; cap.div_ceil(64)].into_boxed_slice();
+            parts.push(Mutex::new(Part { free, quarantine: VecDeque::with_capacity(cap), live }));
         }
-        Self { parts: parts.into_boxed_slice(), epoch: AtomicU64::new(0), quarantined: AtomicU64::new(0), slots }
+        Self { parts: parts.into_boxed_slice(), epoch: AtomicU64::new(0), slots }
     }
 
     /// Number of slots managed.
@@ -82,21 +97,39 @@ impl SlotAllocator {
     /// A free slot from partition `shard % partitions`, or `None` when that
     /// partition has none.
     pub fn alloc(&self, shard: usize) -> Option<u32> {
-        self.parts.get(shard % self.parts.len())?.lock().free.pop()
+        let n = self.parts.len();
+        let mut g = self.parts.get(shard % n)?.lock();
+        let slot = g.free.pop()?;
+        if let Some((w, m)) = g.bit(slot as usize / n) {
+            *w |= m;
+        }
+        Some(slot)
+    }
+
+    /// Whether `slot` is handed out and not retired.
+    pub fn is_live(&self, slot: u32) -> bool {
+        let n = self.parts.len();
+        slot < self.slots
+            && self.part_of(slot).is_some_and(|p| p.lock().bit(slot as usize / n).is_some_and(|(w, m)| *w & m != 0))
     }
 
     /// Quarantines `slot` (state already `DEAD`, hash entries deleted).
-    /// Out-of-range indices are ignored.
-    pub fn retire(&self, slot: u32) {
+    /// Returns `false`, changing nothing, for an out-of-range index or a
+    /// slot that is not live (QA F1: never quarantined twice).
+    pub fn retire(&self, slot: u32) -> bool {
         if slot >= self.slots {
-            return;
+            return false;
         }
-        if let Some(p) = self.part_of(slot) {
-            let mut g = p.lock();
-            let stamp = self.epoch.load(Ordering::Acquire);
-            g.quarantine.push_back((slot, stamp));
-            self.quarantined.fetch_add(1, Ordering::Relaxed);
+        let n = self.parts.len();
+        let Some(p) = self.part_of(slot) else { return false };
+        let mut g = p.lock();
+        match g.bit(slot as usize / n) {
+            Some((w, m)) if *w & m != 0 => *w &= !m,
+            _ => return false,
         }
+        let stamp = self.epoch.load(Ordering::Acquire);
+        g.quarantine.push_back((slot, stamp));
+        true
     }
 
     /// The grace-period epoch.
@@ -126,13 +159,13 @@ impl SlotAllocator {
                 n += 1;
             }
         }
-        self.quarantined.fetch_sub(n, Ordering::Relaxed);
         n
     }
 
     /// Slots waiting for a grace period (`plat_xdp_slots_quarantined`).
+    /// Sums the partitions, each under its own lock (control path only).
     pub fn quarantined(&self) -> u64 {
-        self.quarantined.load(Ordering::Relaxed)
+        self.parts.iter().map(|p| p.lock().quarantine.len() as u64).sum()
     }
 }
 
@@ -355,19 +388,20 @@ mod tests {
         assert_eq!(all, (0..slots).collect::<Vec<_>>(), "every slot back exactly once");
     }
 
-    /// QA finding (WU3): a second retire of the same slot (a caller bug, or
-    /// a retire racing a rollback) quarantines it twice, so after the grace
-    /// period it is on the free stack twice and two sessions can be given
-    /// the same `SLOT` record. The allocator does not guard against it.
-    /// Ignored until the allocator (or `XdpMirror::retire`) refuses a slot
-    /// that is not live.
+    /// QA F1 (WU3): a second retire of the same slot (a caller bug, or a
+    /// retire racing a rollback) must not quarantine it twice, or after the
+    /// grace period it would be on the free stack twice and two sessions
+    /// could be given the same `SLOT` record. The live bit refuses it.
     #[test]
-    #[ignore = "QA finding: double retire duplicates a slot"]
     fn double_retire_does_not_duplicate_a_slot() {
         let a = SlotAllocator::new(2, 1);
         let s = a.alloc(0).unwrap_or(u32::MAX);
-        a.retire(s);
-        a.retire(s);
+        assert!(a.is_live(s));
+        assert!(a.retire(s));
+        assert!(!a.retire(s), "second retire refused");
+        assert!(!a.is_live(s));
+        assert!(!a.retire(1), "never handed out");
+        assert_eq!(a.quarantined(), 1);
         a.advance_epoch();
         a.advance_epoch();
         a.recycle();

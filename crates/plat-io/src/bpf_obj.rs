@@ -239,6 +239,34 @@ pub fn possible_cpus() -> io::Result<usize> {
     parse_possible_cpus(&t).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "cpu/possible"))
 }
 
+/// The map types [`BpfMap`] accepts: exactly those of the `plat-xdp-ebpf`
+/// object (`HashMap` for `OUT6` / `IN4`, `Array` for `SLOT`, `SLICE`,
+/// `CONTROL`, `CONFIG`, `IDENT_KEY`, `IFACES`, `EGRESS`, `PerCpuArray` for
+/// `IDENT`, `STATS`, `FWD`, `SCRATCH`, `DevMapHash` for `TX`).
+pub const SUPPORTED_TYPES: [u32; 4] = [MAP_TYPE_HASH, MAP_TYPE_ARRAY, MAP_TYPE_PERCPU_ARRAY, MAP_TYPE_DEVMAP_HASH];
+
+/// Bytes one lookup copies for a map of `info` (`cpus` is called only for
+/// the per-CPU type): `value_size`, or `round_up(value_size, 8) × possible
+/// CPUs` for `PERCPU_ARRAY`. Errors on an unsupported type or an overflow.
+fn value_len(info: &MapInfo, cpus: impl FnOnce() -> io::Result<usize>) -> io::Result<usize> {
+    let v = info.value_size as usize;
+    match info.map_type {
+        MAP_TYPE_PERCPU_ARRAY => v
+            .next_multiple_of(8)
+            .checked_mul(cpus()?)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "per-CPU value size overflows")),
+        MAP_TYPE_HASH | MAP_TYPE_ARRAY | MAP_TYPE_DEVMAP_HASH => Ok(v),
+        t => Err(io::Error::new(io::ErrorKind::InvalidInput, format!("unsupported BPF map type {t}"))),
+    }
+}
+
+/// Whether `fd` is a BPF map: the kernel names its anonymous inode
+/// `bpf-map` (`bpf_map_new_fd`); programs are `bpf-prog`, links `bpf_link`.
+fn is_map_fd(fd: BorrowedFd<'_>) -> io::Result<bool> {
+    let l = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()))?;
+    Ok(l.as_os_str().as_bytes() == b"anon_inode:bpf-map")
+}
+
 /// A map descriptor with the sizes the kernel reported, so every element
 /// operation can check its buffers. `Sync`: element operations are
 /// independent syscalls.
@@ -259,13 +287,19 @@ impl BpfMap {
     }
 
     /// Wraps a map descriptor (queries its information).
+    ///
+    /// SEC-003 / SEC-009: refuses a descriptor that is not a BPF map (a
+    /// program or link pin also answers `BPF_OBJ_GET_INFO_BY_FD`, with a
+    /// different layout) and every map type other than [`SUPPORTED_TYPES`].
+    /// The lookup buffer length is derived from the type; a per-CPU type
+    /// sized as a plain one would let the kernel write past `out`, so
+    /// unknown types are refused rather than guessed.
     pub fn from_fd(fd: OwnedFd, access: Access) -> io::Result<Self> {
+        if !is_map_fd(fd.as_fd())? {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "descriptor is not a BPF map"));
+        }
         let info = map_info(fd.as_fd())?;
-        let value_len = if info.map_type == MAP_TYPE_PERCPU_ARRAY {
-            (info.value_size as usize).next_multiple_of(8) * possible_cpus()?
-        } else {
-            info.value_size as usize
-        };
+        let value_len = value_len(&info, possible_cpus)?;
         Ok(Self { fd, info, value_len, access })
     }
 
@@ -368,6 +402,35 @@ mod tests {
         assert_eq!(size_of::<ObjAttr>(), 16);
         assert_eq!(size_of::<InfoAttr>(), 16);
         assert_eq!(size_of::<RawMapInfo>(), 40);
+    }
+
+    fn info(map_type: u32, value_size: u32) -> MapInfo {
+        MapInfo { map_type, id: 1, key_size: 4, value_size, max_entries: 1, map_flags: 0, name: [0; 16] }
+    }
+
+    #[test]
+    fn value_len_by_type() {
+        let four = || Ok(4);
+        assert_eq!(value_len(&info(MAP_TYPE_HASH, 4), four).ok(), Some(4));
+        assert_eq!(value_len(&info(MAP_TYPE_ARRAY, 64), four).ok(), Some(64));
+        assert_eq!(value_len(&info(MAP_TYPE_DEVMAP_HASH, 8), four).ok(), Some(8));
+        assert_eq!(value_len(&info(MAP_TYPE_PERCPU_ARRAY, 12), four).ok(), Some(64), "rounded to 8 x CPUs");
+        assert!(value_len(&info(MAP_TYPE_PERCPU_ARRAY, u32::MAX), || Ok(usize::MAX)).is_err());
+        // SEC-003: per-CPU hash, LRU per-CPU hash, per-CPU cgroup storage,
+        // LRU hash and anything else are refused, never sized as plain.
+        for t in [5, 9, 10, 21, 0, 99] {
+            assert!(value_len(&info(t, 8), four).is_err(), "type {t} accepted");
+        }
+        for t in SUPPORTED_TYPES {
+            assert!(value_len(&info(t, 8), four).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_non_bpf_descriptor_is_not_a_map() {
+        let f = std::fs::File::open("/dev/null").unwrap_or_else(|e| panic!("{e}"));
+        assert!(!is_map_fd(f.as_fd()).unwrap_or(true));
+        assert!(BpfMap::from_fd(OwnedFd::from(f), Access::ReadOnly).is_err());
     }
 
     #[test]

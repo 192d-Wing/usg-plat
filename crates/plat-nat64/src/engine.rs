@@ -406,21 +406,22 @@ impl Nat64 {
     /// one (the default), or with [`crate::mirror::NoMirror`], behaviour is
     /// unchanged.
     pub fn set_mirror(&mut self, m: Arc<dyn crate::mirror::Mirror>) {
-        self.state.set_mirror(m, self.prefix);
+        self.state.set_mirror(m, self.prefix, &self.cluster_pool);
     }
 
     /// Eligibility of a flow for the session mirror (plan §4.2 I3): a
-    /// mirror is attached, the flow is UDP, and the remote IPv4 address is
-    /// outside the cluster pool, which excludes own-node and cross-node
+    /// mirror is attached and the flow is UDP. The state adds, just before
+    /// an install (PERF-007: not per packet), that the remote IPv4 address
+    /// is outside the cluster pool, which excludes own-node and cross-node
     /// hairpins (outbound) and keeps the pool source guard in force
-    /// (inbound). The state adds the Active-slice check under the lock.
+    /// (inbound), and the Active-slice check under the lock.
     ///
     /// COMPLIANCE MAPPING:
     /// - NIST 800-53: SC-7 - the fast path only ever carries flows that
     ///   passed every slow-path boundary check and never hairpins
     #[inline]
-    fn mirror_eligible(&self, p: u8, remote4: u32) -> bool {
-        p == proto::UDP && self.state.mirror_on() && !self.cluster_pool.iter().any(|c| c.contains(remote4))
+    fn mirror_eligible(&self, p: u8) -> bool {
+        p == proto::UDP && self.state.mirror_on()
     }
 
     /// A worker context sized by this engine's `[translation.fragments]`.
@@ -677,7 +678,7 @@ impl Nat64 {
         // handed over) is never used (SC-24). The mapping carries its pool
         // index, so this is one load (PERF-002); no code in legacy mode.
         self.state.pool.check_idx_in(M::SLICED, m4.idx)?;
-        let mirror = self.mirror_eligible(k6.proto, dst4);
+        let mirror = self.mirror_eligible(k6.proto);
         if let Err(e) = self.state.outbound_with(m4.k4, (dst4, dport), flags, mirror, &ctx.counters) {
             if e != DropReason::NoBinding {
                 return Err(e);
@@ -1075,7 +1076,7 @@ impl Nat64 {
         let syn = (p == proto::TCP && !hairpin && flags & (tcp::SYN | tcp::RST | tcp::ACK | tcp::FIN) == tcp::SYN)
             .then(|| syn_meta(pkt, &h))
             .flatten();
-        let mirror = !hairpin && self.mirror_eligible(p, h.src);
+        let mirror = !hairpin && self.mirror_eligible(p);
         let k6 = match self.state.inbound_with(k4, (h.src, sport), flags, syn, mirror, &ctx.counters) {
             Ok(Some(k6)) => k6,
             Ok(None) => return Ok(Out::Held),

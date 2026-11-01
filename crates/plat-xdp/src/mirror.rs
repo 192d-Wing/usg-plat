@@ -9,9 +9,15 @@
 //!
 //! **Caller contract.** `install` and `retire` for one session run inside
 //! the `bib4` shard critical section that creates or removes it (plan §4.2;
-//! lock order `bib4 → xslot`), and only after the attribution record is
-//! queued (CLAUDE.md rule 4; I4). So two calls for the same key never race,
-//! and no install happens without an audited session.
+//! lock order `bib4 → xslot`), and only after the attribution record was
+//! handed to the audit sink (CLAUDE.md rule 4; I4). So two calls for the
+//! same key never race, and no install happens for a session the slow path
+//! could not use. Under `on_overflow = "drop_and_alert"` that record may
+//! have been dropped (with an alert): the session is then installed like
+//! any other, exactly as the slow path keeps using its mapping (the rule 4
+//! exception; `plat-nat64` test
+//! `drop_and_alert_installs_even_when_the_record_is_lost`). The engine
+//! wiring is WU5; until then this is the contract, not enforced code.
 //!
 //! **Install** (one `SLOT` record, then two `BPF_NOEXIST` inserts):
 //! 1. take a slot from the caller's partition ([`SlotAllocator`]);
@@ -21,16 +27,32 @@
 //!    inserted, `state = DEAD`, quarantine the slot) and fail; `E2BIG`
 //!    (map full) also backs installs off for [`INSTALL_BACKOFF`].
 //!
-//! **Retire**: `state = DEAD`, delete `OUT6` and `IN4`, quarantine.
+//! **Retire** (only of a live slot, QA F1): `state = DEAD`, delete `OUT6`
+//! and `IN4`, quarantine.
 //!
-//! A program that read a hash value just before a delete may see a reused
-//! element: it then reads another live slot whose key echo differs, and
-//! passes (plan §4.3 proof sketch). Slot records are rewritten only after
-//! the RCU grace period of [`SlotAllocator`].
+//! When `retire` returns, no *new* program run can use the session, but a
+//! run that started before (it already read `state = LIVE`) may still
+//! translate and forward its one packet: at most one packet per CPU,
+//! within one RCU grace period after the retire (SEC-006). If the caller
+//! returns the session's port block to the pool at once and it is
+//! reassigned within that window, such a packet would leave with a
+//! mapping the audit trail attributes to the previous subscriber. This is
+//! a recorded residual (fixes-wu34-round-1; WU5 may defer the block return
+//! to the next slot epoch). A program that read a hash value just before a
+//! delete may also see a reused element: it then reads another live slot
+//! whose key echo differs, and passes (plan §4.3 proof sketch). Slot
+//! records are rewritten only after the RCU grace period of
+//! [`SlotAllocator`].
+//!
+//! **Counters** are per lane (`shard` or slot modulo [`COUNTER_LANES`]),
+//! each lane on its own cache line, so workers installing and retiring in
+//! different shards do not share a written line (PERF-005).
 //!
 //! COMPLIANCE MAPPING:
-//! - NIST 800-53: AU-12 / CLAUDE.md rule 4 - by contract, installs follow
-//!   the queued attribution record (I4); this writer emits no records
+//! - NIST 800-53: AU-12 / CLAUDE.md rule 4 - by contract (enforced once
+//!   wired, WU5), installs follow the attribution record handed to the
+//!   sink (I4), except that under `drop_and_alert` the record may have
+//!   been dropped; this writer emits no records
 //! - NIST 800-53: SC-5 (Denial-of-Service Protection) - bounded maps and
 //!   slots; full maps back installs off and leave sessions on the slow path
 //! - NIST 800-53: SC-7, SC-24 - slice state and generation in `SLICE`;
@@ -128,6 +150,11 @@ impl SessionEntry {
 }
 
 /// Why an install did not happen (the session stays on the slow path).
+///
+/// PERF-002: the WU5 `impl Mirror` maps [`InstallError::MapFull`] and
+/// [`InstallError::Slots`] to `MirrorFail::Full` ([`InstallError::is_full`])
+/// and the rest to `MirrorFail::Error`; the engine backs off after any
+/// failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum InstallError {
     /// `OUT6` / `IN4` full (`E2BIG`), or within the backoff after it.
@@ -142,6 +169,11 @@ pub enum InstallError {
 }
 
 impl InstallError {
+    /// Capacity class (maps full, or no free slot in the partition).
+    pub const fn is_full(self) -> bool {
+        matches!(self, Self::MapFull | Self::Slots)
+    }
+
     /// `reason` label of `plat_xdp_install_failures_total`.
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -152,19 +184,71 @@ impl InstallError {
     }
 }
 
+/// Lanes of a [`LaneCounter`].
+pub const COUNTER_LANES: usize = 64;
+
+/// One cache-line-aligned lane (128 B: adjacent-line prefetch on x86).
+#[derive(Debug, Default)]
+#[repr(align(128))]
+struct Lane(AtomicU64);
+
+/// A counter split into [`COUNTER_LANES`] padded lanes (PERF-005). Adds
+/// and subtracts wrap per lane; [`LaneCounter::get`] sums the lanes with
+/// wrapping, which is exact whenever the true total is in `u64` (a gauge
+/// that is added and subtracted on different lanes stays correct).
+#[derive(Debug)]
+pub struct LaneCounter(Box<[Lane]>);
+
+impl Default for LaneCounter {
+    fn default() -> Self {
+        Self((0..COUNTER_LANES).map(|_| Lane::default()).collect())
+    }
+}
+
+impl LaneCounter {
+    #[inline]
+    fn lane(&self, lane: usize) -> Option<&AtomicU64> {
+        self.0.get(lane % COUNTER_LANES).map(|l| &l.0)
+    }
+
+    /// Adds `n` on lane `lane % COUNTER_LANES`.
+    #[inline]
+    pub fn add(&self, lane: usize, n: u64) {
+        if let Some(a) = self.lane(lane) {
+            a.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    /// Subtracts `n` on lane `lane % COUNTER_LANES` (wrapping).
+    #[inline]
+    pub fn sub(&self, lane: usize, n: u64) {
+        if let Some(a) = self.lane(lane) {
+            a.fetch_sub(n, Ordering::Relaxed);
+        }
+    }
+
+    /// The total.
+    pub fn get(&self) -> u64 {
+        self.0.iter().fold(0u64, |t, l| t.wrapping_add(l.0.load(Ordering::Relaxed)))
+    }
+}
+
 /// Writer counters (plan §4.7).
 #[derive(Debug, Default)]
 pub struct MirrorCounters {
-    pub installs: AtomicU64,
-    pub install_map_full: AtomicU64,
-    pub install_slots: AtomicU64,
-    pub install_error: AtomicU64,
-    pub retires: AtomicU64,
+    pub installs: LaneCounter,
+    pub install_map_full: LaneCounter,
+    pub install_slots: LaneCounter,
+    pub install_error: LaneCounter,
+    pub retires: LaneCounter,
+    /// Retires refused because the slot was not live (a double retire or
+    /// an out-of-range index; QA F1).
+    pub retire_not_live: LaneCounter,
     /// Incremented by the slow path when `seen_ns` extended a session.
-    pub revalidated: AtomicU64,
-    pub gc_deleted: AtomicU64,
+    pub revalidated: LaneCounter,
+    pub gc_deleted: LaneCounter,
     /// Live installed sessions (`plat_xdp_sessions`).
-    pub sessions: AtomicU64,
+    pub sessions: LaneCounter,
 }
 
 /// See the module documentation.
@@ -236,13 +320,13 @@ impl XdpMirror {
         u64::try_from(self.origin.elapsed().as_nanos()).unwrap_or(u64::MAX)
     }
 
-    fn fail(&self, e: InstallError) -> InstallError {
+    fn fail(&self, lane: usize, e: InstallError) -> InstallError {
         let c = match e {
             InstallError::MapFull => &self.counters.install_map_full,
             InstallError::Slots => &self.counters.install_slots,
             InstallError::Error => &self.counters.install_error,
         };
-        c.fetch_add(1, Ordering::Relaxed);
+        c.add(lane, 1);
         e
     }
 
@@ -251,18 +335,18 @@ impl XdpMirror {
     /// caller contract.
     pub fn install(&self, e: &SessionEntry, shard: usize) -> Result<u32, InstallError> {
         if self.now() < self.backoff_until.load(Ordering::Relaxed) {
-            return Err(self.fail(InstallError::MapFull));
+            return Err(self.fail(shard, InstallError::MapFull));
         }
         let Some(sw) = self.slice_word(e.slice) else {
-            return Err(self.fail(InstallError::Error));
+            return Err(self.fail(shard, InstallError::Error));
         };
         let generation = SliceEnt::from_bytes(&sw.load(Ordering::Acquire).to_ne_bytes()).generation;
         let Some(slot) = self.slots.alloc(shard) else {
-            return Err(self.fail(InstallError::Slots));
+            return Err(self.fail(shard, InstallError::Slots));
         };
         let Some(w) = self.slot_words(slot) else {
             self.slots.retire(slot);
-            return Err(self.fail(InstallError::Error));
+            return Err(self.fail(shard, InstallError::Error));
         };
         let words = e.record(SLOT_LIVE, generation).to_words();
         // Unreachable: no hash entry points here, and the header word still
@@ -278,24 +362,25 @@ impl XdpMirror {
         let k6 = e.key6().to_bytes();
         if let Err(err) = self.tables.insert_in4(&k4, slot) {
             self.abandon(slot, None);
-            return Err(self.install_err(&err));
+            return Err(self.install_err(shard, &err));
         }
         if let Err(err) = self.tables.insert_out6(&k6, slot) {
             self.abandon(slot, Some(&k4));
-            return Err(self.install_err(&err));
+            return Err(self.install_err(shard, &err));
         }
-        self.counters.installs.fetch_add(1, Ordering::Relaxed);
-        self.counters.sessions.fetch_add(1, Ordering::Relaxed);
+        let lane = slot as usize;
+        self.counters.installs.add(lane, 1);
+        self.counters.sessions.add(lane, 1);
         Ok(slot)
     }
 
-    fn install_err(&self, err: &io::Error) -> InstallError {
+    fn install_err(&self, shard: usize, err: &io::Error) -> InstallError {
         if err.raw_os_error() == Some(E2BIG) {
             let until = self.now().saturating_add(INSTALL_BACKOFF.as_nanos() as u64);
             self.backoff_until.store(until, Ordering::Relaxed);
-            self.fail(InstallError::MapFull)
+            self.fail(shard, InstallError::MapFull)
         } else {
-            self.fail(InstallError::Error)
+            self.fail(shard, InstallError::Error)
         }
     }
 
@@ -318,14 +403,33 @@ impl XdpMirror {
     /// Retires the session installed in `slot` with entry `e` (the same
     /// entry `install` was given). Delete errors other than "absent" are
     /// returned after the slot was still marked `DEAD` and quarantined, so
-    /// the fast path stops using it either way.
+    /// no new program run uses it either way.
+    ///
+    /// SEC-006: a program run already past its `state` check when this is
+    /// called may still forward one packet with the old mapping (at most
+    /// one per CPU, within one RCU grace period); see the module docs.
+    ///
+    /// QA F1: a slot that is not live (already retired, never handed out,
+    /// out of range) or whose record holds another entry is left untouched (no `DEAD` store over a record that
+    /// may already belong to another session, no second quarantine) and
+    /// counted in `retire_not_live`.
     pub fn retire(&self, slot: u32, e: &SessionEntry) -> io::Result<()> {
+        let lane = slot as usize;
+        // Live, and still holding `e` (the key echo): a stale retire of a
+        // slot recycled to another session must not kill that session.
+        if !self.slots.is_live(slot) || self.record(slot).map(|r| SessionEntry::from_record(&r)) != Some(*e) {
+            self.counters.retire_not_live.add(lane, 1);
+            return Ok(());
+        }
         self.mark_dead(slot);
         let r6 = self.tables.delete_out6(&e.key6().to_bytes());
         let r4 = self.tables.delete_in4(&e.key4().to_bytes());
-        self.slots.retire(slot);
-        self.counters.retires.fetch_add(1, Ordering::Relaxed);
-        let _ = self.counters.sessions.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+        if self.slots.retire(slot) {
+            self.counters.retires.add(lane, 1);
+            self.counters.sessions.sub(lane, 1);
+        } else {
+            self.counters.retire_not_live.add(lane, 1);
+        }
         r6.and(r4).map(drop)
     }
 
@@ -497,7 +601,7 @@ pub(crate) mod tests {
         assert_eq!(t.out6.lock().get(&e.key6().to_bytes()), Some(&s));
         assert_eq!(t.in4.lock().get(&e.key4().to_bytes()), Some(&s));
         assert_eq!(SessionEntry::from_record(&r), e);
-        assert_eq!(m.counters().sessions.load(Ordering::Relaxed), 1);
+        assert_eq!(m.counters().sessions.get(), 1);
         // The program writes seen_ns; the writer reads it.
         if let Some(w) = m.slot_words(s).and_then(|w| w.get(SLOT_WORD_SEEN)) {
             w.store(42, Ordering::Relaxed);
@@ -521,7 +625,7 @@ pub(crate) mod tests {
         m.slot_allocator().advance_epoch();
         assert_eq!(m.slot_allocator().recycle(), 1);
         assert_eq!(m.install(&entry(3), 1), Ok(s));
-        assert_eq!(m.counters().sessions.load(Ordering::Relaxed), 1);
+        assert_eq!(m.counters().sessions.get(), 1);
     }
 
     #[test]
@@ -535,7 +639,7 @@ pub(crate) mod tests {
         // Rollback removed the IN4 entry of the failed install only.
         assert_eq!(t.in4.lock().len(), 1);
         assert_eq!(t.in4.lock().get(&e.key4().to_bytes()), Some(&s));
-        assert_eq!(m.counters().install_error.load(Ordering::Relaxed), 2);
+        assert_eq!(m.counters().install_error.get(), 2);
         assert_eq!(m.slot_allocator().quarantined(), 2);
     }
 
@@ -548,7 +652,7 @@ pub(crate) mod tests {
         let q = m.slot_allocator().quarantined();
         assert_eq!(m.install(&entry(8), 0), Err(InstallError::MapFull));
         assert_eq!(m.slot_allocator().quarantined(), q);
-        assert_eq!(m.counters().install_map_full.load(Ordering::Relaxed), 2);
+        assert_eq!(m.counters().install_map_full.get(), 2);
     }
 
     #[test]
@@ -593,7 +697,7 @@ pub(crate) mod tests {
         assert_eq!(m.slot_allocator().quarantined(), q + 1);
         assert_eq!(t.out6.lock().len(), 1, "no OUT6 entry for the failed install");
         assert_eq!(t.in4.lock().get(&e.key4().to_bytes()), Some(&s), "the existing IN4 entry is kept");
-        assert_eq!(m.counters().sessions.load(Ordering::Relaxed), 1);
+        assert_eq!(m.counters().sessions.get(), 1);
     }
 
     #[test]
@@ -607,12 +711,46 @@ pub(crate) mod tests {
         t.in4.lock().clear();
         assert!(m.retire(s, &e).is_ok());
         assert_eq!(m.record(s).map(|r| r.state), Some(SLOT_DEAD));
-        assert_eq!(m.counters().sessions.load(Ordering::Relaxed), 0);
+        assert_eq!(m.counters().sessions.get(), 0);
         // Out-of-range slot: no write, no quarantine, no panic.
         let q = m.slot_allocator().quarantined();
         assert!(m.retire(u32::MAX, &e).is_ok());
         assert_eq!(m.slot_allocator().quarantined(), q);
-        assert_eq!(m.counters().sessions.load(Ordering::Relaxed), 0);
+        assert_eq!(m.counters().sessions.get(), 0);
+    }
+
+    /// QA F1: a double retire neither rewrites the record (which may by
+    /// then belong to another session) nor quarantines the slot twice.
+    #[test]
+    fn double_retire_is_refused_and_counted() {
+        let (_t, m) = mirror(16, 16);
+        let e = entry(30);
+        let s = m.install(&e, 0).unwrap_or(u32::MAX);
+        assert!(m.retire(s, &e).is_ok());
+        assert!(m.retire(s, &e).is_ok());
+        assert_eq!(m.slot_allocator().quarantined(), 1);
+        assert_eq!((m.counters().retires.get(), m.counters().retire_not_live.get()), (1, 1));
+        m.slot_allocator().advance_epoch();
+        m.slot_allocator().advance_epoch();
+        assert_eq!(m.slot_allocator().recycle(), 1);
+        // Reused by another session: a stale retire of the first leaves it.
+        let f = entry(31);
+        assert_eq!(m.install(&f, 0), Ok(s));
+        let r = m.record(s);
+        assert!(m.retire(s, &e).is_ok());
+        assert_eq!(m.record(s), r, "the other session's record is untouched");
+        assert_eq!(m.counters().retire_not_live.get(), 2);
+        assert_eq!(m.counters().sessions.get(), 1);
+    }
+
+    #[test]
+    fn lane_counters_sum_across_lanes() {
+        let c = LaneCounter::default();
+        c.add(0, 3);
+        c.add(COUNTER_LANES + 1, 2);
+        c.sub(5, 1); // a gauge decremented on another lane
+        assert_eq!(c.get(), 4);
+        assert!(std::mem::align_of::<Lane>() >= 128);
     }
 
     #[test]
@@ -630,6 +768,6 @@ pub(crate) mod tests {
         m.slot_allocator().recycle();
         // Partition 2 holds only slot 2 of 4: no slot until two epochs.
         assert_eq!(m.install(&entry(24), 2), Err(InstallError::Slots));
-        assert_eq!(m.counters().install_slots.load(Ordering::Relaxed), 1);
+        assert_eq!(m.counters().install_slots.get(), 1);
     }
 }

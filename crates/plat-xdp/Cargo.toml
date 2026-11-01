@@ -31,10 +31,10 @@ hex.workspace = true
 plat-io.workspace = true
 aya.workspace = true
 rustix = { workspace = true, features = ["fs", "rand", "thread", "time"] }
-
-# Level-2 harness only: `Xdp::from_pin` takes aya-obj's `XdpAttachType`,
-# which aya 0.16 does not re-export. Same version Aya already pulls in.
-[target.'cfg(target_os = "linux")'.dev-dependencies]
+# The loader parses the object before loading it to refuse an `xdp.frags`
+# section (SEC-001); `Xdp::from_pin` in the level-2 harness takes its
+# `XdpAttachType`, which aya 0.16 does not re-export. Same version Aya
+# already pulls in.
 aya-obj = "=0.6.0"
 
 [lints]

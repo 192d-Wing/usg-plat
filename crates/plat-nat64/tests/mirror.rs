@@ -243,12 +243,18 @@ fn install_rollback_and_back_off() {
     let (mut fx, m) = mirrored(&[], 4096, 64);
     let s = sub(1, 1);
     let k = |fx: &Fx| fx.nat.state().session_slot(k4_of(fx, s, 1000), (SERVER, 53));
-    // Refused (key exists): stays slow path, retried on the next hit.
+    // Refused (key exists): stays slow path and, like every failure
+    // (PERF-002), backs installs off; the first hit after it retries.
     m.fail_next(MirrorFail::Exists, 1);
     run(&mut fx, &udp6(s, 1000, SERVER, 53, b"x")).unwrap();
     assert_eq!(k(&fx), Some(NO_SLOT));
     run(&mut fx, &udp6(s, 1000, SERVER, 53, b"x")).unwrap();
+    assert_eq!(k(&fx), Some(NO_SLOT), "backed off after Exists");
+    fx.clock.advance(Duration::from_millis(plat_nat64::mirror::INSTALL_BACKOFF_MS));
+    run(&mut fx, &udp6(s, 1000, SERVER, 53, b"x")).unwrap();
     assert_ne!(k(&fx), Some(NO_SLOT));
+    let retries = fx.nat.state().mirror_install_stats().map(|s| s.retries.load(std::sync::atomic::Ordering::Relaxed));
+    assert_eq!(retries, Some(1), "one retry on an existing session");
 
     // Full: no install for INSTALL_BACKOFF_MS, then the next hit installs.
     m.fail_next(MirrorFail::Full, 1);

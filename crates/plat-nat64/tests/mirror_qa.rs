@@ -250,13 +250,17 @@ fn a_mirror_that_fails_every_install_leaves_the_slow_path_intact() {
         fx.clock.advance(Duration::from_secs(1));
         exercise(&mut fx);
         let installs = m.installs.load(Ordering::Relaxed);
-        match fail {
-            // Full backs off for a second: one attempt for the whole burst.
-            MirrorFail::Full => assert_eq!(installs, 1, "{fail:?}"),
-            // Error / Exists: retried on every slow-path hit (create, the
-            // reply, the second outbound): 3 per flow.
-            _ => assert_eq!(installs, 30, "{fail:?}"),
-        }
+        // PERF-002 / QA F3: every failure class backs off for a second, so
+        // the whole burst (10 flows x 3 packets) costs one attempt.
+        assert_eq!(installs, 1, "{fail:?}");
+        let st = fx.nat.state().mirror_install_stats().map(|s| {
+            (
+                s.failed.load(Ordering::Relaxed),
+                s.installed.load(Ordering::Relaxed),
+                s.backed_off.load(Ordering::Relaxed),
+            )
+        });
+        assert_eq!(st, Some((1, 0, 29)), "{fail:?}: failed, installed, backed off");
         assert_eq!(m.retires.load(Ordering::Relaxed), 0, "{fail:?}: retire without a slot");
         assert_eq!(m.seen.load(Ordering::Relaxed), 0, "{fail:?}: seen without a slot (would revive)");
         assert_eq!(m.slices.load(Ordering::Relaxed), 1, "legacy slice 0 published once");

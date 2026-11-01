@@ -39,7 +39,9 @@ pub mod tcp;
 
 pub use engine::{Nat64, Verdict, WorkerCtx};
 pub use held::{HeldSynExpiry, SynMeta};
-pub use mirror::{Mirror, MirrorEntry, MirrorFail, MirrorKeys, ModelMirror, NoMirror};
+#[cfg(any(test, feature = "model"))]
+pub use mirror::ModelMirror;
+pub use mirror::{Mirror, MirrorEntry, MirrorFail, MirrorKeys, NoMirror};
 pub use pool::{AllocFail, SliceState};
 pub use repl::{AdoptInput, Directory, Home, ReplHub, ReplProducer, ReplRecord, Shadow, ShadowError};
 pub use state::{

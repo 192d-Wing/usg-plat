@@ -24,8 +24,12 @@
 //! `plat-io` helpers (`bpf_obj`, `bpf_mmap`, `netdev`) hold it.
 //!
 //! COMPLIANCE MAPPING:
-//! - NIST 800-53: AC-6 (Least Privilege) - privileged loading is a separate
-//!   one-shot step; `platd` only opens pins (read-only where it only reads)
+//! - NIST 800-53: AC-6 (Least Privilege) - designed for: privileged
+//!   loading is a separate one-shot step, and `platd` only opens pins
+//!   (read-only where it only reads). Enforced once wired (WU5 `platd`,
+//!   WU6 units); until then backed by the pin-mode tests
+//!   (`maps::tests::pin_access_is_least_privilege`, `tests/unprivileged.rs`,
+//!   `tests/refusals.rs`)
 //! - NIST 800-53: SI-7 (Software, Firmware, and Information Integrity) -
 //!   the object is embedded at build time and its SHA-256 bound into the
 //!   frozen `CONFIG` digest (see [`load::config_record`])

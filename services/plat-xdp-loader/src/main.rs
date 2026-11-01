@@ -13,16 +13,21 @@
 //!
 //! Logs go to stderr (journald). Exit codes: 0 ok, 1 refused or failed,
 //! 2 usage or configuration error. A failed attach removes the pins it
-//! created (fail closed: `platd` then finds no maps).
+//! created and the stale state file (fail closed: `platd` then finds no
+//! maps).
 //!
-// POAM: the WU2 program computes the frame length as `data_end - data`
-// (pointer - pointer), which the verifier allows only with
-// `allow_ptr_leaks`, i.e. CAP_PERFMON: with CAP_BPF CAP_NET_ADMIN alone
-// (plan §7) the load fails "R9 pointer -= pointer prohibited" (measured on
-// 6.8, WU3). Loading with CAP_PERFMON also lets the verifier skip its
-// Spectre v1/v4 hardening for this program (`bypass_spec_v1/v4`). Until the
-// program derives the length without pointer subtraction, the unit needs
-// CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_PERFMON (WU2/WU6).
+//! The program derives the frame length with `bpf_xdp_get_buff_len`, not
+//! by subtracting packet pointers, so on kernels 6.3 and later (verified
+//! 6.6, 6.8) CAP_BPF and CAP_NET_ADMIN suffice and the verifier keeps its
+//! Spectre v1/v4 hardening (no CAP_PERFMON, SEC-001). The state file goes
+//! through `plat_xdp::load::StateDir` (owner and mode checked, no link
+//! followed), and a state file that cannot be written rolls the attach
+//! back.
+//!
+// POAM: POAM-040 - on 6.1 the verifier still refuses the object without
+// CAP_PERFMON (partial stack store into a spilled slot); the loader is not
+// given CAP_PERFMON, so the fast path cannot be loaded on 6.1 with least
+// privilege until the kernel floor or the codegen is decided.
 //!
 //! COMPLIANCE MAPPING:
 //! - NIST 800-53: AC-6 (Least Privilege), AC-6(1) - privileged loading

@@ -20,7 +20,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use plat_io::bpf_obj::{Access, BPF_ANY, BPF_F_ZERO_SEED, BpfMap};
+use plat_io::bpf_obj::{Access, BPF_ANY, BPF_F_MMAPABLE, BPF_F_ZERO_SEED, BpfMap};
 use plat_xdp::maps::{OpenError, XdpMaps};
 use plat_xdp_core::abi::ConfigRec;
 
@@ -163,6 +163,31 @@ fn open_pinned_refuses_substituted_pins() {
     let s = shape_of(XdpMaps::open_pinned(&d, &cfg));
     assert!(s.starts_with("SLOT: flags"), "{s}");
     std::fs::remove_dir_all(&d).unwrap();
+    // SEC-009: SLOT sized other than slot_count(OUT6 entries) = 20.
+    let d = pin_dir("shape6");
+    create(&d, "OUT6", "hash", 40, 4, 16, 0);
+    create(&d, "IN4", "hash", 12, 4, 16, 0);
+    create(&d, "SLOT", "array", 4, 64, 21, BPF_F_MMAPABLE);
+    let s = shape_of(XdpMaps::open_pinned(&d, &cfg));
+    assert!(s.starts_with("SLOT: max_entries 21 (want 20)"), "{s}");
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+/// SEC-003: a per-CPU hash (or any type `BpfMap` cannot size) is refused at
+/// open, so its lookup can never overflow the caller's buffer.
+#[test]
+#[ignore = "root + bpftool (VM)"]
+fn unsupported_map_types_are_refused_at_open() {
+    assert!(root());
+    let d = pin_dir("types");
+    create(&d, "PH", "percpu_hash", 4, 8, 4, 0);
+    create(&d, "LPH", "lru_percpu_hash", 4, 8, 4, 0);
+    create(&d, "LH", "lru_hash", 4, 8, 4, 0);
+    for n in ["PH", "LPH", "LH"] {
+        let e = BpfMap::open(&d.join(n), Access::ReadOnly).err().map(|e| e.kind());
+        assert_eq!(e, Some(ErrorKind::InvalidInput), "{n}");
+    }
+    std::fs::remove_dir_all(&d).unwrap();
 }
 
 #[cfg(feature = "xdp")]
@@ -192,6 +217,10 @@ mod attach {
             frag6: 1280,
             copy_tos: true,
             sliced: false,
+            // RFC 6052 well-known prefix 64:ff9b::/96.
+            prefix: 0x0064_ff9b_u128 << 96,
+            prefix_len: 96,
+            allow_non_global: false,
         }
     }
 

@@ -7,7 +7,9 @@
 #   2. kernel smoke: XDP load + BPF_PROG_TEST_RUN (xdp-smoke.py);
 #   3. with -o OBJECT: the stack and instruction gate on the plat-xdp-ebpf
 #      object (obj-gate.py stats: verifier statistics, ≤ 384 B deepest call
-#      chain, processed-instruction budget; fails closed);
+#      chain, processed-instruction budget; fails closed), run once as
+#      root and once with only CAP_BPF CAP_NET_ADMIN (no CAP_PERFMON;
+#      fatal from 6.3, reported below 6.3, POAM-040);
 #   4. the level-2 netns topology comes up (netns.sh);
 #   5. with -o OBJECT: the level-2 smoke vectors on the object inside that
 #      netns (obj-gate.py testrun, level2-vectors.txt);
@@ -45,6 +47,32 @@ python3 -I "$here/xdp-smoke.py" || fail "kernel smoke test"
 if [ -n "$object" ]; then
     [ -f "$object" ] || fail "no object $object"
     python3 -I "$here/obj-gate.py" stats "$object" || fail "stack and instruction gate"
+    # SEC-001 (AC-6): the loader runs with CAP_BPF and CAP_NET_ADMIN only
+    # (plan §7). Without CAP_PERFMON the verifier is stricter (no pointer
+    # arithmetic leaks, Spectre v1/v4 sanitation, partial stack writes), so
+    # the object must also load with exactly those capabilities.
+    # Without CAP_DAC_OVERRIDE root may not read the shared home tree, so
+    # the gate and the object are copied to a root-owned directory first.
+    echo "least-privilege load (CAP_BPF CAP_NET_ADMIN):"
+    lp=$(mktemp -d)
+    cp "$here/obj-gate.py" "$object" "$lp/"
+    # Before 6.3 the verifier also refuses, without CAP_PERFMON, a partial
+    # stack store into a slot holding a spilled scalar, which the object
+    # hits on 6.1 (POAM-040): there a refusal is reported, not fatal, until
+    # the floor or the codegen is decided. From 6.3 it is fatal.
+    rel=$(uname -r)
+    maj=${rel%%.*}
+    min=${rel#*.}
+    min=${min%%[!0-9]*}
+    if setpriv --bounding-set=-all,+bpf,+net_admin --inh-caps=-all -- \
+        python3 -I "$lp/obj-gate.py" stats "$lp/$(basename "$object")"; then
+        echo "least-privilege load: ok"
+    elif [ "$maj" -lt 6 ] || { [ "$maj" -eq 6 ] && [ "$min" -lt 3 ]; }; then
+        echo "KNOWN: least-privilege load refused on $rel (< 6.3; POAM-040)"
+    else
+        fail "load with CAP_BPF CAP_NET_ADMIN only (no CAP_PERFMON)"
+    fi
+    rm -rf "$lp"
 else
     echo "SKIP: eBPF object gates (no -o OBJECT)"
 fi

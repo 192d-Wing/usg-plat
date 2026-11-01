@@ -233,6 +233,12 @@ pub struct LoadParams {
     pub copy_tos: bool,
     /// `cluster.partition = "slices"`.
     pub sliced: bool,
+    /// `translation.nat64_prefix` network (RFC 6052 §2.2), host order.
+    pub prefix: u128,
+    /// `translation.nat64_prefix` length (32, 40, 48, 56, 64 or 96).
+    pub prefix_len: u8,
+    /// `translation.allow_non_global_destinations` (SC-7).
+    pub allow_non_global: bool,
 }
 
 impl LoadParams {
@@ -245,12 +251,19 @@ impl LoadParams {
             frag6: t.lowest_ipv6_mtu.min(t.ipv6_mtu),
             copy_tos: t.copy_tos,
             sliced: cfg.cluster.partition == Partition::Slices,
+            prefix: t.nat64_prefix.network(),
+            prefix_len: t.nat64_prefix.prefix_len(),
+            allow_non_global: t.allow_non_global_destinations,
         }
     }
 }
 
 /// Version tag of the digest input; bump on any change to [`digest`].
-const DIGEST_TAG: &[u8] = b"usg-plat xdp CONFIG v1\0";
+///
+/// v2 (RFC-004): adds the RFC 6052 prefix, its length and
+/// `allow_non_global_destinations`, so `platd` refuses pins set up for
+/// another prefix or SC-7 policy.
+const DIGEST_TAG: &[u8] = b"usg-plat xdp CONFIG v2\0";
 
 /// The `CONFIG` digest over `object_sha256` and `p` (module docs).
 pub fn digest(p: &LoadParams, object_sha256: &[u8; 32]) -> [u8; 32] {
@@ -261,6 +274,8 @@ pub fn digest(p: &LoadParams, object_sha256: &[u8; 32]) -> [u8; 32] {
     h.update(p.mtu6.to_le_bytes());
     h.update(p.frag6.to_le_bytes());
     h.update([u8::from(p.copy_tos), u8::from(p.sliced)]);
+    h.update(p.prefix.to_be_bytes());
+    h.update([p.prefix_len, u8::from(p.allow_non_global)]);
     h.update(p.xdp.max_sessions.to_le_bytes());
     h.update([p.xdp.mode as u8]);
     h.update((p.xdp.interfaces.len() as u32).to_le_bytes());
@@ -344,6 +359,10 @@ mod linux {
         SlotCollision(String, String, u32),
         #[error("map {0}: BPF_F_ZERO_SEED is set; refusing (CLAUDE.md rule 3)")]
         ZeroSeed(&'static str),
+        #[error("program {0}: multi-buffer XDP (section xdp.frags, BPF_F_XDP_HAS_FRAGS) is refused")]
+        Frags(String),
+        #[error("state directory {0}: {1}")]
+        StateDir(PathBuf, &'static str),
         #[error("eBPF: {0}")]
         Ebpf(String),
         #[error("{0}: {1}")]
@@ -453,6 +472,147 @@ mod linux {
         Ok(b)
     }
 
+    /// SEC-001: the program must not be loaded with `BPF_F_XDP_HAS_FRAGS`
+    /// (Aya sets it for an `xdp.frags` section). Its frame length is
+    /// `bpf_xdp_get_buff_len`, which equals `data_end - data` only for a
+    /// linear buffer, and its parser reads only the linear part.
+    pub fn check_no_frags(object: &[u8]) -> Result<(), LoadError> {
+        let obj = aya_obj::Object::parse(object).map_err(|e| LoadError::Ebpf(format!("parsing the object: {e}")))?;
+        if obj.programs.is_empty() {
+            return Err(LoadError::Ebpf("the object has no program".into()));
+        }
+        for (name, prog) in &obj.programs {
+            match prog.section {
+                aya_obj::ProgramSection::Xdp { frags: false, .. } => {}
+                aya_obj::ProgramSection::Xdp { frags: true, .. } => return Err(LoadError::Frags(name.clone())),
+                _ => return Err(LoadError::Ebpf(format!("program {name} is not an XDP program"))),
+            }
+        }
+        Ok(())
+    }
+
+    /// The directory of the state file, opened once (SEC-002).
+    ///
+    /// The loader runs as root and writes into `/run/plat`, a directory
+    /// `platd` may share. Every operation goes through this descriptor:
+    /// the directory must be owned by the loader's effective uid (root in
+    /// production) and not group- or other-writable, so no other user can
+    /// plant a symlink or file there; files are created with
+    /// `O_CREAT | O_EXCL | O_NOFOLLOW` under a unique temporary name,
+    /// `fchmod`ed, `fsync`ed and `renameat`ed; only the loader's own names
+    /// (the state file and its temporary) are ever unlinked.
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: AC-6 (Least Privilege), SI-7 (Integrity) - a root
+    ///   process never follows a link or writes a file another user could
+    ///   have placed
+    #[derive(Debug)]
+    pub struct StateDir {
+        dir: std::os::fd::OwnedFd,
+        path: PathBuf,
+        name: std::ffi::OsString,
+    }
+
+    impl StateDir {
+        /// Opens the parent directory of `state_file` and checks it.
+        pub fn open(state_file: &Path) -> Result<Self, LoadError> {
+            use rustix::fs::{Mode as FsMode, OFlags};
+            let name = state_file
+                .file_name()
+                .filter(|n| !n.is_empty() && *n != "." && *n != "..")
+                .ok_or_else(|| LoadError::StateDir(state_file.into(), "no file name"))?
+                .to_os_string();
+            let path = match state_file.parent() {
+                Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+                _ => PathBuf::from("."),
+            };
+            let dir = rustix::fs::open(
+                &path,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                FsMode::empty(),
+            )
+            .map_err(|e| LoadError::Io(path.display().to_string(), e.into()))?;
+            let st = rustix::fs::fstat(&dir).map_err(|e| LoadError::Io(path.display().to_string(), e.into()))?;
+            Self::check(&path, st.st_uid, st.st_mode, rustix::process::geteuid().as_raw())?;
+            Ok(Self { dir, path, name })
+        }
+
+        /// The ownership and mode rule, separate for tests.
+        pub(crate) fn check(path: &Path, uid: u32, mode: u32, euid: u32) -> Result<(), LoadError> {
+            if uid != euid {
+                return Err(LoadError::StateDir(path.into(), "not owned by the loader's user (root)"));
+            }
+            if mode & 0o022 != 0 {
+                return Err(LoadError::StateDir(path.into(), "group- or other-writable"));
+            }
+            Ok(())
+        }
+
+        fn err(&self, e: rustix::io::Errno) -> LoadError {
+            LoadError::Io(self.path.join(&self.name).display().to_string(), e.into())
+        }
+
+        /// Writes the state file atomically (mode 0644).
+        pub fn write(&self, text: &str) -> Result<(), LoadError> {
+            use rustix::fs::{Mode as FsMode, OFlags};
+            let r: [u8; 8] = random()?;
+            let mut tmp = std::ffi::OsString::from(".");
+            tmp.push(&self.name);
+            tmp.push(format!(".{}.{}.tmp", std::process::id(), hex::encode(r)));
+            let fd = rustix::fs::openat(
+                &self.dir,
+                &tmp,
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                FsMode::from_raw_mode(0o600),
+            )
+            .map_err(|e| self.err(e))?;
+            let done = (|| {
+                let mut rest = text.as_bytes();
+                while !rest.is_empty() {
+                    let n = rustix::io::write(&fd, rest)?;
+                    rest = rest.get(n..).unwrap_or_default();
+                }
+                rustix::fs::fchmod(&fd, FsMode::from_raw_mode(0o644))?;
+                rustix::fs::fsync(&fd)?;
+                rustix::fs::renameat(&self.dir, &tmp, &self.dir, &self.name)?;
+                rustix::fs::fsync(&self.dir)
+            })();
+            if let Err(e) = done {
+                let _ = rustix::fs::unlinkat(&self.dir, &tmp, rustix::fs::AtFlags::empty());
+                return Err(self.err(e));
+            }
+            Ok(())
+        }
+
+        /// Removes the state file (its own name only); `false` if absent.
+        pub fn remove(&self) -> Result<bool, LoadError> {
+            match rustix::fs::unlinkat(&self.dir, &self.name, rustix::fs::AtFlags::empty()) {
+                Ok(()) => Ok(true),
+                Err(rustix::io::Errno::NOENT) => Ok(false),
+                Err(e) => Err(self.err(e)),
+            }
+        }
+
+        /// Reads the state file without following a link; `None` if absent.
+        pub fn read(&self) -> Result<Option<String>, LoadError> {
+            use rustix::fs::{Mode as FsMode, OFlags};
+            let fd = match rustix::fs::openat(
+                &self.dir,
+                &self.name,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                FsMode::empty(),
+            ) {
+                Ok(fd) => fd,
+                Err(rustix::io::Errno::NOENT) => return Ok(None),
+                Err(e) => return Err(self.err(e)),
+            };
+            let mut t = String::new();
+            io::Read::read_to_string(&mut fs::File::from(fd), &mut t)
+                .map_err(io_err(self.path.join(&self.name).display().to_string()))?;
+            Ok(Some(t))
+        }
+    }
+
     fn chmod(p: &Path, mode: u32) -> Result<(), LoadError> {
         fs::set_permissions(p, fs::Permissions::from_mode(mode)).map_err(io_err(p.display().to_string()))
     }
@@ -488,6 +648,8 @@ mod linux {
             }
             check_unprivileged_bpf()?;
             check_bpffs(dir)?;
+            check_no_frags(object)?;
+            let state = state_file.map(StateDir::open).transpose()?;
             let ifaces = resolve(p)?;
 
             let sessions = p.xdp.max_sessions;
@@ -521,19 +683,22 @@ mod linux {
             }
             remove_pin(&dir.join(PROG_PIN))?;
             let mut created = Vec::new();
+            // Fail closed with nothing half-published: platd finds no pins
+            // (maps_unavailable) and the new links are gone. A link that was
+            // already replaced keeps the new program until the next attach
+            // or detach. The previous state file is stale either way.
+            let rollback = |created: Vec<PathBuf>| {
+                for path in MAPS.iter().map(|m| dir.join(m.name)).chain([dir.join(PROG_PIN)]).chain(created) {
+                    let _ = remove_pin(&path);
+                }
+                if let Some(s) = &state {
+                    let _ = s.remove();
+                }
+            };
             let attached = match publish(&mut e, p, dir, &ifaces, &mut created) {
                 Ok(a) => a,
                 Err(err) => {
-                    // Fail closed with nothing half-published: platd finds no
-                    // pins (maps_unavailable) and the new links are gone. A
-                    // link that was already replaced keeps the new program
-                    // until the next attach or detach.
-                    for path in MAPS.iter().map(|m| dir.join(m.name)).chain([dir.join(PROG_PIN)]).chain(created) {
-                        let _ = remove_pin(&path);
-                    }
-                    if let Some(sf) = state_file {
-                        let _ = remove_pin(sf);
-                    }
+                    rollback(created);
                     return Err(err);
                 }
             };
@@ -545,8 +710,13 @@ mod linux {
                 mode: p.xdp.mode,
                 interfaces: attached,
             };
-            if let Some(sf) = state_file {
-                write_state(sf, &report.state_text())?;
+            // QA F2: an attach whose state file cannot be written is rolled
+            // back, so a failed unit never leaves the fast path live.
+            if let Some(s) = &state
+                && let Err(err) = s.write(&report.state_text())
+            {
+                rollback(created);
+                return Err(err);
             }
             Ok(report)
         }
@@ -554,6 +724,7 @@ mod linux {
         /// Detaches (unpins every link) and removes every pin under `dir`
         /// and the state file. Returns the removed pin names.
         pub fn detach(dir: &Path, state_file: Option<&Path>) -> Result<Vec<String>, LoadError> {
+            let state = state_file.map(StateDir::open).transpose()?;
             let mut gone = Vec::new();
             for l in link_pins(dir)? {
                 if remove_pin(&dir.join(&l))? {
@@ -565,8 +736,8 @@ mod linux {
                     gone.push(n.to_string());
                 }
             }
-            if let Some(sf) = state_file {
-                remove_pin(sf)?;
+            if let Some(s) = &state {
+                s.remove()?;
             }
             Ok(gone)
         }
@@ -582,10 +753,9 @@ mod linux {
                 let _ = writeln!(s, "pin {l} present");
             }
             if let Some(sf) = state_file {
-                match fs::read_to_string(sf) {
-                    Ok(t) => s.push_str(&t),
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => s.push_str("state absent\n"),
-                    Err(e) => return Err(LoadError::Io(sf.display().to_string(), e)),
+                match StateDir::open(sf)?.read()? {
+                    Some(t) => s.push_str(&t),
+                    None => s.push_str("state absent\n"),
                 }
             }
             Ok(s)
@@ -670,13 +840,6 @@ mod linux {
         Ok(v)
     }
 
-    fn write_state(path: &Path, text: &str) -> Result<(), LoadError> {
-        let tmp = path.with_extension("tmp");
-        fs::write(&tmp, text).map_err(io_err(tmp.display().to_string()))?;
-        chmod(&tmp, 0o644)?;
-        fs::rename(&tmp, path).map_err(io_err(path.display().to_string()))
-    }
-
     fn resolve(p: &LoadParams) -> Result<Vec<Iface>, LoadError> {
         let mut v: Vec<Iface> = Vec::new();
         let mut slots = BTreeMap::new();
@@ -749,6 +912,88 @@ mod linux {
     }
 }
 
+#[cfg(all(test, target_os = "linux"))]
+mod state_tests {
+    use std::fs;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::path::PathBuf;
+
+    use super::{LoadError, StateDir};
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("plat-xdp-state-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir(&d).unwrap_or_else(|e| panic!("{e}"));
+        fs::set_permissions(&d, fs::Permissions::from_mode(0o755)).unwrap_or_else(|e| panic!("{e}"));
+        d
+    }
+
+    #[test]
+    fn writes_atomically_with_mode_0644_and_removes_only_its_name() {
+        let d = tmpdir("write");
+        let sf = d.join("xdp.state");
+        let s = StateDir::open(&sf).unwrap_or_else(|e| panic!("{e}"));
+        s.write("a=1\n").unwrap_or_else(|e| panic!("{e}"));
+        s.write("a=2\n").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(fs::read_to_string(&sf).ok().as_deref(), Some("a=2\n"));
+        let m = fs::metadata(&sf).map(|m| m.permissions().mode() & 0o7777).unwrap_or(0);
+        assert_eq!(m, 0o644);
+        // No temporary is left behind.
+        assert_eq!(fs::read_dir(&d).map(Iterator::count).unwrap_or(0), 1);
+        fs::write(d.join("other"), "x").unwrap_or_else(|e| panic!("{e}"));
+        assert!(s.remove().unwrap_or_else(|e| panic!("{e}")));
+        assert!(!s.remove().unwrap_or_else(|e| panic!("{e}")));
+        assert!(d.join("other").exists(), "only the state file's own name is unlinked");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_planted_symlink_is_replaced_not_followed() {
+        let d = tmpdir("link");
+        let victim = d.join("victim");
+        fs::write(&victim, "keep").unwrap_or_else(|e| panic!("{e}"));
+        let sf = d.join("xdp.state");
+        symlink(&victim, &sf).unwrap_or_else(|e| panic!("{e}"));
+        let s = StateDir::open(&sf).unwrap_or_else(|e| panic!("{e}"));
+        assert!(s.read().is_err(), "read follows no link (O_NOFOLLOW)");
+        s.write("a=1\n").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(fs::read_to_string(&victim).ok().as_deref(), Some("keep"));
+        assert!(!fs::symlink_metadata(&sf).map(|m| m.file_type().is_symlink()).unwrap_or(true));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn refuses_writable_or_foreign_or_linked_directories() {
+        let d = tmpdir("mode");
+        for mode in [0o775, 0o757, 0o777] {
+            fs::set_permissions(&d, fs::Permissions::from_mode(mode)).unwrap_or_else(|e| panic!("{e}"));
+            assert!(
+                matches!(StateDir::open(&d.join("xdp.state")), Err(LoadError::StateDir(..))),
+                "mode {mode:o} accepted"
+            );
+        }
+        fs::set_permissions(&d, fs::Permissions::from_mode(0o755)).unwrap_or_else(|e| panic!("{e}"));
+        let euid = rustix::process::geteuid().as_raw();
+        assert!(StateDir::check(&d, euid, 0o40755, euid).is_ok());
+        assert!(matches!(StateDir::check(&d, euid + 1, 0o40755, euid), Err(LoadError::StateDir(..))));
+        // The directory itself must not be a symlink.
+        let l = d.with_extension("lnk");
+        let _ = fs::remove_file(&l);
+        symlink(&d, &l).unwrap_or_else(|e| panic!("{e}"));
+        assert!(StateDir::open(&l.join("xdp.state")).is_err());
+        let _ = fs::remove_file(&l);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_embedded_object_has_no_frags_section() {
+        let o = crate::object();
+        if !o.is_empty() {
+            super::check_no_frags(o).unwrap_or_else(|e| panic!("{e}"));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -811,9 +1056,24 @@ mod tests {
         let mut q = p.clone();
         q.xdp.interfaces[0].role = Role::Both;
         assert_ne!(a.digest, config_record(&q, &[1; 32]).digest);
-        let mut q = p;
+        let mut q = p.clone();
         q.xdp.max_sessions += 1;
         assert_ne!(a.digest, config_record(&q, &[1; 32]).digest);
+        // RFC-004: the RFC 6052 prefix, its length and the SC-7 non-global
+        // policy are bound too.
+        let mut q = p.clone();
+        q.prefix ^= 1 << 100;
+        assert_ne!(a.digest, config_record(&q, &[1; 32]).digest, "prefix");
+        let mut q = p.clone();
+        q.prefix_len = if q.prefix_len == 96 { 64 } else { 96 };
+        assert_ne!(a.digest, config_record(&q, &[1; 32]).digest, "prefix length");
+        let mut q = p.clone();
+        q.allow_non_global = !q.allow_non_global;
+        assert_ne!(a.digest, config_record(&q, &[1; 32]).digest, "allow_non_global_destinations");
+        assert_eq!(
+            (p.prefix, p.prefix_len),
+            (c.translation.nat64_prefix.network(), c.translation.nat64_prefix.prefix_len())
+        );
         assert_eq!((a.mtu4, a.copy_tos, a.sliced), (c.translation.ipv4_mtu, u8::from(c.translation.copy_tos), 0));
     }
 

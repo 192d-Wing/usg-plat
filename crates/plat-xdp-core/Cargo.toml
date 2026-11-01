@@ -16,7 +16,7 @@ publish.workspace = true
 plat-common.workspace = true
 plat-packet.workspace = true
 plat-xlat.workspace = true
-plat-nat64.workspace = true
+plat-nat64 = { workspace = true, features = ["model"] }
 plat-audit.workspace = true
 crossbeam-channel.workspace = true
 proptest.workspace = true

@@ -47,6 +47,10 @@ ALLOWED_HELPERS = {
     65: "bpf_xdp_adjust_tail",
     69: "bpf_fib_lookup",
     160: "bpf_ktime_get_coarse_ns",
+    # SEC-001: the frame length without packet pointer subtraction (which
+    # needs CAP_PERFMON). gpl_only = false at v6.1 (net/core/filter.c:3798-3803)
+    # and v7.2 (filter.c:4044-4049); available since 5.18.
+    188: "bpf_xdp_get_buff_len",
 }
 NAMED_FORBIDDEN = {
     6: "bpf_trace_printk",
@@ -234,6 +238,10 @@ def check(data):
             license_seen = body
         if any(p in name for p in FORBIDDEN_NAME_PARTS):
             problems.append(f"forbidden section {name}")
+        # SEC-001: Aya loads an `xdp.frags` section with BPF_F_XDP_HAS_FRAGS,
+        # under which bpf_xdp_get_buff_len is no longer data_end - data.
+        if name.startswith("xdp.frags"):
+            problems.append(f"section {name}: multi-buffer XDP (BPF_F_XDP_HAS_FRAGS) is not allowed")
         if flags & SHF_EXECINSTR:
             i = 0
             while i + 8 <= len(body):
@@ -364,6 +372,8 @@ def self_test():
             build_elf([(b"xdp", 1, 0x6, insn(OP_CALL, src=1, imm=0) + insn(0x95)), (b"license", 1, 0x3, LICENSE)]),
             1,
         ),
+        ("xdp.frags section", build_elf([(b"xdp.frags", 1, 0x6, ok_code), (b"license", 1, 0x3, LICENSE)]), 1),
+        ("bpf_xdp_get_buff_len", build_elf([(b"xdp", 1, 0x6, insn(OP_CALL, imm=188) + insn(0x95)), (b"license", 1, 0x3, LICENSE)]), 0),
         (
             "non-executable data is not scanned",
             build_elf([(b"xdp", 1, 0x6, ok_code), (b".rodata", 1, 0x2, insn(OP_CALL, imm=6)), (b"license", 1, 0x3, LICENSE)]),
