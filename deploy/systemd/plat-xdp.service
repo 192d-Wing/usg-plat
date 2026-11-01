@@ -3,7 +3,8 @@
 # under the dedicated bpffs /run/plat/bpf (run-plat-bpf.mount), writes
 # /run/plat/xdp.state and exits. Nothing privileged keeps running; platd
 # then opens the pins without capabilities. ExecStop detaches (unpins every
-# link and map, removes the state file).
+# link and map, removes the state file); ExecStopPost repeats it after a
+# failed start, for which systemd skips ExecStop.
 #
 # Used only with [xdp] enabled = true and the platd drop-in
 # platd.service.d/xdp.conf (shipped as an example), which pulls this unit
@@ -55,6 +56,11 @@ RemainAfterExit=yes
 ExecStartPre=+/usr/bin/systemd-tmpfiles --create /usr/lib/tmpfiles.d/plat-xdp.conf
 ExecStart=/usr/libexec/plat/plat-xdp-loader attach --config /etc/plat/platd.toml
 ExecStop=/usr/libexec/plat/plat-xdp-loader detach
+# SEC-W68-001: systemd skips ExecStop= when ExecStart= fails (or the loader
+# is killed), but always runs ExecStopPost=. The loader rolls a failed
+# attach back itself; this repeats the detach for a loader that died
+# mid-way. With nothing attached it removes nothing and exits 0.
+ExecStopPost=/usr/libexec/plat/plat-xdp-loader detach
 # uid 0 owns the pins and the state file (plat_xdp::load::StateDir
 # requires /run/plat to be owned by the loader's user); Group=plat with the
 # setgid mount root makes every pin group plat. The loader chmods the pins

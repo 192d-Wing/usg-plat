@@ -419,14 +419,51 @@ xdp_links() {
     : >"$XPINS/OUT6"
 }
 xguard() {
-    guard_env env PLAT_XDP_STATE="$XST" PLAT_XDP_PIN_DIR="$XPINS" PLAT_XDP_RECHECK_SECS="${RECHECK:-0}" sh "$GUARD" 2>"$WORK/guard.err"
+    guard_env env PLAT_XDP_STATE="$XST" PLAT_XDP_PIN_DIR="$XPINS" PLAT_XDP_CONFIG="${XCONF:-$WORK/absent.toml}" PLAT_XDP_RECHECK_SECS="${RECHECK:-0}" sh "$GUARD" 2>"$WORK/guard.err"
 }
 quiet() { ! grep -q 'sysctl -qw' "$STATE/calls" && [ ! -s "$WORK/guard.err" ]; }
 detached() { [ ! -e "$XPINS/link_2" ] && [ ! -e "$XPINS/link_3" ] && [ -e "$XPINS/OUT6" ] && grep -q 'ip link set dev p6 xdpgeneric off' "$STATE/calls"; }
 
+# SEC-W68-001: no state file, nothing of the fast path may be left (xdp-orphan).
+XCONF=$WORK/xdp.toml
+xdp_conf() { printf '[dataplane]\ninterface = "plat0"\n\n[xdp]\nenabled = %s # comment\n\n[[xdp.interfaces]]\nname = "p6"\nrole = "access"\n\n[[xdp.interfaces]]\nname = "p4"  # upstream\nrole = "upstream"\n' "$1" >"$XCONF"; }
+no_pins() { rm -f "$XPINS"/*; }
 fwd_on
 xdp_links "prog/xdp id 42 " "prog/xdp id 42 "
-if xguard && quiet; then pass "guard without an XDP state file ignores XDP"; else fail "guard acted without a state file: $(cat "$WORK/guard.err")"; fi
+no_pins
+if xguard && quiet; then pass "guard without an XDP state file, pins or [xdp] interfaces ignores XDP"; else fail "guard acted without a state file: $(cat "$WORK/guard.err")"; fi
+xdp_links "" ""
+if xguard && closed xdp-orphan && [ ! -e "$XPINS/link_2" ] && [ ! -e "$XPINS/link_3" ] && [ -e "$XPINS/OUT6" ] &&
+    grep -q 'ip link set dev p6 xdpgeneric off' "$STATE/calls" && grep -q '2 link pins unpinned' "$WORK/guard.err"; then
+    pass "guard fails closed on pins without a state file (xdp-orphan) and unpins every link"
+else fail "orphan pins not detected: $(cat "$WORK/guard.err")"; fi
+fwd_on
+xdp_links "" "prog/xdp id 42 "
+no_pins
+xdp_conf true
+if XCONF=$XCONF xguard && closed xdp-orphan && grep -q 'p4 (ifindex 3) runs XDP program id 42 without' "$WORK/guard.err" &&
+    grep -q 'ip link set dev p4 xdpdrv off' "$STATE/calls"; then
+    pass "guard fails closed on a program on an [xdp] interface without a state file"
+else fail "orphan program not detected: $(cat "$WORK/guard.err")"; fi
+fwd_on
+xdp_links "" "prog/xdp id 42 "
+no_pins
+xdp_conf false
+if XCONF=$XCONF xguard && quiet; then pass "guard ignores XDP programs while [xdp] is disabled"; else fail "orphan with [xdp] off: $(cat "$WORK/guard.err")"; fi
+xdp_conf true
+xdp_links "" ""
+no_pins
+if XCONF=$XCONF xguard && quiet; then pass "guard quiet with [xdp] interfaces, no program, no pins and no state file"; else fail "clean stop tripped: $(cat "$WORK/guard.err")"; fi
+# A transient orphan (the loader pins before it writes the state file) is re-checked.
+xdp_links "" ""
+no_pins
+: >"$XPINS/link_2"
+printf '#!/bin/sh\nrm -f "%s" && exec %s "$@"\n' "$XPINS/link_2" "$(command -v sleep)" >"$BIN/sleep"
+chmod +x "$BIN/sleep"
+if RECHECK=1 xguard && quiet; then pass "guard re-checks a transient orphan before it acts"; else fail "transient orphan acted on: $(cat "$WORK/guard.err")"; fi
+rm -f "$BIN/sleep"
+fwd_on
+xdp_links "prog/xdp id 42 " "prog/xdp id 42 "
 xdp_state 42
 if xguard && quiet; then pass "guard accepts the attached program (id only, as without CAP_SYS_ADMIN)"; else fail "guard tripped on the attached program: $(cat "$WORK/guard.err")"; fi
 xdp_links "prog/xdp id 42 name plat_xdp tag 0123456789abcdef jited " "xdpgeneric/id:42 "
@@ -496,8 +533,28 @@ for bad in "" "prog_id=4x2" "prog_id=42\nprog_tag=0123456789abcdef\ninterface=p6
     fwd_on
     xdp_links "prog/xdp id 42 " "prog/xdp id 42 "
     printf '%b\n' "$bad" >"$XST"
-    if xguard && closed xdp-state-malformed; then :; else fail "malformed state '$bad' not failed closed: $(cat "$WORK/guard.err")"; fi
+    if xguard && closed xdp-state-malformed && [ ! -e "$XPINS/link_2" ] && [ ! -e "$XPINS/link_3" ] && [ -e "$XPINS/OUT6" ] &&
+        grep -q 'every link pin under .* was unpinned (2)' "$WORK/guard.err" && ! grep -q "listed interfaces" "$WORK/guard.err"; then :
+    else fail "malformed state '$bad' not failed closed: $(cat "$WORK/guard.err")"; fi
 done
+# QA-1: no interface in the state file and no link pin: says so.
+fwd_on
+xdp_links "prog/xdp id 42 " "prog/xdp id 42 "
+rm -f "$XPINS"/link_*
+: >"$XST"
+if xguard && closed xdp-state-malformed && grep -q 'no link pin under .* to unpin' "$WORK/guard.err"; then
+    pass "guard unpins every link pin when the state file names no interface, and reports what it did"
+else fail "no-interface message: $(cat "$WORK/guard.err")"; fi
+# SEC-W68-002: detach by the live name of the ifindex, not the state file's.
+fwd_on
+xdp_links "prog/xdp id 77 " "prog/xdp id 42 "
+xdp_state 42
+sed -i.bak 's/^interface=p6 2 /interface=renamed0 2 /' "$XST"
+if xguard && closed xdp-program-swapped && grep -q 'ip link set dev p6 xdpgeneric off' "$STATE/calls" &&
+    ! grep -q 'renamed0' "$STATE/calls" && grep -q 'p6 (ifindex 2) runs program id 77' "$WORK/guard.err" &&
+    grep -q 'fast path detached' "$WORK/guard.err"; then
+    pass "guard detaches by the listed name of the ifindex, not the state file's name"
+else fail "detach by state-file name: $(grep 'ip link set' "$STATE/calls"; cat "$WORK/guard.err")"; fi
 pass "guard fails closed on empty, non-numeric id, bad ifindex, bad tag and missing id state files"
 fwd_on
 xdp_state 42
@@ -549,6 +606,7 @@ if [ "$(unit_val plat-xdp.service CapabilityBoundingSet)" = "CAP_BPF CAP_NET_ADM
     [ "$(unit_val plat-xdp.service RemainAfterExit)" = yes ] &&
     unit_val plat-xdp.service ExecStart | grep -q ' attach --config /etc/plat/platd.toml$' &&
     unit_val plat-xdp.service ExecStop | grep -q ' detach$' &&
+    unit_val plat-xdp.service ExecStopPost | grep -qx '/usr/libexec/plat/plat-xdp-loader detach' &&
     unit_val plat-xdp.service ExecStartPre | grep -q '^+/usr/bin/systemd-tmpfiles --create /usr/lib/tmpfiles.d/plat-xdp.conf$' &&
     [ "$(unit_val plat-xdp.service ReadWritePaths)" = /run/plat ]; then
     pass "plat-xdp.service: CAP_BPF + CAP_NET_ADMIN only, root:plat, attach/detach, tmpfiles"
