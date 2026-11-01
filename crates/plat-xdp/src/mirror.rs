@@ -2,10 +2,9 @@
 //! `SLOT` / `IN4` / `OUT6`, retires them, reads the fast path's `seen_ns`,
 //! and writes slice state and generation into `SLICE`.
 //!
-//! Inherent methods only. The `plat-nat64` mirror trait (WU4) and the
-//! `impl … for XdpMirror` glue (WU5) are not here; [`SessionEntry`] carries
-//! the same facts as plan §4.4's `MirrorEntry` (`k6`, `k4`, remote, `dst6`,
-//! slice).
+//! The `plat-nat64` mirror trait is implemented in [`crate::glue`];
+//! [`SessionEntry`] carries the facts of plan §4.4's `MirrorEntry` (`k6`,
+//! `k4`, remote, `dst6`, slice).
 //!
 //! **Caller contract.** `install` and `retire` for one session run inside
 //! the `bib4` shard critical section that creates or removes it (plan §4.2;
@@ -16,19 +15,34 @@
 //! have been dropped (with an alert): the session is then installed like
 //! any other, exactly as the slow path keeps using its mapping (the rule 4
 //! exception; `plat-nat64` test
-//! `drop_and_alert_installs_even_when_the_record_is_lost`). The engine
-//! wiring is WU5; until then this is the contract, not enforced code.
+//! `drop_and_alert_installs_even_when_the_record_is_lost`).
 //!
-//! **Install** (one `SLOT` record, then two `BPF_NOEXIST` inserts):
+//! **No syscall under the caller's lock (WU5 gate, PERF-001/003/004).** The
+//! `bib4` side only writes shared memory and queues work; the map syscalls
+//! run on the publisher thread ([`XdpMirror::flush`],
+//! `control::spawn_publisher`). Slot states: `FREE → PENDING → LIVE → DEAD`
+//! (or `PENDING → FAILED → DEAD`, or `PENDING → DEAD`); the program
+//! forwards only `LIVE`.
+//!
+//! **Install** (under `bib4`):
 //! 1. take a slot from the caller's partition ([`SlotAllocator`]);
 //! 2. write words 1-7 of the record while it is unreachable, `fence(Release)`;
-//! 3. store word 0 (`state = LIVE`, slice, current slice generation);
-//! 4. insert `IN4`, then `OUT6`. On any error, roll back (delete what was
-//!    inserted, `state = DEAD`, quarantine the slot) and fail; `E2BIG`
-//!    (map full) also backs installs off for [`INSTALL_BACKOFF`].
+//! 3. store word 0 (`state = PENDING`, slice, the engine's generation);
+//! 4. queue a publish op on the partition.
 //!
-//! **Retire** (only of a live slot, QA F1): `state = DEAD`, delete `OUT6`
-//! and `IN4`, quarantine.
+//! **Publish** (publisher thread): insert `IN4`, then `OUT6`
+//! (`BPF_NOEXIST`), then compare-and-swap `PENDING → LIVE`. A retire that
+//! came first (`DEAD`) wins: the publisher deletes what it inserted. On a
+//! failure the inserts are rolled back and the record becomes `FAILED`
+//! (`E2BIG` also backs installs off for [`INSTALL_BACKOFF`]; `EEXIST` is
+//! first retried a few passes); the stale-entry collector then makes the
+//! engine forget the slot, so the session can be mirrored again.
+//!
+//! **Retire** (under `bib4`, only of a live slot, QA F1): `state = DEAD`,
+//! queue a retire op. **Publisher**: delete `OUT6` and `IN4` if this writer
+//! published them, then quarantine the slot. Retire ops of a pass run
+//! before its publishes, so an entry of an expired session is deleted
+//! before a new session with the same keys is published.
 //!
 //! When `retire` returns, no *new* program run can use the session, but a
 //! run that started before (it already read `state = LIVE`) may still
@@ -37,11 +51,12 @@
 //! returns the session's port block to the pool at once and it is
 //! reassigned within that window, such a packet would leave with a
 //! mapping the audit trail attributes to the previous subscriber. This is
-//! a recorded residual (fixes-wu34-round-1; WU5 may defer the block return
-//! to the next slot epoch). A program that read a hash value just before a
-//! delete may also see a reused element: it then reads another live slot
-//! whose key echo differs, and passes (plan §4.3 proof sketch). Slot
-//! records are rewritten only after the RCU grace period of
+//! a recorded residual (fixes-wu34-round-1). A program that reads a hash
+//! value after the `DEAD` store and before the deferred delete finds a
+//! `DEAD` record and passes; one that read it just before a delete may see
+//! a reused element: it then reads another slot whose state or key echo
+//! differs, and passes (plan §4.3 proof sketch). Slot records are rewritten
+//! only after the deletes and then the RCU grace period of
 //! [`SlotAllocator`].
 //!
 //! **Counters** are per lane (`shard` or slot modulo [`COUNTER_LANES`]),
@@ -49,16 +64,19 @@
 //! different shards do not share a written line (PERF-005).
 //!
 //! COMPLIANCE MAPPING:
-//! - NIST 800-53: AU-12 / CLAUDE.md rule 4 - by contract (enforced once
-//!   wired, WU5), installs follow the attribution record handed to the
-//!   sink (I4), except that under `drop_and_alert` the record may have
-//!   been dropped; this writer emits no records
+//! - NIST 800-53: AU-12 / CLAUDE.md rule 4 - installs follow the
+//!   attribution record handed to the sink (I4, enforced by the engine,
+//!   `plat-nat64` `tests/mirror.rs`), except that under `drop_and_alert`
+//!   the record may have been dropped; this writer emits no records
 //! - NIST 800-53: SC-5 (Denial-of-Service Protection) - bounded maps and
 //!   slots; full maps back installs off and leave sessions on the slow path
 //! - NIST 800-53: SC-7, SC-24 - slice state and generation in `SLICE`;
 //!   fencing is one atomic store followed by a full fence
 //! - RFC 6146 §3.5.1 - `seen_ns` lets the slow path extend a session kept
-//!   alive only by fast-path traffic (WU5 converts the clock)
+//!   alive only by fast-path traffic ([`XdpMirror::seen_ms`] converts it to
+//!   engine milliseconds)
+//! - CLAUDE.md rule 2 - no map syscall under a `bib4` lock (WU5 gate:
+//!   `tests/hold_gate.rs`)
 
 use std::fmt;
 use std::io;
@@ -67,14 +85,14 @@ use std::sync::atomic::{AtomicU64, Ordering, fence};
 use std::time::{Duration, Instant};
 
 use plat_xdp_core::abi::{
-    Key4, Key6, MAX_SLICES, SLICE_ACTIVE, SLOT_DEAD, SLOT_LIVE, SLOT_WORD_HDR, SLOT_WORD_SEEN, SLOT_WORDS, SliceEnt,
-    SlotRec,
+    Key4, Key6, MAX_SLICES, SLICE_ACTIVE, SLOT_DEAD, SLOT_FAILED, SLOT_LIVE, SLOT_PENDING, SLOT_WORD_HDR,
+    SLOT_WORD_SEEN, SLOT_WORDS, SliceEnt, SlotRec,
 };
 
 use crate::maps::Words;
-use crate::slots::SlotAllocator;
+use crate::slots::{OP_PUBLISH, OP_RETIRE, SlotAllocator};
 
-/// Install backoff after the hash maps reported full (plan §4.3).
+/// Install back-off after the hash maps reported full (plan §4.3).
 pub const INSTALL_BACKOFF: Duration = Duration::from_secs(1);
 
 /// `OUT6` / `IN4` element operations (the pins on Linux; an in-memory
@@ -151,7 +169,7 @@ impl SessionEntry {
 
 /// Why an install did not happen (the session stays on the slow path).
 ///
-/// PERF-002: the WU5 `impl Mirror` maps [`InstallError::MapFull`] and
+/// PERF-002: `impl Mirror` ([`crate::glue`]) maps [`InstallError::MapFull`] and
 /// [`InstallError::Slots`] to `MirrorFail::Full` ([`InstallError::is_full`])
 /// and the rest to `MirrorFail::Error`; the engine backs off after any
 /// failure.
@@ -244,11 +262,17 @@ pub struct MirrorCounters {
     /// Retires refused because the slot was not live (a double retire or
     /// an out-of-range index; QA F1).
     pub retire_not_live: LaneCounter,
+    /// Retires whose hash deletes failed (the slot was still marked `DEAD`
+    /// and quarantined).
+    pub retire_error: LaneCounter,
     /// Incremented by the slow path when `seen_ns` extended a session.
     pub revalidated: LaneCounter,
     pub gc_deleted: LaneCounter,
-    /// Live installed sessions (`plat_xdp_sessions`).
+    /// Live installed sessions (`plat_xdp_sessions`; includes those whose
+    /// entries are not published yet).
     pub sessions: LaneCounter,
+    /// Publishes retried after `EEXIST`.
+    pub publish_retries: LaneCounter,
 }
 
 /// See the module documentation.
@@ -262,6 +286,12 @@ pub struct XdpMirror {
     /// Nanoseconds since `origin` before which installs are skipped.
     backoff_until: AtomicU64,
     counters: MirrorCounters,
+    /// Deferred publish / delete state ([`XdpMirror::flush`]).
+    publisher: parking_lot::Mutex<Publisher>,
+    /// The engine clock and the `CLOCK_MONOTONIC_COARSE` reading (ns) of
+    /// its origin, for [`XdpMirror::seen_ms`]; `None` until
+    /// [`XdpMirror::with_clock`].
+    clock: Option<(plat_common::Clock, u64)>,
 }
 
 impl XdpMirror {
@@ -280,10 +310,35 @@ impl XdpMirror {
             slot_mem,
             slice_mem,
             slots: SlotAllocator::new(slots, partitions),
+            publisher: parking_lot::Mutex::new(Publisher::new(slots)),
             origin: Instant::now(),
             backoff_until: AtomicU64::new(0),
             counters: MirrorCounters::default(),
+            clock: None,
         }
+    }
+
+    /// Converts `seen_ns` with the engine `clock`, whose origin
+    /// (`now_ms() == 0`) was `origin_ns` on `CLOCK_MONOTONIC_COARSE`
+    /// (Linux: [`crate::control::engine_origin_ns`]).
+    pub fn with_clock(mut self, clock: plat_common::Clock, origin_ns: u64) -> Self {
+        self.clock = Some((clock, origin_ns));
+        self
+    }
+
+    /// The fast path's last use of `slot` in engine milliseconds
+    /// (`State::now_ms` base), 0 if never (plan §5, RFC-002): `seen_ns`
+    /// minus the engine origin, rounded down, clamped to at most the
+    /// engine's `now` (the coarse clocks differ by up to one tick, and a
+    /// use is never in the future) and to at least 1 (a real use is never
+    /// "never"). One atomic load, no syscall.
+    pub fn seen_ms(&self, slot: u32) -> u64 {
+        let ns = self.seen_ns(slot);
+        let Some((clock, origin)) = &self.clock else { return 0 };
+        if ns == 0 {
+            return 0;
+        }
+        (ns.saturating_sub(*origin) / 1_000_000).min(clock.now_ms()).max(1)
     }
 
     /// The writer over `platd`'s pins.
@@ -330,17 +385,29 @@ impl XdpMirror {
         e
     }
 
-    /// Installs `e` from the caller's `shard` (its `bib4` shard index) and
-    /// returns the slot. See the module documentation for the order and the
-    /// caller contract.
-    pub fn install(&self, e: &SessionEntry, shard: usize) -> Result<u32, InstallError> {
+    /// Installs `e` under slice `generation` from the caller's `shard` (its
+    /// `bib4` shard index) and returns the slot. Refused (`Error`) unless
+    /// `SLICE[e.slice]` is Active with exactly `generation` (SEC-005,
+    /// RFC-001: the record carries the engine's generation, never one read
+    /// back from the map).
+    ///
+    /// No syscall (WU5 gate): the record is written `PENDING` and its
+    /// `IN4` / `OUT6` entries are published later by [`XdpMirror::flush`]
+    /// (the publisher thread), which turns it `LIVE`. Map-level failures
+    /// (full, key exists) are therefore found by the publisher: the record
+    /// becomes `FAILED`, never reachable, and the stale-entry collector
+    /// makes the engine forget the slot (see the module docs).
+    pub fn install(&self, e: &SessionEntry, generation: u32, shard: usize) -> Result<u32, InstallError> {
         if self.now() < self.backoff_until.load(Ordering::Relaxed) {
             return Err(self.fail(shard, InstallError::MapFull));
         }
         let Some(sw) = self.slice_word(e.slice) else {
             return Err(self.fail(shard, InstallError::Error));
         };
-        let generation = SliceEnt::from_bytes(&sw.load(Ordering::Acquire).to_ne_bytes()).generation;
+        let cur = SliceEnt::from_bytes(&sw.load(Ordering::Acquire).to_ne_bytes());
+        if cur.state != SLICE_ACTIVE || cur.generation != generation {
+            return Err(self.fail(shard, InstallError::Error));
+        }
         let Some(slot) = self.slots.alloc(shard) else {
             return Err(self.fail(shard, InstallError::Slots));
         };
@@ -348,7 +415,7 @@ impl XdpMirror {
             self.slots.retire(slot);
             return Err(self.fail(shard, InstallError::Error));
         };
-        let words = e.record(SLOT_LIVE, generation).to_words();
+        let words = e.record(SLOT_PENDING, generation).to_words();
         // Unreachable: no hash entry points here, and the header word still
         // says FREE/DEAD from before.
         for (d, s) in w.iter().zip(words.iter()).skip(1) {
@@ -358,79 +425,188 @@ impl XdpMirror {
         if let (Some(h), Some(v)) = (w.get(SLOT_WORD_HDR), words.get(SLOT_WORD_HDR)) {
             h.store(*v, Ordering::Release);
         }
-        let k4 = e.key4().to_bytes();
-        let k6 = e.key6().to_bytes();
-        if let Err(err) = self.tables.insert_in4(&k4, slot) {
-            self.abandon(slot, None);
-            return Err(self.install_err(shard, &err));
+        if !self.slots.defer_publish(slot) {
+            self.mark(slot, SLOT_DEAD);
+            self.slots.retire(slot);
+            return Err(self.fail(shard, InstallError::Error));
         }
-        if let Err(err) = self.tables.insert_out6(&k6, slot) {
-            self.abandon(slot, Some(&k4));
-            return Err(self.install_err(shard, &err));
-        }
-        let lane = slot as usize;
-        self.counters.installs.add(lane, 1);
-        self.counters.sessions.add(lane, 1);
+        self.counters.sessions.add(slot as usize, 1);
         Ok(slot)
     }
 
-    fn install_err(&self, shard: usize, err: &io::Error) -> InstallError {
-        if err.raw_os_error() == Some(E2BIG) {
-            let until = self.now().saturating_add(INSTALL_BACKOFF.as_nanos() as u64);
-            self.backoff_until.store(until, Ordering::Relaxed);
-            self.fail(shard, InstallError::MapFull)
-        } else {
-            self.fail(shard, InstallError::Error)
-        }
+    fn hdr(&self, slot: u32) -> Option<&AtomicU64> {
+        self.slot_words(slot).and_then(|w| w.get(SLOT_WORD_HDR))
     }
 
-    /// Rollback of a failed install: `DEAD`, delete the `IN4` entry if it
-    /// was inserted, quarantine.
-    fn abandon(&self, slot: u32, k4: Option<&[u8; 12]>) {
-        self.mark_dead(slot);
-        if let Some(k) = k4 {
-            let _ = self.tables.delete_in4(k);
-        }
-        self.slots.retire(slot);
-    }
-
-    fn mark_dead(&self, slot: u32) {
-        if let Some(h) = self.slot_words(slot).and_then(|w| w.get(SLOT_WORD_HDR)) {
-            h.store(SlotRec::hdr_word(SLOT_DEAD, 0, 0), Ordering::Release);
+    /// Stores `state` in the header, keeping slice and generation (the
+    /// record still describes its session, so a deferred delete and the
+    /// collectors can read the keys).
+    fn mark(&self, slot: u32, state: u8) {
+        if let Some(h) = self.hdr(slot) {
+            let r = SlotRec::from_bytes(&{
+                let mut b = [0u8; 64];
+                if let Some(c) = b.first_chunk_mut::<8>() {
+                    *c = h.load(Ordering::Acquire).to_ne_bytes();
+                }
+                b
+            });
+            h.store(SlotRec::hdr_word(state, r.slice, r.generation), Ordering::Release);
         }
     }
 
     /// Retires the session installed in `slot` with entry `e` (the same
-    /// entry `install` was given). Delete errors other than "absent" are
-    /// returned after the slot was still marked `DEAD` and quarantined, so
-    /// no new program run uses it either way.
+    /// entry `install` was given): one `DEAD` store, then the hash deletes
+    /// and the quarantine are queued for the publisher (no syscall under
+    /// the caller's `bib4` lock; WU5 gate, PERF-003/004). From the store
+    /// on, no new program run uses the record (the program forwards only
+    /// `LIVE`); the stale `OUT6` / `IN4` entries lead to a dead slot until
+    /// the publisher deletes them, and the slot is reused only a grace
+    /// period after that.
     ///
     /// SEC-006: a program run already past its `state` check when this is
     /// called may still forward one packet with the old mapping (at most
     /// one per CPU, within one RCU grace period); see the module docs.
     ///
     /// QA F1: a slot that is not live (already retired, never handed out,
-    /// out of range) or whose record holds another entry is left untouched (no `DEAD` store over a record that
-    /// may already belong to another session, no second quarantine) and
-    /// counted in `retire_not_live`.
+    /// out of range) or whose record holds another entry is left untouched
+    /// (no `DEAD` store over a record that may already belong to another
+    /// session, no second quarantine) and counted in `retire_not_live`.
     pub fn retire(&self, slot: u32, e: &SessionEntry) -> io::Result<()> {
         let lane = slot as usize;
         // Live, and still holding `e` (the key echo): a stale retire of a
         // slot recycled to another session must not kill that session.
-        if !self.slots.is_live(slot) || self.record(slot).map(|r| SessionEntry::from_record(&r)) != Some(*e) {
+        let rec = self.record(slot);
+        if !self.slots.is_live(slot)
+            || !rec.is_some_and(|r| matches!(r.state, SLOT_PENDING | SLOT_LIVE | SLOT_FAILED))
+            || rec.map(|r| SessionEntry::from_record(&r)) != Some(*e)
+        {
             self.counters.retire_not_live.add(lane, 1);
             return Ok(());
         }
-        self.mark_dead(slot);
-        let r6 = self.tables.delete_out6(&e.key6().to_bytes());
-        let r4 = self.tables.delete_in4(&e.key4().to_bytes());
+        self.mark(slot, SLOT_DEAD);
+        if self.slots.defer_retire(slot) {
+            self.counters.retires.add(lane, 1);
+            self.counters.sessions.sub(lane, 1);
+            return Ok(());
+        }
+        // Not reachable with the two-ops-per-slot bound; never leave the
+        // entries behind: delete synchronously.
+        let mut p = self.publisher.lock();
+        let r = self.delete_keys(&mut p, slot, e);
         if self.slots.retire(slot) {
             self.counters.retires.add(lane, 1);
             self.counters.sessions.sub(lane, 1);
-        } else {
-            self.counters.retire_not_live.add(lane, 1);
         }
+        r
+    }
+
+    /// Deletes `slot`'s `OUT6` / `IN4` entries if this writer published
+    /// them (never another slot's entries with the same keys).
+    fn delete_keys(&self, p: &mut Publisher, slot: u32, e: &SessionEntry) -> io::Result<()> {
+        if !p.take_published(slot) {
+            return Ok(());
+        }
+        let r6 = self.tables.delete_out6(&e.key6().to_bytes());
+        let r4 = self.tables.delete_in4(&e.key4().to_bytes());
         r6.and(r4).map(drop)
+    }
+
+    /// One publisher pass (the `plat-xdp-pub` thread; tests call it
+    /// directly). Takes every queued op of every partition, then:
+    ///
+    /// 1. **retires** first: delete the slot's entries if they were
+    ///    published, then quarantine the slot (its grace period starts);
+    /// 2. **publishes**: for each slot still `PENDING`, insert `IN4` then
+    ///    `OUT6` (`BPF_NOEXIST`), then compare-and-swap the header
+    ///    `PENDING → LIVE`. A retire that won the race (`DEAD`) makes the
+    ///    publisher delete what it inserted. `EEXIST` (a not yet deleted
+    ///    entry of an earlier session, queued in a partition drained after
+    ///    this one) is retried in the next pass, at most
+    ///    [`PUBLISH_RETRIES`] times; that and every other failure turns the
+    ///    record `FAILED` (map full also backs installs off for
+    ///    [`INSTALL_BACKOFF`]).
+    ///
+    /// Returns how many ops were processed. Runs syscalls with no lock held
+    /// except the publisher's own (uncontended) state.
+    pub fn flush(&self) -> usize {
+        let mut guard = self.publisher.lock();
+        let p = &mut *guard;
+        let mut ops = std::mem::take(&mut p.ops);
+        ops.clear();
+        // Retries of the previous pass go first, in their original order.
+        for (slot, _) in p.retry.iter() {
+            ops.push(u64::from(*slot) << 1 | OP_PUBLISH);
+        }
+        let mut tries = std::mem::take(&mut p.retry_next);
+        tries.clear();
+        tries.append(&mut p.retry);
+        self.slots.drain_ops(&mut ops);
+        for &op in ops.iter().filter(|&&op| op & 1 == OP_RETIRE) {
+            let slot = (op >> 1) as u32;
+            if let Some(r) = self.record(slot)
+                && self.delete_keys(p, slot, &SessionEntry::from_record(&r)).is_err()
+            {
+                self.counters.retire_error.add(slot as usize, 1);
+            }
+            self.slots.quarantine(slot);
+        }
+        for &op in ops.iter().filter(|&&op| op & 1 == OP_PUBLISH) {
+            let slot = (op >> 1) as u32;
+            let tried = tries.iter().find(|(s, _)| *s == slot).map_or(0, |(_, n)| *n);
+            self.publish(p, slot, tried);
+        }
+        let n = ops.len();
+        p.ops = ops;
+        p.retry_next = tries;
+        n
+    }
+
+    fn publish(&self, p: &mut Publisher, slot: u32, tried: u8) {
+        let lane = slot as usize;
+        let Some(h) = self.hdr(slot) else { return };
+        let Some(r) = self.record(slot) else { return };
+        if r.state != SLOT_PENDING {
+            // Retired before it was published: its retire op quarantines it.
+            return;
+        }
+        let pending = SlotRec::hdr_word(SLOT_PENDING, r.slice, r.generation);
+        let e = SessionEntry::from_record(&r);
+        let (k4, k6) = (e.key4().to_bytes(), e.key6().to_bytes());
+        let res = self.tables.insert_in4(&k4, slot).and_then(|()| {
+            self.tables.insert_out6(&k6, slot).inspect_err(|_| {
+                let _ = self.tables.delete_in4(&k4);
+            })
+        });
+        match res {
+            Ok(()) => {
+                let live = SlotRec::hdr_word(SLOT_LIVE, r.slice, r.generation);
+                if h.compare_exchange(pending, live, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                    p.set_published(slot);
+                    self.counters.installs.add(lane, 1);
+                } else {
+                    // Retired meanwhile: its retire op finds nothing
+                    // published and only quarantines.
+                    let _ = self.tables.delete_out6(&k6);
+                    let _ = self.tables.delete_in4(&k4);
+                }
+            }
+            Err(err) if err.raw_os_error() == Some(EEXIST) && tried < PUBLISH_RETRIES => {
+                p.retry.push((slot, tried + 1));
+                self.counters.publish_retries.add(lane, 1);
+            }
+            Err(err) => {
+                let kind = if err.raw_os_error() == Some(E2BIG) {
+                    let until = self.now().saturating_add(INSTALL_BACKOFF.as_nanos() as u64);
+                    self.backoff_until.store(until, Ordering::Relaxed);
+                    InstallError::MapFull
+                } else {
+                    InstallError::Error
+                };
+                self.fail(lane, kind);
+                let failed = SlotRec::hdr_word(SLOT_FAILED, r.slice, r.generation);
+                let _ = h.compare_exchange(pending, failed, Ordering::AcqRel, Ordering::Acquire);
+            }
+        }
     }
 
     /// The fast path's last-seen time of `slot` (`bpf_ktime_get_coarse_ns`,
@@ -438,6 +614,14 @@ impl XdpMirror {
     /// One atomic load, no syscall.
     pub fn seen_ns(&self, slot: u32) -> u64 {
         self.slot_words(slot).and_then(|w| w.get(SLOT_WORD_SEEN)).map_or(0, |s| s.load(Ordering::Relaxed))
+    }
+
+    /// Test support: the program's `seen_ns` store.
+    #[cfg(test)]
+    pub(crate) fn touch_ns(&self, slot: u32, ns: u64) {
+        if let Some(w) = self.slot_words(slot).and_then(|w| w.get(SLOT_WORD_SEEN)) {
+            w.store(ns, Ordering::Relaxed);
+        }
     }
 
     /// The record in `slot` as currently stored.
@@ -485,10 +669,11 @@ impl XdpMirror {
     }
 
     /// Scans up to `budget` slots from `cursor` for `LIVE` records whose
-    /// generation no longer equals their slice's (stale after a handover),
-    /// appending them to `out`; returns the next cursor (wraps at the end).
+    /// generation no longer equals their slice's (stale after a handover)
+    /// and for `FAILED` records (a publish that failed), appending them to
+    /// `out`; returns the next cursor (wraps at the end).
     /// The caller re-checks each under its `bib4` shard and retires it
-    /// (plan §4.3 slice-wide invalidation; WU5).
+    /// (plan §4.3 slice-wide invalidation; [`crate::glue::gc_step`]).
     pub fn stale_scan(&self, cursor: u32, budget: u32, out: &mut Vec<(u32, SessionEntry)>) -> u32 {
         let n = self.slots.slots();
         if n == 0 {
@@ -497,8 +682,8 @@ impl XdpMirror {
         let mut c = cursor % n;
         for _ in 0..budget.min(n) {
             if let Some(r) = self.record(c)
-                && r.state == SLOT_LIVE
-                && self.slice(r.slice).is_none_or(|(_, g)| g != r.generation)
+                && (r.state == SLOT_FAILED
+                    || (r.state == SLOT_LIVE && self.slice(r.slice).is_none_or(|(_, g)| g != r.generation)))
             {
                 out.push((c, SessionEntry::from_record(&r)));
             }
@@ -510,6 +695,60 @@ impl XdpMirror {
 
 /// `E2BIG` (Linux and macOS agree on 7).
 const E2BIG: i32 = 7;
+/// `EEXIST` (Linux and macOS agree on 17).
+const EEXIST: i32 = 17;
+
+/// Passes a publish that met `EEXIST` is retried in (the conflicting entry
+/// is an earlier session's whose deferred delete is queued in a partition
+/// the same pass drained later).
+pub const PUBLISH_RETRIES: u8 = 3;
+
+/// The publisher's own state (one lock, taken by [`XdpMirror::flush`] and
+/// by the never-taken synchronous retire fallback; never under a `bib4`
+/// lock in the normal path). Every buffer is preallocated.
+#[derive(Debug)]
+struct Publisher {
+    /// Bit per slot: its entries were published by this writer.
+    published: Box<[u64]>,
+    /// The ops of the current pass (reused).
+    ops: Vec<u64>,
+    /// `EEXIST` publishes for the next pass, with their attempt count.
+    retry: Vec<(u32, u8)>,
+    /// The previous pass's retries (attempt counts).
+    retry_next: Vec<(u32, u8)>,
+}
+
+impl Publisher {
+    fn new(slots: u32) -> Self {
+        let n = slots as usize;
+        Self {
+            published: vec![0u64; n.div_ceil(64)].into_boxed_slice(),
+            ops: Vec::with_capacity(2 * n),
+            retry: Vec::with_capacity(n),
+            retry_next: Vec::with_capacity(n),
+        }
+    }
+
+    fn bit(&mut self, slot: u32) -> Option<(&mut u64, u64)> {
+        Some((self.published.get_mut(slot as usize / 64)?, 1u64 << (slot % 64)))
+    }
+
+    fn set_published(&mut self, slot: u32) {
+        if let Some((w, m)) = self.bit(slot) {
+            *w |= m;
+        }
+    }
+
+    fn take_published(&mut self, slot: u32) -> bool {
+        match self.bit(slot) {
+            Some((w, m)) if *w & m != 0 => {
+                *w &= !m;
+                true
+            }
+            _ => false,
+        }
+    }
+}
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -521,12 +760,20 @@ pub(crate) mod tests {
 
     /// In-memory `OUT6` / `IN4` with the kernel's `NOEXIST` and capacity
     /// semantics.
-    #[derive(Debug, Default)]
+    #[derive(Default)]
     pub(crate) struct ModelTables {
         pub cap: usize,
         pub out6: Mutex<HashMap<[u8; 40], u32>>,
         pub in4: Mutex<HashMap<[u8; 12], u32>>,
         pub fail_out6: std::sync::atomic::AtomicBool,
+        /// Called inside every `OUT6` insert (races).
+        pub on_out6: Mutex<Option<Box<dyn FnMut() + Send>>>,
+    }
+
+    impl std::fmt::Debug for ModelTables {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("ModelTables").field("cap", &self.cap).finish_non_exhaustive()
+        }
     }
 
     fn ins<K: std::hash::Hash + Eq + Copy>(m: &Mutex<HashMap<K, u32>>, cap: usize, k: &K, v: u32) -> io::Result<()> {
@@ -546,7 +793,11 @@ pub(crate) mod tests {
             if self.fail_out6.load(Ordering::Relaxed) {
                 return Err(io::Error::from_raw_os_error(5));
             }
-            ins(&self.out6, self.cap, key, slot)
+            let r = ins(&self.out6, self.cap, key, slot);
+            if let Some(f) = self.on_out6.lock().as_mut() {
+                f();
+            }
+            r
         }
         fn insert_in4(&self, key: &[u8; 12], slot: u32) -> io::Result<()> {
             ins(&self.in4, self.cap, key, slot)
@@ -587,70 +838,126 @@ pub(crate) mod tests {
             slots,
             4,
         );
+        // Slice 0 Active with generation 1, as `Pool::set_mirror` publishes
+        // a legacy pool.
+        assert!(m.set_slice(0, SLICE_ACTIVE, 1));
         (t, m)
     }
 
     #[test]
-    fn install_writes_record_and_keys() {
+    fn install_writes_a_pending_record_and_the_publisher_publishes_it() {
         let (t, m) = mirror(16, 16);
-        assert_eq!(m.activate_slice(0), Some(1));
         let e = entry(1);
-        let s = m.install(&e, 0).unwrap_or(u32::MAX);
+        let s = m.install(&e, 1, 0).unwrap_or(u32::MAX);
+        // Under the caller's lock: the record only, PENDING, no map entry.
+        assert_eq!(m.record(s), Some(e.record(SLOT_PENDING, 1)));
+        assert!(t.out6.lock().is_empty() && t.in4.lock().is_empty(), "no syscall at install");
+        assert_eq!((m.counters().sessions.get(), m.counters().installs.get()), (1, 0));
+        assert_eq!(m.flush(), 1);
         let r = m.record(s).unwrap_or_default();
         assert_eq!(r, e.record(SLOT_LIVE, 1));
         assert_eq!(t.out6.lock().get(&e.key6().to_bytes()), Some(&s));
         assert_eq!(t.in4.lock().get(&e.key4().to_bytes()), Some(&s));
         assert_eq!(SessionEntry::from_record(&r), e);
-        assert_eq!(m.counters().sessions.get(), 1);
+        assert_eq!(m.counters().installs.get(), 1);
+        assert_eq!(m.flush(), 0, "nothing left");
         // The program writes seen_ns; the writer reads it.
-        if let Some(w) = m.slot_words(s).and_then(|w| w.get(SLOT_WORD_SEEN)) {
-            w.store(42, Ordering::Relaxed);
-        }
+        m.touch_ns(s, 42);
         assert_eq!(m.seen_ns(s), 42);
         assert_eq!(m.seen_ns(u32::MAX), 0);
     }
 
     #[test]
-    fn retire_quarantines_until_two_grace_periods() {
+    fn retire_is_dead_at_once_and_deletes_and_quarantines_later() {
         let (t, m) = mirror(16, 4);
         let e = entry(2);
-        let s = m.install(&e, 1).unwrap_or(u32::MAX);
+        let s = m.install(&e, 1, 1).unwrap_or(u32::MAX);
+        m.flush();
         assert!(m.retire(s, &e).is_ok());
+        // Under the caller's lock: DEAD only (the program stops using it).
         assert_eq!(m.record(s).map(|r| r.state), Some(SLOT_DEAD));
+        assert_eq!(t.out6.lock().len(), 1, "delete deferred");
+        assert_eq!(m.slot_allocator().quarantined(), 0);
+        assert_eq!(m.counters().sessions.get(), 0);
+        assert_eq!(m.flush(), 1);
         assert!(t.out6.lock().is_empty() && t.in4.lock().is_empty());
         assert_eq!(m.slot_allocator().quarantined(), 1);
         // Partition 1 has only slot 1: no reuse before the grace period.
-        assert_eq!(m.install(&entry(3), 1), Err(InstallError::Slots));
+        assert_eq!(m.install(&entry(3), 1, 1), Err(InstallError::Slots));
         m.slot_allocator().advance_epoch();
         m.slot_allocator().advance_epoch();
         assert_eq!(m.slot_allocator().recycle(), 1);
-        assert_eq!(m.install(&entry(3), 1), Ok(s));
+        assert_eq!(m.install(&entry(3), 1, 1), Ok(s));
         assert_eq!(m.counters().sessions.get(), 1);
     }
 
+    /// A retire that comes before the publish (same pass or earlier):
+    /// nothing is ever inserted, the slot is quarantined once.
     #[test]
-    fn duplicate_and_error_roll_back() {
+    fn retire_before_publish_never_publishes() {
         let (t, m) = mirror(16, 16);
         let e = entry(4);
-        let s = m.install(&e, 0).unwrap_or(u32::MAX);
-        assert_eq!(m.install(&e, 0), Err(InstallError::Error), "same key twice");
-        t.fail_out6.store(true, Ordering::Relaxed);
-        assert_eq!(m.install(&entry(5), 0), Err(InstallError::Error));
-        // Rollback removed the IN4 entry of the failed install only.
-        assert_eq!(t.in4.lock().len(), 1);
+        let s = m.install(&e, 1, 0).unwrap_or(u32::MAX);
+        assert!(m.retire(s, &e).is_ok());
+        assert_eq!(m.flush(), 2);
+        assert!(t.out6.lock().is_empty() && t.in4.lock().is_empty());
+        assert_eq!(m.record(s).map(|r| r.state), Some(SLOT_DEAD));
+        assert_eq!(m.slot_allocator().quarantined(), 1);
+        assert_eq!(m.counters().installs.get(), 0);
+    }
+
+    #[test]
+    fn publish_failures_turn_failed_and_are_collectable() {
+        let (t, m) = mirror(16, 16);
+        let e = entry(5);
+        let s = m.install(&e, 1, 0).unwrap_or(u32::MAX);
+        m.flush();
+        // Same keys again (the engine never does this; a stale entry would):
+        // EEXIST, retried PUBLISH_RETRIES passes, then FAILED.
+        let mut f = entry(6);
+        f.pool4 = e.pool4;
+        f.pool_port4 = e.pool_port4;
+        f.dst4 = e.dst4;
+        f.dport = e.dport;
+        let s2 = m.install(&f, 1, 0).unwrap_or(u32::MAX);
+        for _ in 0..=PUBLISH_RETRIES {
+            m.flush();
+        }
+        assert_eq!(m.record(s2).map(|r| r.state), Some(SLOT_FAILED));
+        assert_eq!(m.counters().publish_retries.get(), u64::from(PUBLISH_RETRIES));
+        assert_eq!(m.counters().install_error.get(), 1);
+        assert_eq!(t.in4.lock().get(&e.key4().to_bytes()), Some(&s), "the existing entry is kept");
+        assert_eq!(t.out6.lock().len(), 1, "no OUT6 entry for the failed publish");
+        // The collector reports it; its retire is accepted and deletes
+        // nothing of the other session's.
+        let mut found = Vec::new();
+        m.stale_scan(0, 16, &mut found);
+        assert_eq!(found, vec![(s2, f)]);
+        assert!(m.retire(s2, &f).is_ok());
+        m.flush();
         assert_eq!(t.in4.lock().get(&e.key4().to_bytes()), Some(&s));
+        assert_eq!(m.slot_allocator().quarantined(), 1);
+        // OUT6 failing: IN4 rolled back, FAILED.
+        t.fail_out6.store(true, Ordering::Relaxed);
+        let g = entry(7);
+        let s3 = m.install(&g, 1, 0).unwrap_or(u32::MAX);
+        m.flush();
+        assert_eq!(m.record(s3).map(|r| r.state), Some(SLOT_FAILED));
+        assert_eq!(t.in4.lock().len(), 1);
         assert_eq!(m.counters().install_error.get(), 2);
-        assert_eq!(m.slot_allocator().quarantined(), 2);
     }
 
     #[test]
     fn map_full_backs_off() {
         let (_t, m) = mirror(1, 16);
-        assert!(m.install(&entry(6), 0).is_ok());
-        assert_eq!(m.install(&entry(7), 0), Err(InstallError::MapFull));
-        // Within the backoff: refused without touching the maps or slots.
+        assert!(m.install(&entry(6), 1, 0).is_ok());
+        let s = m.install(&entry(7), 1, 0).unwrap_or(u32::MAX);
+        m.flush();
+        assert_eq!(m.record(s).map(|r| r.state), Some(SLOT_FAILED));
+        assert_eq!(m.counters().install_map_full.get(), 1);
+        // Within the back-off: refused at once, without taking a slot.
         let q = m.slot_allocator().quarantined();
-        assert_eq!(m.install(&entry(8), 0), Err(InstallError::MapFull));
+        assert_eq!(m.install(&entry(8), 1, 0), Err(InstallError::MapFull));
         assert_eq!(m.slot_allocator().quarantined(), q);
         assert_eq!(m.counters().install_map_full.get(), 2);
     }
@@ -658,11 +965,13 @@ pub(crate) mod tests {
     #[test]
     fn slices_and_generations() {
         let (_t, m) = mirror(16, 16);
-        assert_eq!(m.slice(0), Some((0, 0)));
+        assert_eq!(m.slice(0), Some((SLICE_ACTIVE, 1)));
+        assert_eq!(m.slice(7), Some((0, 0)));
         assert_eq!(m.activate_slice(7), Some(1));
         let mut e = entry(9);
         e.slice = 7;
-        let s = m.install(&e, 0).unwrap_or(u32::MAX);
+        let s = m.install(&e, 1, 0).unwrap_or(u32::MAX);
+        m.flush();
         assert_eq!(m.record(s).map(|r| r.generation), Some(1));
         assert!(m.deactivate_slice(7, SLICE_FENCED));
         assert_eq!(m.slice(7), Some((SLICE_FENCED, 1)));
@@ -674,42 +983,45 @@ pub(crate) mod tests {
         assert_eq!(stale, vec![(s, e)]);
         assert!(!m.set_slice(MAX_SLICES as u16, SLICE_ACTIVE, 1));
         e.slice = MAX_SLICES as u16;
-        assert_eq!(m.install(&e, 0), Err(InstallError::Error));
+        assert_eq!(m.install(&e, 1, 0), Err(InstallError::Error));
         assert_eq!(m.record(15).map(|r| r.state), Some(SLOT_FREE));
     }
 
-    // ---- QA (WU3): writer edge cases ----
-
+    /// A publish that loses the race with a retire (the `DEAD` store lands
+    /// between the publisher's state read and its `PENDING → LIVE` CAS)
+    /// deletes what it inserted; the retire's op only quarantines.
     #[test]
-    fn rollback_after_in4_failure_leaves_nothing_and_quarantines() {
+    fn publish_losing_to_a_retire_leaves_no_entry() {
         let (t, m) = mirror(16, 16);
-        assert_eq!(m.activate_slice(0), Some(1));
-        // IN4 insert fails because the key already exists (another entry).
+        let m = Arc::new(m);
         let e = entry(20);
-        let s = m.install(&e, 0).unwrap_or(u32::MAX);
-        let mut dup = entry(21);
-        dup.pool_port4 = e.pool_port4; // same IN4 key, other OUT6 key
-        dup.pool4 = e.pool4;
-        dup.dst4 = e.dst4;
-        dup.dport = e.dport;
-        let q = m.slot_allocator().quarantined();
-        assert_eq!(m.install(&dup, 0), Err(InstallError::Error));
-        assert_eq!(m.slot_allocator().quarantined(), q + 1);
-        assert_eq!(t.out6.lock().len(), 1, "no OUT6 entry for the failed install");
-        assert_eq!(t.in4.lock().get(&e.key4().to_bytes()), Some(&s), "the existing IN4 entry is kept");
-        assert_eq!(m.counters().sessions.get(), 1);
+        let s = m.install(&e, 1, 0).unwrap_or(u32::MAX);
+        let (m2, e2) = (m.clone(), e);
+        *t.on_out6.lock() = Some(Box::new(move || {
+            assert!(m2.retire(s, &e2).is_ok());
+        }));
+        m.flush();
+        t.on_out6.lock().take();
+        assert_eq!(m.record(s).map(|r| r.state), Some(SLOT_DEAD));
+        assert!(t.out6.lock().is_empty() && t.in4.lock().is_empty(), "inserted, then removed by the publisher");
+        assert_eq!(m.counters().installs.get(), 0);
+        m.flush();
+        assert_eq!(m.slot_allocator().quarantined(), 1);
+        assert!(t.out6.lock().is_empty() && t.in4.lock().is_empty());
     }
 
     #[test]
     fn retire_of_an_absent_entry_is_harmless_and_counted_once() {
         let (t, m) = mirror(16, 16);
         let e = entry(22);
-        let s = m.install(&e, 0).unwrap_or(u32::MAX);
-        // Keys already gone (e.g. the GC deleted them): retire still marks
-        // DEAD and quarantines; the sessions gauge never underflows.
+        let s = m.install(&e, 1, 0).unwrap_or(u32::MAX);
+        m.flush();
+        // Keys already gone: retire still marks DEAD and quarantines; the
+        // sessions gauge never underflows.
         t.out6.lock().clear();
         t.in4.lock().clear();
         assert!(m.retire(s, &e).is_ok());
+        m.flush();
         assert_eq!(m.record(s).map(|r| r.state), Some(SLOT_DEAD));
         assert_eq!(m.counters().sessions.get(), 0);
         // Out-of-range slot: no write, no quarantine, no panic.
@@ -725,9 +1037,11 @@ pub(crate) mod tests {
     fn double_retire_is_refused_and_counted() {
         let (_t, m) = mirror(16, 16);
         let e = entry(30);
-        let s = m.install(&e, 0).unwrap_or(u32::MAX);
+        let s = m.install(&e, 1, 0).unwrap_or(u32::MAX);
+        m.flush();
         assert!(m.retire(s, &e).is_ok());
         assert!(m.retire(s, &e).is_ok());
+        m.flush();
         assert_eq!(m.slot_allocator().quarantined(), 1);
         assert_eq!((m.counters().retires.get(), m.counters().retire_not_live.get()), (1, 1));
         m.slot_allocator().advance_epoch();
@@ -735,7 +1049,8 @@ pub(crate) mod tests {
         assert_eq!(m.slot_allocator().recycle(), 1);
         // Reused by another session: a stale retire of the first leaves it.
         let f = entry(31);
-        assert_eq!(m.install(&f, 0), Ok(s));
+        assert_eq!(m.install(&f, 1, 0), Ok(s));
+        m.flush();
         let r = m.record(s);
         assert!(m.retire(s, &e).is_ok());
         assert_eq!(m.record(s), r, "the other session's record is untouched");
@@ -754,20 +1069,84 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn install_takes_the_generation_from_slice_and_never_reuses_early() {
+    fn install_needs_the_exact_active_generation_and_never_reuses_early() {
         let (_t, m) = mirror(64, 4);
-        assert_eq!(m.activate_slice(0), Some(1));
         assert!(m.deactivate_slice(0, SLICE_FENCED));
-        assert_eq!(m.activate_slice(0), Some(2));
         let e = entry(23);
-        let s = m.install(&e, 2).unwrap_or(u32::MAX);
+        // SEC-005 / RFC-001: not Active, or another generation: refused.
+        assert_eq!(m.install(&e, 1, 2), Err(InstallError::Error));
+        assert_eq!(m.activate_slice(0), Some(2));
+        assert_eq!(m.install(&e, 1, 2), Err(InstallError::Error), "stale generation");
+        assert_eq!(m.install(&e, 3, 2), Err(InstallError::Error), "future generation");
+        assert_eq!(m.slot_allocator().quarantined(), 0, "refused before a slot is taken");
+        let s = m.install(&e, 2, 2).unwrap_or(u32::MAX);
+        m.flush();
         assert_eq!(m.record(s).map(|r| r.generation), Some(2));
         assert_eq!(s % 4, 2, "partition of shard 2");
         assert!(m.retire(s, &e).is_ok());
+        m.flush();
         m.slot_allocator().advance_epoch();
         m.slot_allocator().recycle();
         // Partition 2 holds only slot 2 of 4: no slot until two epochs.
-        assert_eq!(m.install(&entry(24), 2), Err(InstallError::Slots));
+        assert_eq!(m.install(&entry(24), 2, 2), Err(InstallError::Slots));
         assert_eq!(m.counters().install_slots.get(), 1);
+        assert_eq!(m.counters().install_error.get(), 3);
+    }
+
+    /// Concurrency: installs and retires from several threads (each its own
+    /// shard, as under `bib4`) against a running publisher: every
+    /// published entry belongs to a live slot, and at the end the maps
+    /// hold exactly the live sessions.
+    #[test]
+    fn concurrent_installs_retires_and_publisher_agree() {
+        let (t, m) = mirror(1 << 16, 4096);
+        let m = Arc::new(m);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let publ = {
+            let (m, stop) = (m.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    m.flush();
+                }
+            })
+        };
+        let ws: Vec<_> = (0..4u8)
+            .map(|w| {
+                let m = m.clone();
+                std::thread::spawn(move || {
+                    let mut live = Vec::new();
+                    for i in 0..2000u32 {
+                        let mut e = entry(w);
+                        e.sport6 = (i % 60000) as u16;
+                        e.pool_port4 = 1024 + (i % 60000) as u16;
+                        e.dst4 = [10, w, (i >> 8) as u8, i as u8];
+                        if let Ok(s) = m.install(&e, 1, usize::from(w)) {
+                            live.push((s, e));
+                        }
+                        if i % 3 == 0
+                            && let Some((s, e)) = live.pop()
+                        {
+                            assert!(m.retire(s, &e).is_ok());
+                        }
+                        if i % 512 == 0 {
+                            m.slot_allocator().advance_epoch();
+                            m.slot_allocator().recycle();
+                        }
+                    }
+                    live
+                })
+            })
+            .collect();
+        let live: Vec<(u32, SessionEntry)> = ws.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect();
+        stop.store(true, Ordering::Release);
+        let _ = publ.join();
+        m.flush();
+        assert_eq!(t.in4.lock().len(), live.len());
+        assert_eq!(t.out6.lock().len(), live.len());
+        for (s, e) in &live {
+            assert_eq!(m.record(*s).map(|r| r.state), Some(SLOT_LIVE));
+            assert_eq!(t.in4.lock().get(&e.key4().to_bytes()), Some(s));
+        }
+        assert_eq!(m.counters().sessions.get(), live.len() as u64);
     }
 }

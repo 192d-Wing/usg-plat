@@ -14,6 +14,12 @@ default = ["tls"]
 # daemon refuses TLS configs and, with the default `tls.require_fips`,
 # refuses to start: feature-off builds are lint/CI artefacts only.
 tls = ["dep:plat-tls", "dep:rustls", "plat-audit/tls"]
+# XDP fast path for established UDP sessions (POAM-016 Phase 1): opens the
+# pins the privileged plat-xdp-loader created and mirrors sessions into
+# them. Off by default; building it needs bpf-linker (the embedded object
+# is the one the loader attaches; plan §15). With the feature off, the
+# daemon refuses `[xdp] enabled = true` and is TUN-only as before.
+xdp = ["dep:plat-xdp", "dep:plat-xdp-core", "plat-xdp/xdp"]
 
 [dependencies]
 plat-common.workspace = true
@@ -24,6 +30,8 @@ plat-io.workspace = true
 plat-cluster.workspace = true
 plat-tls = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
+plat-xdp = { workspace = true, optional = true }
+plat-xdp-core = { workspace = true, optional = true }
 clap.workspace = true
 core_affinity.workspace = true
 signal-hook.workspace = true

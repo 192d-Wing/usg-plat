@@ -15,6 +15,7 @@ default = []
 xdp = ["plat-xdp/xdp"]
 
 [dependencies]
+plat-common.workspace = true
 plat-xdp.workspace = true
 clap.workspace = true
 

@@ -195,7 +195,9 @@ fn setup() -> Fx {
         retired: false,
     };
     assert_eq!(fx.mirror.activate_slice(0), Some(1), "fresh SLICE starts at generation 0");
-    fx.slot = ok(fx.mirror.install(&fx.entry, 0), "install");
+    fx.slot = ok(fx.mirror.install(&fx.entry, 1, 0), "install");
+    // Publish the entries (the publisher thread in platd).
+    fx.mirror.flush();
     fx
 }
 
@@ -207,7 +209,8 @@ fn base_state(fx: &mut Fx) {
     if fx.retired {
         // The writer retired it (keys deleted, slot quarantined): install
         // afresh, in another slot.
-        fx.slot = ok(fx.mirror.install(&fx.entry, 1), "re-install");
+        fx.slot = ok(fx.mirror.install(&fx.entry, 1, 1), "re-install");
+        fx.mirror.flush();
         fx.retired = false;
     } else {
         // Undo raw overrides of the record (keys still in OUT6 / IN4).
@@ -593,6 +596,12 @@ fn writer_transitions_stop_the_fast_path() {
     let e = fx.entry;
     assert!(fx.mirror.retire(fx.slot, &e).is_ok());
     fx.retired = true;
+    // WU5: the retire under the lock is the DEAD store only; the entries
+    // still lead to the slot, which the program refuses.
+    expect_pass(&fx, v6, PassReason::SlotDead);
+    expect_pass(&fx, v4, PassReason::SlotDead);
+    // The publisher's deferred deletes: no entry any more.
+    fx.mirror.flush();
     expect_pass(&fx, v6, PassReason::NoSession);
     expect_pass(&fx, v4, PassReason::NoSession);
     base_state(&mut fx);

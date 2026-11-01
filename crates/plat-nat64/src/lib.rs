@@ -32,6 +32,8 @@ pub mod held;
 pub mod ident;
 pub mod mirror;
 pub mod pool;
+#[cfg(feature = "hold-probe")]
+pub mod probe;
 pub mod repl;
 pub mod shard;
 pub mod state;

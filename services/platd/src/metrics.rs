@@ -273,7 +273,7 @@ mod tests {
     use plat_audit::{Event, LifecycleKind};
 
     fn ev() -> Event {
-        Event::Lifecycle { ts_us: 0, kind: LifecycleKind::Start, fips: None, cluster: None }
+        Event::Lifecycle { ts_us: 0, kind: LifecycleKind::Start, fips: None, start: None }
     }
 
     #[test]

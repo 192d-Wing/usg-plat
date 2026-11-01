@@ -382,3 +382,47 @@ fn held_syn_check_config_end_to_end() {
     assert_eq!(code(&o), 2);
     assert!(String::from_utf8_lossy(&o.stderr).contains("requires nat64.tcp_simultaneous_open"));
 }
+
+/// `[xdp]` (POAM-016, plan §4.5): the env keys for the loader unit and the
+/// memory lines; off by default (old keys unchanged), invalid values exit 2.
+#[test]
+fn xdp_check_config_end_to_end() {
+    let d = Dir::new("xdp");
+    let text = |cfg: &Path, env: bool| {
+        let o = check(cfg, env);
+        assert_eq!(code(&o), 0, "{}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    };
+    let off = d.write("off.toml", EXAMPLE, 0o644);
+    let env = text(&off, true);
+    assert!(env.ends_with("PLAT_XDP=0\nPLAT_XDP_IFACES=\nPLAT_XDP_MAP_BYTES=0\n"), "{env}");
+    assert!(!text(&off, false).contains("xdp:"));
+
+    let body = "\n[xdp]\nenabled = true\nmax_sessions = 65536\n\
+                [[xdp.interfaces]]\nname = \"eth0\"\nrole = \"access\"\n\
+                [[xdp.interfaces]]\nname = \"eth1\"\nrole = \"upstream\"\n";
+    let on = d.write("on.toml", &format!("{EXAMPLE}{body}"), 0o644);
+    let env = text(&on, true);
+    assert!(env.contains("PLAT_XDP=1\nPLAT_XDP_IFACES=eth0 eth1\nPLAT_XDP_MAP_BYTES="), "{env}");
+    let bytes: u64 = env.lines().find_map(|l| l.strip_prefix("PLAT_XDP_MAP_BYTES=")).unwrap().parse().unwrap();
+    assert!(bytes > 65_536 * 200, "{bytes}");
+    let mem = |e: &str| -> u64 {
+        e.lines().find_map(|l| l.strip_prefix("PLAT_MEMORY_REQUIRED_BYTES=")).unwrap().parse().unwrap()
+    };
+    // platd's own share: the slot allocator, ~1.25 x max_sessions slots.
+    assert_eq!(mem(&env) - mem(&text(&off, true)), (65_536 + 16_384) * plat_common::memory::XDP_SLOT_USER_BYTES);
+    let t = text(&on, false);
+    assert!(t.contains("xdp: native on eth0 eth1; platd-side") && t.contains("PLAT_XDP_MAP_BYTES"), "{t}");
+
+    for (i, bad) in [
+        "\n[xdp]\nenabled = true\n",
+        "\n[xdp]\nenabled = true\nmode = \"generic\"\n[[xdp.interfaces]]\nname = \"eth0\"\nrole = \"access\"\n",
+        "\n[xdp]\nenabled = true\nunknown = 1\n[[xdp.interfaces]]\nname = \"eth0\"\nrole = \"access\"\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let p = d.write(&format!("bad{i}.toml"), &format!("{EXAMPLE}{bad}"), 0o644);
+        assert_eq!(code(&check(&p, false)), 2, "{bad}");
+    }
+}

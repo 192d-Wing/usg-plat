@@ -228,6 +228,11 @@ pub struct Shared {
     /// The daemon's effective uid (allowed on the operator socket besides
     /// root).
     daemon_uid: u32,
+    /// `CLOCK_MONOTONIC_COARSE` ns at which this member self-fences (lease
+    /// end), refreshed every control step: the XDP dead-man deadline is
+    /// capped by it (plan §9, SC-24).
+    #[cfg(all(feature = "xdp", target_os = "linux"))]
+    lease_fence_ns: AtomicU64,
 }
 
 impl std::fmt::Debug for Shared {
@@ -287,6 +292,13 @@ impl Shared {
     #[cfg(test)]
     pub fn takeovers(&self, label: &str) -> u64 {
         TAKEOVER_LABELS.iter().position(|l| *l == label).map_or(0, |i| self.takeovers[i].load(Ordering::Relaxed))
+    }
+
+    /// `CLOCK_MONOTONIC_COARSE` ns of this member's lease self-fence (0
+    /// before the first control step: no lease, nothing may be forwarded).
+    #[cfg(all(feature = "xdp", target_os = "linux"))]
+    pub fn lease_fence_ns(&self) -> u64 {
+        self.lease_fence_ns.load(Ordering::Acquire)
     }
 
     /// `/healthz` problem, if any (duplicate member id seen recently).
@@ -812,6 +824,10 @@ impl Ctl {
         s.committed = self.m.committed();
         s.leader = self.m.leader();
         s.lease_remaining = self.m.lease_remaining(now).min(3_600_000);
+        #[cfg(all(feature = "xdp", target_os = "linux"))]
+        self.sh
+            .lease_fence_ns
+            .store(plat_xdp::control::coarse_now_ns().saturating_add(s.lease_remaining * 1_000_000), Ordering::Release);
         s.weights = self.m.weights().to_vec();
     }
 
@@ -1148,6 +1164,8 @@ pub fn launch(core: Core) -> Result<ClusterHandle, String> {
         ctl: tx.clone(),
         audit: core.audit.clone(),
         daemon_uid: rustix::process::geteuid().as_raw(),
+        #[cfg(all(feature = "xdp", target_os = "linux"))]
+        lease_fence_ns: AtomicU64::new(0),
     });
     net.set_inbound(Arc::new(Glue {
         tx: tx.clone(),

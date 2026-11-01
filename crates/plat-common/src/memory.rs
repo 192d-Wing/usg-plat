@@ -38,6 +38,52 @@ pub const BIB4_SHARD_FACTOR: u64 = 16;
 pub const BIB4_MAX_SHARDS: u64 = 1 << 16;
 /// Share of physical RAM the requirement may use, in percent.
 pub const RAM_PERCENT: u64 = 90;
+/// `platd`-side bytes per XDP `SLOT`, all preallocated (upper bound): free
+/// stack 4, quarantine 16, partition op queue 16, the publisher's op buffer
+/// 16 and retry lists 16, live and published bits.
+pub const XDP_SLOT_USER_BYTES: u64 = 72;
+/// Kernel bytes per `xdp.max_sessions` entry of the preallocated `OUT6` and
+/// `IN4` hash maps (element header, 40 + 12 B keys, 4 B values, rounding;
+/// upper bound).
+pub const XDP_HASH_BYTES: u64 = 192;
+/// Kernel bytes per `SLOT` record (`BPF_F_MMAPABLE` array, page-rounded).
+pub const XDP_SLOT_BYTES: u64 = 64;
+/// Kernel bytes per possible CPU of the per-CPU maps (`IDENT` 4096 × 16 B,
+/// `STATS`, `FWD`, `SCRATCH`).
+pub const XDP_PERCPU_BYTES: u64 = 72 << 10;
+/// Fixed kernel bytes of the small maps and the program.
+pub const XDP_FIXED_BYTES: u64 = 2 << 20;
+
+/// `SLOT` entries for `xdp.max_sessions`: ⌈1.25 × max_sessions⌉ (plan §4.1;
+/// `plat_xdp::maps::slot_count`).
+pub fn xdp_slots(max_sessions: u32) -> u64 {
+    let m = u64::from(max_sessions);
+    m + m.div_ceil(4)
+}
+
+/// `platd`-side memory of `[xdp]` (0 while it is off): included in
+/// [`required_bytes`].
+pub fn xdp_user_bytes(cfg: &Config) -> u64 {
+    if !cfg.xdp.enabled {
+        return 0;
+    }
+    xdp_slots(cfg.xdp.max_sessions).saturating_mul(XDP_SLOT_USER_BYTES)
+}
+
+/// Kernel memory of the `[xdp]` maps (0 while it is off), charged to the
+/// loader unit's cgroup at map creation, not to `platd`
+/// (`PLAT_XDP_MAP_BYTES`, the loader unit's `MemoryMax`). `cpus` is the
+/// number of possible CPUs (per-CPU maps).
+pub fn xdp_map_bytes(cfg: &Config, cpus: u64) -> u64 {
+    if !cfg.xdp.enabled {
+        return 0;
+    }
+    u64::from(cfg.xdp.max_sessions)
+        .saturating_mul(XDP_HASH_BYTES)
+        .saturating_add(xdp_slots(cfg.xdp.max_sessions).saturating_mul(XDP_SLOT_BYTES))
+        .saturating_add(cpus.max(1).saturating_mul(XDP_PERCPU_BYTES))
+        .saturating_add(XDP_FIXED_BYTES)
+}
 
 /// Workers `platd run` starts: `dataplane.workers`, or one per CPU minus one
 /// (at least one) when 0.
@@ -54,6 +100,7 @@ pub fn worker_count(cfg: &Config) -> usize {
 ///  + workers × fragment memory per worker
 ///  + (workers + 1) × repl_ring_entries × 64 (HA only)
 ///  + held-SYN worst case (`Nat64Config::held_syn_memory`)
+///  + [`xdp_user_bytes`] (`[xdp]` only)
 ///  + shard headers + 256 MiB`,
 ///
 /// where the shard headers are 128 B × (4 × `table_shards` for `bib6`,
@@ -74,6 +121,7 @@ pub fn required_bytes(cfg: &Config, workers: usize) -> u64 {
         .saturating_add(w.saturating_mul(cfg.translation.fragments.memory_per_worker()))
         .saturating_add(ring)
         .saturating_add(cfg.nat64.held_syn_memory())
+        .saturating_add(xdp_user_bytes(cfg))
         .saturating_add(shard_header_bytes(cfg.nat64.table_shards))
         .saturating_add(HEADROOM_BYTES)
 }

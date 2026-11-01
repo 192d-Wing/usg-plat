@@ -553,3 +553,101 @@ fn fragment_timeout_versus_session_timeouts_and_ceiling() {
 fn invalid_parse(edits: &[(&str, &str)]) {
     assert!(with(edits).is_err(), "{edits:?}");
 }
+
+// ---- [xdp] (POAM-016 Phase 1, plan §4.5) ----
+
+fn xdp(body: &str) -> Result<Config, ConfigError> {
+    let mut t = EXAMPLE.to_string();
+    t.push_str("\n[xdp]\n");
+    t.push_str(body);
+    Config::from_toml(&t)
+}
+
+#[track_caller]
+fn xdp_invalid(body: &str, want: &str) {
+    match xdp(body) {
+        Err(ConfigError::Invalid(m)) => assert!(m.contains(want), "{body}: {m}"),
+        other => panic!("expected Invalid for {body:?}, got {other:?}"),
+    }
+}
+
+const IF1: &str = "[[xdp.interfaces]]\nname = \"eth0\"\nrole = \"access\"\n";
+
+#[test]
+fn xdp_off_by_default_and_unchecked_while_off() {
+    let c = with(&[]).unwrap();
+    assert!(!c.xdp.enabled);
+    assert_eq!(c.xdp.mode_str(), "off");
+    assert_eq!(plat_common::memory::xdp_user_bytes(&c), 0);
+    assert_eq!(plat_common::memory::xdp_map_bytes(&c, 8), 0);
+    // Off: nothing is validated (an empty interface list is fine).
+    let c = xdp("enabled = false\nheartbeat_ms = 1\n").unwrap();
+    assert!(!c.xdp.enabled);
+}
+
+#[test]
+fn xdp_valid_minimal_and_defaults() {
+    let c = xdp(&format!("enabled = true\n{IF1}")).unwrap();
+    let x = &c.xdp;
+    assert_eq!((x.max_sessions, x.heartbeat_ms, x.deadline_ms), (1 << 20, 250, 1000));
+    assert_eq!(x.mode_str(), "native");
+    assert_eq!(x.interface_names(), "eth0");
+    assert!(plat_common::memory::xdp_user_bytes(&c) > 0);
+    assert!(plat_common::memory::xdp_map_bytes(&c, 4) > u64::from(x.max_sessions) * 200);
+    let two = format!("enabled = true\n{IF1}[[xdp.interfaces]]\nname = \"eth1.100\"\nrole = \"both\"\n");
+    assert_eq!(xdp(&two).unwrap().xdp.interface_names(), "eth0 eth1.100");
+}
+
+#[test]
+fn xdp_rules() {
+    xdp_invalid("enabled = true\n", "xdp.interfaces");
+    let many: String = (0..33).map(|i| format!("[[xdp.interfaces]]\nname = \"e{i}\"\nrole = \"both\"\n")).collect();
+    xdp_invalid(&format!("enabled = true\n{many}"), "xdp.interfaces");
+    for bad in ["", "abcdefghijklmnop", "eth 0", "eth/0"] {
+        xdp_invalid(&format!("enabled = true\n[[xdp.interfaces]]\nname = \"{bad}\"\nrole = \"access\"\n"), "name");
+    }
+    xdp_invalid("enabled = true\n[[xdp.interfaces]]\nname = \"plat0\"\nrole = \"access\"\n", "TUN");
+    xdp_invalid(&format!("enabled = true\n{IF1}{IF1}"), "listed twice");
+    xdp_invalid(&format!("enabled = true\nmode = \"generic\"\n{IF1}"), "allow_generic");
+    assert!(xdp(&format!("enabled = true\nmode = \"generic\"\nallow_generic = true\n{IF1}")).is_ok());
+    xdp_invalid(&format!("enabled = true\nmax_sessions = 4095\n{IF1}"), "max_sessions");
+    assert!(xdp(&format!("enabled = true\nmax_sessions = 4096\n{IF1}")).is_ok());
+    assert!(xdp(&format!("enabled = true\nmax_sessions = 4000000\n{IF1}")).is_ok());
+    xdp_invalid(&format!("enabled = true\nmax_sessions = 4000001\n{IF1}"), "nat64.max_sessions");
+    xdp_invalid(&format!("enabled = true\nheartbeat_ms = 49\n{IF1}"), "heartbeat_ms");
+    xdp_invalid(&format!("enabled = true\nheartbeat_ms = 1001\ndeadline_ms = 5000\n{IF1}"), "heartbeat_ms");
+    assert!(xdp(&format!("enabled = true\nheartbeat_ms = 50\ndeadline_ms = 200\n{IF1}")).is_ok());
+    xdp_invalid(&format!("enabled = true\nheartbeat_ms = 50\ndeadline_ms = 199\n{IF1}"), "deadline_ms");
+}
+
+#[test]
+fn xdp_unknown_fields_and_values_are_parse_errors() {
+    for body in [
+        format!("enabled = true\npin_dir = \"/tmp\"\n{IF1}"),
+        format!("enabled = true\nmode = \"offload\"\n{IF1}"),
+        "enabled = true\n[[xdp.interfaces]]\nname = \"eth0\"\nrole = \"egress\"\n".to_string(),
+        "enabled = true\n[[xdp.interfaces]]\nname = \"eth0\"\nrole = \"access\"\nmtu = 1500\n".to_string(),
+    ] {
+        assert!(matches!(xdp(&body), Err(ConfigError::Parse(_))), "{body}");
+    }
+}
+
+#[test]
+fn xdp_deadline_is_capped_by_the_ha_lease() {
+    // lease_ms 3000 with the default drift margin: the self-fence instant
+    // caps the dead-man deadline.
+    let base = ha_section(2, "lease_ms = 3000\nheartbeat_ms = 500", "");
+    let cfg = |d: u32| {
+        let mut t = EXAMPLE.replacen(NC, &base, 1);
+        t.push_str(&format!("\n[xdp]\nenabled = true\ndeadline_ms = {d}\n{IF1}"));
+        Config::from_toml(&t)
+    };
+    let c = cfg(1000).unwrap();
+    let h = c.cluster.ha_active().unwrap();
+    let cap = h.lease_ms * (100 - u64::from(h.drift_margin_pct)) / 100;
+    assert!(cfg(cap as u32).is_ok());
+    match cfg(cap as u32 + 1) {
+        Err(ConfigError::Invalid(m)) => assert!(m.contains("lease_ms"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+}

@@ -211,7 +211,7 @@ fn cluster_records_verify() {
     for a in ["cluster_view_change", "nat_port_block_adopt", "cluster_peer_rejected", "cluster_hook"] {
         assert!(text.contains(&format!("\"event.action\":\"{a}\"")), "{a}");
     }
-    assert!(text.contains("\"plat.schema\":7"));
+    assert!(text.contains("\"plat.schema\":8"));
     let edited = text.replacen("\"cluster.epoch\":4", "\"cluster.epoch\":3", 1);
     assert!(!verify(edited.as_bytes()).unwrap().ok(), "edited epoch");
 }

@@ -104,6 +104,10 @@ pub fn render(out: &mut String, enabled: bool, s: &Snapshot, m: &XdpMirror, c: &
     fam("plat_xdp_slots_quarantined", "gauge", "Slots waiting for an RCU grace period");
     fam("plat_xdp_gc_deleted_total", "counter", "Stale-generation entries deleted");
     fam("plat_xdp_heartbeat_stalls_total", "counter", "Heartbeats withheld because platd made no progress");
+    fam("plat_xdp_publish_retries_total", "counter", "Deferred publishes retried after EEXIST");
+    fam("plat_xdp_retire_errors_total", "counter", "Deferred deletes that failed");
+    fam("plat_xdp_grace_failures_total", "counter", "Forced RCU grace periods (membarrier) that failed");
+    fam("plat_xdp_slots_quarantined_max", "gauge", "Highest quarantined slot count seen by the control thread");
     let k = m.counters();
     let ld = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
     let _ = writeln!(out, "plat_xdp_enabled {}", u8::from(enabled));
@@ -128,6 +132,10 @@ pub fn render(out: &mut String, enabled: bool, s: &Snapshot, m: &XdpMirror, c: &
     let _ = writeln!(out, "plat_xdp_slots_quarantined {}", m.slot_allocator().quarantined());
     let _ = writeln!(out, "plat_xdp_gc_deleted_total {}", k.gc_deleted.get());
     let _ = writeln!(out, "plat_xdp_heartbeat_stalls_total {}", ld(&c.heartbeat_stalls));
+    let _ = writeln!(out, "plat_xdp_publish_retries_total {}", k.publish_retries.get());
+    let _ = writeln!(out, "plat_xdp_retire_errors_total {}", k.retire_error.get());
+    let _ = writeln!(out, "plat_xdp_grace_failures_total {}", ld(&c.grace_failures));
+    let _ = writeln!(out, "plat_xdp_slots_quarantined_max {}", ld(&c.quarantined_high));
 }
 
 #[cfg(test)]
@@ -165,7 +173,8 @@ mod tests {
         for r in PassReason::ALL {
             assert!(out.contains(&format!("reason=\"{}\"", r.as_str())));
         }
-        assert_eq!(out.matches("# TYPE").count(), 14);
+        assert_eq!(out.matches("# TYPE").count(), 18);
+        assert!(out.contains("plat_xdp_slots_quarantined_max 0\n"));
         assert!(out.contains("plat_xdp_retire_not_live_total 0\n"));
     }
 }

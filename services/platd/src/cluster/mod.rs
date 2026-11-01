@@ -37,8 +37,6 @@ mod tests;
 #[cfg(feature = "tls")]
 pub mod witness;
 
-use std::sync::Arc;
-
 use plat_audit::{ClusterStart, SliceCidr};
 use plat_cluster::{DigestInput, DigestMember, MemberId, PartitionScheme, SliceId, SliceMap};
 use plat_common::config::Partition;
@@ -182,7 +180,7 @@ pub fn mode(cfg: &Config) -> &'static str {
 /// COMPLIANCE MAPPING:
 /// - NIST 800-53: CM-2, CM-3, AU-3 - the digest identifies the cluster
 ///   configuration each node started with (POAM-017c)
-pub fn cluster_start(cfg: &Config) -> Arc<ClusterStart> {
+pub fn cluster_start(cfg: &Config) -> ClusterStart {
     let slices = if cfg.cluster.ha_enabled() {
         Vec::new()
     } else {
@@ -193,13 +191,13 @@ pub fn cluster_start(cfg: &Config) -> Arc<ClusterStart> {
     } else {
         u16::try_from(cfg.cluster.members.len()).unwrap_or(u16::MAX)
     };
-    Arc::new(ClusterStart {
+    ClusterStart {
         node_id: cfg.node.id,
         mode: mode(cfg),
         config_digest: plat_cluster::config_digest(&digest_input(cfg)),
         slices,
         member_count,
-    })
+    }
 }
 
 /// Lower-case hex of a digest.

@@ -22,6 +22,7 @@ never limits forwarding.
 | 5 | TLS (branch `feat/fips-tls`). `service_start` gains `plat.fips` / `plat.fips_provider` (CEF `cn2`/`cs1`). `audit_remote_loss` gains optional `plat.reason` (`io`, `tls_handshake`, `tls_verify`, `tls_revocation`; CEF `reason`); TCP losses now carry `io`. New records `management_connection`, `management_connection_suppressed`, `tls_revocation_check`, `revocation_source_refresh`. First records that carry peer-supplied text (certificate subject, SANs, issuer DN, serial, URLs), sanitised and capped (see Injection safety). |
 | 6 | Branch `fix/linux-validation` (unreleased). New record `audit_recovery` (`plat.reason` `empty_file`/`missing_header`/`truncated_tail`, `plat.audit.last_checkpoint_seq`, `plat.audit.max_seq`, `plat.audit.lease_state` `ok`/`absent`/`corrupt`/`inflated`/`high`; CEF `reason`, `cn3` `lastCheckpointSeq`, `cn2` `maxSeq`, `cs4` `leaseState`). `audit_output_failure` may carry `plat.reason` (`truncate_failed`, `seq_lease_failed`, `seq_exhausted`; CEF `reason`). New lease file `.<name>.seq`. `verify-log` exit 3 and `--allow-recovery`. |
 | 7 | Branch `feat/cluster-ha` (unreleased). Cluster high availability. New records `cluster_view_change`, `cluster_member_state`, `cluster_slice_acquire`, `cluster_slice_release`, `nat_port_block_adopt`, `cluster_peer_rejected`, `cluster_peer_suppressed`, `cluster_replication_gap`, `cluster_hook`, `cluster_operator_command`. `nat_port_block_release` may carry `plat.release_reason` (`handover`; CEF `reason`). `service_start` may carry `cluster.node_id`, `cluster.mode`, `cluster.config_digest`, `cluster.slices`, `cluster.slice_count`, `cluster.member_count` (CEF `cs2`/`cs3`/`cs4`/`cn3`). `tls_revocation_check` gains roles `cluster_peer_client` / `cluster_peer_server`. Additive within schema 7 (branch `fix/poams-020-024-013`): `nat_resource_limit` `event.reason` value `aggregate_subscriber_limit` (POAM-013); `cluster.config_digest` now also covers `cross_node_hairpin`, `aggregate_prefix_len` and `max_subscribers_per_aggregate` (value changes, field unchanged). Chain format unchanged. |
+| 8 | Branch `feat/xdp-wu5` (unreleased). XDP fast path for established UDP sessions (POAM-016 Phase 1). `service_start` gains `plat.xdp.mode` (`off` / `native` / `generic`, always present when written by `platd`) and, with `[xdp]` enabled, `plat.xdp.object_sha256` (SHA-256 of the embedded eBPF object) and `plat.xdp.interfaces` (configured names, space-separated); CEF `cs5` (`xdpMode`), `flexString1` (`xdpObjectSha256`), `flexString2` (`xdpInterfaces`). New record `xdp_fastpath_state` (`plat.xdp.state` `enabled` / `disabled`, `event.reason`; CEF `cs1` `xdpState`, `reason`). `dataplane_counter` gains the `plat.counter.name` value `xdp_aborted`. No per-packet or per-session record from the fast path; attribution records unchanged. Chain format unchanged. |
 
 Branch `feat/protocol-completeness` (unreleased) adds drop reasons, counters
 and one gauge but changes no record type or field name, so the schema stays
@@ -30,7 +31,8 @@ and one gauge but changes no record type or field name, so the schema stays
 
 Files written by the v1 chain (schema 1) **no longer verify** with
 `platd verify-log`: the first line must be an `audit_chain_continue` header.
-Files written under schemas 2–7 use the same chain v2 and verify.
+Files written under schemas 2–8 use the same chain v2 and verify (a chain may
+span files of different schemas, e.g. 7 then 8 after an upgrade).
 
 ## Controls
 
@@ -103,7 +105,8 @@ local file, are never sent to syslog, and carry no `event.sequence`,
 | `nat_binding_create` | 6 | `success` | `network.transport` (`tcp`/`udp`/`icmp`), `source.ip` (full IPv6 host), `source.port`, `source.nat.ip`, `source.nat.port` |
 | `nat_binding_delete` | 6 | `success` | as create, plus `event.duration` |
 | `nat_resource_limit` | 4 | `failure` | `event.reason`, `source.ip`, `plat.subscriber.prefix` |
-| `service_start`, `service_stop` | 5 | `success` | `service.version`; `service_start` also `plat.fips` (bool), `plat.fips_provider`, and (schema 7) `cluster.node_id`, `cluster.mode`, `cluster.config_digest`, `cluster.slices`, `cluster.slice_count`, `cluster.member_count` |
+| `service_start`, `service_stop` | 5 | `success` | `service.version`; `service_start` also `plat.fips` (bool), `plat.fips_provider`, and (schema 7) `cluster.node_id`, `cluster.mode`, `cluster.config_digest`, `cluster.slices`, `cluster.slice_count`, `cluster.member_count`, and (schema 8) `plat.xdp.mode`, optional `plat.xdp.object_sha256`, `plat.xdp.interfaces` |
+| `xdp_fastpath_state` | 5 (`enabled`, `shutdown`), 4 (disabled for any other reason) | `success` (`enabled`, or `disabled` by `shutdown`), `failure` | `plat.xdp.state` (`enabled` / `disabled`), `event.reason` |
 | `dataplane_counter` | 6 | (none) | `plat.counter.name`, `plat.counter.value` |
 | `audit_queue_overflow` | 4 | `failure` | `plat.audit.lost` |
 | `audit_output_failure` | 3 (`degraded`), 4 (`recovered`) | `failure` | `plat.audit.destination` (`file`), `plat.audit.state` (`degraded` / `recovered`), `plat.audit.lost`, `plat.reason` (optional: `truncate_failed`, `seq_lease_failed`, `seq_exhausted`) |
@@ -192,6 +195,49 @@ digest; a different digest is refused on the peer channel
 
 ```json
 {"@timestamp":"2026-10-29T08:00:00.000000Z","plat.schema":7,"event.sequence":1,"event.kind":"event","event.category":"network","event.action":"service_start","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"success","service.version":"0.1.0","plat.fips":true,"plat.fips_provider":"aws-lc-rs-fips","cluster.node_id":0,"cluster.mode":"ha","cluster.config_digest":"9f2c…(64 hex)","cluster.slices":[],"cluster.slice_count":0,"cluster.member_count":2}
+```
+
+With the XDP fast path (schema 8; POAM-016 Phase 1) `service_start` also
+records `plat.xdp.mode` (`off` while `[xdp]` is absent or disabled, else
+`native` or `generic`) and, when enabled, `plat.xdp.object_sha256` (the
+SHA-256 of the eBPF object embedded in this `platd`, the one the loader must
+have attached; SI-7, CM-2) and `plat.xdp.interfaces` (the configured
+interface names, operator-supplied and validated `[A-Za-z0-9_.-]`, joined by
+spaces). Whether the fast path actually runs is in the
+`xdp_fastpath_state` records that follow.
+
+```json
+{"@timestamp":"2026-11-01T14:00:00.000000Z","plat.schema":8,"event.sequence":1,"event.kind":"event","event.category":"network","event.action":"service_start","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"success","service.version":"0.1.0","plat.fips":true,"plat.fips_provider":"aws-lc-rs-fips","cluster.node_id":0,"cluster.mode":"contiguous","cluster.config_digest":"…(64 hex)","cluster.slices":["192.0.2.0/24"],"cluster.slice_count":1,"cluster.member_count":1,"plat.xdp.mode":"native","plat.xdp.object_sha256":"240c2f82…(64 hex)","plat.xdp.interfaces":"eth0 eth1"}
+```
+
+### `xdp_fastpath_state` (schema 8)
+
+One record per state change of the XDP fast path (AU-2, AU-12; SC-24, SI-7),
+from `platd`'s start-up and its `plat-xdp-ctl` thread, never per packet or
+session; at most a few per process. `plat.xdp.state` is `enabled` (the
+program may forward) or `disabled` (every packet goes to the slow path).
+`event.reason`:
+
+| `event.reason` | State | Meaning |
+|---|---|---|
+| `start` | enabled | Pins opened, object and frozen `CONFIG` digest matched, `CONTROL` enabled |
+| `config_mismatch` | disabled | The frozen `CONFIG` was set up for another configuration (at start, or found by the 10 s integrity check) |
+| `object_mismatch` | disabled | The loader attached another object than this binary's (`/run/plat/xdp.state`) |
+| `link_mismatch` | disabled | The attached program changed while running (state file program id) |
+| `maps_unavailable` | disabled | Pins missing, of the wrong shape, replaced by a re-run loader, or the TUN or a thread could not be set up |
+| `unsupported_host` | disabled | `membarrier(MEMBARRIER_CMD_GLOBAL)` unavailable (`nohz_full`) or failing 10 times in a row: slots cannot be reused safely (decision Q5, SEC-007) |
+| `heartbeat_stalled` | disabled | The sweeper or a worker made no progress: heartbeats withheld, the dead-man deadline stops the fast path (SC-24) |
+| `heartbeat_resumed` | enabled | Progress again after a stall |
+| `shutdown` | disabled | `platd` is stopping (`CONTROL` disabled) |
+
+Every reason except `start`, `heartbeat_resumed` and `shutdown` is a
+failure (`event.outcome:"failure"`, severity 4). After `config_mismatch`,
+`object_mismatch`, `link_mismatch`, `maps_unavailable` or
+`unsupported_host` the fast path stays off until `platd` restarts. Alert on
+any of them; correlate with `plat_xdp_*` metrics.
+
+```json
+{"@timestamp":"2026-11-01T14:00:00.120000Z","plat.schema":8,"event.sequence":2,"event.kind":"event","event.category":"network","event.action":"xdp_fastpath_state","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"success","plat.xdp.state":"enabled","event.reason":"start"}
 ```
 
 ### Cluster records (schema 7)
@@ -289,6 +335,11 @@ reason (for example `hop_limit`, `port_exhausted`, `too_big`). Inbound
 TTL ≤ 1 packets that the inbound filter refuses are counted `no_binding` or
 `filtered`, not `hop_limit` (Time Exceeded is filter-gated); a too-big DF
 IPv4 packet the filter refuses is counted the same way, not `too_big`.
+
+XDP fast path (schema 8): `xdp_aborted`, packets the program dropped after a
+failed post-rewrite check (`XDP_ABORTED`; should stay 0). It is the only
+non-drop-reason value; fast-path forwarding and pass counts are only in
+`/metrics` (`plat_xdp_*`).
 
 Held-SYN drop reason (`fix/poam-008-simultaneous-open`, schema stays 7: a
 new value of the existing `plat.counter.name` field, no field change):
@@ -711,7 +762,8 @@ keeps microseconds), `dvchost` (node name), `cn1` (`sequence`), `cn4`
 | `cluster_operator_command` | `act` (command), `cs1` (`force`), `cn3` (`member`, optional), `suid`, `spid` (optional), `reason` (refused only) |
 | `nat_binding_create`, `nat_binding_delete` | `proto`, `c6a2`, `spt`, `sourceTranslatedAddress`, `sourceTranslatedPort` |
 | `nat_resource_limit` | `reason`, `c6a2`, `cn2` (`subscriberPrefixLen`) |
-| `service_start`, `service_stop` | none; `service_start` adds `cs1` (`fipsProvider`), `cn2` (`fips`, 1/0), and with clustering `cs2` (`clusterMode`), `cs3` (`configDigest`), `cs4` (`slices`, comma-separated), `cn3` (`memberCount`); the node id is `cn4` |
+| `service_start`, `service_stop` | none; `service_start` adds `cs1` (`fipsProvider`), `cn2` (`fips`, 1/0), and with clustering `cs2` (`clusterMode`), `cs3` (`configDigest`), `cs4` (`slices`, comma-separated), `cn3` (`memberCount`), and (schema 8) `cs5` (`xdpMode`), `flexString1` (`xdpObjectSha256`, optional), `flexString2` (`xdpInterfaces`, optional); the node id is `cn4` |
+| `xdp_fastpath_state` | `cs1` (`xdpState`), `reason` |
 | `dataplane_counter` | `cs2` (`counter`), `cn3` (`value`) |
 | `audit_queue_overflow` | `cn3` (`lost`) |
 | `audit_output_failure` | `cs3=file` (`destination`), `cs4` (`state`), `cn3` (`lost`), `reason` (optional) |
@@ -724,7 +776,7 @@ keeps microseconds), `dvchost` (node name), `cn1` (`sequence`), `cn4`
 | `revocation_source_refresh` | `act` (transition), `cs1` (`crlSource` or `ocspKey`), `reason` (optional) |
 | `audit_retention_prune` | `act` (state), `cs3=file` (`destination`), `cn3` (`prunedRotatedUs`), `cs5` (`prunedSeqRange`, `first-last`), `cs4` (`prunedChainPrefix`) |
 
-The custom keys `cn2`, `cn3`, `cs1`–`cs5` and `flexString1` carry different meanings per
+The custom keys `cn2`, `cn3`, `cs1`–`cs5`, `flexString1` and `flexString2` carry different meanings per
 record type; SIEM parsers must key on the matching `…Label` field.
 `release` and `delete` records carry no duration in CEF.
 
@@ -896,6 +948,19 @@ for `nat_port_block_release` (same address and range), `service_stop`,
   subscriber's address is full while other addresses have free blocks).
   `GET /cluster` returns the view and per-slice owners as JSON. `/healthz`
   returns 503 for 60 s after a duplicate member id was seen.
+- XDP fast path (only with `[xdp]` enabled and the fast path attached;
+  schema 8, decision Q7: separate families, the existing ones stay slow-path
+  only, so a total is `plat_v6_to_v4_total + plat_xdp_packets_total{dir="v6_to_v4"}`):
+  gauges `plat_xdp_enabled`, `plat_xdp_sessions`, `plat_xdp_slots_quarantined`,
+  `plat_xdp_slots_quarantined_max`; counters
+  `plat_xdp_packets_total{dir}` / `plat_xdp_bytes_total{dir}` (`v6_to_v4`,
+  `v4_to_v6`), `plat_xdp_pass_total{reason}` (every pass reason of plan
+  §4.7), `plat_xdp_aborted_total`, `plat_xdp_installs_total`,
+  `plat_xdp_install_failures_total{reason}` (`map_full`, `slots`, `error`),
+  `plat_xdp_retires_total`, `plat_xdp_retire_not_live_total`,
+  `plat_xdp_retire_errors_total`, `plat_xdp_publish_retries_total`,
+  `plat_xdp_revalidated_total`, `plat_xdp_gc_deleted_total`,
+  `plat_xdp_heartbeat_stalls_total`, `plat_xdp_grace_failures_total`.
 - Linux only: `plat_tun_rx_dropped_total{interface}` and
   `plat_tun_tx_dropped_total{interface}`, the kernel's drop counters for the
   TUN (`/sys/class/net/<if>/statistics/{rx,tx}_dropped`, read at scrape).

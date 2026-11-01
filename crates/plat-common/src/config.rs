@@ -102,6 +102,10 @@ pub struct Config {
     /// Process-wide TLS policy (FIPS, key exchange, revocation).
     #[serde(default)]
     pub tls: TlsConfig,
+    /// XDP fast path for established UDP sessions (POAM-016 Phase 1);
+    /// absent or `enabled = false`: today's TUN-only data plane.
+    #[serde(default)]
+    pub xdp: XdpConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -936,6 +940,122 @@ pub struct DataplaneConfig {
 impl Default for DataplaneConfig {
     fn default() -> Self {
         Self { interface: "plat0".into(), workers: 0, pin_cpus: true, sweep_interval_ms: 1000 }
+    }
+}
+
+/// Most interfaces in `[xdp]` (plan §4.5).
+pub const XDP_MAX_INTERFACES: usize = 32;
+/// Floor of `xdp.max_sessions`.
+pub const XDP_MIN_SESSIONS: u32 = 4096;
+
+/// `xdp.mode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum XdpMode {
+    /// Driver XDP.
+    #[default]
+    Native,
+    /// SKB-mode XDP (testing only; needs `allow_generic`).
+    Generic,
+}
+
+impl XdpMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Generic => "generic",
+        }
+    }
+}
+
+/// `xdp.interfaces[].role` (decision Q3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum XdpRole {
+    /// IPv6 → IPv4 only.
+    Access,
+    /// IPv4 → IPv6 only.
+    Upstream,
+    Both,
+}
+
+impl XdpRole {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Access => "access",
+            Self::Upstream => "upstream",
+            Self::Both => "both",
+        }
+    }
+}
+
+/// One `[[xdp.interfaces]]` entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct XdpInterface {
+    pub name: String,
+    pub role: XdpRole,
+}
+
+/// `[xdp]` (plan §4.5): the XDP fast path for established UDP sessions.
+/// Off by default. The pin directory is fixed (`/run/plat/bpf`), not
+/// configurable (CM-7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct XdpConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub mode: XdpMode,
+    #[serde(default)]
+    pub allow_generic: bool,
+    /// Fast-path capacity (`OUT6` / `IN4` entries), 4096..=`nat64.max_sessions`.
+    #[serde(default = "d_xdp_sessions")]
+    pub max_sessions: u32,
+    /// `CONTROL.deadline` refresh, 50..=1000.
+    #[serde(default = "d_xdp_heartbeat")]
+    pub heartbeat_ms: u32,
+    /// Dead-man deadline: >= 4 x `heartbeat_ms`; with HA at most the lease
+    /// self-fence time.
+    #[serde(default = "d_xdp_deadline")]
+    pub deadline_ms: u32,
+    #[serde(default)]
+    pub interfaces: Vec<XdpInterface>,
+}
+
+fn d_xdp_sessions() -> u32 {
+    1 << 20
+}
+fn d_xdp_heartbeat() -> u32 {
+    250
+}
+fn d_xdp_deadline() -> u32 {
+    1000
+}
+
+impl Default for XdpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: XdpMode::Native,
+            allow_generic: false,
+            max_sessions: d_xdp_sessions(),
+            heartbeat_ms: d_xdp_heartbeat(),
+            deadline_ms: d_xdp_deadline(),
+            interfaces: Vec::new(),
+        }
+    }
+}
+
+impl XdpConfig {
+    /// `xdp.mode` as recorded on `service_start` (`off` while disabled).
+    pub const fn mode_str(&self) -> &'static str {
+        if self.enabled { self.mode.as_str() } else { "off" }
+    }
+
+    /// Interface names joined by spaces (`PLAT_XDP_IFACES`, `service_start`).
+    pub fn interface_names(&self) -> String {
+        self.interfaces.iter().map(|i| i.name.as_str()).collect::<Vec<_>>().join(" ")
     }
 }
 
@@ -1851,7 +1971,63 @@ impl Config {
         if n.held_syn_unreachable && !n.tcp_simultaneous_open {
             return invalid("nat64.held_syn_unreachable requires nat64.tcp_simultaneous_open = true");
         }
-        self.validate_cluster()
+        self.validate_cluster()?;
+        self.validate_xdp()
+    }
+
+    /// `[xdp]` (POAM-016 Phase 1, plan §4.5). Nothing is checked while it
+    /// is off, so an old or minimal config parses and validates unchanged.
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: CM-6, CM-7 - off by default; generic (SKB) mode only
+    ///   with `allow_generic`; bounded interface list with roles
+    /// - NIST 800-53: SC-5 - fast-path capacity 4096..=`nat64.max_sessions`
+    /// - NIST 800-53: SC-24 - dead-man deadline at least 4 heartbeats and,
+    ///   with HA, no later than the lease self-fence instant
+    fn validate_xdp(&self) -> Result<(), ConfigError> {
+        let x = &self.xdp;
+        if !x.enabled {
+            return Ok(());
+        }
+        if x.interfaces.is_empty() || x.interfaces.len() > XDP_MAX_INTERFACES {
+            return invalid(format!("xdp.interfaces: 1..={XDP_MAX_INTERFACES} entries required"));
+        }
+        for (i, f) in x.interfaces.iter().enumerate() {
+            if f.name.is_empty()
+                || f.name.len() > 15
+                || !f.name.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+            {
+                return invalid(format!("xdp.interfaces[{i}].name must be 1..=15 chars [A-Za-z0-9_.-]"));
+            }
+            if f.name == self.dataplane.interface {
+                return invalid(format!("xdp.interfaces[{i}].name must not be the TUN (dataplane.interface)"));
+            }
+            if x.interfaces.iter().take(i).any(|g| g.name == f.name) {
+                return invalid(format!("xdp.interfaces[{i}].name {} is listed twice", f.name));
+            }
+        }
+        if x.mode == XdpMode::Generic && !x.allow_generic {
+            return invalid("xdp.mode = \"generic\" needs xdp.allow_generic = true (testing only)");
+        }
+        let cap = u32::try_from(self.nat64.max_sessions).unwrap_or(u32::MAX);
+        if x.max_sessions < XDP_MIN_SESSIONS || x.max_sessions > cap {
+            return invalid(format!("xdp.max_sessions must be {XDP_MIN_SESSIONS}..=nat64.max_sessions ({cap})"));
+        }
+        if !(50..=1000).contains(&x.heartbeat_ms) {
+            return invalid("xdp.heartbeat_ms must be 50..=1000");
+        }
+        if u64::from(x.deadline_ms) < 4 * u64::from(x.heartbeat_ms) {
+            return invalid("xdp.deadline_ms must be >= 4 x xdp.heartbeat_ms");
+        }
+        if let Some(ha) = self.cluster.ha_active() {
+            let cap = ha.lease_ms.saturating_mul(100 - u64::from(ha.drift_margin_pct.min(100))) / 100;
+            if u64::from(x.deadline_ms) > cap {
+                return invalid(format!(
+                    "xdp.deadline_ms must be <= cluster.ha.lease_ms x (1 - drift_margin_pct/100) = {cap}"
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// `[translation.fragments]` ranges and the timeout ordering.

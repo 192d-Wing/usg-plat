@@ -110,6 +110,7 @@ ifneq ($(XDP_USER),)
 	[ "$$want" = "$$got" ] || { echo "ERROR: embedded object $$o ($$got) differs from $(XDP_OBJ) ($$want)" >&2; exit 1; }; \
 	echo "xdp: embedded object = gated object ($$got)"
 	cargo build -p plat-xdp-loader --features xdp --release
+	cargo build -p platd --features xdp --release
 else
 	@echo "xdp: skipped plat-xdp object build (no crates/plat-xdp yet; WU3)"
 endif
@@ -146,6 +147,7 @@ ifneq ($(XDP_USER),)
 endif
 ifneq ($(XDP_LOADER),)
 	cargo clippy -p plat-xdp-loader --features xdp --all-targets -- -D warnings
+	cargo clippy -p platd --features xdp --all-targets -- -D warnings
 endif
 
 # Levels 2-4 in virtme-ng VMs (Linux only; plan §11): fetch each matrix kernel

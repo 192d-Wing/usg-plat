@@ -138,6 +138,10 @@ pub struct Counters {
     /// Gauge: live fragment-table entries of this worker, written by the
     /// worker once per housekeeping pass (`plat_fragment_entries`).
     fragment_entries: CachePadded<AtomicU64>,
+    /// Liveness: housekeeping passes of this worker (every 64 packets and
+    /// on every idle poll), read by the XDP control thread's health check
+    /// (a hung worker stops the fast path's heartbeat; plan §9).
+    alive: CachePadded<AtomicU64>,
 }
 
 impl Default for Counters {
@@ -146,6 +150,7 @@ impl Default for Counters {
             drops: std::array::from_fn(|_| CachePadded::new(AtomicU64::new(0))),
             events: std::array::from_fn(|_| CachePadded::new(AtomicU64::new(0))),
             fragment_entries: CachePadded::new(AtomicU64::new(0)),
+            alive: CachePadded::new(AtomicU64::new(0)),
         }
     }
 }
@@ -185,6 +190,17 @@ impl Counters {
     #[inline]
     pub fn set_fragment_entries(&self, n: u64) {
         self.fragment_entries.store(n, Ordering::Relaxed);
+    }
+
+    /// One housekeeping pass (worker only).
+    #[inline]
+    pub fn tick_alive(&self) {
+        self.alive.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Housekeeping passes so far (liveness).
+    pub fn alive(&self) -> u64 {
+        self.alive.load(Ordering::Relaxed)
     }
 
     pub fn fragment_entries(&self) -> u64 {

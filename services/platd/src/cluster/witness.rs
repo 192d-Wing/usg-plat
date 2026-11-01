@@ -332,7 +332,7 @@ pub fn run(path: &Path) -> ExitCode {
         ts_us: Clock::wall_us(),
         kind: LifecycleKind::Start,
         fips: Some(plat_audit::FipsMark { active: fips, provider: st.provider }),
-        cluster: None,
+        start: None,
     });
     let code = match start(&f, sink.clone()) {
         Ok(h) => {
@@ -348,7 +348,7 @@ pub fn run(path: &Path) -> ExitCode {
             ExitCode::FAILURE
         }
     };
-    sink.emit(Event::Lifecycle { ts_us: Clock::wall_us(), kind: LifecycleKind::Stop, fips: None, cluster: None });
+    sink.emit(Event::Lifecycle { ts_us: Clock::wall_us(), kind: LifecycleKind::Stop, fips: None, start: None });
     drop(sink);
     if let Some(l) = logger {
         l.join();

@@ -78,9 +78,8 @@ fn main() -> ExitCode {
 }
 
 fn read_params(path: &Path) -> Result<plat_xdp::load::LoadParams, (u8, String)> {
-    let text = std::fs::read_to_string(path).map_err(|e| (2, format!("reading {}: {e}", path.display())))?;
-    let (cfg, xdp) = plat_xdp::load::split_config(&text).map_err(|e| (2, e.to_string()))?;
-    Ok(plat_xdp::load::LoadParams::new(&cfg, xdp))
+    let cfg = plat_common::Config::load(path).map_err(|e| (2, e.to_string()))?;
+    Ok(plat_xdp::load::LoadParams::from_config(&cfg))
 }
 
 #[cfg(target_os = "linux")]

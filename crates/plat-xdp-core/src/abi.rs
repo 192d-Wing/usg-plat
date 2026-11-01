@@ -46,6 +46,13 @@ pub const SLOT_FREE: u8 = 0;
 pub const SLOT_LIVE: u8 = 1;
 /// Retired; waiting in quarantine for an RCU grace period.
 pub const SLOT_DEAD: u8 = 2;
+/// Written, its `OUT6` / `IN4` entries not yet published (WU5 deferred
+/// publish): the program passes it like any state other than `LIVE`.
+pub const SLOT_PENDING: u8 = 3;
+/// Publishing failed (map full, key exists): never reachable; the engine
+/// forgets the slot through the stale-entry collector and may mirror the
+/// session again.
+pub const SLOT_FAILED: u8 = 4;
 
 /// `SLICE` states. The values equal `plat_nat64::SliceState` (asserted by
 /// the host tests).

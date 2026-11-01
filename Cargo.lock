@@ -1258,16 +1258,20 @@ version = "0.1.0"
 dependencies = [
  "aya",
  "aya-obj",
+ "crossbeam-channel",
  "hex",
  "parking_lot",
+ "plat-audit",
+ "plat-cluster",
  "plat-common",
  "plat-io",
+ "plat-nat64",
+ "plat-packet",
  "plat-xdp-core",
+ "plat-xlat",
  "rustix",
- "serde",
  "sha2",
  "thiserror",
- "toml",
 ]
 
 [[package]]
@@ -1297,6 +1301,7 @@ name = "plat-xdp-loader"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "plat-common",
  "plat-xdp",
 ]
 
@@ -1324,6 +1329,8 @@ dependencies = [
  "plat-nat64",
  "plat-packet",
  "plat-tls",
+ "plat-xdp",
+ "plat-xdp-core",
  "plat-xlat",
  "rcgen",
  "rustix",

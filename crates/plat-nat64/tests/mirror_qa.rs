@@ -11,6 +11,7 @@
 
 mod common;
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
@@ -21,6 +22,7 @@ use plat_cluster::{SliceId, SliceMap};
 use plat_common::config::SteeringMode;
 use plat_common::{Clock, Counters, DropReason};
 use plat_nat64::mirror::NO_SLOT;
+use plat_nat64::state::MIRROR_BACKOFF_LANES;
 use plat_nat64::state::{Key4, Key6};
 use plat_nat64::{
     AdoptInput, AdoptMeta, ClusterSetup, Directory, Mirror, MirrorEntry, MirrorFail, MirrorKeys, ModelMirror, Nat64,
@@ -229,6 +231,10 @@ impl Mirror for Refuser {
     }
 }
 
+fn k4_of(fx: &Fx, src6: u128, sport: u16) -> Key4 {
+    fx.nat.state().lookup6(Key6 { proto: proto::UDP, addr: src6, port: sport }).unwrap()
+}
+
 fn exercise(fx: &mut Fx) {
     let s = sub(1, 1);
     for i in 0..10u16 {
@@ -250,17 +256,16 @@ fn a_mirror_that_fails_every_install_leaves_the_slow_path_intact() {
         fx.clock.advance(Duration::from_secs(1));
         exercise(&mut fx);
         let installs = m.installs.load(Ordering::Relaxed);
-        // PERF-002 / QA F3: every failure class backs off for a second, so
-        // the whole burst (10 flows x 3 packets) costs one attempt.
-        assert_eq!(installs, 1, "{fail:?}");
-        let st = fx.nat.state().mirror_install_stats().map(|s| {
-            (
-                s.failed.load(Ordering::Relaxed),
-                s.installed.load(Ordering::Relaxed),
-                s.backed_off.load(Ordering::Relaxed),
-            )
-        });
-        assert_eq!(st, Some((1, 0, 29)), "{fail:?}: failed, installed, backed off");
+        // PERF-002 / QA F3: every failure class backs off for a second on
+        // its lane (NEW-2: `bib4` shard modulo MIRROR_BACKOFF_LANES), so
+        // the burst (10 flows x 3 packets) costs at most one attempt per
+        // lane the flows' BIBs fall in, and every other packet backs off.
+        let lanes: HashSet<usize> = (0..10u16)
+            .map(|i| fx.nat.state().bib4_shard_of(k4_of(&fx, sub(1, 1), 1000 + i)) % MIRROR_BACKOFF_LANES)
+            .collect();
+        assert_eq!(installs, lanes.len() as u64, "{fail:?}");
+        let st = fx.nat.state().mirror_install_stats().map(|s| (s.failed, s.installed, s.backed_off));
+        assert_eq!(st, Some((installs, 0, 30 - installs)), "{fail:?}: failed, installed, backed off");
         assert_eq!(m.retires.load(Ordering::Relaxed), 0, "{fail:?}: retire without a slot");
         assert_eq!(m.seen.load(Ordering::Relaxed), 0, "{fail:?}: seen without a slot (would revive)");
         assert_eq!(m.slices.load(Ordering::Relaxed), 1, "legacy slice 0 published once");

@@ -40,8 +40,20 @@ use parking_lot::Mutex;
 /// Default number of partitions (plan §4.3: `xslot[shard % 1024]`).
 pub const PARTITIONS: usize = 1024;
 
+/// Deferred hash work of a slot (WU5, plan §4.3 publish-after-unlock):
+/// [`OP_PUBLISH`] after an install wrote the record, [`OP_RETIRE`] after a
+/// retire marked it `DEAD`. Encoded `slot << 1 | kind`.
+pub const OP_PUBLISH: u64 = 0;
+/// See [`OP_PUBLISH`].
+pub const OP_RETIRE: u64 = 1;
+
 #[derive(Debug)]
 struct Part {
+    /// Deferred hash work, drained by the publisher. At most one publish
+    /// and one retire per slot are outstanding (a slot is reused only
+    /// after its retire was drained and its grace period passed), so the
+    /// preallocated capacity of two per slot is never exceeded.
+    ops: Vec<u64>,
     free: Vec<u32>,
     /// `(slot, epoch stamp)`, stamps non-decreasing (read under the lock).
     quarantine: VecDeque<(u32, u64)>,
@@ -76,7 +88,12 @@ impl SlotAllocator {
             // Highest index on top: lower slots are handed out first.
             let free: Vec<u32> = mine.rev().collect();
             let live = vec![0u64; cap.div_ceil(64)].into_boxed_slice();
-            parts.push(Mutex::new(Part { free, quarantine: VecDeque::with_capacity(cap), live }));
+            parts.push(Mutex::new(Part {
+                ops: Vec::with_capacity(2 * cap),
+                free,
+                quarantine: VecDeque::with_capacity(cap),
+                live,
+            }));
         }
         Self { parts: parts.into_boxed_slice(), epoch: AtomicU64::new(0), slots }
     }
@@ -130,6 +147,68 @@ impl SlotAllocator {
         let stamp = self.epoch.load(Ordering::Acquire);
         g.quarantine.push_back((slot, stamp));
         true
+    }
+
+    /// Queues `op` ([`OP_PUBLISH`] / [`OP_RETIRE`]) for `slot` under its
+    /// partition lock; `false` (nothing queued) only if the preallocated
+    /// queue is full, which the two-per-slot bound rules out.
+    fn push_op(g: &mut Part, slot: u32, op: u64) -> bool {
+        if g.ops.len() >= g.ops.capacity() {
+            return false;
+        }
+        g.ops.push(u64::from(slot) << 1 | op);
+        true
+    }
+
+    /// Queues the publish of a slot handed out by [`SlotAllocator::alloc`]
+    /// whose record is written (`PENDING`).
+    pub fn defer_publish(&self, slot: u32) -> bool {
+        self.part_of(slot).is_some_and(|p| Self::push_op(&mut p.lock(), slot, OP_PUBLISH))
+    }
+
+    /// Ends `slot`'s life as [`SlotAllocator::retire`] does, but queues the
+    /// hash deletes and the quarantine for the publisher
+    /// ([`SlotAllocator::quarantine`] after the deletes). `false`, changing
+    /// nothing, for a slot that is not live or a full queue.
+    pub fn defer_retire(&self, slot: u32) -> bool {
+        if slot >= self.slots {
+            return false;
+        }
+        let n = self.parts.len();
+        let Some(p) = self.part_of(slot) else { return false };
+        let mut g = p.lock();
+        if g.ops.len() >= g.ops.capacity() {
+            return false;
+        }
+        match g.bit(slot as usize / n) {
+            Some((w, m)) if *w & m != 0 => *w &= !m,
+            _ => return false,
+        }
+        Self::push_op(&mut g, slot, OP_RETIRE)
+    }
+
+    /// Moves every queued op of every partition to `out` (in queue order
+    /// per partition), each partition under its own lock. `out` is the
+    /// publisher's reusable buffer.
+    pub fn drain_ops(&self, out: &mut Vec<u64>) -> usize {
+        let before = out.len();
+        for p in self.parts.iter() {
+            out.append(&mut p.lock().ops);
+        }
+        out.len() - before
+    }
+
+    /// Quarantines a slot whose deferred retire was drained (its hash
+    /// entries are gone): stamped with the current epoch, like
+    /// [`SlotAllocator::retire`].
+    pub fn quarantine(&self, slot: u32) {
+        if slot >= self.slots {
+            return;
+        }
+        if let Some(p) = self.part_of(slot) {
+            let stamp = self.epoch.load(Ordering::Acquire);
+            p.lock().quarantine.push_back((slot, stamp));
+        }
     }
 
     /// The grace-period epoch.

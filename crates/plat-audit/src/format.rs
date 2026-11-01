@@ -205,7 +205,8 @@ pub fn json(out: &mut Vec<u8>, seq: u64, node: &NodeIdent, ev: &Event) {
                 sub_addr(sub)
             );
         }
-        Event::Lifecycle { fips, ref cluster, .. } => {
+        Event::Lifecycle { fips, ref start, .. } => {
+            let (cluster, xdp) = start.as_deref().map_or((None, None), |s| (s.cluster.as_ref(), s.xdp.as_ref()));
             let _ = write!(out, ",\"event.outcome\":\"success\",\"service.version\":\"{}\"", env!("CARGO_PKG_VERSION"));
             if let Some(f) = fips {
                 let _ = write!(out, ",\"plat.fips\":{},\"plat.fips_provider\":\"{}\"", f.active, f.provider);
@@ -226,6 +227,28 @@ pub fn json(out: &mut Vec<u8>, seq: u64, node: &NodeIdent, ev: &Event) {
                     c.member_count
                 );
             }
+            if let Some(x) = xdp {
+                let _ = write!(out, ",\"plat.xdp.mode\":\"{}\"", x.mode);
+                if let Some(h) = &x.object_sha256 {
+                    out.extend_from_slice(b",\"plat.xdp.object_sha256\":\"");
+                    hex32(out, h);
+                    out.push(b'"');
+                }
+                if !x.interfaces.is_empty() {
+                    out.extend_from_slice(b",\"plat.xdp.interfaces\":\"");
+                    json_str(out, &x.interfaces);
+                    out.push(b'"');
+                }
+            }
+        }
+        Event::XdpFastpathState { state, reason, .. } => {
+            let _ = write!(
+                out,
+                ",\"event.outcome\":\"{}\",\"plat.xdp.state\":\"{}\",\"event.reason\":\"{}\"",
+                ev.outcome().unwrap_or("unknown"),
+                state.as_str(),
+                reason.as_str()
+            );
         }
         Event::Counter { name, value, .. } => {
             let _ = write!(out, ",\"plat.counter.name\":\"{name}\",\"plat.counter.value\":{value}");
@@ -655,7 +678,8 @@ pub fn cef(out: &mut Vec<u8>, seq: u64, node: &NodeIdent, ev: &Event) {
                 lease_state.as_str()
             );
         }
-        Event::Lifecycle { fips, ref cluster, .. } => {
+        Event::Lifecycle { fips, ref start, .. } => {
+            let (cluster, xdp) = start.as_deref().map_or((None, None), |s| (s.cluster.as_ref(), s.xdp.as_ref()));
             if let Some(f) = fips {
                 let _ =
                     write!(out, " cs1={} cs1Label=fipsProvider cn2={} cn2Label=fips", f.provider, u8::from(f.active));
@@ -667,6 +691,24 @@ pub fn cef(out: &mut Vec<u8>, seq: u64, node: &NodeIdent, ev: &Event) {
                 slices_list(out, c, b',', "");
                 let _ = write!(out, " cs4Label=slices cn3={} cn3Label=memberCount", c.member_count);
             }
+            // cs4 (slices) and cs6 (schema) are taken: the XDP fields use
+            // cs5 and the flex strings (schema 8).
+            if let Some(x) = xdp {
+                let _ = write!(out, " cs5={} cs5Label=xdpMode", x.mode);
+                if let Some(h) = &x.object_sha256 {
+                    out.extend_from_slice(b" flexString1=");
+                    hex32(out, h);
+                    out.extend_from_slice(b" flexString1Label=xdpObjectSha256");
+                }
+                if !x.interfaces.is_empty() {
+                    out.extend_from_slice(b" flexString2=");
+                    cef_str(out, &x.interfaces);
+                    out.extend_from_slice(b" flexString2Label=xdpInterfaces");
+                }
+            }
+        }
+        Event::XdpFastpathState { state, reason, .. } => {
+            let _ = write!(out, " cs1={} cs1Label=xdpState reason={}", state.as_str(), reason.as_str());
         }
         Event::ManagementConnection { ref conn, .. } => {
             let accepted = conn.reason == crate::event::MgmtReason::Accepted;
@@ -1084,6 +1126,71 @@ mod tests {
         String::from_utf8(v).unwrap()
     }
 
+    /// Schema 8: XDP fields on service_start and the xdp_fastpath_state
+    /// record, JSON and CEF.
+    #[test]
+    fn xdp_records_schema_8() {
+        use crate::event::{LifecycleKind, StartInfo, XdpReason, XdpStart, XdpState};
+        use std::sync::Arc;
+        let start = |x: XdpStart| Event::Lifecycle {
+            ts_us: 0,
+            kind: LifecycleKind::Start,
+            fips: None,
+            start: Some(Arc::new(StartInfo { cluster: None, xdp: Some(x) })),
+        };
+        let on =
+            start(XdpStart { mode: "native", object_sha256: Some([0xab; 32]), interfaces: "eth0 eth1.100".into() });
+        let j = json_of(&on);
+        let want = format!(
+            ",\"plat.xdp.mode\":\"native\",\"plat.xdp.object_sha256\":\"{}\",\"plat.xdp.interfaces\":\"eth0 eth1.100\"}}",
+            "ab".repeat(32)
+        );
+        assert!(j.ends_with(&want), "{j}");
+        assert!(j.contains("\"plat.schema\":8,"), "{j}");
+        let c = cef_of(&on);
+        assert!(
+            c.ends_with(&format!(
+                " cs5=native cs5Label=xdpMode flexString1={} flexString1Label=xdpObjectSha256 \
+                 flexString2=eth0 eth1.100 flexString2Label=xdpInterfaces",
+                "ab".repeat(32)
+            )),
+            "{c}"
+        );
+        assert!(c.contains(" cs6=8 cs6Label=schema"), "the schema keeps cs6: {c}");
+        let off = start(XdpStart { mode: "off", object_sha256: None, interfaces: String::new() });
+        assert!(json_of(&off).ends_with(",\"plat.xdp.mode\":\"off\"}"));
+        assert!(cef_of(&off).ends_with(" cs5=off cs5Label=xdpMode"));
+
+        for (st, r, outcome, sev) in [
+            (XdpState::Enabled, XdpReason::Start, "success", 5),
+            (XdpState::Disabled, XdpReason::ConfigMismatch, "failure", 4),
+            (XdpState::Disabled, XdpReason::ObjectMismatch, "failure", 4),
+            (XdpState::Disabled, XdpReason::LinkMismatch, "failure", 4),
+            (XdpState::Disabled, XdpReason::MapsUnavailable, "failure", 4),
+            (XdpState::Disabled, XdpReason::UnsupportedHost, "failure", 4),
+            (XdpState::Disabled, XdpReason::HeartbeatStalled, "failure", 4),
+            (XdpState::Enabled, XdpReason::HeartbeatResumed, "success", 5),
+            (XdpState::Disabled, XdpReason::Shutdown, "success", 5),
+        ] {
+            let ev = Event::XdpFastpathState { ts_us: 0, state: st, reason: r };
+            assert_eq!((ev.action(), ev.outcome(), ev.severity()), ("xdp_fastpath_state", Some(outcome), sev));
+            let j = json_of(&ev);
+            assert!(
+                j.ends_with(&format!(
+                    ",\"event.outcome\":\"{outcome}\",\"plat.xdp.state\":\"{}\",\"event.reason\":\"{}\"}}",
+                    st.as_str(),
+                    r.as_str()
+                )),
+                "{j}"
+            );
+            let c = cef_of(&ev);
+            assert!(
+                c.ends_with(&format!(" outcome={outcome} cs1={} cs1Label=xdpState reason={}", st.as_str(), r.as_str())),
+                "{c}"
+            );
+        }
+    }
+
     /// Schema 5: FIPS state on service_start, reason on remote loss.
     #[test]
     fn fips_and_remote_loss_reason() {
@@ -1092,12 +1199,12 @@ mod tests {
             ts_us: 0,
             kind: LifecycleKind::Start,
             fips: Some(FipsMark { active: true, provider: "aws-lc-rs-fips" }),
-            cluster: None,
+            start: None,
         };
         let s = json_of(&ev);
         assert!(s.contains("\"plat.fips\":true,\"plat.fips_provider\":\"aws-lc-rs-fips\""), "{s}");
         assert!(cef_of(&ev).contains(" cs1=aws-lc-rs-fips cs1Label=fipsProvider cn2=1 cn2Label=fips"));
-        let stop = Event::Lifecycle { ts_us: 0, kind: LifecycleKind::Stop, fips: None, cluster: None };
+        let stop = Event::Lifecycle { ts_us: 0, kind: LifecycleKind::Stop, fips: None, start: None };
         assert!(!json_of(&stop).contains("plat.fips"));
         let loss = Event::RemoteLoss {
             ts_us: 0,
@@ -1235,7 +1342,7 @@ mod tests {
         let golden = |ev: &Event, body: &str| {
             let j = json_of(ev);
             let head = format!(
-                "{{\"@timestamp\":\"1970-01-01T00:00:00.000000Z\",\"plat.schema\":7,\"event.sequence\":1,\
+                "{{\"@timestamp\":\"1970-01-01T00:00:00.000000Z\",\"plat.schema\":8,\"event.sequence\":1,\
                  \"event.kind\":\"event\",\"event.category\":\"network\",\"event.action\":\"{}\",\
                  \"observer.type\":\"nat64\",\"observer.name\":\"plat-01\",\"plat.node_id\":3",
                 ev.action()
@@ -1433,12 +1540,15 @@ mod tests {
             ts_us: 0,
             kind: LifecycleKind::Start,
             fips: None,
-            cluster: Some(Arc::new(ClusterStart {
-                node_id: 3,
-                mode: "contiguous",
-                config_digest: [0xcd; 32],
-                slices: vec![SliceCidr { net: 0xc000_0200, len: 25 }, slice],
-                member_count: 4,
+            start: Some(Arc::new(StartInfo {
+                cluster: Some(ClusterStart {
+                    node_id: 3,
+                    mode: "contiguous",
+                    config_digest: [0xcd; 32],
+                    slices: vec![SliceCidr { net: 0xc000_0200, len: 25 }, slice],
+                    member_count: 4,
+                }),
+                xdp: None,
             })),
         };
         let j = json_of(&start);
@@ -1456,12 +1566,15 @@ mod tests {
             ts_us: 0,
             kind: LifecycleKind::Start,
             fips: None,
-            cluster: Some(Arc::new(ClusterStart {
-                node_id: 0,
-                mode: "ha",
-                config_digest: [0; 32],
-                slices: vec![slice; ClusterStart::SLICES_MAX + 10],
-                member_count: 2,
+            start: Some(Arc::new(StartInfo {
+                cluster: Some(ClusterStart {
+                    node_id: 0,
+                    mode: "ha",
+                    config_digest: [0; 32],
+                    slices: vec![slice; ClusterStart::SLICES_MAX + 10],
+                    member_count: 2,
+                }),
+                xdp: None,
             })),
         };
         let j = json_of(&many);

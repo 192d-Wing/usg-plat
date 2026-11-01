@@ -14,15 +14,20 @@ default = []
 # build in build.rs) and embed it. Off by default, so `cargo build/test/
 # clippy --workspace` never needs bpf-linker (plan §15).
 xdp = []
+# The WU5 lock-hold gate harness (`tests/hold_gate.rs`, VM, root): the
+# `bib4` hold-time probe of plat-nat64. Measurement builds only.
+hold-gate = ["plat-nat64/hold-probe"]
 
 [dependencies]
 plat-common.workspace = true
 plat-xdp-core.workspace = true
+# The `plat_nat64::mirror::Mirror` glue (`impl Mirror for XdpMirror`).
+plat-nat64.workspace = true
+plat-cluster.workspace = true
+plat-packet.workspace = true
 parking_lot.workspace = true
-serde.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
-toml.workspace = true
 hex.workspace = true
 
 # Linux only: BPF syscalls, mmap, program load and attach. Aya is an exact
@@ -36,6 +41,17 @@ rustix = { workspace = true, features = ["fs", "rand", "thread", "time"] }
 # `XdpAttachType`, which aya 0.16 does not re-export. Same version Aya
 # already pulls in.
 aya-obj = "=0.6.0"
+
+[dev-dependencies]
+# `glue` tests drive a real engine with the plat-nat64 test fixtures
+# (`tests/common`), included by path.
+plat-audit.workspace = true
+plat-xlat.workspace = true
+crossbeam-channel.workspace = true
+
+[[test]]
+name = "hold_gate"
+required-features = ["hold-gate"]
 
 [lints]
 workspace = true
