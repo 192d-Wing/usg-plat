@@ -20,6 +20,12 @@ plat-nat64.workspace = true
 plat-audit.workspace = true
 crossbeam-channel.workspace = true
 proptest.workspace = true
+criterion.workspace = true
+
+# PERF-006: host cost of decide_v6 / decide_v4 (make bench).
+[[bench]]
+name = "decide"
+harness = false
 
 [lints]
 workspace = true

@@ -12,7 +12,7 @@
 #   5. with -o OBJECT: the level-2 smoke vectors on the object inside that
 #      netns (obj-gate.py testrun, level2-vectors.txt);
 #   6. level 2: the plat-xdp test_run suite inside that netns, when its test
-#      binary is passed (WU3 adds it; skipped until then);
+#      binary is passed (make test-xdp builds it; vng-run.sh -l);
 #   7. level 4: the e2e topology, then e2e.sh run (skips, exit 77, until
 #      platd and plat-xdp-loader with the xdp feature exist, WU5/WU6).
 #
@@ -58,7 +58,7 @@ if [ -n "$level2" ]; then
     [ -x "$level2" ] || fail "level-2 test binary not executable: $level2"
     nsenter --net=/run/netns/platxdp "$level2" --ignored --test-threads=1 || fail "level 2 test_run suite"
 else
-    echo "SKIP: level 2 (no plat-xdp test_run binary; WU3)"
+    echo "SKIP: level 2 (no plat-xdp test_run binary passed)"
 fi
 "$here/netns.sh" down platxdp
 

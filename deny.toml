@@ -26,9 +26,15 @@ allow = ["Apache-2.0", "MIT", "BSD-3-Clause", "Unicode-3.0", "ISC"]
 # records the decision rather than unblocking the check; it widens nothing for
 # any other crate or version. A version bump of plat-xdp-ebpf must update the
 # pin here (cargo-deny then warns "license exception was not encountered").
+# Zlib is NOT allowed globally. Only foldhash carries it: the default hasher of
+# hashbrown 0.17 ("default-hasher"), which aya 0.16.0 (plat-xdp, userspace XDP
+# loader; Linux only) enables. Zlib is a permissive OSI licence with no
+# copyleft; pinned to the exact version so a bump is reviewed again (CM-10,
+# SR-3; WU3).
 exceptions = [
     { crate = "aws-lc-fips-sys", allow = ["OpenSSL"] },
     { crate = "plat-xdp-ebpf@0.1.0", allow = ["GPL-2.0-only"] },
+    { crate = "foldhash@0.2.0", allow = ["Zlib"] },
 ]
 
 [bans]

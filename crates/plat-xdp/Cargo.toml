@@ -1,0 +1,41 @@
+[package]
+name = "plat-xdp"
+description = "Userspace side of the usg-plat XDP fast path: loader library, pinned-map writer (SLOT/SLICE/CONTROL), slot allocator, heartbeat and counters"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# Aya needs 1.98.
+rust-version = "1.98"
+publish.workspace = true
+
+[features]
+default = []
+# Build the plat-xdp-ebpf object (bpf-linker, nested bpfel-unknown-none
+# build in build.rs) and embed it. Off by default, so `cargo build/test/
+# clippy --workspace` never needs bpf-linker (plan §15).
+xdp = []
+
+[dependencies]
+plat-common.workspace = true
+plat-xdp-core.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+hex.workspace = true
+
+# Linux only: BPF syscalls, mmap, program load and attach. Aya is an exact
+# workspace pin; its internal `unsafe` is a reviewed dependency (SR-3).
+[target.'cfg(target_os = "linux")'.dependencies]
+plat-io.workspace = true
+aya.workspace = true
+rustix = { workspace = true, features = ["fs", "rand", "thread", "time"] }
+
+# Level-2 harness only: `Xdp::from_pin` takes aya-obj's `XdpAttachType`,
+# which aya 0.16 does not re-export. Same version Aya already pulls in.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+aya-obj = "=0.6.0"
+
+[lints]
+workspace = true
