@@ -40,7 +40,7 @@ test: xdp-env
 # Deploy scripts: POSIX syntax, shellcheck (required when CI=true) and a stubbed run
 # against the real `platd check-config --format env` output.
 DEPLOY_SH := deploy/systemd/plat-tun-setup.sh deploy/systemd/plat-fwguard.sh deploy/tests/deploy-scripts-test.sh \
-	deploy/hooks/frr-announce.sh deploy/hooks/frr-withdraw.sh deploy/systemd/plat-v6-announce.sh $(wildcard deploy/tests/cluster/*.sh)
+	deploy/hooks/frr-announce.sh deploy/hooks/frr-withdraw.sh deploy/systemd/plat-v6-announce.sh deploy/tests/xdp/e2e.sh $(wildcard deploy/tests/cluster/*.sh)
 test-deploy:
 	for f in $(DEPLOY_SH); do sh -n $$f || exit 1; done
 	@if command -v shellcheck >/dev/null 2>&1; then shellcheck -x $(DEPLOY_SH); \
@@ -202,8 +202,13 @@ release:
 # Linux packages for the host architecture. Native build only: the AWS-LC
 # FIPS module is built with the host toolchain, never cross-linked (SC-13).
 # CI builds x86_64 and aarch64 on native runners (.github/workflows/packages.yml).
+# The packages also carry plat-xdp-loader and the XDP units (off by default).
+# Without XDP=1 the loader has no embedded object and refuses to attach;
+# XDP=1 builds platd and the loader with the `xdp` feature (bpf-linker
+# required, see `make xdp`).
+DIST_FEATURES := $(if $(XDP),--features platd/xdp --features plat-xdp-loader/xdp)
 dist:
-	cargo build --profile dist -p platd
+	cargo build --profile dist -p platd -p plat-xdp-loader $(DIST_FEATURES)
 
 deb: dist
 	cargo deb -p platd --no-build --no-strip --profile dist

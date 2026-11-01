@@ -389,6 +389,116 @@ platd check-config -c /etc/plat/platd.toml   # prints the slice table and this n
   `limactl edit plat-linux --network lima:user-v2`), with a VXLAN overlay
   for the test addresses.
 
+## XDP fast path (`[xdp]`, optional, off by default)
+
+An eBPF/XDP program on the physical NICs can forward packets of established
+UDP sessions without the TUN (POAM-016 Phase 1; design in
+`ARCHITECTURE.md`). It is **off by default**: without an `[xdp]` section,
+or with `enabled = false`, the data plane is TUN-only and the section is
+not checked. Phase 1 is code-complete, deploy units included (WU6). Packages
+built with plain `make packages` carry the loader and the XDP units but not
+the `xdp` feature, so the loader refuses to attach; build them with
+`make packages XDP=1`. The speed-up has not been measured (no bare-metal
+benchmark yet, `docs/performance.md`), and the maximum worker `bib4` hold
+(criterion ≤ 20 µs) is not measurable in the VM (0.3–0.9 ms with the
+mirror off too, vCPU preemption) and stays open in POAM-016.
+
+Requirements and constraints:
+
+- **Linux 6.6 LTS or later.** The loader refuses older kernels. Native
+  (driver) mode; `mode = "generic"` is for testing and is refused unless
+  `allow_generic = true`. Not supported on `nohz_full` hosts: `platd`
+  keeps the fast path off and records `xdp_fastpath_state` with reason
+  `unsupported_host`.
+- **Build.** `platd` and `plat-xdp-loader` built with the `xdp` feature
+  (`make xdp` builds and checks the eBPF object and the feature builds;
+  `make dist XDP=1` builds the release binaries and `make packages XDP=1`
+  the packages with the fast path; all need the pinned `bpf-linker` from
+  `deploy/tests/xdp/install-bpf-linker.sh`). Without `XDP=1` the loader
+  has no embedded object and refuses to attach. A
+  `platd` without the feature, or off Linux, refuses to start when
+  `[xdp] enabled = true`.
+- **Kernel setting.** `kernel.unprivileged_bpf_disabled` must be 1 or 2
+  (the Debian and Ubuntu default is 2); the loader refuses otherwise.
+- **What stays on the slow path.** The first packets of every flow (until
+  its entries are published, about 1 ms), TCP, ICMP, fragments, IPv4
+  options, IPv6 extension headers, VLAN-tagged frames, TTL / hop limit
+  ≤ 2, packets above the MTU limits, IPv4 UDP with checksum 0, UDP
+  datagrams longer than 1536 B, and **UDP whose checksum does not verify**
+  (`plat_xdp_pass_total{reason="udp_csum_unverified"}`). Frames from local
+  or container senders with TX checksum offload (`CHECKSUM_PARTIAL`, for
+  example on a veth) carry an incomplete checksum and therefore always take
+  the slow path.
+- **`platd` and the loader restart together.** The loader creates fresh
+  maps on every attach. A `platd` restarted alone is refused
+  (`xdp_fastpath_state` reason `stale_maps`) and runs TUN-only until the
+  loader is re-run.
+- **Host filters.** Fast-path packets bypass nftables (other than the
+  checks the program makes itself), `rp_filter` and tc: put site ACLs
+  upstream or in the `platd` configuration (POAM-037).
+
+Deployment (`deploy/systemd/`): a dedicated bpffs mounted at
+`/run/plat/bpf` (`run-plat-bpf.mount`; `plat-xdp.tmpfiles.conf`, installed
+as `/usr/lib/tmpfiles.d/plat-xdp.conf`, makes the root `2750 root:plat`),
+the oneshot `plat-xdp.service` that runs
+`/usr/libexec/plat/plat-xdp-loader attach --config /etc/plat/platd.toml`
+with `CAP_BPF` and `CAP_NET_ADMIN` only (and `detach` on stop), and a
+`platd.service` drop-in that orders `platd` after it and re-adds the `bpf`
+system call. `platd` itself keeps no capabilities. The drop-in ships as an
+example, `/usr/share/doc/platd/examples/platd.service.d/xdp.conf`; to
+enable the fast path copy it to `/etc/systemd/system/platd.service.d/` and
+run `systemctl daemon-reload`. `plat-xdp.service` is bound to
+`platd.service` (`PartOf=`, `BindsTo=`), so restarting `platd` re-runs the
+loader. The drop-in makes `platd` require the loader unit (`Requires=`), so
+**stopping `plat-xdp.service` also stops `platd`**: the whole translator,
+TUN path included, goes down; it does not fall back to TUN-only. To run
+TUN-only, set `[xdp] enabled = false` (or remove the drop-in), run
+`systemctl daemon-reload` and restart `platd`. If `plat-fwguard` finds a
+program other than the one the loader attached, it detaches it and turns
+forwarding off; restore with `systemctl restart platd`. Verified on one
+Ubuntu 24.04 / kernel 6.8 aarch64 VM only
+(`docs/compliance/LINUX_VERIFICATION.md` L26, L28, L31 PASS; L27 partial
+(veth only)).
+
+Manual install (from a source tree, after `make dist XDP=1`, which builds
+both `platd` and the loader with the `xdp` feature; packages install the
+same files, with the drop-in only as the example above):
+
+```sh
+install -m 0755 target/dist/platd /usr/bin/platd
+install -D -m 0755 target/dist/plat-xdp-loader \
+  /usr/libexec/plat/plat-xdp-loader
+install -m 0644 deploy/systemd/plat-xdp.service \
+  deploy/systemd/run-plat-bpf.mount /etc/systemd/system/
+install -D -m 0644 deploy/systemd/plat-xdp.tmpfiles.conf \
+  /usr/lib/tmpfiles.d/plat-xdp.conf
+install -D -m 0644 deploy/systemd/platd.service.d.example/xdp.conf \
+  /etc/systemd/system/platd.service.d/xdp.conf
+systemctl daemon-reload
+systemd-tmpfiles --create /usr/lib/tmpfiles.d/plat-xdp.conf
+systemctl restart platd
+```
+
+```toml
+[xdp]
+enabled = true
+mode = "native"
+max_sessions = 1048576      # 4096..=nat64.max_sessions
+heartbeat_ms = 250          # 50..=1000
+deadline_ms = 1000          # >= 4 x heartbeat_ms; with HA <= the lease self-fence time
+[[xdp.interfaces]]
+name = "eth0"
+role = "access"             # IPv6 -> IPv4
+[[xdp.interfaces]]
+name = "eth1"
+role = "upstream"           # IPv4 -> IPv6
+```
+
+`platd check-config --format env` prints `PLAT_XDP`, `PLAT_XDP_IFACES` and
+`PLAT_XDP_MAP_BYTES` (kernel map memory, for the loader unit's
+`MemoryMax`). Watch `plat_xdp_*` in `/metrics` and the
+`xdp_fastpath_state` records (`docs/compliance/SIEM_LOGGING.md`).
+
 <!-- --8<-- [start:performance] -->
 ## Measured performance
 

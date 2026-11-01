@@ -22,7 +22,7 @@ never limits forwarding.
 | 5 | TLS (branch `feat/fips-tls`). `service_start` gains `plat.fips` / `plat.fips_provider` (CEF `cn2`/`cs1`). `audit_remote_loss` gains optional `plat.reason` (`io`, `tls_handshake`, `tls_verify`, `tls_revocation`; CEF `reason`); TCP losses now carry `io`. New records `management_connection`, `management_connection_suppressed`, `tls_revocation_check`, `revocation_source_refresh`. First records that carry peer-supplied text (certificate subject, SANs, issuer DN, serial, URLs), sanitised and capped (see Injection safety). |
 | 6 | Branch `fix/linux-validation` (unreleased). New record `audit_recovery` (`plat.reason` `empty_file`/`missing_header`/`truncated_tail`, `plat.audit.last_checkpoint_seq`, `plat.audit.max_seq`, `plat.audit.lease_state` `ok`/`absent`/`corrupt`/`inflated`/`high`; CEF `reason`, `cn3` `lastCheckpointSeq`, `cn2` `maxSeq`, `cs4` `leaseState`). `audit_output_failure` may carry `plat.reason` (`truncate_failed`, `seq_lease_failed`, `seq_exhausted`; CEF `reason`). New lease file `.<name>.seq`. `verify-log` exit 3 and `--allow-recovery`. |
 | 7 | Branch `feat/cluster-ha` (unreleased). Cluster high availability. New records `cluster_view_change`, `cluster_member_state`, `cluster_slice_acquire`, `cluster_slice_release`, `nat_port_block_adopt`, `cluster_peer_rejected`, `cluster_peer_suppressed`, `cluster_replication_gap`, `cluster_hook`, `cluster_operator_command`. `nat_port_block_release` may carry `plat.release_reason` (`handover`; CEF `reason`). `service_start` may carry `cluster.node_id`, `cluster.mode`, `cluster.config_digest`, `cluster.slices`, `cluster.slice_count`, `cluster.member_count` (CEF `cs2`/`cs3`/`cs4`/`cn3`). `tls_revocation_check` gains roles `cluster_peer_client` / `cluster_peer_server`. Additive within schema 7 (branch `fix/poams-020-024-013`): `nat_resource_limit` `event.reason` value `aggregate_subscriber_limit` (POAM-013); `cluster.config_digest` now also covers `cross_node_hairpin`, `aggregate_prefix_len` and `max_subscribers_per_aggregate` (value changes, field unchanged). Chain format unchanged. |
-| 8 | Branch `feat/xdp-wu5` (unreleased). XDP fast path for established UDP sessions (POAM-016 Phase 1). `service_start` gains `plat.xdp.mode` (`off` / `native` / `generic`, always present when written by `platd`) and, with `[xdp]` enabled, `plat.xdp.object_sha256` (SHA-256 of the embedded eBPF object) and `plat.xdp.interfaces` (configured names, space-separated); CEF `cs5` (`xdpMode`), `flexString1` (`xdpObjectSha256`), `flexString2` (`xdpInterfaces`). New record `xdp_fastpath_state` (`plat.xdp.state` `enabled` / `disabled`, `event.reason`; CEF `cs1` `xdpState`, `reason`). `dataplane_counter` gains the `plat.counter.name` value `xdp_aborted`. No per-packet or per-session record from the fast path; attribution records unchanged. Chain format unchanged. |
+| 8 | Branch `feat/xdp-wu5`, merged on `main` @ `9a9c752` (unreleased). XDP fast path for established UDP sessions (POAM-016 Phase 1). `service_start` gains `plat.xdp.mode` (`off` / `native` / `generic`, always present when written by `platd`) and, with `[xdp]` enabled, `plat.xdp.object_sha256` (SHA-256 of the embedded eBPF object) and `plat.xdp.interfaces` (configured names, space-separated); CEF `cs5` (`xdpMode`), `flexString1` (`xdpObjectSha256`), `flexString2` (`xdpInterfaces`). New record `xdp_fastpath_state` (`plat.xdp.state` `enabled` / `disabled`, `event.reason`; CEF `cs1` `xdpState`, `reason`). `dataplane_counter` gains the `plat.counter.name` value `xdp_aborted`. No per-packet or per-session record from the fast path; attribution records unchanged. Chain format unchanged. |
 
 Branch `feat/protocol-completeness` (unreleased) adds drop reasons, counters
 and one gauge but changes no record type or field name, so the schema stays
@@ -83,7 +83,7 @@ Common fields on every sequenced record:
 | Field | Type | Meaning |
 |-------|------|---------|
 | `@timestamp` | RFC 3339 UTC, µs | Event time |
-| `plat.schema` | int | Schema version (7) |
+| `plat.schema` | int | Schema version (8) |
 | `event.sequence` | int | Monotonically increasing. With `[audit.file]` configured it continues across restarts and across files, and is never reused while any audit file or the lease file `.<name>.seq` is present (with every audit file removed but the lease kept, numbering resumes above the lease, `lease_state` `high`); numbers of records after the last checkpoint of a crashed file are skipped, not reused. Without a file (syslog only) it restarts at 1 with each process. A gap means records were lost (see AU-5 records). |
 | `event.kind`, `event.category` | `event`, `network` | ECS categorisation |
 | `event.action` | string | Record type, below; also the syslog MSGID |
@@ -131,7 +131,7 @@ local file, are never sent to syslog, and carry no `event.sequence`,
 ### `nat_port_block_allocate` / `nat_port_block_release`
 
 ```json
-{"@timestamp":"2026-10-28T14:16:00.000001Z","plat.schema":7,"event.sequence":7,"event.kind":"event","event.category":"network","event.action":"nat_port_block_allocate","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"success","source.ip":"2001:db8:100:1::","plat.subscriber.prefix":"2001:db8:100:1::/64","source.nat.ip":"192.0.2.10","plat.nat.port_start":1024,"plat.nat.port_end":1535}
+{"@timestamp":"2026-10-28T14:16:00.000001Z","plat.schema":8,"event.sequence":7,"event.kind":"event","event.category":"network","event.action":"nat_port_block_allocate","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"success","source.ip":"2001:db8:100:1::","plat.subscriber.prefix":"2001:db8:100:1::/64","source.nat.ip":"192.0.2.10","plat.nat.port_start":1024,"plat.nat.port_end":1535}
 ```
 
 A block is released after it has been empty for 60 s, and only once its
@@ -142,7 +142,7 @@ record at shutdown or on a crash (POAM-009).
 ### `nat_binding_create` / `nat_binding_delete` (`audit.mode = "session"`)
 
 ```json
-{"@timestamp":"2026-10-28T14:16:00.120000Z","plat.schema":7,"event.sequence":8,"event.kind":"event","event.category":"network","event.action":"nat_binding_create","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"success","network.transport":"udp","source.ip":"2001:db8:100:1::5","source.port":40000,"source.nat.ip":"192.0.2.10","source.nat.port":1100}
+{"@timestamp":"2026-10-28T14:16:00.120000Z","plat.schema":8,"event.sequence":8,"event.kind":"event","event.category":"network","event.action":"nat_binding_create","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"success","network.transport":"udp","source.ip":"2001:db8:100:1::5","source.port":40000,"source.nat.ip":"192.0.2.10","source.nat.port":1100}
 ```
 
 Destinations are deliberately **not** logged (privacy; not needed for
@@ -159,7 +159,7 @@ attribution).
 record per second per reason.
 
 ```json
-{"@timestamp":"2026-10-28T14:16:01.000000Z","plat.schema":7,"event.sequence":9,"event.kind":"event","event.category":"network","event.action":"nat_resource_limit","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","event.reason":"subscriber_block_limit","source.ip":"2001:db8:100:1::","plat.subscriber.prefix":"2001:db8:100:1::/64"}
+{"@timestamp":"2026-10-28T14:16:01.000000Z","plat.schema":8,"event.sequence":9,"event.kind":"event","event.category":"network","event.action":"nat_resource_limit","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","event.reason":"subscriber_block_limit","source.ip":"2001:db8:100:1::","plat.subscriber.prefix":"2001:db8:100:1::/64"}
 ```
 
 ### `service_start` / `service_stop`
@@ -178,7 +178,7 @@ exists, so a `service_start` with `plat.fips:false` means the operator set
 `require_fips = false` and no TLS configured).
 
 ```json
-{"@timestamp":"2026-10-28T14:00:00.000000Z","plat.schema":7,"event.sequence":1,"event.kind":"event","event.category":"network","event.action":"service_start","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"success","service.version":"0.1.0","plat.fips":true,"plat.fips_provider":"aws-lc-rs-fips"}
+{"@timestamp":"2026-10-28T14:00:00.000000Z","plat.schema":8,"event.sequence":1,"event.kind":"event","event.category":"network","event.action":"service_start","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"success","service.version":"0.1.0","plat.fips":true,"plat.fips_provider":"aws-lc-rs-fips","plat.xdp.mode":"off"}
 ```
 
 With clustering (schema 7) `service_start` also records this node's cluster
@@ -194,7 +194,7 @@ digest; a different digest is refused on the peer channel
 (`cluster_peer_rejected` `digest_mismatch`).
 
 ```json
-{"@timestamp":"2026-10-29T08:00:00.000000Z","plat.schema":7,"event.sequence":1,"event.kind":"event","event.category":"network","event.action":"service_start","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"success","service.version":"0.1.0","plat.fips":true,"plat.fips_provider":"aws-lc-rs-fips","cluster.node_id":0,"cluster.mode":"ha","cluster.config_digest":"9f2c…(64 hex)","cluster.slices":[],"cluster.slice_count":0,"cluster.member_count":2}
+{"@timestamp":"2026-10-29T08:00:00.000000Z","plat.schema":8,"event.sequence":1,"event.kind":"event","event.category":"network","event.action":"service_start","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"success","service.version":"0.1.0","plat.fips":true,"plat.fips_provider":"aws-lc-rs-fips","cluster.node_id":0,"cluster.mode":"ha","cluster.config_digest":"9f2c…(64 hex)","cluster.slices":[],"cluster.slice_count":0,"cluster.member_count":2,"plat.xdp.mode":"off"}
 ```
 
 With the XDP fast path (schema 8; POAM-016 Phase 1) `service_start` also
@@ -227,19 +227,39 @@ program may forward) or `disabled` (every packet goes to the slow path).
 | `maps_unavailable` | disabled | Pins missing, of the wrong shape, replaced by a re-run loader, or the TUN or a thread could not be set up |
 | `stale_maps` | disabled | The pinned maps were already used by an earlier `platd` (`CONTROL` touched or a `SLOT` record present): a restart must re-run the loader for fresh maps (SEC-001) |
 | `unsupported_host` | disabled | `membarrier(MEMBARRIER_CMD_GLOBAL)` unavailable (`nohz_full`) or failing 10 times in a row: slots cannot be reused safely (decision Q5, SEC-007) |
-| `heartbeat_stalled` | disabled | The sweeper or a worker made no progress: heartbeats withheld, the dead-man deadline stops the fast path (SC-24) |
+| `heartbeat_stalled` | disabled | The sweeper, a worker or the publisher thread (`plat-xdp-pub`) made no progress: heartbeats withheld, the dead-man deadline stops the fast path (SC-24) |
 | `heartbeat_resumed` | enabled | Progress again after a stall |
 | `shutdown` | disabled | `platd` is stopping (`CONTROL` disabled) |
 
 Every reason except `start`, `heartbeat_resumed` and `shutdown` is a
 failure (`event.outcome:"failure"`, severity 4). After `config_mismatch`,
 `object_mismatch`, `link_mismatch`, `maps_unavailable`, `stale_maps` or
-`unsupported_host` the fast path stays off until `platd` restarts. Alert on
-any of them; correlate with `plat_xdp_*` metrics.
+`unsupported_host` the fast path stays off until `platd` restarts (after
+`stale_maps`, `object_mismatch` or `config_mismatch` the loader must be
+re-run too, because only a fresh attach gives fresh, matching maps). Alert
+on any of them; correlate with `plat_xdp_*` metrics.
 
 ```json
 {"@timestamp":"2026-11-01T14:00:00.120000Z","plat.schema":8,"event.sequence":2,"event.kind":"event","event.category":"network","event.action":"xdp_fastpath_state","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"success","plat.xdp.state":"enabled","event.reason":"start"}
+{"@timestamp":"2026-11-01T14:00:10.000000Z","plat.schema":8,"event.sequence":3,"event.kind":"event","event.category":"network","event.action":"xdp_fastpath_state","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","plat.xdp.state":"disabled","event.reason":"heartbeat_stalled"}
 ```
+
+The same failure record in CEF (syslog severity 4, CEF severity 7):
+
+```text
+<132>1 2026-11-01T14:00:10.000000Z plat-01 platd 4242 xdp_fastpath_state - CEF:0|USG|usg-plat|0.1.0|xdp_fastpath_state|xdp_fastpath_state|7|rt=1793541610000 dvchost=plat-01 cn1=3 cn1Label=sequence cn4=0 cn4Label=nodeId cs6=8 cs6Label=schema outcome=failure cs1=disabled cs1Label=xdpState reason=heartbeat_stalled
+```
+
+SIEM correlation: a `heartbeat_stalled` without a later
+`heartbeat_resumed` means every packet is on the slow path; expect
+`plat_xdp_pass_total{reason="deadline"}` to rise and `plat_xdp_packets_total`
+to stop. Compare `plat.xdp.object_sha256` across nodes and releases to detect
+an unexpected object (SI-7).
+
+All examples in this document show `plat.schema` 8 (CEF `cs6=8`), what a
+current build writes on every record; records whose fields schema 8 did not
+change are otherwise identical to their schema 7 form. Every `service_start`
+written by `platd` carries `plat.xdp.mode`.
 
 ### Cluster records (schema 7)
 
@@ -295,24 +315,24 @@ above). They are control-plane records (cluster threads), never per packet.
   `auto_failover`, `member_up`, `unknown_member`, `invalid`, `rejected`.
 
 ```json
-{"@timestamp":"2026-10-29T08:10:03.200000Z","plat.schema":7,"event.sequence":5120,"event.kind":"event","event.category":"network","event.action":"cluster_slice_acquire","observer.type":"nat64","observer.name":"plat-02","plat.node_id":1,"event.outcome":"success","cluster.slice":"192.0.2.16/28","cluster.epoch":9,"cluster.prev_owner":0,"cluster.reason":"takeover","cluster.blocks_adopted":5,"cluster.bibs_adopted":70,"cluster.blocks_quarantined":1,"cluster.in_sync":true}
-{"@timestamp":"2026-10-29T08:10:03.200010Z","plat.schema":7,"event.sequence":5121,"event.kind":"event","event.category":"network","event.action":"nat_port_block_adopt","observer.type":"nat64","observer.name":"plat-02","plat.node_id":1,"event.outcome":"success","source.ip":"2001:db8:100:1::","plat.subscriber.prefix":"2001:db8:100:1::/64","source.nat.ip":"192.0.2.17","plat.nat.port_start":1024,"plat.nat.port_end":1535,"plat.block.allocated_us":1793260000000000,"cluster.epoch":9,"cluster.prev_owner":0}
-{"@timestamp":"2026-10-29T08:10:04.000000Z","plat.schema":7,"event.sequence":5190,"event.kind":"event","event.category":"network","event.action":"cluster_peer_rejected","observer.type":"nat64","observer.name":"plat-02","plat.node_id":1,"event.outcome":"failure","source.ip":"198.51.100.30","source.port":40000,"tls.client.identity":"dns:plat-01.cluster.example","cluster.claimed_id":0,"cluster.reason":"duplicate_id"}
+{"@timestamp":"2026-10-29T08:10:03.200000Z","plat.schema":8,"event.sequence":5120,"event.kind":"event","event.category":"network","event.action":"cluster_slice_acquire","observer.type":"nat64","observer.name":"plat-02","plat.node_id":1,"event.outcome":"success","cluster.slice":"192.0.2.16/28","cluster.epoch":9,"cluster.prev_owner":0,"cluster.reason":"takeover","cluster.blocks_adopted":5,"cluster.bibs_adopted":70,"cluster.blocks_quarantined":1,"cluster.in_sync":true}
+{"@timestamp":"2026-10-29T08:10:03.200010Z","plat.schema":8,"event.sequence":5121,"event.kind":"event","event.category":"network","event.action":"nat_port_block_adopt","observer.type":"nat64","observer.name":"plat-02","plat.node_id":1,"event.outcome":"success","source.ip":"2001:db8:100:1::","plat.subscriber.prefix":"2001:db8:100:1::/64","source.nat.ip":"192.0.2.17","plat.nat.port_start":1024,"plat.nat.port_end":1535,"plat.block.allocated_us":1793260000000000,"cluster.epoch":9,"cluster.prev_owner":0}
+{"@timestamp":"2026-10-29T08:10:04.000000Z","plat.schema":8,"event.sequence":5190,"event.kind":"event","event.category":"network","event.action":"cluster_peer_rejected","observer.type":"nat64","observer.name":"plat-02","plat.node_id":1,"event.outcome":"failure","source.ip":"198.51.100.30","source.port":40000,"tls.client.identity":"dns:plat-01.cluster.example","cluster.claimed_id":0,"cluster.reason":"duplicate_id"}
 ```
 
 More schema-7 examples (field order as in the golden test
 `plat-audit/src/format.rs::cluster_records_schema_7`; values illustrative):
 
 ```json
-{"@timestamp":"2026-10-29T08:10:00.100000Z","plat.schema":7,"event.sequence":5101,"event.kind":"event","event.category":"network","event.action":"cluster_view_change","observer.type":"nat64","observer.name":"plat-02","plat.node_id":1,"event.outcome":"success","cluster.epoch":9,"cluster.leader":1,"cluster.members_live":[1,2],"cluster.reason":"member_lost"}
-{"@timestamp":"2026-10-29T08:10:00.000000Z","plat.schema":7,"event.sequence":5100,"event.kind":"event","event.category":"network","event.action":"cluster_member_state","observer.type":"nat64","observer.name":"plat-02","plat.node_id":1,"event.outcome":"success","cluster.peer.id":0,"cluster.peer.name":"plat-01","cluster.peer.identity":"dns:plat-01.cluster.example","cluster.peer.ip":"198.51.100.11","cluster.peer.state":"down","cluster.epoch":8}
-{"@timestamp":"2026-10-29T08:09:58.000000Z","plat.schema":7,"event.sequence":7310,"event.kind":"event","event.category":"network","event.action":"cluster_slice_release","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"success","cluster.slice":"192.0.2.16/28","cluster.epoch":8,"cluster.reason":"lease_lost"}
-{"@timestamp":"2026-10-29T09:00:00.000000Z","plat.schema":7,"event.sequence":7400,"event.kind":"event","event.category":"network","event.action":"nat_port_block_release","observer.type":"nat64","observer.name":"plat-02","plat.node_id":1,"event.outcome":"success","source.ip":"2001:db8:100:1::","plat.subscriber.prefix":"2001:db8:100:1::/64","source.nat.ip":"192.0.2.17","plat.nat.port_start":1024,"plat.nat.port_end":1535,"event.duration":3000000000000,"plat.release_reason":"handover"}
-{"@timestamp":"2026-10-29T08:11:00.000000Z","plat.schema":7,"event.sequence":5200,"event.kind":"event","event.category":"network","event.action":"cluster_peer_suppressed","observer.type":"nat64","observer.name":"plat-02","plat.node_id":1,"event.outcome":"failure","cluster.suppressed":12,"cluster.window_secs":60}
-{"@timestamp":"2026-10-29T08:12:00.000000Z","plat.schema":7,"event.sequence":5300,"event.kind":"event","event.category":"network","event.action":"cluster_replication_gap","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","cluster.slice":"192.0.2.16/28","cluster.lost":33,"cluster.action":"resync"}
-{"@timestamp":"2026-10-29T08:10:03.201500Z","plat.schema":7,"event.sequence":5140,"event.kind":"event","event.category":"network","event.action":"cluster_hook","observer.type":"nat64","observer.name":"plat-02","plat.node_id":1,"event.outcome":"success","cluster.hook":"announce","cluster.slice":"192.0.2.16/28","cluster.epoch":9,"process.exit_code":0,"event.duration":1500000}
-{"@timestamp":"2026-10-29T08:20:00.000000Z","plat.schema":7,"event.sequence":5400,"event.kind":"event","event.category":"network","event.action":"cluster_operator_command","observer.type":"nat64","observer.name":"plat-02","plat.node_id":1,"event.outcome":"success","cluster.command":"takeover","cluster.member":0,"cluster.force":true,"user.id":"0","process.pid":4242}
-{"@timestamp":"2026-10-29T08:20:05.000000Z","plat.schema":7,"event.sequence":5401,"event.kind":"event","event.category":"network","event.action":"cluster_operator_command","observer.type":"nat64","observer.name":"plat-02","plat.node_id":1,"event.outcome":"failure","cluster.command":"takeover","cluster.member":0,"cluster.force":false,"user.id":"1001","process.pid":5150,"cluster.reason":"not_authorized"}
+{"@timestamp":"2026-10-29T08:10:00.100000Z","plat.schema":8,"event.sequence":5101,"event.kind":"event","event.category":"network","event.action":"cluster_view_change","observer.type":"nat64","observer.name":"plat-02","plat.node_id":1,"event.outcome":"success","cluster.epoch":9,"cluster.leader":1,"cluster.members_live":[1,2],"cluster.reason":"member_lost"}
+{"@timestamp":"2026-10-29T08:10:00.000000Z","plat.schema":8,"event.sequence":5100,"event.kind":"event","event.category":"network","event.action":"cluster_member_state","observer.type":"nat64","observer.name":"plat-02","plat.node_id":1,"event.outcome":"success","cluster.peer.id":0,"cluster.peer.name":"plat-01","cluster.peer.identity":"dns:plat-01.cluster.example","cluster.peer.ip":"198.51.100.11","cluster.peer.state":"down","cluster.epoch":8}
+{"@timestamp":"2026-10-29T08:09:58.000000Z","plat.schema":8,"event.sequence":7310,"event.kind":"event","event.category":"network","event.action":"cluster_slice_release","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"success","cluster.slice":"192.0.2.16/28","cluster.epoch":8,"cluster.reason":"lease_lost"}
+{"@timestamp":"2026-10-29T09:00:00.000000Z","plat.schema":8,"event.sequence":7400,"event.kind":"event","event.category":"network","event.action":"nat_port_block_release","observer.type":"nat64","observer.name":"plat-02","plat.node_id":1,"event.outcome":"success","source.ip":"2001:db8:100:1::","plat.subscriber.prefix":"2001:db8:100:1::/64","source.nat.ip":"192.0.2.17","plat.nat.port_start":1024,"plat.nat.port_end":1535,"event.duration":3000000000000,"plat.release_reason":"handover"}
+{"@timestamp":"2026-10-29T08:11:00.000000Z","plat.schema":8,"event.sequence":5200,"event.kind":"event","event.category":"network","event.action":"cluster_peer_suppressed","observer.type":"nat64","observer.name":"plat-02","plat.node_id":1,"event.outcome":"failure","cluster.suppressed":12,"cluster.window_secs":60}
+{"@timestamp":"2026-10-29T08:12:00.000000Z","plat.schema":8,"event.sequence":5300,"event.kind":"event","event.category":"network","event.action":"cluster_replication_gap","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","cluster.slice":"192.0.2.16/28","cluster.lost":33,"cluster.action":"resync"}
+{"@timestamp":"2026-10-29T08:10:03.201500Z","plat.schema":8,"event.sequence":5140,"event.kind":"event","event.category":"network","event.action":"cluster_hook","observer.type":"nat64","observer.name":"plat-02","plat.node_id":1,"event.outcome":"success","cluster.hook":"announce","cluster.slice":"192.0.2.16/28","cluster.epoch":9,"process.exit_code":0,"event.duration":1500000}
+{"@timestamp":"2026-10-29T08:20:00.000000Z","plat.schema":8,"event.sequence":5400,"event.kind":"event","event.category":"network","event.action":"cluster_operator_command","observer.type":"nat64","observer.name":"plat-02","plat.node_id":1,"event.outcome":"success","cluster.command":"takeover","cluster.member":0,"cluster.force":true,"user.id":"0","process.pid":4242}
+{"@timestamp":"2026-10-29T08:20:05.000000Z","plat.schema":8,"event.sequence":5401,"event.kind":"event","event.category":"network","event.action":"cluster_operator_command","observer.type":"nat64","observer.name":"plat-02","plat.node_id":1,"event.outcome":"failure","cluster.command":"takeover","cluster.member":0,"cluster.force":false,"user.id":"1001","process.pid":5150,"cluster.reason":"not_authorized"}
 ```
 
 A `cluster_hook` killed on timeout has no `process.exit_code` and outcome
@@ -353,7 +373,7 @@ other held-SYN counters (`tcp_syn_held`, `tcp_syn_held_dup`,
 bound ports filling the held-SYN cap (SC-5); alert on it.
 
 ```json
-{"@timestamp":"2026-10-29T14:17:00.000000Z","plat.schema":7,"event.sequence":41,"event.kind":"event","event.category":"network","event.action":"dataplane_counter","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"plat.counter.name":"fragment_overlap","plat.counter.value":3}
+{"@timestamp":"2026-10-29T14:17:00.000000Z","plat.schema":8,"event.sequence":41,"event.kind":"event","event.category":"network","event.action":"dataplane_counter","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"plat.counter.name":"fragment_overlap","plat.counter.value":3}
 ```
 
 SIEM guidance: a rising `fragment_overlap` or `fragment_tiny` indicates
@@ -365,7 +385,7 @@ steered across workers (POAM-035). Correlate with the source by packet
 capture: these counters carry no addresses.
 
 ```json
-{"@timestamp":"2026-10-28T14:17:00.000000Z","plat.schema":7,"event.sequence":40,"event.kind":"event","event.category":"network","event.action":"dataplane_counter","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"plat.counter.name":"filtered","plat.counter.value":12}
+{"@timestamp":"2026-10-28T14:17:00.000000Z","plat.schema":8,"event.sequence":40,"event.kind":"event","event.category":"network","event.action":"dataplane_counter","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"plat.counter.name":"filtered","plat.counter.value":12}
 ```
 
 ### `audit_queue_overflow`
@@ -390,7 +410,7 @@ opened or rotated.
   because records were lost.
 
 ```json
-{"@timestamp":"2026-10-28T14:20:00.000000Z","plat.schema":7,"event.sequence":512,"event.kind":"event","event.category":"network","event.action":"audit_output_failure","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","plat.audit.destination":"file","plat.audit.state":"degraded","plat.audit.lost":12}
+{"@timestamp":"2026-10-28T14:20:00.000000Z","plat.schema":8,"event.sequence":512,"event.kind":"event","event.category":"network","event.action":"audit_output_failure","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","plat.audit.destination":"file","plat.audit.state":"degraded","plat.audit.lost":12}
 ```
 
 `plat_audit_file_lost_total` also counts records that reached the failed file
@@ -430,7 +450,7 @@ without `\n`, e.g. a power cut). Severity 4, `event.outcome` `failure`.
   lease).
 
 ```json
-{"@timestamp":"2026-10-29T06:01:00.000000Z","plat.schema":7,"event.sequence":2099522,"event.kind":"event","event.category":"network","event.action":"audit_recovery","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","plat.audit.destination":"file","plat.reason":"truncated_tail","plat.audit.last_checkpoint_seq":1699072,"plat.audit.max_seq":2099521,"plat.audit.lease_state":"ok"}
+{"@timestamp":"2026-10-29T06:01:00.000000Z","plat.schema":8,"event.sequence":2099522,"event.kind":"event","event.category":"network","event.action":"audit_recovery","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","plat.audit.destination":"file","plat.reason":"truncated_tail","plat.audit.last_checkpoint_seq":1699072,"plat.audit.max_seq":2099521,"plat.audit.lease_state":"ok"}
 ```
 
 A clean start (intact newest file) writes no `audit_recovery`, even if the
@@ -462,7 +482,7 @@ counted as delivered. Every lost batch is counted once; the sum of
 `plat_audit_remote_lost_total` for that destination.
 
 ```json
-{"@timestamp":"2026-10-28T14:21:00.000000Z","plat.schema":7,"event.sequence":700,"event.kind":"event","event.category":"network","event.action":"audit_remote_loss","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","plat.audit.destination":"syslog","destination.ip":"198.51.100.10","destination.port":6514,"plat.audit.lost":3,"plat.reason":"tls_verify"}
+{"@timestamp":"2026-10-28T14:21:00.000000Z","plat.schema":8,"event.sequence":700,"event.kind":"event","event.category":"network","event.action":"audit_remote_loss","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","plat.audit.destination":"syslog","destination.ip":"198.51.100.10","destination.port":6514,"plat.audit.lost":3,"plat.reason":"tls_verify"}
 ```
 
 ### `audit_storage_threshold`
@@ -479,7 +499,7 @@ max(2 × `max_bytes`, 1 GiB)).
   `plat.audit.available_bytes`; it clears with a `recovered` record.
 
 ```json
-{"@timestamp":"2026-10-28T14:22:00.000000Z","plat.schema":7,"event.sequence":800,"event.kind":"event","event.category":"network","event.action":"audit_storage_threshold","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","plat.audit.destination":"file","plat.audit.state":"below_threshold","plat.audit.available_bytes":1073741824,"plat.audit.min_free_bytes":2147483648}
+{"@timestamp":"2026-10-28T14:22:00.000000Z","plat.schema":8,"event.sequence":800,"event.kind":"event","event.category":"network","event.action":"audit_storage_threshold","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","plat.audit.destination":"file","plat.audit.state":"below_threshold","plat.audit.available_bytes":1073741824,"plat.audit.min_free_bytes":2147483648}
 ```
 
 ### `audit_retention_prune`
@@ -497,7 +517,7 @@ file's header carries the full value). Two phases:
    at the next rotation with a new `scheduled` record.
 
 ```json
-{"@timestamp":"2026-10-28T15:00:00.000000Z","plat.schema":7,"event.sequence":90001,"event.kind":"event","event.category":"network","event.action":"audit_retention_prune","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"unknown","plat.audit.state":"scheduled","plat.audit.pruned_rotated_us":1793196960000000,"plat.audit.pruned_seq_first":1,"plat.audit.pruned_seq_last":45000,"plat.audit.pruned_chain_prefix":"9f2c4e01b7a6d3c8"}
+{"@timestamp":"2026-10-28T15:00:00.000000Z","plat.schema":8,"event.sequence":90001,"event.kind":"event","event.category":"network","event.action":"audit_retention_prune","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"unknown","plat.audit.state":"scheduled","plat.audit.pruned_rotated_us":1793196960000000,"plat.audit.pruned_seq_first":1,"plat.audit.pruned_seq_last":45000,"plat.audit.pruned_chain_prefix":"9f2c4e01b7a6d3c8"}
 ```
 
 ### `management_connection` (mTLS management only)
@@ -537,7 +557,7 @@ One record per TCP connection accepted by the mTLS listener
   `source.ip` still records the full address.
 
 ```json
-{"@timestamp":"2026-10-28T14:30:00.000000Z","plat.schema":7,"event.sequence":901,"event.kind":"event","event.category":"network","event.action":"management_connection","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"success","source.ip":"2001:db8:ff::10","source.port":50412,"plat.mgmt.reason":"accepted","tls.client.subject":"prometheus-01","tls.client.hash.sha256":"<64 hex>","url.path":"/metrics","plat.mgmt.allow_entry":"dns:prometheus-01.ops.example.net","tls.client.x509.alternative_names":["dns:prometheus-01.ops.example.net"]}
+{"@timestamp":"2026-10-28T14:30:00.000000Z","plat.schema":8,"event.sequence":901,"event.kind":"event","event.category":"network","event.action":"management_connection","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"success","source.ip":"2001:db8:ff::10","source.port":50412,"plat.mgmt.reason":"accepted","tls.client.subject":"prometheus-01","tls.client.hash.sha256":"<64 hex>","url.path":"/metrics","plat.mgmt.allow_entry":"dns:prometheus-01.ops.example.net","tls.client.x509.alternative_names":["dns:prometheus-01.ops.example.net"]}
 ```
 
 ### `management_connection_suppressed`
@@ -546,7 +566,7 @@ One record per TCP connection accepted by the mTLS listener
 by the token bucket during the last `plat.mgmt.window_secs` seconds.
 
 ```json
-{"@timestamp":"2026-10-28T14:31:00.000000Z","plat.schema":7,"event.sequence":950,"event.kind":"event","event.category":"network","event.action":"management_connection_suppressed","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","plat.mgmt.suppressed":41,"plat.mgmt.window_secs":60}
+{"@timestamp":"2026-10-28T14:31:00.000000Z","plat.schema":8,"event.sequence":950,"event.kind":"event","event.category":"network","event.action":"management_connection_suppressed","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","plat.mgmt.suppressed":41,"plat.mgmt.window_secs":60}
 ```
 
 ### `tls_revocation_check`
@@ -587,7 +607,7 @@ dialed, `tls.server.hash.sha256`). With
 - `plat.ocsp.responder` / `plat.crl.source`: `host:port` of the source used.
 
 ```json
-{"@timestamp":"2026-10-28T14:32:00.000000Z","plat.schema":7,"event.sequence":960,"event.kind":"event","event.category":"network","event.action":"tls_revocation_check","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","plat.tls.role":"syslog_server","tls.server.hash.sha256":"<64 hex>","x509.serial_number":"01ab","x509.issuer.distinguished_name":"CN=Intermediate,O=Example","plat.revocation.chain_index":1,"plat.revocation.status":"revoked","plat.revocation.source":"crl_fetch","plat.revocation.policy":"hard_fail","plat.ocsp.reason":"connect","plat.revocation.reason":"key_compromise","plat.revocation.date":"2026-10-20T00:00:00.000000Z","plat.ocsp.responder":"ocsp.example.net:80","plat.crl.source":"crl.example.net:80"}
+{"@timestamp":"2026-10-28T14:32:00.000000Z","plat.schema":8,"event.sequence":960,"event.kind":"event","event.category":"network","event.action":"tls_revocation_check","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","plat.tls.role":"syslog_server","tls.server.hash.sha256":"<64 hex>","x509.serial_number":"01ab","x509.issuer.distinguished_name":"CN=Intermediate,O=Example","plat.revocation.chain_index":1,"plat.revocation.status":"revoked","plat.revocation.source":"crl_fetch","plat.revocation.policy":"hard_fail","plat.ocsp.reason":"connect","plat.revocation.reason":"key_compromise","plat.revocation.date":"2026-10-20T00:00:00.000000Z","plat.ocsp.responder":"ocsp.example.net:80","plat.crl.source":"crl.example.net:80"}
 ```
 
 ### `revocation_source_refresh`
@@ -605,13 +625,13 @@ watched source (a CRL URL/file/CDP, or an OCSP watch entry):
 | `state_persist_failed` | writing `crl-numbers` failed (`event.reason` `state_write_failed`); retried at the next store, one record per failure streak |
 
 ```json
-{"@timestamp":"2026-10-28T14:33:00.000000Z","plat.schema":7,"event.sequence":970,"event.kind":"event","event.category":"network","event.action":"revocation_source_refresh","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","plat.revocation.transition":"failing","plat.crl.source":"crl.example.net:80","event.reason":"timeout"}
+{"@timestamp":"2026-10-28T14:33:00.000000Z","plat.schema":8,"event.sequence":970,"event.kind":"event","event.category":"network","event.action":"revocation_source_refresh","observer.type":"nat64","observer.name":"plat-01","plat.node_id":0,"event.outcome":"failure","plat.revocation.transition":"failing","plat.crl.source":"crl.example.net:80","event.reason":"timeout"}
 ```
 
 ### `audit_chain_continue` (local file only, first line of every file)
 
 ```json
-{"@timestamp":"2026-10-28T14:00:00.000000Z","plat.schema":7,"event.action":"audit_chain_continue","observer.name":"plat-01","plat.node_id":0,"plat.audit.prev_chain":"<64 hex digits; all zero if no predecessor is known>","plat.audit.prev_seq":45000,"plat.audit.next_seq":45001}
+{"@timestamp":"2026-10-28T14:00:00.000000Z","plat.schema":8,"event.action":"audit_chain_continue","observer.name":"plat-01","plat.node_id":0,"plat.audit.prev_chain":"<64 hex digits; all zero if no predecessor is known>","plat.audit.prev_seq":45000,"plat.audit.next_seq":45001}
 ```
 
 `prev_chain` / `prev_seq`: the previous file's final checkpoint chain and its
@@ -620,7 +640,7 @@ watched source (a CRL URL/file/CDP, or an OCSP watch entry):
 ### `audit_checkpoint` (local file only, after every batch)
 
 ```json
-{"@timestamp":"2026-10-28T14:00:00.100000Z","plat.schema":7,"event.action":"audit_checkpoint","observer.name":"plat-01","plat.node_id":0,"plat.audit.seq_first":45001,"plat.audit.seq_last":45012,"plat.audit.batch_sha256":"<64 hex>","plat.audit.chain_sha256":"<64 hex>"}
+{"@timestamp":"2026-10-28T14:00:00.100000Z","plat.schema":8,"event.action":"audit_checkpoint","observer.name":"plat-01","plat.node_id":0,"plat.audit.seq_first":45001,"plat.audit.seq_last":45012,"plat.audit.batch_sha256":"<64 hex>","plat.audit.chain_sha256":"<64 hex>"}
 ```
 
 Chain v2:
@@ -738,7 +758,7 @@ newest checkpoint is also not detectable locally.
 ### CEF
 
 ```text
-<134>1 2026-10-28T14:16:00.000001Z plat-01 platd 4242 nat_port_block_allocate - CEF:0|USG|usg-plat|0.1.0|nat_port_block_allocate|nat_port_block_allocate|3|rt=1793196960000 dvchost=plat-01 cn1=7 cn1Label=sequence cn4=0 cn4Label=nodeId cs6=7 cs6Label=schema outcome=success c6a2=2001:db8:100:1:: cn2=64 cn2Label=subscriberPrefixLen sourceTranslatedAddress=192.0.2.10 cs1=1024-1535 cs1Label=portRange
+<134>1 2026-10-28T14:16:00.000001Z plat-01 platd 4242 nat_port_block_allocate - CEF:0|USG|usg-plat|0.1.0|nat_port_block_allocate|nat_port_block_allocate|3|rt=1793196960000 dvchost=plat-01 cn1=7 cn1Label=sequence cn4=0 cn4Label=nodeId cs6=8 cs6Label=schema outcome=success c6a2=2001:db8:100:1:: cn2=64 cn2Label=subscriberPrefixLen sourceTranslatedAddress=192.0.2.10 cs1=1024-1535 cs1Label=portRange
 ```
 
 Header: `CEF:0|USG|usg-plat|<version>|<event.action>|<event.action>|<severity>`.

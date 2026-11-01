@@ -251,6 +251,17 @@ fn memory_summary(cfg: &Config, unit: Option<&std::path::Path>) -> String {
             memory::xdp_user_bytes(cfg),
             memory::xdp_map_bytes(cfg, possible_cpus())
         ));
+        // A warning only: the config may be checked on another host; the
+        // loader refuses a missing interface at attach (QA WU6/8).
+        #[cfg(target_os = "linux")]
+        for i in &cfg.xdp.interfaces {
+            if let Err(e) = plat_io::netdev::index(&i.name) {
+                o.push_str(&format!(
+                    "WARNING: xdp interface {} not found on this host ({e}): plat-xdp-loader attach will fail\n",
+                    i.name
+                ));
+            }
+        }
     }
     let path = unit
         .map(std::path::Path::to_path_buf)

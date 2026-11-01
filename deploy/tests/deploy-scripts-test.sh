@@ -44,6 +44,22 @@ cat >"$BIN/ip" <<'STUB'
 #!/bin/sh
 # Minimal ip(8): one TUN, main-table routes kept in $STATE/routes{4,6}.
 echo "ip $*" >>"$STATE/calls"
+case "$*" in
+    # plat-fwguard's XDP check: $STATE/links (or $STATE/links.N for the
+    # N-th listing) in `ip -o -d link show` form; detaching removes the
+    # device's program unless $STATE/xdp.sticky exists.
+    "-o -d link show")
+        [ -f "$STATE/links.fail" ] && exit 1
+        n=$(($(cat "$STATE/links.calls" 2>/dev/null || echo 0) + 1))
+        echo "$n" >"$STATE/links.calls"
+        if [ -f "$STATE/links.$n" ]; then cat "$STATE/links.$n"; else cat "$STATE/links" 2>/dev/null; fi
+        exit 0 ;;
+    "link set dev "*" xdpgeneric off" | "link set dev "*" xdpdrv off")
+        [ -f "$STATE/xdp.sticky" ] && exit 1
+        sed -e "/^[0-9]*: $4[@:]/s| prog/xdp id [0-9][^\\\\]*||" -e "/^[0-9]*: $4[@:]/s| xdp[a-z]*/id:[0-9]*||" \
+            "$STATE/links" >"$STATE/l.tmp" && mv "$STATE/l.tmp" "$STATE/links"
+        exit 0 ;;
+esac
 fam=4
 case "$1" in -4) shift ;; -6) fam=6; shift ;; esac
 case "$1 $2" in
@@ -86,7 +102,7 @@ cat >"$BIN/sysctl" <<'STUB'
 echo "sysctl $*" >>"$STATE/calls"
 case "$1" in
     -n) cat "$STATE/sysctl.$2" 2>/dev/null || echo 1 ;;
-    -qw) shift; for kv; do echo "${kv#*=}" >"$STATE/sysctl.${kv%%=*}"; done ;;
+    -qw) [ -f "$STATE/sysctl.fail" ] && exit 1; shift; for kv; do echo "${kv#*=}" >"$STATE/sysctl.${kv%%=*}"; done ;;
 esac
 STUB
 cat >"$BIN/id" <<'STUB'
@@ -378,6 +394,260 @@ fwd_on
 if run_guard && closed missing-table; then pass "guard disables forwarding when the table is gone"; else fail "guard did not fail closed"; fi
 : >"$STATE/calls"
 if run_guard && ! grep -q 'sysctl -qw' "$STATE/calls" && [ ! -s "$WORK/guard.err" ]; then pass "guard quiet once forwarding is off"; else fail "guard repeated action"; fi
+
+# --- 4b. XDP fast path integrity in the guard (plan §6, §11 deploy tests) -----
+# State file as plat-xdp-loader writes it; links as `ip -o -d link show`
+# prints them (with -d as root the tag too, without CAP_SYS_ADMIN only the id).
+XST=$WORK/run/plat/xdp.state
+XPINS=$WORK/run/plat/bpf
+mkdir -p "$XPINS"
+cp "$WORK/good.nft" "$STATE/loaded.nft"
+xdp_state() {
+    printf 'object_sha256=%s\nprog_id=%s\nprog_tag=%s\nmode=native\nnonce=%s\ninterface=p6 2 access\ninterface=p4 3 upstream\n' \
+        "$(printf '%064d' 0 | tr 0 a)" "$1" 0123456789abcdef "$(printf '%032d' 0)" >"$XST"
+}
+# $1, $2: the program parts of p6 and p4 ("" = none).
+xdp_links() {
+    rm -f "$STATE"/links.[0-9]* "$STATE/links.calls" "$STATE/xdp.sticky"
+    {
+        echo '1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000\    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00 promiscuity 0'
+        echo "2: p6@if3: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 xdp qdisc noqueue state UP mode DEFAULT group default qlen 1000\\    link/ether 02:00:00:00:02:01 brd ff:ff:ff:ff:ff:ff link-netns xc promiscuity 0 \\    veth $1\\    addrgenmode eui64 numtxqueues 6"
+        echo "3: p4@if2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 xdp qdisc noqueue state UP mode DEFAULT group default qlen 1000\\    link/ether 02:00:00:00:01:01 brd ff:ff:ff:ff:ff:ff link-netns xs promiscuity 0 \\    veth $2\\    addrgenmode eui64 numtxqueues 6"
+    } >"$STATE/links"
+    : >"$XPINS/link_2"
+    : >"$XPINS/link_3"
+    : >"$XPINS/OUT6"
+}
+xguard() {
+    guard_env env PLAT_XDP_STATE="$XST" PLAT_XDP_PIN_DIR="$XPINS" PLAT_XDP_CONFIG="${XCONF:-$WORK/absent.toml}" PLAT_XDP_RECHECK_SECS="${RECHECK:-0}" sh "$GUARD" 2>"$WORK/guard.err"
+}
+quiet() { ! grep -q 'sysctl -qw' "$STATE/calls" && [ ! -s "$WORK/guard.err" ]; }
+detached() { [ ! -e "$XPINS/link_2" ] && [ ! -e "$XPINS/link_3" ] && [ -e "$XPINS/OUT6" ] && grep -q 'ip link set dev p6 xdpgeneric off' "$STATE/calls"; }
+
+# SEC-W68-001: no state file, nothing of the fast path may be left (xdp-orphan).
+XCONF=$WORK/xdp.toml
+xdp_conf() { printf '[dataplane]\ninterface = "plat0"\n\n[xdp]\nenabled = %s # comment\n\n[[xdp.interfaces]]\nname = "p6"\nrole = "access"\n\n[[xdp.interfaces]]\nname = "p4"  # upstream\nrole = "upstream"\n' "$1" >"$XCONF"; }
+no_pins() { rm -f "$XPINS"/*; }
+fwd_on
+xdp_links "prog/xdp id 42 " "prog/xdp id 42 "
+no_pins
+if xguard && quiet; then pass "guard without an XDP state file, pins or [xdp] interfaces ignores XDP"; else fail "guard acted without a state file: $(cat "$WORK/guard.err")"; fi
+xdp_links "" ""
+if xguard && closed xdp-orphan && [ ! -e "$XPINS/link_2" ] && [ ! -e "$XPINS/link_3" ] && [ -e "$XPINS/OUT6" ] &&
+    grep -q 'ip link set dev p6 xdpgeneric off' "$STATE/calls" && grep -q '2 link pins unpinned' "$WORK/guard.err"; then
+    pass "guard fails closed on pins without a state file (xdp-orphan) and unpins every link"
+else fail "orphan pins not detected: $(cat "$WORK/guard.err")"; fi
+fwd_on
+xdp_links "" "prog/xdp id 42 "
+no_pins
+xdp_conf true
+if XCONF=$XCONF xguard && closed xdp-orphan && grep -q 'p4 (ifindex 3) runs XDP program id 42 without' "$WORK/guard.err" &&
+    grep -q 'ip link set dev p4 xdpdrv off' "$STATE/calls"; then
+    pass "guard fails closed on a program on an [xdp] interface without a state file"
+else fail "orphan program not detected: $(cat "$WORK/guard.err")"; fi
+fwd_on
+xdp_links "" "prog/xdp id 42 "
+no_pins
+xdp_conf false
+if XCONF=$XCONF xguard && quiet; then pass "guard ignores XDP programs while [xdp] is disabled"; else fail "orphan with [xdp] off: $(cat "$WORK/guard.err")"; fi
+xdp_conf true
+xdp_links "" ""
+no_pins
+if XCONF=$XCONF xguard && quiet; then pass "guard quiet with [xdp] interfaces, no program, no pins and no state file"; else fail "clean stop tripped: $(cat "$WORK/guard.err")"; fi
+# A transient orphan (the loader pins before it writes the state file) is re-checked.
+xdp_links "" ""
+no_pins
+: >"$XPINS/link_2"
+printf '#!/bin/sh\nrm -f "%s" && exec %s "$@"\n' "$XPINS/link_2" "$(command -v sleep)" >"$BIN/sleep"
+chmod +x "$BIN/sleep"
+if RECHECK=1 xguard && quiet; then pass "guard re-checks a transient orphan before it acts"; else fail "transient orphan acted on: $(cat "$WORK/guard.err")"; fi
+rm -f "$BIN/sleep"
+fwd_on
+xdp_links "prog/xdp id 42 " "prog/xdp id 42 "
+xdp_state 42
+if xguard && quiet; then pass "guard accepts the attached program (id only, as without CAP_SYS_ADMIN)"; else fail "guard tripped on the attached program: $(cat "$WORK/guard.err")"; fi
+xdp_links "prog/xdp id 42 name plat_xdp tag 0123456789abcdef jited " "xdpgeneric/id:42 "
+if xguard && quiet; then pass "guard accepts id and tag (details form) and the short form"; else fail "guard tripped on id and tag: $(cat "$WORK/guard.err")"; fi
+xdp_links "" ""
+if xguard && quiet; then pass "guard ignores interfaces without a program (detached)"; else fail "guard tripped on a detached interface: $(cat "$WORK/guard.err")"; fi
+xdp_links "prog/xdp id 77 " "prog/xdp id 42 "
+if xguard && closed xdp-program-swapped && detached && grep -q 'p6 (ifindex 2) runs program id 77' "$WORK/guard.err" &&
+    grep -q 'fast path detached' "$WORK/guard.err"; then
+    pass "guard detaches a swapped program and disables forwarding"
+else fail "swapped program not handled: $(cat "$WORK/guard.err")"; fi
+: >"$STATE/calls"
+if xguard && quiet; then pass "guard quiet once the swapped program is detached and forwarding is off"; else fail "guard repeated XDP action: $(cat "$WORK/guard.err")"; fi
+fwd_on
+xdp_links "prog/xdp id 42 name plat_xdp tag fedcba9876543210 jited " "prog/xdp id 42 "
+if xguard && closed xdp-program-swapped && detached; then pass "guard detects a wrong tag with the same id"; else fail "wrong tag not detected: $(cat "$WORK/guard.err")"; fi
+fwd_on
+xdp_links "prog/xdp id 77 " ""
+: >"$STATE/xdp.sticky"
+if ! xguard && closed xdp-program-swapped && grep -q 'could NOT be detached' "$WORK/guard.err"; then
+    pass "guard fails (exit 1) when the swapped program cannot be detached, forwarding off"
+else fail "undetachable program not reported: $(cat "$WORK/guard.err")"; fi
+fwd_on
+xdp_links "prog/xdp id 77 " ""
+printf 'prog_id=42\nprog_tag=0123456789abcdef\n' >"$XST"
+if xguard && closed xdp-state-malformed; then pass "guard fails closed on a malformed state file"; else fail "malformed state file not detected: $(cat "$WORK/guard.err")"; fi
+fwd_on
+# A loader replacing the program writes the state file right after the links:
+# the guard checks again after PLAT_XDP_RECHECK_SECS before it acts.
+xdp_state 42
+xdp_links "prog/xdp id 42 " "prog/xdp id 42 "
+sed 's|prog/xdp id 42 |prog/xdp id 77 |' "$STATE/links" >"$STATE/links.1"
+if RECHECK=1 xguard && quiet; then pass "guard re-checks a mismatch before acting"; else fail "guard acted on a transient mismatch: $(cat "$WORK/guard.err")"; fi
+# QA WU6/8 additions: persistent mismatch across the re-check, more malformed
+# state files, ip(8) failure and output variants, exit codes when closed.
+fwd_on
+xdp_links "prog/xdp id 77 " "prog/xdp id 42 "
+cp "$STATE/links" "$STATE/links.1"
+cp "$STATE/links" "$STATE/links.2"
+if RECHECK=1 xguard && closed xdp-program-swapped && detached && [ "$(cat "$STATE/links.calls")" -ge 2 ]; then
+    pass "guard acts when the mismatch persists across the 1 s re-check"
+else fail "persistent mismatch after re-check: $(cat "$WORK/guard.err")"; fi
+fwd_on
+xdp_links "prog/xdp id 42 " "prog/xdp id 77 name evil tag 0123456789abcdef "
+if xguard && closed xdp-program-swapped && grep -q 'p4 (ifindex 3) runs program id 77' "$WORK/guard.err"; then
+    pass "guard detects a swap on the second (upstream) interface"
+else fail "upstream swap not detected: $(cat "$WORK/guard.err")"; fi
+fwd_on
+xdp_links "prog/xdp id 42 " "xdpdrv/id:77 "
+if xguard && closed xdp-program-swapped && grep -q 'runs program id 77,' "$WORK/guard.err"; then
+    pass "guard detects a swap in the short form (xdpdrv/id:N)"
+else fail "short-form swap not detected: $(cat "$WORK/guard.err")"; fi
+fwd_on
+xdp_links "prog/xdp id 420 " "prog/xdp id 42 "
+if xguard && closed xdp-program-swapped; then pass "guard does not prefix-match program ids (420 vs 42)"; else fail "id 420 accepted for 42: $(cat "$WORK/guard.err")"; fi
+# Malformed with parseable interface lines: closed and the listed links unpinned.
+for bad in "prog_id=42\nprog_tag=ZZ\ninterface=p6 2 access" "prog_tag=0123456789abcdef\ninterface=p6 2 access"; do
+    fwd_on
+    xdp_links "prog/xdp id 42 " "prog/xdp id 42 "
+    printf '%b\n' "$bad" >"$XST"
+    if xguard && closed xdp-state-malformed && [ ! -e "$XPINS/link_2" ]; then :; else fail "malformed state '$bad' not failed closed: $(cat "$WORK/guard.err")"; fi
+done
+# Malformed without a parseable interface: forwarding off (the guard cannot
+# know which links to unpin; QA WU6/8 finding: the message still says the
+# listed interfaces' links were unpinned).
+for bad in "" "prog_id=4x2" "prog_id=42\nprog_tag=0123456789abcdef\ninterface=p6 two access"; do
+    fwd_on
+    xdp_links "prog/xdp id 42 " "prog/xdp id 42 "
+    printf '%b\n' "$bad" >"$XST"
+    if xguard && closed xdp-state-malformed && [ ! -e "$XPINS/link_2" ] && [ ! -e "$XPINS/link_3" ] && [ -e "$XPINS/OUT6" ] &&
+        grep -q 'every link pin under .* was unpinned (2)' "$WORK/guard.err" && ! grep -q "listed interfaces" "$WORK/guard.err"; then :
+    else fail "malformed state '$bad' not failed closed: $(cat "$WORK/guard.err")"; fi
+done
+# QA-1: no interface in the state file and no link pin: says so.
+fwd_on
+xdp_links "prog/xdp id 42 " "prog/xdp id 42 "
+rm -f "$XPINS"/link_*
+: >"$XST"
+if xguard && closed xdp-state-malformed && grep -q 'no link pin under .* to unpin' "$WORK/guard.err"; then
+    pass "guard unpins every link pin when the state file names no interface, and reports what it did"
+else fail "no-interface message: $(cat "$WORK/guard.err")"; fi
+# SEC-W68-002: detach by the live name of the ifindex, not the state file's.
+fwd_on
+xdp_links "prog/xdp id 77 " "prog/xdp id 42 "
+xdp_state 42
+sed -i.bak 's/^interface=p6 2 /interface=renamed0 2 /' "$XST"
+if xguard && closed xdp-program-swapped && grep -q 'ip link set dev p6 xdpgeneric off' "$STATE/calls" &&
+    ! grep -q 'renamed0' "$STATE/calls" && grep -q 'p6 (ifindex 2) runs program id 77' "$WORK/guard.err" &&
+    grep -q 'fast path detached' "$WORK/guard.err"; then
+    pass "guard detaches by the listed name of the ifindex, not the state file's name"
+else fail "detach by state-file name: $(grep 'ip link set' "$STATE/calls"; cat "$WORK/guard.err")"; fi
+pass "guard fails closed on empty, non-numeric id, bad ifindex, bad tag and missing id state files"
+fwd_on
+xdp_state 42
+xdp_links "prog/xdp id 42 " "prog/xdp id 42 "
+: >"$STATE/links.fail"
+if xguard && closed xdp-unverifiable && [ ! -e "$XPINS/link_2" ] && [ ! -e "$XPINS/link_3" ]; then
+    pass "guard fails closed (xdp-unverifiable) when ip -o -d link show fails"
+else fail "unverifiable not handled: $(cat "$WORK/guard.err")"; fi
+rm -f "$STATE/links.fail"
+fwd_on
+xdp_links "" ""
+sed -i.bak '/^3: /d' "$STATE/links"
+if xguard && quiet; then pass "guard ignores a state-file interface absent from the listing"; else fail "absent interface: $(cat "$WORK/guard.err")"; fi
+# Forwarding already off: an undetachable swap still exits 1 and is reported.
+fwd_on
+echo 0 >"$STATE/sysctl.net.ipv4.ip_forward"; echo 0 >"$STATE/sysctl.net.ipv6.conf.all.forwarding"
+xdp_links "prog/xdp id 77 " ""
+: >"$STATE/xdp.sticky"
+if ! xguard && ! grep -q 'sysctl -qw' "$STATE/calls" && grep -q 'could NOT be detached' "$WORK/guard.err"; then
+    pass "guard exits 1 on an undetachable swap even with forwarding already off"
+else fail "undetachable swap with forwarding off: $(cat "$WORK/guard.err")"; fi
+fwd_on
+xdp_links "prog/xdp id 77 " ""
+: >"$STATE/sysctl.fail"
+if ! xguard && grep -q 'forwarding could NOT be disabled' "$WORK/guard.err"; then
+    pass "guard exits 1 when forwarding cannot be disabled after a swap"
+else fail "sysctl failure not reported: $(cat "$WORK/guard.err")"; fi
+rm -f "$STATE/sysctl.fail"
+xdp_state 42
+fwd_on
+: >"$WORK/guard.err"
+if [ ! -e /run/plat/xdp.state ]; then
+    xdp_links "prog/xdp id 77 " ""
+    if PLAT_XDP_STATE=$XST PLAT_NFT_RULES=$RULES PATH="$BIN:$PATH" STATE=$STATE sh "$GUARD" 2>/dev/null && quiet; then
+        pass "XDP test hooks ignored without PLAT_TEST_MODE=1"
+    else fail "guard honoured PLAT_XDP_STATE outside test mode"; fi
+fi
+
+# --- 4c. XDP units and tmpfiles (static; real behaviour: e2e.sh E2E_UNITS=1) --
+SD=$ROOT/deploy/systemd
+XTMP=$SD/plat-xdp.tmpfiles.conf
+if grep -Eq '^d +/run/plat +0755 +root +root ' "$XTMP" && grep -Eq '^z +/run/plat/bpf +2750 +root +plat ' "$XTMP"; then
+    pass "plat-xdp.tmpfiles.conf: /run/plat 0755 root:root, /run/plat/bpf 2750 root:plat"
+else fail "plat-xdp.tmpfiles.conf entries"; fi
+unit_val() {
+    uv_unit=$1 uv_key=$2
+    sed -n "s/^$uv_key=//p" "$SD/$uv_unit"
+}
+if [ "$(unit_val plat-xdp.service CapabilityBoundingSet)" = "CAP_BPF CAP_NET_ADMIN" ] &&
+    [ "$(unit_val plat-xdp.service AmbientCapabilities)" = "CAP_BPF CAP_NET_ADMIN" ] &&
+    [ "$(unit_val plat-xdp.service Group)" = plat ] && [ "$(unit_val plat-xdp.service User)" = root ] &&
+    [ "$(unit_val plat-xdp.service RemainAfterExit)" = yes ] &&
+    unit_val plat-xdp.service ExecStart | grep -q ' attach --config /etc/plat/platd.toml$' &&
+    unit_val plat-xdp.service ExecStop | grep -q ' detach$' &&
+    unit_val plat-xdp.service ExecStopPost | grep -qx '/usr/libexec/plat/plat-xdp-loader detach' &&
+    unit_val plat-xdp.service ExecStartPre | grep -q '^+/usr/bin/systemd-tmpfiles --create /usr/lib/tmpfiles.d/plat-xdp.conf$' &&
+    [ "$(unit_val plat-xdp.service ReadWritePaths)" = /run/plat ]; then
+    pass "plat-xdp.service: CAP_BPF + CAP_NET_ADMIN only, root:plat, attach/detach, tmpfiles"
+else fail "plat-xdp.service privileges or commands"; fi
+if unit_val plat-xdp.service PartOf | grep -qx platd.service && unit_val plat-xdp.service BindsTo | grep -qx platd.service &&
+    unit_val plat-xdp.service Before | grep -qx platd.service &&
+    unit_val platd.service.d.example/xdp.conf Requires | grep -qx plat-xdp.service &&
+    unit_val platd.service.d.example/xdp.conf After | grep -qx plat-xdp.service; then
+    pass "plat-xdp.service bound to platd both ways (fresh attach on every platd start)"
+else fail "plat-xdp.service / platd binding"; fi
+if [ "$(unit_val platd.service.d.example/xdp.conf SystemCallFilter)" = bpf ] &&
+    ! grep -Eq '^(CapabilityBoundingSet|AmbientCapabilities|ProcSubset|ProtectProc|ReadWritePaths)=' "$SD/platd.service.d.example/xdp.conf"; then
+    pass "platd xdp drop-in adds only the bpf syscall (no capability, /proc/self kept)"
+else fail "platd xdp drop-in"; fi
+if [ "$(unit_val run-plat-bpf.mount Where)" = /run/plat/bpf ] && [ "$(unit_val run-plat-bpf.mount Type)" = bpf ] &&
+    unit_val run-plat-bpf.mount Options | grep -q '^mode=0750,nosuid,nodev,noexec$'; then
+    pass "run-plat-bpf.mount: dedicated bpffs at /run/plat/bpf"
+else fail "run-plat-bpf.mount"; fi
+if unit_val plat-fwguard.service ReadWritePaths | grep -qx -- '-/run/plat/bpf' &&
+    [ "$(unit_val plat-fwguard.service CapabilityBoundingSet)" = CAP_NET_ADMIN ]; then
+    pass "plat-fwguard.service can unpin XDP links with CAP_NET_ADMIN only"
+else fail "plat-fwguard.service XDP paths"; fi
+if [ "$(unit_val plat-xdp.service Type)" = oneshot ] && [ "$(unit_val plat-xdp.service NoNewPrivileges)" = yes ] &&
+    [ "$(unit_val plat-xdp.service IPAddressDeny)" = any ] &&
+    [ "$(unit_val plat-xdp.service RestrictAddressFamilies)" = "AF_UNIX AF_NETLINK" ] &&
+    unit_val plat-xdp.service SecureBits | grep -q noroot-locked &&
+    unit_val plat-xdp.service ProtectSystem | grep -qx strict &&
+    unit_val platd.service.d.example/xdp.conf RequiresMountsFor | grep -qx /run/plat/bpf &&
+    unit_val platd.service.d.example/xdp.conf ReadOnlyPaths | grep -qx /run/plat; then
+    pass "plat-xdp.service sandbox (oneshot, NNP, noroot-locked, no IP) and drop-in mount/read-only paths"
+else fail "plat-xdp.service sandbox or drop-in mount dependency"; fi
+PKG=$ROOT/services/platd/Cargo.toml
+pkg_ok=1
+for f in deploy/systemd/plat-xdp.service deploy/systemd/run-plat-bpf.mount deploy/systemd/plat-xdp.tmpfiles.conf \
+    deploy/systemd/platd.service.d.example/xdp.conf target/release/plat-xdp-loader; do
+    [ "$(grep -c "$f\"" "$PKG")" -eq 2 ] || { fail "packaging: $f not in both the deb and the rpm assets"; pkg_ok=0; }
+done
+[ "$pkg_ok" = 0 ] || pass "packaging lists the loader and the XDP units (deb and rpm)"
 
 # --- 5. cluster announce/withdraw hooks (deploy/hooks) ------------------------
 ANNOUNCE=$ROOT/deploy/hooks/frr-announce.sh

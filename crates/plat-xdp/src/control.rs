@@ -132,12 +132,24 @@ pub enum Stale {
 /// `slots` words through the mmap at start. An all-`FREE` `SLOT` also
 /// proves `OUT6` / `IN4` empty: the loader inserts nothing and every
 /// writer install stores a non-zero header before any entry is published.
-/// On success `CONTROL.deadline_ns` becomes 1 (in the past: the program
-/// still passes everything), which marks the maps consumed, so a second
-/// `platd` on the same pins is refused even before this one installs.
+///
+/// SEC-007: the claim itself is one `compare_exchange(0, 1)` on
+/// `CONTROL.deadline_ns`, taken *before* the `SLOT` scan, so of two
+/// processes racing on the same pins exactly one wins and the other gets
+/// [`Stale::ControlUsed`]. Deadline 1 is in the past: the program still
+/// passes everything. A claim refused by the scan keeps the mark (the
+/// maps are stale either way; clearing it would reopen the race).
 pub fn claim_fresh(control: &XdpControl, slot_mem: &dyn Words, slots: u32) -> Result<(), Stale> {
     let c = control.read();
-    if c.enabled != 0 || c.deadline_ns != 0 || c.tun_ifindex != 0 || c.tun_mtu != 0 {
+    if c.enabled != 0 || c.tun_ifindex != 0 || c.tun_mtu != 0 {
+        return Err(Stale::ControlUsed);
+    }
+    let Some(deadline) = control.w(W_DEADLINE) else {
+        return Err(Stale::ControlUsed);
+    };
+    // AcqRel: the winner's later stores are ordered after the claim, and a
+    // loser observes every store the winner made before it.
+    if deadline.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
         return Err(Stale::ControlUsed);
     }
     let w = slot_mem.words();
@@ -147,7 +159,6 @@ pub fn claim_fresh(control: &XdpControl, slot_mem: &dyn Words, slots: u32) -> Re
             return Err(Stale::SlotUsed(i));
         }
     }
-    control.heartbeat(1);
     fence(Ordering::SeqCst);
     Ok(())
 }
@@ -476,11 +487,38 @@ mod tests {
             w.store(SlotRec::hdr_word(SLOT_DEAD, 0, 1), Ordering::Relaxed);
         }
         assert_eq!(claim_fresh(&c2, &slots, 8), Err(Stale::SlotUsed(5)));
-        assert_eq!(c2.read().deadline_ns, 0, "a refused claim marks nothing");
+        assert_eq!(c2.read().deadline_ns, 1, "SEC-007: the claim is taken before the scan and kept");
+        assert_eq!(claim_fresh(&c2, &HeapWords::new(8 * SLOT_WORDS), 8), Err(Stale::ControlUsed), "still consumed");
         let c3 = XdpControl::with_mem(Arc::new(HeapWords::new(3)));
         assert!(c3.enable(7, 1500, 9));
         c3.disable();
         assert_eq!(claim_fresh(&c3, &HeapWords::new(8), 1), Err(Stale::ControlUsed), "enabled once");
+    }
+
+    /// SEC-007: of many claims racing on the same fresh maps exactly one
+    /// succeeds; every other one is refused `ControlUsed` (the claim is a
+    /// compare-exchange, not check-then-set).
+    #[test]
+    fn racing_claims_have_one_winner() {
+        use plat_xdp_core::abi::SLOT_WORDS;
+        for _ in 0..200 {
+            let c = XdpControl::with_mem(Arc::new(HeapWords::new(3)));
+            let slots = Arc::new(HeapWords::new(64 * SLOT_WORDS));
+            let go = Arc::new(std::sync::Barrier::new(8));
+            let hs: Vec<_> = (0..8)
+                .map(|_| {
+                    let (c, slots, go) = (c.clone(), Arc::clone(&slots), Arc::clone(&go));
+                    std::thread::spawn(move || {
+                        go.wait();
+                        claim_fresh(&c, &*slots, 64)
+                    })
+                })
+                .collect();
+            let rs: Vec<_> = hs.into_iter().map(|h| h.join().unwrap_or(Err(Stale::SlotUsed(u32::MAX)))).collect();
+            assert_eq!(rs.iter().filter(|r| r.is_ok()).count(), 1, "{rs:?}");
+            assert!(rs.iter().all(|r| matches!(r, Ok(()) | Err(Stale::ControlUsed))), "{rs:?}");
+            assert_eq!(c.read().deadline_ns, 1);
+        }
     }
 
     /// SEC-002: a source that stops (a stuck or dead publisher thread)

@@ -88,6 +88,13 @@ assets = [
     ["../../deploy/hooks/frr-withdraw.sh", "usr/libexec/plat/", "755"],
     ["../../deploy/systemd/platd.service.d.example/v6-announce.conf", "usr/share/doc/platd/examples/platd.service.d/", "644"],
     ["../../deploy/systemd/frr.service.d.example/plat-v6-announce.conf", "usr/share/doc/platd/examples/frr.service.d/", "644"],
+    # XDP fast path (POAM-016; off unless [xdp] and the platd drop-in are
+    # installed). The loader needs `make dist XDP=1` (embedded object).
+    ["target/release/plat-xdp-loader", "usr/libexec/plat/", "755"],
+    ["../../deploy/systemd/plat-xdp.service", "usr/lib/systemd/system/", "644"],
+    ["../../deploy/systemd/run-plat-bpf.mount", "usr/lib/systemd/system/", "644"],
+    ["../../deploy/systemd/plat-xdp.tmpfiles.conf", "usr/lib/tmpfiles.d/plat-xdp.conf", "644"],
+    ["../../deploy/systemd/platd.service.d.example/xdp.conf", "usr/share/doc/platd/examples/platd.service.d/", "644"],
 ]
 
 [package.metadata.generate-rpm]
@@ -113,4 +120,9 @@ assets = [
     { source = "../../deploy/hooks/frr-withdraw.sh", dest = "/usr/libexec/plat/frr-withdraw.sh", mode = "755" },
     { source = "../../deploy/systemd/platd.service.d.example/v6-announce.conf", dest = "/usr/share/doc/platd/examples/platd.service.d/v6-announce.conf", mode = "644", doc = true },
     { source = "../../deploy/systemd/frr.service.d.example/plat-v6-announce.conf", dest = "/usr/share/doc/platd/examples/frr.service.d/plat-v6-announce.conf", mode = "644", doc = true },
+    { source = "target/release/plat-xdp-loader", dest = "/usr/libexec/plat/plat-xdp-loader", mode = "755" },
+    { source = "../../deploy/systemd/plat-xdp.service", dest = "/usr/lib/systemd/system/plat-xdp.service", mode = "644" },
+    { source = "../../deploy/systemd/run-plat-bpf.mount", dest = "/usr/lib/systemd/system/run-plat-bpf.mount", mode = "644" },
+    { source = "../../deploy/systemd/plat-xdp.tmpfiles.conf", dest = "/usr/lib/tmpfiles.d/plat-xdp.conf", mode = "644" },
+    { source = "../../deploy/systemd/platd.service.d.example/xdp.conf", dest = "/usr/share/doc/platd/examples/platd.service.d/xdp.conf", mode = "644", doc = true },
 ]

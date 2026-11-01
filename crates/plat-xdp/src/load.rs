@@ -613,57 +613,33 @@ mod linux {
                 .map_err(ebpf("program type"))?;
             xdp.load().map_err(ebpf("verifier"))?;
             let info = xdp.info().map_err(ebpf("program info"))?;
+            let prog = (info.id(), format!("{:016x}", info.tag()));
 
-            // Fresh maps: drop the previous run's pins (a running program
-            // keeps its own maps until its link is updated below).
-            for m in MAPS {
-                remove_pin(&dir.join(m.name))?;
-            }
-            remove_pin(&dir.join(PROG_PIN))?;
+            // From here on every error path rolls back completely (SEC-W68-001):
+            // every link pin under `dir` (new, replaced or stale), every map
+            // and program pin, and the state file, so a failed attach leaves
+            // nothing attached and nothing for fwguard to miss. systemd does
+            // not run ExecStop when ExecStart fails; ExecStopPost=... detach
+            // repeats this for a loader that was killed mid-way.
             let mut created = Vec::new();
-            // Fail closed with nothing half-published: platd finds no pins
-            // (maps_unavailable) and the new links are gone. A link that was
-            // already replaced keeps the new program until the next attach
-            // or detach. The previous state file is stale either way.
-            let rollback = |created: Vec<PathBuf>| {
-                for path in MAPS.iter().map(|m| dir.join(m.name)).chain([dir.join(PROG_PIN)]).chain(created) {
-                    let _ = remove_pin(&path);
-                }
-                if let Some(s) = &state {
-                    let _ = s.remove();
-                }
-            };
-            let attached = match publish(&mut e, p, dir, &ifaces, &mut created) {
-                Ok(a) => a,
+            match publish_and_record(&mut e, p, dir, &ifaces, prog, state.as_ref(), &mut created) {
+                Ok(r) => Ok(r),
                 Err(err) => {
-                    rollback(created);
-                    return Err(err);
+                    rollback(dir, state.as_ref(), created);
+                    Err(err)
                 }
-            };
-
-            let report = AttachReport {
-                object_sha256: crate::object_sha256_hex(),
-                prog_id: info.id(),
-                prog_tag: format!("{:016x}", info.tag()),
-                mode: p.xdp.mode,
-                interfaces: attached,
-                nonce: p.nonce,
-            };
-            // QA F2: an attach whose state file cannot be written is rolled
-            // back, so a failed unit never leaves the fast path live.
-            if let Some(s) = &state
-                && let Err(err) = s.write(&report.state_text())
-            {
-                rollback(created);
-                return Err(err);
             }
-            Ok(report)
         }
 
         /// Detaches (unpins every link) and removes every pin under `dir`
-        /// and the state file. Returns the removed pin names.
+        /// and the state file. Returns the removed pin names. Nothing to
+        /// remove is success (`ExecStopPost=` runs it after every stop and
+        /// every failed start, also when `/run/plat` does not exist yet).
         pub fn detach(dir: &Path, state_file: Option<&Path>) -> Result<Vec<String>, LoadError> {
-            let state = state_file.map(StateDir::open).transpose()?;
+            let state = match state_file.map(StateDir::open).transpose() {
+                Err(LoadError::Io(_, e)) if e.kind() == io::ErrorKind::NotFound => None,
+                r => r?,
+            };
             let mut gone = Vec::new();
             for l in link_pins(dir)? {
                 if remove_pin(&dir.join(&l))? {
@@ -698,6 +674,60 @@ mod linux {
                 }
             }
             Ok(s)
+        }
+    }
+
+    /// Drops the previous run's map and program pins, publishes the new
+    /// ones ([`publish`]) and writes the state file (QA F2: an attach whose
+    /// state file cannot be written fails, and the caller rolls it back).
+    fn publish_and_record(
+        e: &mut Ebpf,
+        p: &LoadParams,
+        dir: &Path,
+        ifaces: &[Iface],
+        prog: (u32, String),
+        state: Option<&StateDir>,
+        created: &mut Vec<PathBuf>,
+    ) -> Result<AttachReport, LoadError> {
+        // Fresh maps: drop the previous run's pins (a running program
+        // keeps its own maps until its link is updated below).
+        for m in MAPS {
+            remove_pin(&dir.join(m.name))?;
+        }
+        remove_pin(&dir.join(PROG_PIN))?;
+        let attached = publish(e, p, dir, ifaces, created)?;
+        let report = AttachReport {
+            object_sha256: crate::object_sha256_hex(),
+            prog_id: prog.0,
+            prog_tag: prog.1,
+            mode: p.xdp.mode,
+            interfaces: attached,
+            nonce: p.nonce,
+        };
+        if let Some(s) = state {
+            s.write(&report.state_text())?;
+        }
+        Ok(report)
+    }
+
+    /// Fail closed after a failed attach (best effort, every step tried):
+    /// unpins every link under `dir` (detaching it; `created` covers a
+    /// directory that cannot be listed), every map and program pin, and
+    /// removes the state file. `platd` then finds no maps
+    /// (maps_unavailable) and plat-fwguard no orphan.
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: SC-24 (Fail in Known State), SC-7 - no fast path is
+    ///   left attached without its state file
+    pub(crate) fn rollback(dir: &Path, state: Option<&StateDir>, created: Vec<PathBuf>) {
+        let links = link_pins(dir).unwrap_or_default().into_iter().map(|l| dir.join(l));
+        for path in
+            created.into_iter().chain(links).chain(MAPS.iter().map(|m| dir.join(m.name))).chain([dir.join(PROG_PIN)])
+        {
+            let _ = remove_pin(&path);
+        }
+        if let Some(s) = state {
+            let _ = s.remove();
         }
     }
 
@@ -883,6 +913,45 @@ mod state_tests {
         assert!(s.remove().unwrap_or_else(|e| panic!("{e}")));
         assert!(!s.remove().unwrap_or_else(|e| panic!("{e}")));
         assert!(d.join("other").exists(), "only the state file's own name is unlinked");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// SEC-W68-001: a failed attach removes every link pin (new, replaced
+    /// or stale), every map and program pin and the state file; nothing
+    /// else in the directory.
+    #[test]
+    fn rollback_unpins_every_link_map_and_program_and_the_state() {
+        let d = tmpdir("rollback");
+        let pins = d.join("bpf");
+        fs::create_dir(&pins).unwrap_or_else(|e| panic!("{e}"));
+        let mut names: Vec<String> = crate::maps::MAPS.iter().map(|m| m.name.to_string()).collect();
+        names.extend([crate::maps::PROG_PIN.to_string(), "link_2".into(), "link_3".into(), "link_99".into()]);
+        for n in &names {
+            fs::write(pins.join(n), "").unwrap_or_else(|e| panic!("{e}"));
+        }
+        fs::write(pins.join("other"), "").unwrap_or_else(|e| panic!("{e}"));
+        let sf = d.join("xdp.state");
+        let s = StateDir::open(&sf).unwrap_or_else(|e| panic!("{e}"));
+        s.write("prog_id=1\n").unwrap_or_else(|e| panic!("{e}"));
+        // A created pin that is gone already is no error.
+        super::linux::rollback(&pins, Some(&s), vec![pins.join("link_2"), pins.join("link_7")]);
+        let left: Vec<String> = fs::read_dir(&pins)
+            .map(|r| r.filter_map(|e| e.ok()?.file_name().into_string().ok()).collect())
+            .unwrap_or_default();
+        assert_eq!(left, ["other"]);
+        assert!(!sf.exists());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// ExecStopPost= detach: nothing attached, no pin directory and no
+    /// state directory are all success.
+    #[test]
+    fn detach_with_nothing_attached_succeeds() {
+        let d = tmpdir("detach");
+        let gone = super::Loader::detach(&d.join("bpf"), Some(&d.join("absent/xdp.state")));
+        assert!(matches!(gone.as_deref(), Ok([])), "{gone:?}");
+        let gone = super::Loader::detach(&d, Some(&d.join("xdp.state")));
+        assert!(matches!(gone.as_deref(), Ok([])), "{gone:?}");
         let _ = fs::remove_dir_all(&d);
     }
 

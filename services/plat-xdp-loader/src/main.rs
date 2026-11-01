@@ -1,6 +1,6 @@
 //! `plat-xdp-loader`: the one-shot privileged step of the XDP fast path
 //! (plan §7). Run by `plat-xdp.service` (`ExecStart=… attach`, `ExecStop=…
-//! detach`) as root with only `CAP_BPF` and `CAP_NET_ADMIN`; it creates
+//! detach`, `ExecStopPost=… detach`) as root with only `CAP_BPF` and `CAP_NET_ADMIN`; it creates
 //! fresh maps, seeds and freezes them, loads, pins and attaches the
 //! embedded program under the dedicated bpffs mount `/run/plat/bpf`, writes
 //! `/run/plat/xdp.state`, and exits. Nothing privileged keeps running;
@@ -12,9 +12,11 @@
 //! - `status`: which pins exist, and the state file.
 //!
 //! Logs go to stderr (journald). Exit codes: 0 ok, 1 refused or failed,
-//! 2 usage or configuration error. A failed attach removes the pins it
-//! created and the stale state file (fail closed: `platd` then finds no
-//! maps).
+//! 2 usage or configuration error. A failed attach (any error after the
+//! program is loaded) unpins every link, map and program pin and removes
+//! the state file, so nothing is left attached (fail closed: `platd` then
+//! finds no maps, SEC-W68-001). `detach` with nothing attached, or without
+//! `/run/plat`, succeeds (`ExecStopPost=` runs it after a failed start).
 //!
 //! The program derives the frame length with `bpf_xdp_get_buff_len`, not
 //! by subtracting packet pointers, so CAP_BPF and CAP_NET_ADMIN suffice and the verifier keeps its

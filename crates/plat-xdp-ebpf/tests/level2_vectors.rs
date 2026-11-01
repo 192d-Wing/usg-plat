@@ -368,15 +368,16 @@ fn fix_v4_csum(p: &mut [u8]) {
 /// recomputed. The Ethernet addresses differ by design (the core vectors use
 /// one FIB MAC pair, the namespace one per egress), so they are checked
 /// against the namespace's FIB result instead (plan §2.4).
-fn assert_independent(name: &str, got: &[u8]) {
-    let Some((_, v6, core)) = INDEPENDENT.iter().find(|(n, _, _)| *n == name) else {
-        panic!("{name}: redirect without an independent expected output");
+fn assert_independent(name: &str, got: &[u8], extra: Option<&(bool, Vec<u8>)>) {
+    let (v6, mut want) = match (INDEPENDENT.iter().find(|(n, _, _)| *n == name), extra) {
+        (Some((_, v6, core)), None) => (*v6, core_expected(if *v6 { CORE_V6 } else { CORE_V4 }, core)),
+        (None, Some((v6, want))) => (*v6, want.clone()),
+        _ => panic!("{name}: redirect without exactly one independent expected output"),
     };
-    let mut want = core_expected(if *v6 { CORE_V6 } else { CORE_V4 }, core);
-    let (smac, dmac) = if *v6 { (UP0_MAC, UP0_NH) } else { (ACC0_MAC, ACC0_NH) };
+    let (smac, dmac) = if v6 { (UP0_MAC, UP0_NH) } else { (ACC0_MAC, ACC0_NH) };
     assert_eq!(got[..6], dmac, "{name}: destination MAC");
     assert_eq!(got[6..12], smac, "{name}: source MAC");
-    if *v6 {
+    if v6 {
         if got[20] & 0x40 != 0 {
             assert_eq!(got[18..20], [0, 0], "{name}: DF set with a non-zero ID");
         }
@@ -384,6 +385,79 @@ fn assert_independent(name: &str, got: &[u8]) {
         fix_v4_csum(&mut want);
     }
     assert_eq!(hex(&got[12..]), hex(&want[12..]), "{name}: differs from the independent reference");
+}
+
+/// RFC 1071 sum of `b` as big-endian 16-bit words (odd tail padded with
+/// zero), written out here independently of `plat-xdp-core::csum`.
+fn ref_sum(b: &[u8]) -> u32 {
+    b.chunks(2).map(|c| u32::from(u16::from_be_bytes([c[0], c.get(1).copied().unwrap_or(0)]))).sum()
+}
+
+/// Folds and complements; a computed 0 is sent as 0xFFFF (RFC 768).
+fn ref_finish(mut s: u32) -> u16 {
+    while s > 0xffff {
+        s = (s & 0xffff) + (s >> 16);
+    }
+    match !(s as u16) {
+        0 => 0xffff,
+        c => c,
+    }
+}
+
+/// `frame` (Ethernet + IPv6 or option-less IPv4 + UDP) with its payload
+/// replaced by `payload`: IP and UDP lengths updated, the IPv4 header
+/// checksum and the full UDP checksum recomputed from scratch (RFC 768,
+/// RFC 8200 §8.1). Builds both the inputs and the independent expected
+/// outputs of the odd-length vectors (RFC-008), so neither goes through
+/// the incremental update the program implements.
+fn with_payload(frame: &[u8], payload: &[u8]) -> Vec<u8> {
+    let v6 = frame[12..14] == [0x86, 0xdd];
+    let udp = if v6 { 14 + 40 } else { 14 + 20 };
+    let ulen = (8 + payload.len()) as u16;
+    let mut f = frame[..udp + 8].to_vec();
+    f.extend_from_slice(payload);
+    f[udp + 4..udp + 6].copy_from_slice(&ulen.to_be_bytes());
+    f[udp + 6..udp + 8].copy_from_slice(&[0, 0]);
+    let pseudo = if v6 {
+        f[18..20].copy_from_slice(&ulen.to_be_bytes());
+        ref_sum(&f[22..54])
+    } else {
+        f[16..18].copy_from_slice(&(20 + ulen).to_be_bytes());
+        fix_v4_csum(&mut f);
+        ref_sum(&f[26..34])
+    };
+    let c = ref_finish(pseudo + u32::from(ulen) + 17 + ref_sum(&f[udp..]));
+    f[udp + 6..udp + 8].copy_from_slice(&c.to_be_bytes());
+    f
+}
+
+/// Name, ingress, frame, expected verdict, and for a redirect the
+/// independent expected output (`true` = IPv6 -> IPv4).
+type OddVector = (String, u32, Vec<u8>, Want, Option<(bool, Vec<u8>)>);
+
+/// RFC-008: payloads giving UDP lengths of 1, 2 and 3 mod 4 (the
+/// program's checksum tail and byte-swap paths), valid in both directions
+/// with an independent expected output, and the same frames with the last
+/// (tail) payload byte corrupted, which must be declined.
+fn odd_length_vectors() -> Vec<OddVector> {
+    const BYTES: [u8; 11] = [0xff, 0xfe, 0x01, 0x80, 0x7f, 0x00, 0xa5, 0x5a, 0xc3, 0xff, 0x3c];
+    let mut v = Vec::new();
+    for (dir, ingress, file, core) in [("v6", ACC, CORE_V6, "spike_5b_payload"), ("v4", UP, CORE_V4, "in_5b_payload")] {
+        let (input, out) = (core_input(file, core), core_expected(file, core));
+        for n in [9usize, 10, 11] {
+            let ulen = 8 + n;
+            let payload = &BYTES[..n];
+            let good = with_payload(&input, payload);
+            let want = with_payload(&out, payload);
+            let name = format!("{dir}_udp_len_{ulen}_mod4_{}", ulen % 4);
+            let mut bad = good.clone();
+            let last = bad.len() - 1;
+            bad[last] ^= 0x01;
+            v.push((format!("{name}_corrupt"), ingress, bad, Want::Pass(PassReason::UdpCsumUnverified), None));
+            v.push((name, ingress, good, Want::Redirect, Some((dir == "v6", want))));
+        }
+    }
+    v
 }
 
 fn generate() -> String {
@@ -532,13 +606,14 @@ fn generate() -> String {
     ];
     let frames = frames
         .into_iter()
-        .map(|(n, i, f, w)| (n, i, f, w, None))
-        .chain(declines.into_iter().chain(rfc_declines).map(|(n, i, f, w, o)| (n, i, f, w, Some(o))));
+        .map(|(n, i, f, w)| (n.to_string(), i, f, w, None, None))
+        .chain(declines.into_iter().chain(rfc_declines).map(|(n, i, f, w, o)| (n.to_string(), i, f, w, Some(o), None)))
+        .chain(odd_length_vectors().into_iter().map(|(n, i, f, w, x)| (n, i, f, w, None, x)));
 
     let mut idents = BTreeSet::new();
     let mut lines = String::new();
-    for (name, ingress, frame, want, ovr) in frames {
-        let (name, ingress, frame, want) = (&name, &ingress, &frame, &want);
+    for (name, ingress, frame, want, ovr, extra) in frames {
+        let (name, ingress, frame, want) = (name.as_str(), &ingress, &frame, &want);
         let mut env = NsEnv::new();
         if let Some(o) = ovr {
             o.apply(&mut env);
@@ -549,7 +624,7 @@ fn generate() -> String {
         match (want, action.pass_reason()) {
             (Want::Redirect, None) => {
                 let (eg, o) = apply(frame, &out, &action).unwrap_or_else(|| panic!("{name}: no redirect"));
-                assert_independent(name, &o);
+                assert_independent(name, &o, extra.as_ref());
                 writeln!(
                     lines,
                     "frame {name} {} redirect {} {SLOT} {} {}",
@@ -665,9 +740,27 @@ fn vectors_cover_both_directions_and_declines() {
         assert!(v.lines().any(|l| l.starts_with(&format!("frame {f} ")) && l.contains(&format!(" pass {r} "))), "{f}");
     }
     // RFC-002: every redirect is checked against an independent output.
+    let odd = odd_length_vectors();
     for l in v.lines().filter(|l| l.starts_with("frame ") && l.contains(" redirect ")) {
         let name = l.split_whitespace().nth(1).unwrap_or_default();
-        assert!(INDEPENDENT.iter().any(|(n, _, _)| *n == name), "{name}: no independent expected output");
+        assert!(
+            INDEPENDENT.iter().any(|(n, _, _)| *n == name) || odd.iter().any(|o| o.0 == name && o.4.is_some()),
+            "{name}: no independent expected output"
+        );
+    }
+    // RFC-008: UDP length 1, 2 and 3 mod 4, valid and corrupt, both
+    // directions.
+    for d in ["v6", "v4"] {
+        for m in 1..=3 {
+            let valid = format!("_mod4_{m} ");
+            let bad = format!("_mod4_{m}_corrupt ");
+            let of = |tag: &str, verdict: &str| {
+                v.lines()
+                    .any(|l| l.starts_with(&format!("frame {d}_udp_len_")) && l.contains(tag) && l.contains(verdict))
+            };
+            assert!(of(&valid, " redirect "), "{d}: UDP length {m} mod 4, valid");
+            assert!(of(&bad, " pass udp_csum_unverified "), "{d}: UDP length {m} mod 4, corrupt");
+        }
     }
     for w in v.lines().filter(|l| l.starts_with("with ")) {
         let f = w.split_whitespace().nth(1).unwrap_or_default();
