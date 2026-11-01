@@ -973,8 +973,11 @@ fn backup_gap_and_restart_mid_snapshot_resync() {
     let repl_b = b.h().shared.repl.clone().unwrap();
     let s = (0..16u16).find(|s| repl_a.lock().owners(*s) == (Some(0), Some(1))).unwrap();
     let resyncs = repl_a.lock().stats.resync_total.load(std::sync::atomic::Ordering::Relaxed);
+    // Gaps may already have been counted while the cluster formed (a
+    // snapshot racing live records); only the injected one is asserted.
+    let gaps = repl_b.lock().stats.rx_gaps.load(std::sync::atomic::Ordering::Relaxed);
     repl_b.lock().on_data(0, Msg::BibDelete { slice: s, seq: u64::MAX / 2, proto: 17, v4: 0, port4: 1 }).unwrap();
-    assert_eq!(repl_b.lock().stats.rx_gaps.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(repl_b.lock().stats.rx_gaps.load(std::sync::atomic::Ordering::Relaxed), gaps + 1);
     wait("A resyncs on B's request", Duration::from_secs(5), || {
         repl_a.lock().stats.resync_total.load(std::sync::atomic::Ordering::Relaxed) > resyncs
     });

@@ -423,7 +423,8 @@ X
 # plat-fwguard.timer (Wants=), and the guard must not check the PLAT
 # namespace, which has no forward policy table, during the other cases.
 fwguard_in_ns() {
-    if [ "$1" = on ]; then
+    fg_mode=$1
+    if [ "$fg_mode" = on ]; then
         mkdir -p /run/systemd/system/plat-fwguard.service.d
         printf '[Service]\nNetworkNamespacePath=/run/netns/%s\n' "$NS_P" >/run/systemd/system/plat-fwguard.service.d/zz-e2e.conf
     else
@@ -468,15 +469,19 @@ state_id() { sed -n 's/^prog_id=//p' /run/plat/xdp.state 2>/dev/null; }
 
 # Waits up to $1 s for a fast path enabled by an attach other than prog id $2.
 wait_reattached() {
+    wr_secs=$1 wr_old=$2
     i=0
-    while [ "$(state_id)" = "$2" ] || [ -z "$(state_id)" ] || [ "$(metric plat_xdp_enabled 2>/dev/null)" != 1 ]; do
+    while [ "$(state_id)" = "$wr_old" ] || [ -z "$(state_id)" ] || [ "$(metric plat_xdp_enabled 2>/dev/null)" != 1 ]; do
         i=$((i + 1))
-        [ $i -lt $(($1 * 5)) ] || return 1
+        [ $i -lt $((wr_secs * 5)) ] || return 1
         sleep 0.2
     done
 }
 
-xdp_prog_on() { ip -n "$NS_P" -o -d link show dev "$1" | sed -n 's|.*prog/xdp id \([0-9]*\).*|\1|p'; }
+xdp_prog_on() {
+    xp_dev=$1
+    ip -n "$NS_P" -o -d link show dev "$xp_dev" | sed -n 's|.*prog/xdp id \([0-9]*\).*|\1|p'
+}
 
 units_cases() {
     # loader_privileges: exactly CAP_BPF (39) + CAP_NET_ADMIN (12), group

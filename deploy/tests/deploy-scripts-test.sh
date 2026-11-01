@@ -599,7 +599,10 @@ XTMP=$SD/plat-xdp.tmpfiles.conf
 if grep -Eq '^d +/run/plat +0755 +root +root ' "$XTMP" && grep -Eq '^z +/run/plat/bpf +2750 +root +plat ' "$XTMP"; then
     pass "plat-xdp.tmpfiles.conf: /run/plat 0755 root:root, /run/plat/bpf 2750 root:plat"
 else fail "plat-xdp.tmpfiles.conf entries"; fi
-unit_val() { sed -n "s/^$2=//p" "$SD/$1"; }
+unit_val() {
+    uv_unit=$1 uv_key=$2
+    sed -n "s/^$uv_key=//p" "$SD/$uv_unit"
+}
 if [ "$(unit_val plat-xdp.service CapabilityBoundingSet)" = "CAP_BPF CAP_NET_ADMIN" ] &&
     [ "$(unit_val plat-xdp.service AmbientCapabilities)" = "CAP_BPF CAP_NET_ADMIN" ] &&
     [ "$(unit_val plat-xdp.service Group)" = plat ] && [ "$(unit_val plat-xdp.service User)" = root ] &&

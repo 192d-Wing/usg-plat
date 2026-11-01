@@ -73,6 +73,7 @@ XDP_CONFIG=/etc/plat/platd.toml
 XDP_RECHECK=1
 case "${PLAT_FWGUARD_XDP_RECHECK_SECS:-}" in
     [0-9] | [12][0-9] | 30) XDP_RECHECK=$PLAT_FWGUARD_XDP_RECHECK_SECS ;;
+    *) ;;
 esac
 if [ "${PLAT_TEST_MODE:-0}" = 1 ]; then
     NFT_RULES=${PLAT_NFT_RULES:-$NFT_RULES}
@@ -122,8 +123,14 @@ xdp_conf_ifaces() {
 # From the listing in $links: the line and the name (without @peer) of an
 # ifindex, the ifindex of a name, and a line's XDP program id (details form
 # "prog/xdp id N [name X] [tag T]", short form "xdp[generic|drv|offload]/id:N").
-if_line() { printf '%s\n' "$links" | grep "^$1: " | head -n 1; }
-if_name() { if_line "$1" | sed -n 's/^[0-9][0-9]*: \([^:@ ][^:@ ]*\)[@:].*/\1/p'; }
+if_line() {
+    il_ifx=$1
+    printf '%s\n' "$links" | grep "^$il_ifx: " | head -n 1
+}
+if_name() {
+    in_ifx=$1
+    if_line "$in_ifx" | sed -n 's/^[0-9][0-9]*: \([^:@ ][^:@ ]*\)[@:].*/\1/p'
+}
 if_index() {
     re=$(printf '%s' "$1" | sed 's/\./\\./g')
     printf '%s\n' "$links" | sed -n "s/^\([0-9][0-9]*\): ${re}[@:].*/\1/p" | head -n 1
@@ -259,7 +266,7 @@ if [ -n "$xstate" ]; then
             removed=1
             nunpinned=$((nunpinned + 1))
         fi
-        case "$ifx" in *[!0-9]*) continue ;; esac
+        case "$ifx" in *[!0-9]*) continue ;; *) ;; esac
         name=
         if [ -n "$links" ]; then
             name=$(if_name "$ifx")
