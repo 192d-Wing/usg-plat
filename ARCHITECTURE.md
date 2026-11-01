@@ -129,8 +129,8 @@ a `platd` built without the `xdp` cargo feature) the data plane is TUN-only
 and none of this runs. Minimum kernel: **Linux 6.6 LTS** (the loader
 refuses older kernels, `plat_xdp::load::check_kernel`). Status: code
 complete, deploy units included (WU6; verified on one Ubuntu 24.04 /
-kernel 6.8 aarch64 VM, LINUX_VERIFICATION L26–L28, L31); the speed-up is
-not measured and x86_64 / bare metal are not verified (POAM-016).
+kernel 6.8 aarch64 VM, LINUX_VERIFICATION L26, L28, L31 PASS; L27 partial (veth only)); the speed-up is
+not measured, x86_64 / bare metal are not verified, and the maximum worker `bib4` hold (criterion ≤ 20 µs) is not measurable in the VM (0.3–0.9 ms with the mirror off too, vCPU preemption) and stays open in POAM-016.
 
 ```mermaid
 flowchart TD
@@ -262,7 +262,12 @@ flowchart TD
   the loader's state file (`/run/plat/xdp.state`) and, on mismatch, unpins
   the links, detaches the program and turns forwarding off (a program held
   by a foreign `bpf_link` cannot be detached without `CAP_SYS_ADMIN`:
-  POAM-037).
+  POAM-037). It also reports an XDP program or `/run/plat/bpf` pins found
+  without a loader state file (orphans, reason `xdp-orphan`) and fails closed
+  the same way. A mismatch is re-checked after
+  `PLAT_FWGUARD_XDP_RECHECK_SECS` (default 1 s, 0..=30) so a slow attach does
+  not trip it. `plat-xdp.service` also runs `detach` as `ExecStopPost=`, so an
+  attach that fails part-way leaves nothing attached.
 - **Not seen by the host filters.** Fast-path packets bypass netfilter,
   `rp_filter` and tc (POAM-037); egress drops of redirected packets are not
   visible to `platd` (POAM-039).

@@ -395,9 +395,13 @@ An eBPF/XDP program on the physical NICs can forward packets of established
 UDP sessions without the TUN (POAM-016 Phase 1; design in
 `ARCHITECTURE.md`). It is **off by default**: without an `[xdp]` section,
 or with `enabled = false`, the data plane is TUN-only and the section is
-not checked. Phase 1 is code-complete apart from the deploy units; the
-packages ship without the `xdp` feature, and the speed-up has not been
-measured (no bare-metal benchmark yet, `docs/performance.md`).
+not checked. Phase 1 is code-complete, deploy units included (WU6). Packages
+built with plain `make packages` carry the loader and the XDP units but not
+the `xdp` feature, so the loader refuses to attach; build them with
+`make packages XDP=1`. The speed-up has not been measured (no bare-metal
+benchmark yet, `docs/performance.md`), and the maximum worker `bib4` hold
+(criterion ≤ 20 µs) is not measurable in the VM (0.3–0.9 ms with the
+mirror off too, vCPU preemption) and stays open in POAM-016.
 
 Requirements and constraints:
 
@@ -407,8 +411,11 @@ Requirements and constraints:
   keeps the fast path off and records `xdp_fastpath_state` with reason
   `unsupported_host`.
 - **Build.** `platd` and `plat-xdp-loader` built with the `xdp` feature
-  (`make xdp`; needs the pinned `bpf-linker` from
-  `deploy/tests/xdp/install-bpf-linker.sh`). A
+  (`make xdp` builds and checks the eBPF object and the feature builds;
+  `make dist XDP=1` builds the release binaries and `make packages XDP=1`
+  the packages with the fast path; all need the pinned `bpf-linker` from
+  `deploy/tests/xdp/install-bpf-linker.sh`). Without `XDP=1` the loader
+  has no embedded object and refuses to attach. A
   `platd` without the feature, or off Linux, refuses to start when
   `[xdp] enabled = true`.
 - **Kernel setting.** `kernel.unprivileged_bpf_disabled` must be 1 or 2
@@ -442,10 +449,35 @@ example, `/usr/share/doc/platd/examples/platd.service.d/xdp.conf`; to
 enable the fast path copy it to `/etc/systemd/system/platd.service.d/` and
 run `systemctl daemon-reload`. `plat-xdp.service` is bound to
 `platd.service` (`PartOf=`, `BindsTo=`), so restarting `platd` re-runs the
-loader. If `plat-fwguard` finds a program other than the one the loader
-attached, it detaches it and turns forwarding off; restore with
-`systemctl restart platd`. Verified on one Ubuntu 24.04 / kernel 6.8
-aarch64 VM only (`docs/compliance/LINUX_VERIFICATION.md` L26–L28, L31).
+loader. The drop-in makes `platd` require the loader unit (`Requires=`), so
+**stopping `plat-xdp.service` also stops `platd`**: the whole translator,
+TUN path included, goes down; it does not fall back to TUN-only. To run
+TUN-only, set `[xdp] enabled = false` (or remove the drop-in), run
+`systemctl daemon-reload` and restart `platd`. If `plat-fwguard` finds a
+program other than the one the loader attached, it detaches it and turns
+forwarding off; restore with `systemctl restart platd`. Verified on one
+Ubuntu 24.04 / kernel 6.8 aarch64 VM only
+(`docs/compliance/LINUX_VERIFICATION.md` L26, L28, L31 PASS; L27 partial
+(veth only)).
+
+Manual install (from a source tree, after `make dist XDP=1`, which builds
+both `platd` and the loader with the `xdp` feature; packages install the
+same files, with the drop-in only as the example above):
+
+```sh
+install -m 0755 target/dist/platd /usr/bin/platd
+install -D -m 0755 target/dist/plat-xdp-loader \
+  /usr/libexec/plat/plat-xdp-loader
+install -m 0644 deploy/systemd/plat-xdp.service \
+  deploy/systemd/run-plat-bpf.mount /etc/systemd/system/
+install -D -m 0644 deploy/systemd/plat-xdp.tmpfiles.conf \
+  /usr/lib/tmpfiles.d/plat-xdp.conf
+install -D -m 0644 deploy/systemd/platd.service.d.example/xdp.conf \
+  /etc/systemd/system/platd.service.d/xdp.conf
+systemctl daemon-reload
+systemd-tmpfiles --create /usr/lib/tmpfiles.d/plat-xdp.conf
+systemctl restart platd
+```
 
 ```toml
 [xdp]
