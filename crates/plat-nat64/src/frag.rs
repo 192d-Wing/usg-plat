@@ -852,17 +852,21 @@ mod tests {
         }
         assert_eq!(t.len(), 0);
         assert_eq!(c.drops(DropReason::FragmentTimeout), 4, "four buffer slots held");
-        // Every slot came back.
+        // Every slot came back. The held cap is per hashed load bucket, so a
+        // new source that shares a bucket with an earlier one is refused by
+        // the cap (not by a lost slot): skip it and try the next source.
         let mut n = 0;
-        for id in 100..110 {
+        for id in 100..200 {
             if !t.can_buffer() {
                 break;
             }
             let i = t.get_or_insert(&key_from(u128::from(id), id), 6000, &c).unwrap();
-            t.buffer(i, &[0; 10], &c).unwrap();
-            n += 1;
+            if t.buffer(i, &[0; 10], &c).is_ok() {
+                n += 1;
+            }
         }
         assert_eq!(n, 4);
+        assert!(!t.can_buffer(), "all four slots are in use again");
     }
 
     #[test]
