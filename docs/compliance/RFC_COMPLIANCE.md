@@ -145,7 +145,37 @@ exceeds `ipv4_mtu` is split as IPv4 fragments (DF=0) rather than answered
 with Packet Too Big; a hairpinned ≤ 1280-byte packet above `ipv4_mtu` is
 looped back whole.
 
-## XDP fast path (POAM-016 Phase 1, `[xdp]`; WU5)
+## XDP fast path (POAM-016 Phase 1, `[xdp]`, off by default)
+
+Scope: `main` @ `9a9c752` (WU1–WU5, WU7). Only established UDP sessions
+take the fast path; every other packet is passed unmodified to the slow
+path, whose rows above apply unchanged. "Equivalent" means the fast path's
+output is byte-identical to today's wire output (the engine's output after
+both kernel hops), with the random IPv4 Identification substituted
+(`plat-xdp-core/tests/diff_engine.rs`, level 1, in `make test`; level 2
+compares the compiled object under `BPF_PROG_TEST_RUN`, VM).
+
+| RFC | Requirement | Status | Location / test |
+| --- | --- | --- | --- |
+| 7915 §5.1 | IPv6 → IPv4 header: DF set iff the IPv4 packet is longer than 1260 B, ID 0 with DF, TOS from Traffic Class only with `copy_tos`, no options, TTL from Hop Limit | Implemented, equivalent to the slow path, including its two-hop TTL model (output = input − 2, RFC-007) | `plat-xdp-core/src/rewrite.rs`; `tests/diff_engine.rs::canonical_outbound_is_redirected_identically`, `sizes_at_every_mtu_threshold_match_the_engine`, `ipv4_id_comes_from_the_counter_only_without_df`; `plat-xdp/tests/test_run.rs::ident_ids_are_random_and_df_is_zero` (VM) |
+| 7915 §4.1 | IPv4 → IPv6 header: Traffic Class from TOS per `copy_tos`, flow label 0, no Fragment Header | Implemented; fragments and IPv4 options always pass to the slow path | `tests/diff_engine.rs::canonical_inbound_is_redirected_identically`; `tests/qa_gaps.rs::flow_label_is_ignored_outbound_and_zero_inbound`; `tests/malformed.rs::fragments_extension_headers_and_other_protocols`, `ihl_other_than_5` |
+| 7915 §4.5, 768 | Zero-checksum IPv4 UDP | Passed to the slow path (which applies `[translation.fragments] udp_zero_checksum`) | `tests/diff_engine.rs::zero_udp_checksum_never_redirects` |
+| 7915 §4.5 / §5.1, 1624 | UDP checksum after translation | Implemented: incremental update, bit-exact port of `plat-packet::checksum` including the `0x0000` / `0xFFFF` edges, applied only to frames whose full checksum verified (see the first bullet below) | `tests/csum_equiv.rs::rfc1624_edge_vectors`, `udp_nonzero_exhaustive`; `tests/csum_partial.rs::decision_declines_partial_and_accepts_full` |
+| 7915 §4, §5 (size) | Packets above the MTU limits (fragment, Packet Too Big, Frag Needed) | Passed to the slow path, which fragments or answers as today; thresholds `mtu4`, `mtu6`, `lowest_ipv6_mtu` and the TUN MTU match the engine within ±2 B | `tests/diff_engine.rs::sizes_at_every_mtu_threshold_match_the_engine` |
+| 6146 §3.5.1, 4787 REQ-6 | UDP session lookup and lifetime refresh in both directions | Implemented (see "Session refresh" below) | `plat-xdp` `glue::tests::expiry_is_one_timeout_after_the_last_fast_path_packet`; `plat-nat64/tests/mirror.rs::expiry_retires_and_seen_read_back_extends`; `deploy/tests/xdp/e2e.sh run` fast_path_keepalive (VM) |
+| 6146 §3.5.1.2 | Filtering | Stricter than every configured mode: the fast path forwards only an exact 5-tuple of an existing session (APDF-strict); a new remote always goes to the slow path's filter | `tests/diff_engine.rs::dead_slot_or_echo_mismatch_never_redirects`; `plat-nat64/tests/mirror_qa.rs::adf_inbound_created_session_is_mirrored_and_unsolicited_is_not` |
+| 6146 §3.5.4 | Session expiry | Implemented: only the slow path's sweeper expires sessions; it retires the fast-path entry (slot `DEAD` under `bib4`, entries deleted by the publisher) | `plat-nat64/tests/mirror.rs::expiry_retires_and_seen_read_back_extends`, `read_back_on_the_packet_path_and_drop_expired_retires`; `deploy/tests/xdp/e2e.sh run` idle_expiry (VM) |
+| 6146 §4 | UDP timer ≥ 2 min | Unchanged (config); fast-path activity is recorded at 1 s granularity and read back rounded up, so a session never expires early | `tests/diff_engine.rs::seen_is_refreshed_at_most_once_a_second`; `glue::tests::seen_is_clamped_to_now_and_never_zero_for_a_use` |
+| 6146 §3.8, 4787 REQ-9 | Hairpinning | Slow path only: hairpin sessions are never installed | `tests/diff_engine.rs::hairpin_is_never_installed` |
+| 4787 REQ-1, REQ-2, REQ-8 | Endpoint-independent mapping, paired pooling, mapping refresh | Unchanged: mappings are created only by the slow path; the fast path uses the stored mapping | `plat-nat64/tests/mirror.rs::udp_session_is_mirrored_after_its_audit_record` |
+| 6052 §2.2, §3.1 | Address mapping and the §3.1 checks | Implemented by construction: the `OUT6` key holds the canonical `prefix.embed(dst4)` computed by `plat-xlat`, so a non-canonical suffix misses; §3.1 and the non-global checks ran when the session was created. The RFC 6052 prefix and its length are bound into the `CONFIG` digest | `tests/diff_engine.rs::non_canonical_destination_never_redirects`; `tests/qa_gaps.rs::every_prefix_length_canonical_only`; `plat-xdp/src/load.rs::digest_binds_object_and_parameters` |
+| 1812 §5.3.1, 8200 §3 | TTL / Hop Limit expiry | TTL or Hop Limit ≤ 2 passes, so the kernel (value 1) or `platd` (value 2) sends Time Exceeded as today | `tests/diff_engine.rs::hop_limit_two_or_less_never_redirects` |
+| 8200 §4 | Extension headers | Never in the fast path (passed) | `tests/malformed.rs::fragments_extension_headers_and_other_protocols` |
+| 6864, 7739 §5.3 | IPv4 Identification uniqueness | **Deviation (POAM-038)**: the fast path and the slow path draw IDs from independent tables (same RFC 7739 §5.3 scheme); DF = 0 only | `plat-xdp-core/src/ident.rs`; `tests/abi.rs::ident_matches_the_engine_scheme` |
+| 6888 §4, REQ-12, REQ-14, 7422 | Logging of mappings | Unchanged: port-block and BIB records come from the slow path, and a session is mirrored only after its attributing record was queued (rule 4; `drop_and_alert` exception). No per-packet or per-session records from the fast path, so no destination is logged (REQ-12) and the log volume is unchanged (REQ-14) | `plat-nat64/tests/mirror.rs::udp_session_is_mirrored_after_its_audit_record`, `drop_and_alert_installs_even_when_the_record_is_lost` |
+
+Paths in the table are in `crates/plat-xdp-core/` unless they name another
+crate or start with `deploy/`.
 
 - **UDP checksum (RFC 768, RFC 8200 §8.1, RFC 7915 §4.5 / §5.1, RFC
   1624).** The fast path updates the UDP checksum incrementally (RFC 1624),

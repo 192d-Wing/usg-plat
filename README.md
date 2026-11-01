@@ -389,6 +389,84 @@ platd check-config -c /etc/plat/platd.toml   # prints the slice table and this n
   `limactl edit plat-linux --network lima:user-v2`), with a VXLAN overlay
   for the test addresses.
 
+## XDP fast path (`[xdp]`, optional, off by default)
+
+An eBPF/XDP program on the physical NICs can forward packets of established
+UDP sessions without the TUN (POAM-016 Phase 1; design in
+`ARCHITECTURE.md`). It is **off by default**: without an `[xdp]` section,
+or with `enabled = false`, the data plane is TUN-only and the section is
+not checked. Phase 1 is code-complete apart from the deploy units; the
+packages ship without the `xdp` feature, and the speed-up has not been
+measured (no bare-metal benchmark yet, `docs/performance.md`).
+
+Requirements and constraints:
+
+- **Linux 6.6 LTS or later.** The loader refuses older kernels. Native
+  (driver) mode; `mode = "generic"` is for testing and is refused unless
+  `allow_generic = true`. Not supported on `nohz_full` hosts: `platd`
+  keeps the fast path off and records `xdp_fastpath_state` with reason
+  `unsupported_host`.
+- **Build.** `platd` and `plat-xdp-loader` built with the `xdp` feature
+  (`make xdp`; needs the pinned `bpf-linker` from
+  `deploy/tests/xdp/install-bpf-linker.sh`). A
+  `platd` without the feature, or off Linux, refuses to start when
+  `[xdp] enabled = true`.
+- **Kernel setting.** `kernel.unprivileged_bpf_disabled` must be 1 or 2
+  (the Debian and Ubuntu default is 2); the loader refuses otherwise.
+- **What stays on the slow path.** The first packets of every flow (until
+  its entries are published, about 1 ms), TCP, ICMP, fragments, IPv4
+  options, IPv6 extension headers, VLAN-tagged frames, TTL / hop limit
+  ≤ 2, packets above the MTU limits, IPv4 UDP with checksum 0, UDP
+  datagrams longer than 1536 B, and **UDP whose checksum does not verify**
+  (`plat_xdp_pass_total{reason="udp_csum_unverified"}`). Frames from local
+  or container senders with TX checksum offload (`CHECKSUM_PARTIAL`, for
+  example on a veth) carry an incomplete checksum and therefore always take
+  the slow path.
+- **`platd` and the loader restart together.** The loader creates fresh
+  maps on every attach. A `platd` restarted alone is refused
+  (`xdp_fastpath_state` reason `stale_maps`) and runs TUN-only until the
+  loader is re-run.
+- **Host filters.** Fast-path packets bypass nftables (other than the
+  checks the program makes itself), `rp_filter` and tc: put site ACLs
+  upstream or in the `platd` configuration (POAM-037).
+
+Deployment (`deploy/systemd/`): a dedicated bpffs mounted at
+`/run/plat/bpf` (`run-plat-bpf.mount`; `plat-xdp.tmpfiles.conf`, installed
+as `/usr/lib/tmpfiles.d/plat-xdp.conf`, makes the root `2750 root:plat`),
+the oneshot `plat-xdp.service` that runs
+`/usr/libexec/plat/plat-xdp-loader attach --config /etc/plat/platd.toml`
+with `CAP_BPF` and `CAP_NET_ADMIN` only (and `detach` on stop), and a
+`platd.service` drop-in that orders `platd` after it and re-adds the `bpf`
+system call. `platd` itself keeps no capabilities. The drop-in ships as an
+example, `/usr/share/doc/platd/examples/platd.service.d/xdp.conf`; to
+enable the fast path copy it to `/etc/systemd/system/platd.service.d/` and
+run `systemctl daemon-reload`. `plat-xdp.service` is bound to
+`platd.service` (`PartOf=`, `BindsTo=`), so restarting `platd` re-runs the
+loader. If `plat-fwguard` finds a program other than the one the loader
+attached, it detaches it and turns forwarding off; restore with
+`systemctl restart platd`. Verified on one Ubuntu 24.04 / kernel 6.8
+aarch64 VM only (`docs/compliance/LINUX_VERIFICATION.md` L26–L28, L31).
+
+```toml
+[xdp]
+enabled = true
+mode = "native"
+max_sessions = 1048576      # 4096..=nat64.max_sessions
+heartbeat_ms = 250          # 50..=1000
+deadline_ms = 1000          # >= 4 x heartbeat_ms; with HA <= the lease self-fence time
+[[xdp.interfaces]]
+name = "eth0"
+role = "access"             # IPv6 -> IPv4
+[[xdp.interfaces]]
+name = "eth1"
+role = "upstream"           # IPv4 -> IPv6
+```
+
+`platd check-config --format env` prints `PLAT_XDP`, `PLAT_XDP_IFACES` and
+`PLAT_XDP_MAP_BYTES` (kernel map memory, for the loader unit's
+`MemoryMax`). Watch `plat_xdp_*` in `/metrics` and the
+`xdp_fastpath_state` records (`docs/compliance/SIEM_LOGGING.md`).
+
 <!-- --8<-- [start:performance] -->
 ## Measured performance
 

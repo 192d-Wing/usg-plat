@@ -66,10 +66,13 @@ each item.
 | L23 | Cluster HA replication back-pressure and mis-steer (F8, F13) | SC-5, SI-4, SC-7 | POAM-017(b), POAM-029 | PASS (three-VM run, round 6). F8: worker rate within noise (3596 vs 3533 pps), no replication loss, B in sync. F13 fresh /64 (2001:db8:100:336b::/64): mis-steer counted and dropped (13), no block on the non-home node, in steady state and after a platd restart of that node |
 | L24 | Multiqueue TUN keeps every fragment of a datagram on one queue (Q2) | SC-5(2), SC-5 | POAM-035 | PASS (2026-10-29, performance review of `feat/protocol-completeness`): 0/64 IPv4 and 0/64 IPv6 datagrams split across 4 queues |
 | L25 | Pool-source guard rule and `cross_node_hairpin` start gate on real nftables | SC-7, SC-7(5), AC-4, CM-6 | POAM-024 | PASS (2026-10-29, kernel 6.8, nftables 1.0.9, three network namespaces): pool sources dropped from the external interface in both modes, accepted from the cluster interface only with the switch on; gate passes on real `nft list` output, refuses 4 broken snapshots |
-| L26 | XDP loader and `platd` privileges and sandbox under the units (`plat-xdp.service`, `run-plat-bpf.mount`, `platd.service.d/xdp.conf`) | AC-6, AC-6(1), AC-6(10), CM-7, SC-39, SC-5 | POAM-016 | PASS (2026-11-01, WU6, kernel 6.8, systemd 255): verify clean; exposure `plat-xdp` 1.6, `platd` with the drop-in 1.6 (1.5 without), `plat-fwguard` 2.1; loader CapEff/CapPrm/CapBnd/CapAmb `0000008000001000` (CAP_BPF + CAP_NET_ADMIN), uid 0 gid plat, NoNewPrivs 1, Seccomp 2; pins root:plat with the `MAPS` modes, mount root 2750 root:plat, `/run/plat` 0755 root, state 0644; `platd` (no capabilities, `ProtectProc=invisible`, `ProcSubset=pid`) opens the pins; `MemoryMax` bounds map creation (8M: ENOMEM, 64M: attach) |
-| L27 | End-to-end through the units, native and generic mode (veth) | SC-7, SC-24, AU-12 | POAM-016 | PARTIAL (2026-11-01, WU6, veth only, not real or virtio NICs): `e2e.sh run` with `E2E_UNITS=1` PASS native and generic: 150/150 echoes, 149/150 datagrams per direction on the fast path, 300 receiver checksums verified; `systemctl restart platd` and SIGKILL (`Restart=on-failure`) each re-run the loader (new program id, no `stale_maps`); stop detaches (no pins, no state file, no program) |
-| L28 | `plat-fwguard` stops a swapped XDP program | SC-7, SC-24, SI-7 | POAM-016, POAM-037 | PASS (2026-11-01, WU6, veth): another program attached to an `[xdp]` interface through netlink is reported `xdp-program-swapped`, detached and forwarding turned off by `plat-fwguard.service` in its sandbox (CAP_NET_ADMIN only); a program on a foreign bpf_link cannot be detached (exit 1, residual in `plat-fwguard.sh`) |
-| L31 | Fast-path-only session lifetime and idle expiry under the units | SC-10, SC-5 | POAM-016 | PASS (2026-11-01, WU6, veth): session alive after 150 s of fast-path-only traffic (`udp_secs` 120), expired after 125 s idle (`plat_sessions` 0, `plat_xdp_sessions` 0, 1 retire) |
+| L26 | XDP: privileges and sandbox (loader and `platd`) under the units (`plat-xdp.service`, `run-plat-bpf.mount`, `plat-xdp.tmpfiles.conf`, `platd.service.d/xdp.conf`) | AC-6, AC-6(1), AC-6(10), CM-7, SC-39, SC-5 | POAM-016, POAM-040 | PASS (2026-11-01, WU6, Ubuntu 24.04 aarch64, kernel 6.8.0-147, systemd 255; least-privilege load also on 6.6.13, 6.12.107, 7.2.14, refusal on 6.1): verify clean; exposure `plat-xdp` 1.6, `platd` with the drop-in 1.6 (1.5 without), `plat-fwguard` 2.1; loader CapEff/CapBnd/CapAmb `0000008000001000` (CAP_BPF + CAP_NET_ADMIN), uid 0 gid plat, NoNewPrivs 1, Seccomp 2; pins root:plat with the `MAPS` modes, mount root 2750 root:plat, `/run/plat` 0755 root, state 0644; `platd` (no capabilities, `ProtectProc=invisible`, `ProcSubset=pid`) opens the pins and reads `/proc/self/fd`; `MemoryMax` bounds map creation (8M: ENOMEM, 64M: attach). Not verified on x86_64 or bare metal |
+| L27 | XDP: end to end through the units, native and generic mode | SC-7, SC-10, SC-24, AU-12, SI-4 | POAM-016 | PARTIAL (2026-11-01, WU6, kernel 6.8.0-147, systemd 255, veth only, not real or virtio NICs): `e2e.sh run` with `E2E_UNITS=1` PASS native and generic: 150/150 echoes, 149/150 datagrams per direction on the fast path, 300 receiver checksums verified; `systemctl restart platd` and SIGKILL (`Restart=on-failure`) each re-run the loader (new program id, no `stale_maps`); stop detaches (no pins, no state file, no program). TUN-only capture comparison and `frag_needed_revalidate` not written |
+| L28 | XDP: `plat-fwguard` stops a swapped program | SC-7, SC-24, SI-7 | POAM-016, POAM-037 | PASS (2026-11-01, WU6, kernel 6.8.0-147, systemd 255, veth): another program attached to an `[xdp]` interface through netlink is reported `xdp-program-swapped`, detached and forwarding turned off by `plat-fwguard.service` in its sandbox (CAP_NET_ADMIN only); a program on a foreign bpf_link cannot be detached (exit 1, forwarding stays off; POAM-037 residual, marker in `plat-fwguard.sh`) |
+| L29 | XDP: `kill -STOP` / `kill -9 platd` stops the fast path within `deadline_ms` | SC-24 | POAM-016 | NOT RUN (mechanism tested at level 1 and level 2; SIGKILL restart and reattach covered in L27) |
+| L30 | XDP: HA fence and takeover | SC-24, CP-10 | POAM-016, POAM-007 | NOT RUN (in-process tests only) |
+| L31 | XDP: fast-path-only session lifetime and idle expiry under the units | SC-10, SC-5, RFC 6146 §3.5.1 | POAM-016 | PASS (2026-11-01, WU6, kernel 6.8.0-147, systemd 255, veth, native and generic): alive after 150 s of fast-path-only traffic (`udp_secs` 120), reclaimed after 125 s idle (`plat_sessions` 0, `plat_xdp_sessions` 0, 1 retire) |
+| L32 | XDP: map-full fallback | SC-5 | POAM-016 | NOT RUN (host tests only) |
 
 ## Procedures, pass criteria and results
 
@@ -538,13 +541,26 @@ pool-source guard"; it now reads "has no matching pool-source guard rule"
 Not covered: `plat-fwguard` live-table sync and a start under the systemd
 unit.
 
-### L26, L27, L28, L31 — XDP fast path under the systemd units (POAM-016, WU6)
+### L26–L32 — XDP fast path (POAM-016 Phase 1)
 
-Numbering: the plan's L25–L31 for the XDP fast path follow the existing
-L25 here, so they are L26–L32 (plan L25 privileges = L26, L26 end-to-end =
-L27, L27 `fwguard` = L28, L30 fast-path-only lifetime = L31). L29 (`kill
--STOP` / `kill -9` deadline), L30 (HA fence and takeover) and L32 (map-full
-fallback) are not run here.
+Plan §11 numbered these items L25–L31; L25 was already taken by the
+pool-source guard, so they are L26–L32 here (plan L25 is L26, and so on).
+
+Environment for every XDP result below: Lima VM `plat-linux` (Ubuntu
+24.04.5 aarch64, kernel 6.8.0-147, 6 vCPU shared with the host) and
+virtme-ng guests booted from Debian packages fetched through the signed
+`InRelease` (`deploy/tests/xdp/fetch-kernel.sh`): 6.6.13, 6.12.107 and
+7.2.14; 6.1 only to check the refusal. Source: `feat/xdp-wu3-wu4`
+(2026-10-31/11-01) and `feat/xdp-wu5` after its review round 1
+(2026-11-01), both merged on `main` @ `9a9c752`. The loader and `platd`
+were started by hand as root for the WU3–WU5 results. WU6 (`45efd96`,
+2026-11-01) re-ran L26, L27, L28 and L31 through the shipped systemd units
+on the same VM (systemd 255); see "Through the units" below. x86_64 and
+bare metal were not run. Raw records:
+`target/agent-workflow/20261030-194356-xdp-phase1/` (`fixes-wu34-round-1.md`,
+`impl-notes-wu5.md`, `fixes-wu5-round-1.md`; not in the repository).
+
+#### Through the units (WU6)
 
 - Install (as root, Lima VM `plat-linux`, Ubuntu 24.04, kernel
   6.8.0-147 aarch64, systemd 255): `make xdp` binaries to `/usr/bin/platd`
@@ -574,7 +590,7 @@ fallback) are not run here.
   attach into a scratch bpffs, its links unpinned) to `p6` through netlink,
   and starts `plat-fwguard.service` in the namespace.
 
-Result (2026-11-01, WU6): **PASS** for L26, L28 and L31; **PARTIAL** for
+Result (2026-11-01, WU6, kernel 6.8.0-147, systemd 255): **PASS** for L26, L28 and L31; **PARTIAL** for
 L27 (veth only, no real or virtio NIC). Both modes: 150/150 echoes, the
 slow path translated the first datagram, the fast path the rest, every
 receiver checksum verified; `restart_reattach` and
@@ -586,3 +602,133 @@ program id 12096, the loader attached id 12093 tag eef266ef8d7d1b35; fast
 path detached`, the program was gone and forwarding was off. The guard
 sees only the program id (the tag needs CAP_SYS_ADMIN, which it does not
 have). Not covered: x86_64, real NICs, a `.deb` / `.rpm` install (L18).
+
+#### L26 — privileges and sandbox
+
+- Pass criteria: the loader attaches with `CAP_BPF` and `CAP_NET_ADMIN`
+  only on every supported kernel and refuses older ones; pins get group
+  `plat` at the root of the dedicated bpffs; `platd` with no capabilities,
+  `NoNewPrivileges` and its seccomp filter plus `bpf` can open the pins it
+  needs and nothing else; with the shipped units, `systemd-analyze
+  security` scores, mount visibility in `platd`'s namespace and memcg
+  charging of map memory to the loader unit are recorded.
+- Verified: least-privilege load and attach
+  (`setpriv --bounding-set=-all,+bpf,+net_admin`, `deploy/tests/xdp/guest.sh`)
+  on 6.6.13, 6.12.107, 7.2.14 and 6.8.0-147; processed instructions with
+  least privilege 10167 (6.6), 3837 (6.12), 4462 (7.2) of 12 000, stack
+  336 B (352 rounded) of 384 everywhere; the loader refuses the 6.1 image
+  (`LoadError::KernelTooOld`). Setgid inheritance at the root of a dedicated
+  bpffs mount at `/run/plat/bpf` (WU3). The loader under
+  `setpriv --regid=plat` with only the two capabilities creates the pins
+  `root:plat` 0640 / 0660 (WU5 round 1). `unprivileged.rs` as `nobody:plat`
+  under `systemd-run` (`NoNewPrivileges`, empty bounding set,
+  `SystemCallFilter=@system-service bpf`, `ProtectSystem=strict`) with
+  `unprivileged_bpf_disabled=2`: 1 passed (publish and deferred delete, a
+  second claim of the same pins refused).
+- Verified through the units (WU6, 6.8.0-147, systemd 255; "Through the
+  units" above): `systemd-analyze verify` clean; `systemd-analyze security`
+  exposure `plat-xdp.service` 1.6, `platd.service` with the drop-in 1.6
+  (1.5 without), `plat-fwguard.service` 2.1; loader CapEff/CapBnd/CapAmb
+  `0000008000001000`, NoNewPrivs 1, Seccomp 2; pins `root:plat` with the
+  `MAPS` modes; `/proc/self/fd` readable in `platd` under its real unit
+  (`ProtectProc=invisible`, `ProcSubset=pid`; the loader unit has no `ProcSubset=pid`); `MemoryMax` bounds one
+  attach's map creation (the charge moves to the parent slice after the
+  loader exits; the default `max_sessions` needs about 290 MB,
+  `PLAT_XDP_MAP_BYTES=288194560`).
+- Not covered: x86_64, bare metal, a `.deb` / `.rpm` install (L18).
+
+Result: **PASS** (one Ubuntu 24.04 / 6.8 aarch64 host).
+
+#### L27 — end to end, native and generic mode
+
+- Pass criteria: on real or virtio NICs in native mode, UDP in both
+  directions is translated, the first packets by the slow path and the
+  rest by the fast path, with every delivered checksum correct and the
+  audit records present.
+- Verified on veth in three network namespaces (`deploy/tests/xdp/e2e.sh
+  run`, 2026-11-01, kernel 6.8.0-147): native and generic mode, TX
+  checksum offload off: 40/40 echoes, 1 / 1 slow-path and 39 / 39
+  fast-path packets per direction, 80 captured checksums verified; TX
+  offload on: every sender frame is `CHECKSUM_PARTIAL`, so the fast path
+  declines all of them (`udp_csum_unverified` 78) and the slow path
+  delivers 40/40 with correct checksums; full run in native mode: 150/150
+  echoes, 1 / 1 slow path, 149 / 149 fast path, 300 checksums verified,
+  `service_start` with `plat.xdp.mode` and `xdp_fastpath_state` `start` and
+  `shutdown` in the audit file.
+- Through the units (WU6, `E2E_UNITS=1`, native and generic): PASS, see
+  "Through the units" above (150/150 echoes, 149 / 149 fast path, restart
+  and SIGKILL reattach, stop detaches).
+- Not covered: real or virtio NICs; the
+  comparison with a TUN-only capture and the `frag_needed_revalidate` case
+  (not written yet).
+
+Result: **PARTIAL** (veth only).
+
+#### L28 — `plat-fwguard` stops the fast path
+
+- Pass criteria: when `plat-fwguard` turns forwarding off (modified
+  `inet plat` table, or an attached program that does not match the
+  loader's state file), fast-path forwarding stops at once
+  (`plat_xdp_pass_total{reason="fib_fwd_disabled"}` rises).
+- The mechanism in the program (`FWD_DISABLED` from `bpf_fib_lookup`) is
+  tested at level 2 (`crates/plat-xdp/tests/test_run.rs::fib_result_codes_from_namespace_state`,
+  VM). The `fwguard` program-id check (WU6, `deploy/systemd/plat-fwguard.sh`):
+  `fwguard_swapped` under the units (see "Through the units" above) was
+  reported `xdp-program-swapped`, the program detached and forwarding
+  turned off. Residual (POAM-037, `// POAM:` marker in `plat-fwguard.sh`):
+  a foreign program attached through a `bpf_link` pinned elsewhere or held
+  open cannot be detached without CAP_SYS_ADMIN; the guard reports it,
+  exits 1 and forwarding stays off.
+
+Result: **PASS** (veth, 6.8.0-147, systemd 255).
+
+#### L29 — `kill -STOP` / `kill -9 platd`
+
+- Pass criteria: after `kill -STOP` or `kill -9` of `platd`, fast-path
+  forwarding stops within `deadline_ms`; after `kill -CONT` it resumes
+  (`heartbeat_resumed`) or, after a crash, stays off until `platd` and the
+  loader restart.
+- Not run. Tested so far: the deadline and disable decisions at level 1
+  (`crates/plat-xdp-core/tests/diff_engine.rs::disabled_or_deadline_passed_never_redirects`)
+  and writer transitions on the real program at level 2
+  (`test_run.rs::writer_transitions_stop_the_fast_path`, VM); the stall
+  logic in `crates/plat-xdp/src/control.rs` tests
+  `stall_resume_fault_transitions`, `a_stalled_source_fails_the_health_check`.
+
+Result: **NOT RUN**.
+
+#### L30 — HA fence and takeover
+
+- Pass criteria: on fence, release and takeover the fast path stops
+  forwarding the slice's sessions before the engine does, and the new
+  owner forwards only sessions it created.
+- Not run on Linux (needs the three-VM bed with `[xdp]`). In-process:
+  `crates/plat-nat64/tests/mirror.rs::fencing_stops_the_mirror_at_once_and_generations_retire_stale_entries`,
+  `crates/plat-nat64/tests/mirror_qa.rs::slice_ordering_rule_mirror_never_more_permissive_than_engine`.
+
+Result: **NOT RUN**.
+
+#### L31 — fast-path-only session lifetime
+
+- Pass criteria: a session kept alive only by fast-path traffic outlives
+  `udp_secs`, and is reclaimed by the sweeper one timeout after its last
+  packet.
+- `deploy/tests/xdp/e2e.sh run` (2026-11-01, kernel 6.8.0-147, veth, native
+  mode, `udp_secs` 120): the session was alive after 150 s of fast-path-only
+  traffic; after 125 s idle `plat_sessions` 0, `plat_xdp_sessions` 0,
+  `plat_xdp_retires_total` 1. Exact expiry is unit-tested
+  (`plat-xdp` `glue::tests::expiry_is_one_timeout_after_the_last_fast_path_packet`).
+
+Result: **PASS** (veth; by hand and, in WU6, through the units in native
+and generic mode).
+
+#### L32 — map-full fallback
+
+- Pass criteria: with `OUT6` / `IN4` full, new sessions stay on the slow
+  path (`plat_xdp_install_failures_total{reason="map_full"}`), installs
+  back off for 1 s, and traffic is unaffected.
+- Not run on Linux. Host tests: `crates/plat-xdp/src/mirror.rs` tests
+  `map_full_backs_off`, `publish_failures_turn_failed_and_are_collectable`;
+  `crates/plat-nat64/tests/mirror.rs::install_rollback_and_back_off`.
+
+Result: **NOT RUN**.
