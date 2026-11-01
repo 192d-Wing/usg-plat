@@ -90,7 +90,8 @@ skip() { echo "e2e: SKIP: $*" >&2; exit 77; }
 # Metric value from platd's /metrics in the PLAT namespace ($1: the whole
 # series name with labels, e.g. 'plat_xdp_packets_total{dir="v6_to_v4"}').
 metric() {
-    nsx "$NS_P" curl -fsS "http://127.0.0.1:$MGMT_PORT/metrics" | awk -v k="$1" '$1 == k { print $2; f = 1 } END { if (!f) print -1 }'
+    metric_key=$1
+    nsx "$NS_P" curl -fsS "http://127.0.0.1:$MGMT_PORT/metrics" | awk -v k="$metric_key" '$1 == k { print $2; f = 1 } END { if (!f) print -1 }'
 }
 
 # Non-zero plat_xdp_* series and the server-side view (diagnostics).
@@ -203,6 +204,7 @@ while True:
 ' >/dev/null 2>&1 </dev/null &
     echo_pid=$!
     client() {
+        echo_count=$1
         nsx "$NS_C" python3 -I -c '
 import socket, sys, time
 n = int(sys.argv[1])
@@ -219,7 +221,7 @@ for i in range(n):
         pass
     time.sleep(1.0)
 print(ok)
-' "$1"
+' "$echo_count"
     }
 
     # Captures at both receivers, to check every delivered checksum.
