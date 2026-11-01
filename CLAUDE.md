@@ -77,8 +77,9 @@ chain, 1 on a verification failure, an unverified tail (unless
    outside `plat-packet`: `plat-xdp-core`'s fixed-layout classifier accepts a
    strict subset of what `plat-packet` accepts (property-tested) and passes
    everything else to the slow path (`XDP_PASS`, counted reason). Its controls
-   are the differential harness (levels 1–4, which gate every change) and the
-   verifier; no `bpf_printk` or `aya-log` in the object.
+   are the differential harness (level 1 runs in `make test` on every change;
+   levels 2–3 run in the advisory `xdp-*` CI jobs and level 4 on a Linux VM)
+   and the verifier; no `bpf_printk` or `aya-log` in the object.
 2. **Hot path budget.** No heap allocation, no blocking I/O, no global lock on
    the steady-state path. At most one shard lock per table. Audit hand-off is
    `AuditSink::emit` (non-blocking `try_send`). With `[xdp]`, workers and the
@@ -149,7 +150,7 @@ chain, 1 on a verification failure, an unverified tail (unless
 | AC-6/SC-39 XDP | `plat-xdp.service` oneshot loader alone holds `CAP_BPF`/`CAP_NET_ADMIN` (`Group=plat`, bound to `platd` so both restart together); `platd` stays capability-free, its drop-in adds only the `bpf` syscall and read-only `/run/plat`; bpffs at `/run/plat/bpf` via `run-plat-bpf.mount`; `plat-fwguard` detaches a swapped program (verified on one Ubuntu 24.04 / 6.8 VM, L26/L28) |
 | CM-6/CM-7 | `deny_unknown_fields`, validated ranges, management is loopback-only plaintext or mTLS (never plaintext off-host) |
 | CM-3/SA-11/SR-3 | CI (fmt, clippy host + aarch64, tests on Linux, cargo-audit/deny) is a required check on `main`; actions pinned by SHA |
-| AC-6/SC-39 | systemd unit grants no capabilities and sandboxes the unprivileged `plat` user (not yet verified on Linux, `docs/compliance/LINUX_VERIFICATION.md`) |
+| AC-6/SC-39 | systemd unit grants no capabilities and sandboxes the unprivileged `plat` user (verified on one Ubuntu 24.04 Linux VM, `docs/compliance/LINUX_VERIFICATION.md` L1–L4 and L26; not on x86_64 or bare metal) |
 
 ## Compliance Documentation
 
