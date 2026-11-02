@@ -572,6 +572,7 @@ https://192d-wing.github.io/usg-plat/ from `main`.
 - `docs/compliance/SIEM_LOGGING.md`: log schema and SIEM correlation
 - `docs/compliance/NIST_800-53_MAPPING.md`, `RFC_COMPLIANCE.md`, `POAM.md`
 - `docs/compliance/LINUX_VERIFICATION.md`: Linux verification results
+- `ROADMAP.md`: current status, next steps and backlog
 - `COAs.md`: courses of action for data-plane throughput (XDP hybrid selected)
 - `docs/jool-comparison.md`: feature comparison with Jool
 - `CLAUDE.md` (also read by Codex as `AGENTS.md`) and
