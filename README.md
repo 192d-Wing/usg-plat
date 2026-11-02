@@ -460,6 +460,15 @@ Ubuntu 24.04 / kernel 6.8 aarch64 VM only
 (`docs/compliance/LINUX_VERIFICATION.md` L26, L28, L31 PASS; L27 partial
 (veth only)).
 
+CI checks the fast path on every change, on x86_64 and aarch64 runners, as
+required status checks on `main`: `xdp build` (eBPF object, licence,
+helper allow-list, no loops, reproducible build), `xdp vm` (verifier load
+with `CAP_BPF` + `CAP_NET_ADMIN` only and the level-2 `BPF_PROG_TEST_RUN`
+vectors on kernels 6.6, 6.12 and the latest) and `xdp core proptest`
+(1 M differential cases against the full engine). The runtime checks
+through the systemd units (L26–L32) are not part of CI and have been run on
+the aarch64 VM only.
+
 Manual install (from a source tree, after `make dist XDP=1`, which builds
 both `platd` and the loader with the `xdp` feature; packages install the
 same files, with the drop-in only as the example above):
@@ -563,4 +572,6 @@ https://192d-wing.github.io/usg-plat/ from `main`.
 - `docs/compliance/SIEM_LOGGING.md`: log schema and SIEM correlation
 - `docs/compliance/NIST_800-53_MAPPING.md`, `RFC_COMPLIANCE.md`, `POAM.md`
 - `docs/compliance/LINUX_VERIFICATION.md`: Linux verification results
+- `COAs.md`: courses of action for data-plane throughput (XDP hybrid selected)
+- `docs/jool-comparison.md`: feature comparison with Jool
 - `CLAUDE.md` and `.claude/skills/plat-workflow/`: development workflow
