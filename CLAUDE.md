@@ -1,6 +1,8 @@
 # CLAUDE.md
 
-Guidance for Claude Code when working in this repository.
+Guidance for AI coding agents working in this repository. Claude Code reads
+this file as `CLAUDE.md`; Codex reads the same file through the `AGENTS.md`
+symlink. Edit `CLAUDE.md` only.
 
 ## Project Overview
 
@@ -27,6 +29,12 @@ conversation acts as orchestrator and delegates to the subagents in
 `.claude/agents/`: `plat-architect`, `plat-coder`, `qa-engineer`,
 `security-reviewer`, `nist-800-53-reviewer`, `rfc-conformance-reviewer`,
 `performance-reviewer`, `compliance-scribe`, `release-engineer`.
+
+Codex runs the same workflow: the skill is linked as
+`.agents/skills/plat-workflow` (invoke it with `$plat-workflow`), and the
+same nine agents are generated into `.codex/agents/*.toml` from
+`.claude/agents/*.md` by `make codex-agents` (`make check` fails when they
+drift). Edit only the `.claude/` sources.
 
 - `/plat-workflow <task>`: plan → build → test → parallel review → fix loop → docs → release gate
 - `/plat-workflow review [base-ref]`: review the current diff only
