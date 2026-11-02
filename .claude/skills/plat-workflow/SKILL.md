@@ -54,7 +54,7 @@ production code yourself, except for trivial merge glue between agent outputs.
 
 ## Roster
 
-| Agent (`subagent_type`)    | Writes code?  | Responsibility |
+| Agent (name)              | Writes code?  | Responsibility |
 |----------------------------|---------------|----------------|
 | `plat-architect`           | No            | Design, crate boundaries, hot-path/threading impact, threat sketch, test plan, control/RFC pre-mapping |
 | `plat-coder`               | Yes           | Implements the plan and fixes findings; adds compliance annotations in code |
@@ -133,7 +133,7 @@ fmt, clippy and the touched crates' tests, and writes `impl-notes.md`.
 
 Parallel coders only when the plan splits into work units with disjoint file
 sets and no ordering dependency: one `plat-coder` per unit with
-`isolation: "worktree"`, merged by you afterwards. Never two coders on one file.
+`isolation: "worktree"` (under Codex, see "Running under Codex"), merged by you afterwards. Never two coders on one file.
 
 ## Phase 3 — Verify (`qa-engineer`)
 
@@ -192,3 +192,32 @@ unless the user asks.
 - Never weaken a security, compliance, or performance-regression finding to reach PASS.
 - Keep the user's task list current: one plan step per phase that runs.
 - Long-running commands (workspace tests, benches, fuzzing, Linux cross-checks) run in the background.
+
+## Running under Codex
+
+The skill is the same file for both tools (Codex finds it through the
+`.agents/skills/plat-workflow` symlink; invoke it with `$plat-workflow`).
+The agents are generated from `.claude/agents/*.md` into
+`.codex/agents/*.toml` with the same names (`make codex-agents`). What differs:
+
+- **Spawning.** Ask Codex to spawn an agent by its name (for example "spawn
+  `security-reviewer` with this prompt: …"). Spawning every selected
+  reviewer in one request runs them in parallel; Codex waits for all of them
+  before it continues. `agents.max_concurrent_threads_per_session` caps how
+  many run at once.
+- **No worktree isolation.** Codex gives agents no git worktree of their own.
+  Never run two `plat-coder` agents in one checkout at the same time: either
+  run work units one after another, or create a worktree per coder yourself
+  (`git worktree add ../usg-plat-<wu> -b <branch>`), give each coder its
+  absolute path, and merge the branches afterwards.
+- **Tool limits are instructions only.** A Codex agent file has no tool list,
+  so the reviewers' and scribe's write limits are stated in their
+  instructions but not enforced. After each read-only agent returns, check
+  `git status` and revert any change it should not have made.
+- **Sandbox and approvals** come from the session; agents cannot widen them.
+  Steps that need the network or the Lima VM (`limactl`) need a session that
+  allows them.
+- **Fix-loop re-checks.** Route the follow-up to the reviewer that raised the
+  finding if Codex still has its thread; otherwise spawn a fresh one with
+  its `findings-<role>.md` and the fix notes.
+

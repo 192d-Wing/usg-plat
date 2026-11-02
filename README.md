@@ -574,4 +574,6 @@ https://192d-wing.github.io/usg-plat/ from `main`.
 - `docs/compliance/LINUX_VERIFICATION.md`: Linux verification results
 - `COAs.md`: courses of action for data-plane throughput (XDP hybrid selected)
 - `docs/jool-comparison.md`: feature comparison with Jool
-- `CLAUDE.md` and `.claude/skills/plat-workflow/`: development workflow
+- `CLAUDE.md` (also read by Codex as `AGENTS.md`) and
+  `.claude/skills/plat-workflow/`: development workflow for Claude Code and
+  Codex (`.agents/skills/`, `.codex/agents/`)

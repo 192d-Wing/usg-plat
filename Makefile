@@ -32,7 +32,16 @@ check-notls:
 
 # xdp-env (defined below) refuses a pre-set RUSTC_BOOTSTRAP, so the required
 # CI jobs (which run these targets) assert it too (SEC-004 / NIST-007).
-check: xdp-env fmt clippy check-linux check-notls
+check: xdp-env fmt clippy check-linux check-notls codex-agents-check
+
+# Codex agent definitions (.codex/agents/*.toml) are generated from the Claude
+# Code ones (.claude/agents/*.md); check fails when they have drifted.
+.PHONY: codex-agents codex-agents-check
+codex-agents:
+	python3 -I .codex/sync-agents.py
+
+codex-agents-check:
+	python3 -I .codex/sync-agents.py --check
 
 test: xdp-env
 	cargo test --workspace
