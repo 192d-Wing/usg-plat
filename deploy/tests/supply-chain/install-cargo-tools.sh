@@ -34,7 +34,7 @@ trap 'rm -rf "$work"' EXIT
 while read -r name version sum; do
 	[[ -n "$name" ]] || continue
 	if [[ ${#want[@]} -gt 0 ]] && ! printf '%s\n' "${want[@]}" | grep -qx "$name"; then continue; fi
-	if cargo install --list | grep -qx "$name v$version:"; then
+	if cargo install --list | grep -qE "^$name v$version( \(.*\))?:$"; then
 		echo "$name $version already installed"
 		continue
 	fi

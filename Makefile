@@ -233,7 +233,7 @@ CHECK_JSONSCHEMA_VERSION ?= 0.39.0
 CHECK_JSONSCHEMA ?= $(if $(shell command -v uvx 2>/dev/null),uvx --from check-jsonschema==$(CHECK_JSONSCHEMA_VERSION) check-jsonschema)
 export CHECK_JSONSCHEMA
 # Fails unless `cargo install --list` shows tool $(1) at version $(2).
-tool-pin = cargo install --list | grep -qx '$(1) v$(2):' || { echo "ERROR: $(1) $(2) required: deploy/tests/supply-chain/install-cargo-tools.sh $(1)" >&2; exit 1; }
+tool-pin = cargo install --list | grep -qE '^$(1) v$(2)( \(.*\))?:$$' || { echo "ERROR: $(1) $(2) required: deploy/tests/supply-chain/install-cargo-tools.sh $(1)" >&2; exit 1; }
 
 dist:
 ifeq ($(AUDITABLE),0)
