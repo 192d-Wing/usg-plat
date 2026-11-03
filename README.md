@@ -384,7 +384,8 @@ platd check-config -c /etc/plat/platd.toml   # prints the slice table and this n
   --member <id>` hands the slices back.
 - **Test bed**: `deploy/lima/` (plat-linux-2, plat-edge) and
   `deploy/tests/cluster/` (setup.sh, failure cases F1-F13 via run-all.sh,
-  attrib-check.sh). The VMs share the Lima `user-v2` network (no host
+  attrib-check.sh; `xdp-setup.sh` then `f14-xdp-fence-takeover.sh` for
+  the XDP fast path on both nodes, LINUX_VERIFICATION L30). The VMs share the Lima `user-v2` network (no host
   prerequisite beyond Lima; add it to an existing plat-linux with
   `limactl edit plat-linux --network lima:user-v2`), with a VXLAN overlay
   for the test addresses.
@@ -457,7 +458,7 @@ TUN-only, set `[xdp] enabled = false` (or remove the drop-in), run
 program other than the one the loader attached, it detaches it and turns
 forwarding off; restore with `systemctl restart platd`. Verified on one
 Ubuntu 24.04 / kernel 6.8 aarch64 VM only
-(`docs/compliance/LINUX_VERIFICATION.md` L26, L28, L31 PASS; L27 partial
+(`docs/compliance/LINUX_VERIFICATION.md` L26, L28, L30, L31, L32 PASS; L29 partial (deadline PASS, the stop is not audited); L27 partial
 (veth only)).
 
 CI checks the fast path on every change, on x86_64 and aarch64 runners, as

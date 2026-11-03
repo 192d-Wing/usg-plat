@@ -4,6 +4,22 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 
 ## [Unreleased]
 
+### XDP Linux verification (branch `test/xdp-linux-verification`)
+
+- `deploy/tests/xdp/e2e.sh`: new cases `frag_needed_revalidate`,
+  `deadman_stop` and `deadman_kill9` (LINUX_VERIFICATION L29),
+  `capture_compare` (fast path vs a TUN-only `platd`, receiver frames
+  byte-equal except the IPv4 ID / header checksum when DF = 0) and, with
+  `E2E_MAPFULL=1`, `map_full` (L32); `auto_restart_reattach` under the
+  units also times the SIGKILL stop.
+- `deploy/tests/cluster/xdp-setup.sh` and `f14-xdp-fence-takeover.sh`
+  (L30): the fast path on both HA nodes, crash takeover and failback by
+  handover with SLICE map, audit and edge-capture checks; `lib.sh`
+  `gen_config` appends `[xdp]` when `PLAT_XDP=1`.
+- Results (aarch64 Lima VMs, 2026-11-03): L30 and L32 PASS; L29 PASS for the
+  deadline, with a finding: a `kill -STOP` of `platd` leaves no
+  `xdp_fastpath_state` record (`docs/compliance/LINUX_VERIFICATION.md`).
+
 ### TCP simultaneous open (branch `fix/poam-008-simultaneous-open`, closes POAM-008)
 
 - RFC 6146 §3.5.2.2: an unsolicited inbound IPv4 SYN (no ACK/RST,

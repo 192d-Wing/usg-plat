@@ -25,12 +25,11 @@ selected) and [`docs/jool-comparison.md`](docs/jool-comparison.md).
 
 Ordered by value for the effort, with what each needs.
 
-1. **XDP verification the VM can do (no new hardware).** Run
-   LINUX_VERIFICATION L29 (`kill -STOP` dead-man deadline), L30 (HA fence
-   and takeover, on the two existing Lima nodes) and L32 (map-full
-   fallback); write the two missing e2e cases (TUN-only capture comparison,
-   `frag_needed_revalidate`). Turns SC-24 for the fast path from
-   in-process to Linux-verified.
+1. **XDP verification the VM can do (no new hardware).** Done
+   2026-11-03 (`test/xdp-linux-verification`): L30 and L32 PASS, L29 PASS
+   for the deadline, the two e2e cases written and passing. Left: the L29
+   finding (a `kill -STOP` of `platd` runs the deadline out with no
+   `xdp_fastpath_state` record), which needs a code fix and a re-run.
 2. **XDP Phase 0: bare-metal measurement (needs hardware).** x86 host with
    a real NIC (zero-copy XDP driver) and an external traffic generator.
    Measures the actual speed-up over TUN, the `bib4` maximum hold ≤ 20 µs
