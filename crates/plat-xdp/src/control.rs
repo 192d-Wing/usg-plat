@@ -315,9 +315,18 @@ pub struct ControlState {
     stalled: bool,
     faulted: bool,
     grace_failed: u32,
+    /// The deadline last stored in `CONTROL` (0: none yet).
+    last_deadline: u64,
 }
 
 impl ControlState {
+    /// Starts from the deadline `enable` stored, so a lapse before the
+    /// first beat is seen too. Values 0 and 1 (unset, claim mark) are
+    /// ignored.
+    pub fn with_deadline(deadline_ns: u64) -> Self {
+        Self { last_deadline: if deadline_ns > 1 { deadline_ns } else { 0 }, ..Self::default() }
+    }
+
     /// A heartbeat tick: `Some(deadline)` to store, or `None` (stalled or
     /// faulted). Reports the transitions.
     pub fn beat(
@@ -332,6 +341,18 @@ impl ControlState {
         if self.faulted {
             return None;
         }
+        // COMPLIANCE MAPPING:
+        // - NIST 800-53: AU-12 (Audit Record Generation) - a deadline lapse
+        //   this thread did not see as it happened (SIGSTOP, CPU
+        //   starvation, a long hook) is still reported as Stalled+Resumed
+        // - NIST 800-53: SC-24 (Fail in Known State) - the program stops
+        //   forwarding at `now >= deadline_ns` (`decide`); the same test on
+        //   the same clock (`CLOCK_MONOTONIC_COARSE`) is applied here
+        if !self.stalled && self.last_deadline != 0 && now_ns >= self.last_deadline {
+            c.heartbeat_stalls.fetch_add(1, Ordering::Relaxed);
+            self.stalled = true;
+            notify(Transition::Stalled);
+        }
         if !healthy {
             c.heartbeat_stalls.fetch_add(1, Ordering::Relaxed);
             if !self.stalled {
@@ -345,7 +366,9 @@ impl ControlState {
             notify(Transition::Resumed);
         }
         let d = now_ns.saturating_add(t.deadline.as_nanos() as u64);
-        Some(cap.map_or(d, |c| d.min(c)))
+        let d = cap.map_or(d, |c| d.min(c));
+        self.last_deadline = d;
+        Some(d)
     }
 
     /// A fault: `true` the first time (the caller disables `CONTROL`).
@@ -388,7 +411,7 @@ pub fn spawn(
 ) -> io::Result<JoinHandle<()>> {
     let tick = GRACE_INTERVAL.min(timing.heartbeat);
     std::thread::Builder::new().name("plat-xdp-ctl".into()).spawn(move || {
-        let mut st = ControlState::default();
+        let mut st = ControlState::with_deadline(control.read().deadline_ns);
         let mut since_beat = Duration::ZERO;
         let mut since_grace = Duration::ZERO;
         let mut since_check = Duration::ZERO;
@@ -564,6 +587,45 @@ mod tests {
             assert!(!g.grace(false));
         }
         assert!(g.grace(false));
+    }
+
+    #[test]
+    fn a_missed_deadline_is_reported_once() {
+        let t = ControlTiming { heartbeat: Duration::from_millis(250), deadline: Duration::from_millis(1000) };
+        let c = ControlCounters::default();
+        let mut st = ControlState::with_deadline(1_000);
+        let mut seen = Vec::new();
+        let mut n = |x| seen.push(x);
+        // Normal beats inside the deadline: nothing.
+        assert_eq!(st.beat(true, 999, &t, None, &c, &mut n), Some(1_000_000_999));
+        assert_eq!(st.beat(true, 250_000_999, &t, None, &c, &mut n), Some(1_250_000_999));
+        assert_eq!(c.heartbeat_stalls.load(Ordering::Relaxed), 0);
+        // Frozen past the deadline (SIGSTOP): Stalled then Resumed, once.
+        assert!(st.beat(true, 5_000_000_000, &t, None, &c, &mut n).is_some());
+        assert!(st.beat(true, 5_250_000_000, &t, None, &c, &mut n).is_some());
+        assert_eq!(c.heartbeat_stalls.load(Ordering::Relaxed), 1);
+        drop(n);
+        assert_eq!(seen, [Transition::Stalled, Transition::Resumed]);
+    }
+
+    #[test]
+    fn a_beat_at_the_deadline_is_a_lapse() {
+        let t = ControlTiming { heartbeat: Duration::from_millis(250), deadline: Duration::from_millis(1000) };
+        let c = ControlCounters::default();
+        let mut seen = Vec::new();
+        let mut n = |x| seen.push(x);
+        let mut st = ControlState::default();
+        let d = st.beat(true, 0, &t, None, &c, &mut n).unwrap_or(0);
+        assert!(st.beat(true, d - 1, &t, None, &c, &mut n).is_some(), "one ns early: fine");
+        let d = d - 1 + 1_000_000_000;
+        assert!(st.beat(true, d, &t, None, &c, &mut n).is_some(), "the program fails at now >= deadline");
+        // Unhealthy after a lapse: one Stalled, no double count.
+        let mut st2 = ControlState::with_deadline(100);
+        assert_eq!(st2.beat(false, 200, &t, None, &c, &mut n), None);
+        drop(n);
+        assert_eq!(seen, [Transition::Stalled, Transition::Resumed, Transition::Stalled]);
+        assert_eq!(c.heartbeat_stalls.load(Ordering::Relaxed), 3, "lapse + lapse + unhealthy tick");
+        assert_eq!(ControlState::with_deadline(1).last_deadline, 0, "claim mark ignored");
     }
 
     #[test]

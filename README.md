@@ -458,7 +458,7 @@ TUN-only, set `[xdp] enabled = false` (or remove the drop-in), run
 program other than the one the loader attached, it detaches it and turns
 forwarding off; restore with `systemctl restart platd`. Verified on one
 Ubuntu 24.04 / kernel 6.8 aarch64 VM only
-(`docs/compliance/LINUX_VERIFICATION.md` L26, L28, L30, L31, L32 PASS; L29 partial (deadline PASS, the stop is not audited); L27 partial
+(`docs/compliance/LINUX_VERIFICATION.md` L26, L28, L29, L30, L31, L32 PASS; L27 partial
 (veth only)).
 
 CI checks the fast path on every change, on x86_64 and aarch64 runners, as

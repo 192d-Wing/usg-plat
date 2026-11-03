@@ -696,6 +696,7 @@ dm_summary() {
 #
 # COMPLIANCE MAPPING:
 # - NIST 800-53: SC-24 (Fail in Known State) - dead-man deadline
+# - NIST 800-53: AU-12 (Audit Record Generation) - the lapse is a record
 deadman_stop() {
     if [ "$units" = 1 ]; then dm_target=$(systemctl show -p MainPID --value platd.service); else dm_target=$platd_pid; fi
     read -r dm_a dm_p <<X
@@ -726,14 +727,14 @@ X
     sleep 1
     dm_states=$(xdp_states)
     echo "e2e: xdp_fastpath_state since start: $dm_states" >&2
-    # The freeze stops plat-xdp-ctl too, so the deadline runs out without a
-    # heartbeat_stalled record, and after SIGCONT the first health check
-    # passes (no heartbeat_resumed): reported, not failed (verification run
-    # finding, LINUX_VERIFICATION L29).
+    # The freeze stops plat-xdp-ctl too; its first beat after SIGCONT sees
+    # that the stored deadline passed and reports heartbeat_stalled then
+    # heartbeat_resumed, counting one stall (AU-12, LINUX_VERIFICATION L29).
     case $dm_states in
         *heartbeat_stalled*heartbeat_resumed*) ;;
-        *) echo "e2e: FINDING deadman_stop: no heartbeat_stalled / heartbeat_resumed record for the deadline expiry" >&2 ;;
+        *) die "deadman_stop: no heartbeat_stalled / heartbeat_resumed record for the deadline expiry" ;;
     esac
+    [ "$((st1 - st0))" -ge 1 ] || die "deadman_stop: heartbeat stalls did not move ($st0 -> $st1)"
     # deadline_ms = 1000; heartbeat_ms = 250, so the deadline is 750..1000
     # ms after the signal; 60 ms for the coarse clock and capture latency.
     [ "$1" -ge 0 ] && [ "$1" -le 1060 ] || die "deadman_stop: forwarding $1 ms after SIGSTOP (deadline_ms 1000)"

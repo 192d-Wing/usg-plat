@@ -129,7 +129,7 @@ a `platd` built without the `xdp` cargo feature) the data plane is TUN-only
 and none of this runs. Minimum kernel: **Linux 6.6 LTS** (the loader
 refuses older kernels, `plat_xdp::load::check_kernel`). Status: code
 complete, deploy units included (WU6; verified on one Ubuntu 24.04 /
-kernel 6.8 aarch64 VM, LINUX_VERIFICATION L26, L28, L30, L31, L32 PASS; L29 partial (deadline PASS, the stop is not audited); L27 partial (veth only)); the speed-up is
+kernel 6.8 aarch64 VM, LINUX_VERIFICATION L26, L28, L29, L30, L31, L32 PASS; L27 partial (veth only)); the speed-up is
 not measured, x86_64 / bare metal are not verified, and the maximum worker `bib4` hold (criterion ≤ 20 µs) is not measurable in the VM (0.3–0.9 ms with the mirror off too, vCPU preemption) and stays open in POAM-016.
 
 ```mermaid

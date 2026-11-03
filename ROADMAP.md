@@ -26,10 +26,10 @@ selected) and [`docs/jool-comparison.md`](docs/jool-comparison.md).
 Ordered by value for the effort, with what each needs.
 
 1. **XDP verification the VM can do (no new hardware).** Done
-   2026-11-03 (`test/xdp-linux-verification`): L30 and L32 PASS, L29 PASS
-   for the deadline, the two e2e cases written and passing. Left: the L29
-   finding (a `kill -STOP` of `platd` runs the deadline out with no
-   `xdp_fastpath_state` record), which needs a code fix and a re-run.
+   2026-11-03 (`test/xdp-linux-verification`): L30, L32 and L29 PASS, the two e2e cases written and passing. The L29
+   audit finding (a `kill -STOP` of `platd` ran the deadline out with no
+   `xdp_fastpath_state` record) is fixed and re-run. Left: the
+   intermittent `frag_needed_revalidate` failure.
 2. **XDP Phase 0: bare-metal measurement (needs hardware).** x86 host with
    a real NIC (zero-copy XDP driver) and an external traffic generator.
    Measures the actual speed-up over TUN, the `bib4` maximum hold ≤ 20 µs

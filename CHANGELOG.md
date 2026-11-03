@@ -16,9 +16,13 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
   (L30): the fast path on both HA nodes, crash takeover and failback by
   handover with SLICE map, audit and edge-capture checks; `lib.sh`
   `gen_config` appends `[xdp]` when `PLAT_XDP=1`.
-- Results (aarch64 Lima VMs, 2026-11-03): L30 and L32 PASS; L29 PASS for the
-  deadline, with a finding: a `kill -STOP` of `platd` leaves no
-  `xdp_fastpath_state` record (`docs/compliance/LINUX_VERIFICATION.md`).
+- Results (aarch64 Lima VMs, 2026-11-03): L30, L32 and L29 PASS.
+- Fixed (L29, AU-12): a `kill -STOP` (or any freeze or starvation) of
+  `platd` ran the XDP dead-man deadline out with no `xdp_fastpath_state`
+  record. `plat-xdp-ctl` now reports a deadline it missed on its next
+  beat as `heartbeat_stalled` then `heartbeat_resumed` and counts the
+  stall (`plat_xdp_heartbeat_stalls_total`); no schema change.
+  `deadman_stop` fails without both records.
 
 ### TCP simultaneous open (branch `fix/poam-008-simultaneous-open`, closes POAM-008)
 

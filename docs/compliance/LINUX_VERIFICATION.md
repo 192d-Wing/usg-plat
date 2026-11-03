@@ -69,7 +69,7 @@ each item.
 | L26 | XDP: privileges and sandbox (loader and `platd`) under the units (`plat-xdp.service`, `run-plat-bpf.mount`, `plat-xdp.tmpfiles.conf`, `platd.service.d/xdp.conf`) | AC-6, AC-6(1), AC-6(10), CM-7, SC-39, SC-5 | POAM-016, POAM-040 | PASS (2026-11-01, WU6, Ubuntu 24.04 aarch64, kernel 6.8.0-147, systemd 255; least-privilege load also on 6.6.13, 6.12.107, 7.2.14, refusal on 6.1): verify clean; exposure `plat-xdp` 1.6, `platd` with the drop-in 1.6 (1.5 without), `plat-fwguard` 2.1; loader CapEff/CapBnd/CapAmb `0000008000001000` (CAP_BPF + CAP_NET_ADMIN), uid 0 gid plat, NoNewPrivs 1, Seccomp 2; pins root:plat with the `MAPS` modes, mount root 2750 root:plat, `/run/plat` 0755 root, state 0644; `platd` (no capabilities, `ProtectProc=invisible`, `ProcSubset=pid`) opens the pins and reads `/proc/self/fd`; `MemoryMax` bounds map creation (8M: ENOMEM, 64M: attach). Not verified on x86_64 or bare metal |
 | L27 | XDP: end to end through the units, native and generic mode | SC-7, SC-10, SC-24, AU-12, SI-4 | POAM-016 | PARTIAL (2026-11-01, WU6, kernel 6.8.0-147, systemd 255, veth only, not real or virtio NICs): `e2e.sh run` with `E2E_UNITS=1` PASS native and generic: 150/150 echoes, 149/150 datagrams per direction on the fast path, 300 receiver checksums verified; `systemctl restart platd` and SIGKILL (`Restart=on-failure`) each re-run the loader (new program id, no `stale_maps`); stop detaches (no pins, no state file, no program). 2026-11-03 (verification run, kernel 6.8.0-147, veth, native and generic, by hand): the TUN-only capture comparison (45 frames per receiver byte-equal except the IPv4 ID and header checksum when DF = 0, pool port mapped) and `frag_needed_revalidate` (ICMPv6 Packet Too Big, MTU 1420, for a fast-path-only flow older than `udp_secs`) PASS |
 | L28 | XDP: `plat-fwguard` stops a swapped program | SC-7, SC-24, SI-7 | POAM-016, POAM-037 | PASS (2026-11-01, WU6, kernel 6.8.0-147, systemd 255, veth): another program attached to an `[xdp]` interface through netlink is reported `xdp-program-swapped`, detached and forwarding turned off by `plat-fwguard.service` in its sandbox (CAP_NET_ADMIN only); a program on a foreign bpf_link cannot be detached (exit 1, forwarding stays off; POAM-037 residual, marker in `plat-fwguard.sh`) |
-| L29 | XDP: `kill -STOP` / `kill -9 platd` stops the fast path within `deadline_ms` | SC-24, AU-12 | POAM-016 | PARTIAL (2026-11-03, kernel 6.8.0-147, veth, native and generic, by hand and through the units): forwarding stops 783–993 ms after `kill -STOP` (`deadline_ms` 1000) and resumes after `kill -CONT`; 692–945 ms after `kill -9` with the program left attached (by hand); 36–53 ms under the units (the loader unit detaches); the units re-run the loader. Finding: no `xdp_fastpath_state` record (no `heartbeat_stalled` / `heartbeat_resumed`) and `plat_xdp_heartbeat_stalls_total` 0 for the stop; only `plat_xdp_pass_total{reason="deadline"}` shows it |
+| L29 | XDP: `kill -STOP` / `kill -9 platd` stops the fast path within `deadline_ms` | SC-24, AU-12 | POAM-016 | PASS (2026-11-03, kernel 6.8.0-147, veth, native and generic, by hand and through the units): forwarding stops 783–993 ms after `kill -STOP` (`deadline_ms` 1000) and resumes after `kill -CONT`; 692–945 ms after `kill -9` with the program left attached (by hand); 36–53 ms under the units (the loader unit detaches); the units re-run the loader. Audit finding of the first run fixed (`ControlState::beat` reports a missed deadline); re-run (native ×2, generic ×1, by hand): `heartbeat_stalled` + `heartbeat_resumed` records and `plat_xdp_heartbeat_stalls_total` 0 → 1 every run |
 | L30 | XDP: HA fence and takeover | SC-24, CP-10, AU-12 | POAM-016, POAM-007 | PASS (2026-11-03, `deploy/tests/cluster/f14-xdp-fence-takeover.sh` on `plat-linux` 6.8.0-147 + `plat-linux-2` 6.8.0-142 + `plat-edge`, `[xdp]` generic on the VXLAN overlay, one run): crash of A, takeover by B in 3.4 s (10 `cluster_slice_acquire` takeover, 8 `nat_port_block_adopt`, B's SLICE entries 0/0 → Active/1, B forwards on the fast path); failback by handover: B's SLICE entries Fenced, A's Active, 0 packets of the handed-back slices from B after the last release, zero attribution overlap. Not run: an operator-socket fence alone, x86_64, real NICs |
 | L31 | XDP: fast-path-only session lifetime and idle expiry under the units | SC-10, SC-5, RFC 6146 §3.5.1 | POAM-016 | PASS (2026-11-01, WU6, kernel 6.8.0-147, systemd 255, veth, native and generic): alive after 150 s of fast-path-only traffic (`udp_secs` 120), reclaimed after 125 s idle (`plat_sessions` 0, `plat_xdp_sessions` 0, 1 retire) |
 | L32 | XDP: map-full fallback | SC-5 | POAM-016 | PASS (2026-11-03, `E2E_MAPFULL=1 e2e.sh run`, kernel 6.8.0-147, veth, native, by hand): 5000 flows against `max_sessions` 4096: 5000/5000 echoes in each of 3 rounds, 4096 fast-path sessions, 162 `map_full` + 1092 `slots` install failures, overflow on the slow path, 30000 receiver checksums verified; after expiry 100 new flows all installed and on the fast path. The 1 s back-off itself is not observable from outside |
@@ -756,18 +756,31 @@ Result: **PASS** (veth, 6.8.0-147, systemd 255).
     (`BindsTo=` stops `plat-xdp.service`, whose detach ends the fast path
     before the deadline), then `Restart=on-failure` re-ran the loader (new
     program id).
-- **Finding (not fixed in this run):** the stop leaves no audit trace. A
-  frozen process freezes `plat-xdp-ctl` too, so it never sees the stall;
-  after `kill -CONT` the first health check passes. The audit file holds
-  only `enabled:start`; `plat_xdp_heartbeat_stalls_total` stayed 0. Only
-  the per-CPU pass counter (`deadline`) shows the stop. This contradicts
-  the AU-12 (XDP) claim that every fast-path state change is an
-  `xdp_fastpath_state` record. A frozen or starved process (SIGSTOP, VM
-  pause, a timer jump as seen in this run) is the case the deadline
-  exists for.
+- **Finding of the first run (fixed):** the stop left no audit trace. A
+  frozen process freezes `plat-xdp-ctl` too, so it never saw the stall;
+  after `kill -CONT` the first health check passed. The audit file held
+  only `enabled:start`; `plat_xdp_heartbeat_stalls_total` stayed 0; only
+  the per-CPU pass counter (`deadline`) showed the stop. A frozen or
+  starved process (SIGSTOP, VM pause, CPU starvation, a timer jump) is
+  the case the deadline exists for.
+- Fix: `ControlState::beat` (`crates/plat-xdp/src/control.rs`) keeps the
+  deadline it last stored (seeded from `CONTROL` at thread start) and, on
+  the next beat, if `now >= deadline` on `CLOCK_MONOTONIC_COARSE` (the
+  program's test in `decide`), counts a stall and reports
+  `heartbeat_stalled` then `heartbeat_resumed` before storing a new
+  deadline. Tests `a_missed_deadline_is_reported_once`,
+  `a_beat_at_the_deadline_is_a_lapse`. `deadman_stop` now fails without
+  both records or without a stall count.
+- Re-run (2026-11-03, `plat-linux`, kernel 6.8.0-147, by hand, `make xdp`
+  of the fix): native ×2 and generic ×1, `deadman_stop` PASS each time.
+  Last arrival 759, 759 (native), 913 (generic) ms after the signal;
+  `heartbeat stalls 0 -> 1`; `xdp_fastpath_state since start: enabled:start
+  disabled:heartbeat_stalled enabled:heartbeat_resumed`. Not re-run under
+  the units (the fix is in the control thread, which is the same in both).
+  One other native run failed earlier in `frag_needed_revalidate` (the
+  known intermittent failure) before reaching `deadman_stop`.
 
-Result: **PARTIAL**: the dead-man deadline (SC-24) PASS; the
-`heartbeat_resumed` record in the pass criteria FAIL (finding above).
+Result: **PASS**.
 
 #### L30 — HA fence and takeover
 
