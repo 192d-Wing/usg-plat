@@ -694,8 +694,9 @@ Result: **PASS** (one Ubuntu 24.04 / 6.8 aarch64 host).
     `lookup4_session`) is not controllable end to end; the
     `lookup4_session` branch is covered by
     `crates/plat-nat64/tests/mirror.rs::expiry_retires_and_seen_read_back_extends`.
-  - Runs: `frag_needed_revalidate` passed in 6 of 8 runs, intermittent (by hand native
-    ×3 and generic, units ×2); one units run on `plat-linux` right after
+  - Runs: `frag_needed_revalidate` passed in 9 of 11 runs, intermittent (by hand native
+    ×3 and generic, units ×2, and the three L29 re-runs: native ×2,
+    generic); one units run on `plat-linux` right after
     the VM timer jump got no Packet Too Big at the client while `platd`
     counted 7 packets in and 3 out; not reproduced, cause unknown (the
     case now also captures on the TUN to tell on a recurrence). A second
