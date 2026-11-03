@@ -54,6 +54,10 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
   byte-equal except the IPv4 ID / header checksum when DF = 0) and, with
   `E2E_MAPFULL=1`, `map_full` (L32); `auto_restart_reattach` under the
   units also times the SIGKILL stop.
+- `deploy/tests/xdp/e2e.sh`: captures use `tcpdump --immediate-mode`, and
+  `frag_needed_revalidate` waits for the Packet Too Big before stopping
+  the capture (its two intermittent failures were tcpdump dropping the
+  packet from an unretired TPACKET_V3 block on SIGTERM; 20 of 20 runs pass).
 - `deploy/tests/cluster/xdp-setup.sh` and `f14-xdp-fence-takeover.sh`
   (L30): the fast path on both HA nodes, crash takeover and failback by
   handover with SLICE map, audit and edge-capture checks; `lib.sh`

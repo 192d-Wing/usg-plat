@@ -327,9 +327,9 @@ print(ok)
     fi
 
     # Captures at both receivers, to check every delivered checksum.
-    nsenter --net="/run/netns/$NS_S" tcpdump -s 200 -U -ni s0 -w "$work/s0.pcap" udp >/dev/null 2>&1 </dev/null &
+    nsenter --net="/run/netns/$NS_S" tcpdump --immediate-mode -s 200 -U -ni s0 -w "$work/s0.pcap" udp >/dev/null 2>&1 </dev/null &
     pcap_s=$!
-    nsenter --net="/run/netns/$NS_C" tcpdump -s 200 -U -ni c0 -w "$work/c0.pcap" udp >/dev/null 2>&1 </dev/null &
+    nsenter --net="/run/netns/$NS_C" tcpdump --immediate-mode -s 200 -U -ni c0 -w "$work/c0.pcap" udp >/dev/null 2>&1 </dev/null &
     pcap_c=$!
     sleep 1
     n=${E2E_ECHOES:-150}
@@ -566,7 +566,7 @@ mapping() { python3 -I "$work/pcap.py" map "$2" "$1"; }
 # lm_p to its mapping, waiting for the fast-path publish.
 live_mapping() {
     lm_i0=$(metric plat_xdp_installs_total)
-    nsenter --net="/run/netns/$NS_S" tcpdump -s 96 -U -ni s0 -w "$work/map.pcap" udp dst port 7 >/dev/null 2>&1 </dev/null &
+    nsenter --net="/run/netns/$NS_S" tcpdump --immediate-mode -s 96 -U -ni s0 -w "$work/map.pcap" udp dst port 7 >/dev/null 2>&1 </dev/null &
     pcap_s=$! pcap_c=
     sleep 1
     client 1 >/dev/null
@@ -598,10 +598,10 @@ frag_needed_revalidate() {
 $(mapping 40000 "$work/s0.pcap")
 X
     [ -n "$fn_p" ] || die "frag_needed_revalidate: no mapping for port 40000 in the capture"
-    nsenter --net="/run/netns/$NS_C" tcpdump -s 0 -U -ni c0 -w "$work/ptb.pcap" icmp6 >/dev/null 2>&1 </dev/null &
+    nsenter --net="/run/netns/$NS_C" tcpdump --immediate-mode -s 0 -U -ni c0 -w "$work/ptb.pcap" icmp6 >/dev/null 2>&1 </dev/null &
     pcap_s=$!
     # Diagnostics: the TUN side in the PLAT namespace.
-    nsenter --net="/run/netns/$NS_P" tcpdump -s 0 -U -ni plat0 -w "$work/ptb-tun.pcap" icmp or icmp6 >/dev/null 2>&1 </dev/null &
+    nsenter --net="/run/netns/$NS_P" tcpdump --immediate-mode -s 0 -U -ni plat0 -w "$work/ptb-tun.pcap" icmp or icmp6 >/dev/null 2>&1 </dev/null &
     pcap_c=$!
     sleep 1
     rv0=$(metric plat_xdp_revalidated_total)
@@ -626,7 +626,16 @@ icmp = icmp[:2] + struct.pack("!H", csum(icmp)) + icmp[4:]
 s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
 s.sendto(icmp, (src, 0))
 ' "$fn_a" "$fn_p" || die "frag_needed_revalidate: sending the Frag Needed failed"
-    sleep 1
+    # Waits up to 5 s for the Packet Too Big in the capture (it usually
+    # arrives within a millisecond). Without --immediate-mode, tcpdump
+    # (TPACKET_V3) lost it on SIGTERM while it sat in an unretired ring
+    # block: the 2 of 11 failures, where platd had translated it.
+    i=0
+    until [ -n "$(python3 -I "$work/pcap.py" icmp6 "$work/ptb.pcap" 2)" ] || [ $i -ge 50 ]; do
+        i=$((i + 1))
+        sleep 0.1
+    done
+    sleep 0.2
     kill "$pcap_s" "$pcap_c" 2>/dev/null || true
     wait "$pcap_s" "$pcap_c" 2>/dev/null || true
     pcap_s=
@@ -667,7 +676,7 @@ while time.time() < end:
 }
 
 dm_capture() {
-    nsenter --net="/run/netns/$NS_S" tcpdump -s 96 -U -ni s0 -w "$1" udp dst port 7 >/dev/null 2>&1 </dev/null &
+    nsenter --net="/run/netns/$NS_S" tcpdump --immediate-mode -s 96 -U -ni s0 -w "$1" udp dst port 7 >/dev/null 2>&1 </dev/null &
     pcap_s=$! pcap_c=
     sleep 1
 }
@@ -783,9 +792,9 @@ X
 # threshold of 1260 B total), each echoed; captures at both receivers.
 # $1 = label.
 cmp_traffic() {
-    nsenter --net="/run/netns/$NS_S" tcpdump -s 0 -U -ni s0 -w "$work/cmp-$1-s0.pcap" udp dst port 7 >/dev/null 2>&1 </dev/null &
+    nsenter --net="/run/netns/$NS_S" tcpdump --immediate-mode -s 0 -U -ni s0 -w "$work/cmp-$1-s0.pcap" udp dst port 7 >/dev/null 2>&1 </dev/null &
     pcap_s=$!
-    nsenter --net="/run/netns/$NS_C" tcpdump -s 0 -U -ni c0 -w "$work/cmp-$1-c0.pcap" udp dst port 40002 >/dev/null 2>&1 </dev/null &
+    nsenter --net="/run/netns/$NS_C" tcpdump --immediate-mode -s 0 -U -ni c0 -w "$work/cmp-$1-c0.pcap" udp dst port 40002 >/dev/null 2>&1 </dev/null &
     pcap_c=$!
     sleep 1
     cf0=$(metric 'plat_xdp_packets_total{dir="v6_to_v4"}')
@@ -905,9 +914,9 @@ mf_counters() {
 }
 
 map_full() {
-    nsenter --net="/run/netns/$NS_S" tcpdump -s 200 -U -ni s0 -w "$work/mf-s0.pcap" udp dst port 7 >/dev/null 2>&1 </dev/null &
+    nsenter --net="/run/netns/$NS_S" tcpdump --immediate-mode -s 200 -U -ni s0 -w "$work/mf-s0.pcap" udp dst port 7 >/dev/null 2>&1 </dev/null &
     pcap_s=$!
-    nsenter --net="/run/netns/$NS_C" tcpdump -s 200 -U -ni c0 -w "$work/mf-c0.pcap" udp src port 7 >/dev/null 2>&1 </dev/null &
+    nsenter --net="/run/netns/$NS_C" tcpdump --immediate-mode -s 200 -U -ni c0 -w "$work/mf-c0.pcap" udp src port 7 >/dev/null 2>&1 </dev/null &
     pcap_c=$!
     sleep 1
     read -r r1 r2 r3 <<X
