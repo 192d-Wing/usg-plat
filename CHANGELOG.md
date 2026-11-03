@@ -21,12 +21,16 @@ First tagged release.
   (`download-artifact`, `attest-build-provenance`) pinned by commit SHA;
   `id-token`/`contents`/`attestations: write` granted only to `release`.
 - `scripts/verify-release.sh` / `make verify-release DIR=.. TAG=..`: checks
-  every bundle against identity `packages.yml@refs/tags/v*` (and the exact tag
-  for SHA256SUMS) and issuer `https://token.actions.githubusercontent.com`.
+  every bundle against the exact identity `packages.yml@refs/tags/<tag>` and
+  issuer `https://token.actions.githubusercontent.com` (needs cosign v3.0.3
+  or later, checked), and the provenance attestations when `gh` is present.
+- Release collection fails on a file-name collision or an unexpected file
+  count (11); tag builds do not restore the rust-cache from `main`.
 
 #### Security / compliance
 - Untested until the first tag runs. Depends on public Sigstore (Fulcio,
-  Rekor). apt/dnf repository metadata is not signed (POAM-044).
+  Rekor). apt/dnf repository metadata is not signed and nothing enforces
+  signatures at install (POAM-044). `v*` tags protected by ruleset 26491202.
 - No config-schema or log-schema change (`LOG_SCHEMA_VERSION` stays 8).
 
 ### SBOM and CBOM in CI (CM-8, SR-3, SR-4, RA-5); version 0.2.0

@@ -56,6 +56,8 @@ jobs:
       - name: Install pinned toolchain from rust-toolchain.toml
         run: rustup toolchain install && rustup show
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        # Tag (release) builds start clean: no cache restored from main.
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         with:
           key: packages-${{ matrix.arch }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -137,6 +139,8 @@ jobs:
       - name: Install pinned toolchain from rust-toolchain.toml (incl. rust-src)
         run: rustup toolchain install && rustup show
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        # Tag (release) builds start clean: no cache restored from main.
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         with:
           key: sbom-xdp-${{ matrix.arch }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -170,6 +174,8 @@ jobs:
             docs/compliance/cbom.cdx.json
           if-no-files-found: error
 
+  # POAM: POAM-044 (untested until the first tag; public Sigstore; repo
+  # metadata unsigned; signatures not enforced at install)
   # Tag-only: checksum, sign (cosign keyless) and publish. The only job with
   # id-token: write and contents: write. Verify with scripts/verify-release.sh.
   release:
@@ -201,11 +207,20 @@ jobs:
       - name: Collect release files and write SHA256SUMS
         run: |
           mkdir dist
-          find artifacts -type f \( -name '*.deb' -o -name '*.rpm' -o -name 'platd-*-*.cdx.json' \) -exec cp -n {} dist/ \;
+          # Fail on a name collision instead of silently keeping one copy.
+          find artifacts -type f \( -name '*.deb' -o -name '*.rpm' -o -name 'platd-*-*.cdx.json' \) -print0 |
+            while IFS= read -r -d '' f; do
+              b=$(basename "$f")
+              if [ -e "dist/$b" ]; then echo "::error::duplicate release file name $b ($f)"; exit 1; fi
+              cp "$f" "dist/$b"
+            done
           cp artifacts/platd-packages-x86_64/docs/compliance/cbom.cdx.json dist/platd-cbom.cdx.json
           for a in x86_64 aarch64; do
             cp "artifacts/platd-sbom-xdp-$a/target/xdp/plat-xdp-ebpf.sha256" "dist/plat-xdp-ebpf-$a.sha256"
           done
+          # 2 arches x (deb + rpm + SBOM + xdp SBOM + eBPF hash) + CBOM = 11
+          n=$(find dist -maxdepth 1 -type f | wc -l)
+          if [ "$n" -ne 11 ]; then echo "::error::expected 11 release files, found $n"; ls -l dist; exit 1; fi
           cd dist && sha256sum -- * | LC_ALL=C sort -k2 > SHA256SUMS && cat SHA256SUMS
       - name: Install cosign (pinned version and SHA-256)
         run: |

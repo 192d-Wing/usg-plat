@@ -53,21 +53,23 @@ policy. Tagged releases are signed with Sigstore cosign keyless; see
 Download every file of a GitHub Release (for example
 `gh release download v0.2.0 -D dl`), then run
 `scripts/verify-release.sh dl v0.2.0` (or `make verify-release DIR=dl TAG=v0.2.0`).
-It needs cosign 2.0 or later and network access to the public Sigstore
+It needs cosign v3.0.3 or later (the script checks `cosign version`) and network access to the public Sigstore
 trust root. For one file it runs:
 
 ```sh
 cosign verify-blob --bundle <file>.sigstore.json \
-  --certificate-identity-regexp '^https://github\.com/192d-Wing/usg-plat/\.github/workflows/packages\.yml@refs/tags/v.*$' \
+  --certificate-identity https://github.com/192d-Wing/usg-plat/.github/workflows/packages.yml@refs/tags/v0.2.0 \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   <file>
 ```
 
-It also checks `SHA256SUMS` against the exact tag and every file against
+Every bundle is checked against the exact tag, and every file against
 `SHA256SUMS`. A signature proves the file was built by this repository's
 `packages.yml` on a `v*` tag; it relies on GitHub's OIDC issuer and the
-public Fulcio/Rekor services. Build provenance attestations can be checked
-with `gh attestation verify <file> --repo 192d-Wing/usg-plat`. The signing
+public Fulcio/Rekor services. When `gh` is installed the script also checks the build
+provenance attestations with `gh attestation verify <file> --repo 192d-Wing/usg-plat
+--signer-workflow 192d-Wing/usg-plat/.github/workflows/packages.yml
+--source-ref refs/tags/v0.2.0`. Nothing enforces verification at install time. The signing
 path is untested until the first tag runs.
 
 ### Manual install
