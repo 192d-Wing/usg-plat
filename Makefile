@@ -290,7 +290,7 @@ rpm: sbom
 
 packages: deb rpm
 
-# Verify a downloaded GitHub Release: make verify-release DIR=./dl TAG=v0.2.0
+# Verify a downloaded GitHub Release: make verify-release DIR=./dl TAG=v0.2.1
 # (cosign keyless bundles, identity = packages.yml at refs/tags/v*; SI-7, SR-11).
 verify-release:
 	@test -n "$(DIR)" && test -n "$(TAG)" || { echo "usage: make verify-release DIR=<dir> TAG=v<x.y.z>" >&2; exit 2; }

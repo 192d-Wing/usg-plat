@@ -4,9 +4,24 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-03
+
+First published release. Same code as 0.2.0, whose tag run signed every
+file but published nothing.
+
+### Fixed
+- `packages.yml` `release` job: the self-verify step had no `GH_TOKEN`, so
+  `gh attestation verify` in `scripts/verify-release.sh` exited 4 and the
+  GitHub Release was never created (v0.2.0 run 41740651420; cosign
+  verification of all 11 files and `SHA256SUMS` had passed). The step now
+  gets `GH_TOKEN: ${{ github.token }}`.
+
+### Changed
+- Workspace version 0.2.0 -> 0.2.1.
+
 ## [0.2.0] - 2026-11-03
 
-First tagged release.
+First tagged release (signed by the v0.2.0 tag run, not published).
 
 ### Release signing (SI-7, SR-4, SR-11, CM-14)
 
