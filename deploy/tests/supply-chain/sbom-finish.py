@@ -20,8 +20,8 @@ Steps (plan §1.1, §1.1b, §1.1c):
     name, version, purl; no extras); aws-lc-fips-sys, aws-lc-rs and rustls
     are present.
  5. T7 (--auditable, Linux): the cargo-auditable `.dep-v0` section of each
-    binary is present; its runtime packages equal that binary's normal-edge
-    closure and its build packages are a subset of the build closure.
+    binary is present; it records every registry package the binary links
+    (normal-edge closure) and nothing outside the shipped build closure.
  6. T8 (--xdp-object): adds the eBPF object as a component with its SHA-256,
     nested crates (bpfel graph and build-std from the sysroot lock) and the
     build formulation; the hash must equal `<obj>.sha256` and the newest
@@ -204,19 +204,21 @@ def dep_v0(binary):
         return json.loads(zlib.decompress(out.read_bytes()))
 
 
-def auditable_check(info, normal, build):
-    """info: decoded .dep-v0; normal/build: {(name, version)} registry closures."""
+def auditable_check(info, normal, full):
+    """info: decoded .dep-v0; normal: the binary's own normal-edge registry
+    closure; full: the registry closure of the whole shipped build.
+
+    cargo-auditable records a cargo-metadata view of one `cargo auditable
+    build` invocation: proc-macros are filed as build packages, and the
+    build tools of every package in that invocation can appear under each
+    binary. So the check is containment, not equality: everything the binary
+    links is recorded (cargo audit bin sees it), and nothing is recorded that
+    the shipped build does not resolve."""
     if info is None:
         return ["T7: no .dep-v0 section (binary not built with cargo auditable)"]
-    errs = []
-    rt = {(p["name"], p["version"]) for p in info["packages"]
-          if p.get("source") == "crates.io" and p.get("kind", "runtime") == "runtime"}
-    bd = {(p["name"], p["version"]) for p in info["packages"]
-          if p.get("source") == "crates.io" and p.get("kind") == "build"}
-    for x in sorted(rt ^ normal):
-        errs.append(f"T7: runtime package {x} differs between .dep-v0 and the SBOM normal closure")
-    for x in sorted(bd - build):
-        errs.append(f"T7: build package {x} in .dep-v0 is not in the SBOM build closure")
+    rec = {(p["name"], p["version"]) for p in info["packages"] if p.get("source") == "crates.io"}
+    errs = [f"T7: package {x} is linked but missing from .dep-v0" for x in sorted(normal - rec)]
+    errs += [f"T7: package {x} in .dep-v0 is not in the shipped build closure" for x in sorted(rec - full)]
     return errs
 
 
@@ -380,8 +382,8 @@ def self_test():
                          {"name": "platd", "version": "0.1.0", "source": "local"}]}
     assert auditable_check(info, {("rustls", "0.23.46")}, {("rustls", "0.23.46"), ("cc", "1.2.0")}) == []
     assert auditable_check(None, set(), set())
-    assert auditable_check(info, {("rustls", "0.23.46"), ("x", "1")}, {("cc", "1.2.0")})
-    assert auditable_check(info, {("rustls", "0.23.46")}, set())
+    assert auditable_check(info, {("rustls", "0.23.46"), ("x", "1")}, {("rustls", "0.23.46"), ("cc", "1.2.0")})
+    assert auditable_check(info, {("rustls", "0.23.46")}, {("rustls", "0.23.46")})
     # T8: tampered object hash fails.
     with tempfile.TemporaryDirectory() as d:
         obj = Path(d) / "plat-xdp-ebpf"
@@ -436,8 +438,7 @@ def main(argv):
         name = Path(b).name
         own = [f for f in feats if f.startswith(f"{name}/")]
         normal = set(cargo_tree([name], "normal", a.target, own))
-        nb = set(cargo_tree([name], "normal,build", a.target, own))
-        errs += [f"{b}: {e}" for e in auditable_check(dep_v0(b), normal, nb)]
+        errs += [f"{b}: {e}" for e in auditable_check(dep_v0(b), normal, want)]
 
     if a.xdp_object:
         version = bom["metadata"]["component"].get("version", "0.0.0")
