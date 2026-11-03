@@ -111,5 +111,6 @@ not cryptographic protection of data and are therefore not CBOM components.
 
 | Item | Where | Purpose | Why excluded |
 |------|-------|---------|--------------|
+| Release signing (cosign keyless: Fulcio-issued ephemeral ECDSA P-256 key, SHA-256, Rekor transparency log) | `.github/workflows/packages.yml` `release` job, `scripts/verify-release.sh` | Signs release files in CI (SI-7, SR-11; POAM-044) | Runs in CI and on the verifier's host, not in the TOE; not a CBOM component. |
 | `ahash` (randomly keyed `RandomState`) | `crates/plat-nat64/src/shard.rs` and other hash maps | HashDoS-resistant table hashing (SC-5) | Not a cryptographic primitive; keys are per process and never leave memory. Allowed in `deploy/tests/supply-chain/crypto-allow.toml`. |
 | RFC 7739 IPv4 Identification key | `crates/plat-nat64/src/ident.rs` `IdentKey` (boot-random, from `ahash`), `crates/plat-xdp-core/src/ident.rs` | Picks the per-flow counter and offset for the IPv4 ID (RFC 7739 §5.3, SC-7 side channel) | Unpredictability aid, not confidentiality or integrity; no SC-13 claim (see the module comment). |

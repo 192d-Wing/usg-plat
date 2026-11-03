@@ -2,7 +2,7 @@
 LINUX_TARGET ?= aarch64-unknown-linux-gnu
 ZENSICAL ?= uvx zensical@0.0.73
 
-.PHONY: all check fmt clippy check-linux check-notls test test-deploy bench ir security compliance-annotations release dist deb rpm packages docs docs-serve sbom cbom-check
+.PHONY: all check fmt clippy check-linux check-notls test test-deploy bench ir security compliance-annotations release dist deb rpm packages docs docs-serve sbom cbom-check verify-release
 
 all: check test
 
@@ -49,7 +49,7 @@ test: xdp-env
 # Deploy scripts: POSIX syntax, shellcheck (required when CI=true) and a stubbed run
 # against the real `platd check-config --format env` output.
 DEPLOY_SH := deploy/systemd/plat-tun-setup.sh deploy/systemd/plat-fwguard.sh deploy/tests/deploy-scripts-test.sh \
-	deploy/hooks/frr-announce.sh deploy/hooks/frr-withdraw.sh deploy/systemd/plat-v6-announce.sh deploy/tests/xdp/e2e.sh $(wildcard deploy/tests/cluster/*.sh)
+	deploy/hooks/frr-announce.sh deploy/hooks/frr-withdraw.sh deploy/systemd/plat-v6-announce.sh deploy/tests/xdp/e2e.sh scripts/verify-release.sh $(wildcard deploy/tests/cluster/*.sh)
 test-deploy:
 	for f in $(DEPLOY_SH); do sh -n $$f || exit 1; done
 	@if command -v shellcheck >/dev/null 2>&1; then shellcheck -x $(DEPLOY_SH); \
@@ -289,6 +289,12 @@ rpm: sbom
 	cargo generate-rpm -p services/platd --profile dist
 
 packages: deb rpm
+
+# Verify a downloaded GitHub Release: make verify-release DIR=./dl TAG=v0.2.0
+# (cosign keyless bundles, identity = packages.yml at refs/tags/v*; SI-7, SR-11).
+verify-release:
+	@test -n "$(DIR)" && test -n "$(TAG)" || { echo "usage: make verify-release DIR=<dir> TAG=v<x.y.z>" >&2; exit 2; }
+	sh scripts/verify-release.sh $(DIR) $(TAG)
 
 docs:
 	$(ZENSICAL) build --clean

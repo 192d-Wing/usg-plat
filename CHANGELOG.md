@@ -4,6 +4,35 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-03
+
+First tagged release.
+
+### Release signing (SI-7, SR-4, SR-11, CM-14)
+
+#### Added
+- `packages.yml` `release` job, on `v*` tags only: collects the .deb/.rpm,
+  SBOMs, CBOM and eBPF object hashes, writes `SHA256SUMS`, signs it and each
+  file with Sigstore cosign keyless (GitHub Actions OIDC, public Rekor log;
+  `<file>.sigstore.json` bundles), adds GitHub build provenance attestations
+  and publishes a GitHub Release. Fails if the tag differs from the workspace
+  version. Pushes, PRs and dispatch runs neither sign nor publish.
+- cosign v3.1.4 installed by pinned version and SHA-256; new actions
+  (`download-artifact`, `attest-build-provenance`) pinned by commit SHA;
+  `id-token`/`contents`/`attestations: write` granted only to `release`.
+- `scripts/verify-release.sh` / `make verify-release DIR=.. TAG=..`: checks
+  every bundle against the exact identity `packages.yml@refs/tags/<tag>` and
+  issuer `https://token.actions.githubusercontent.com` (needs cosign v3.0.3
+  or later, checked), and the provenance attestations when `gh` is present.
+- Release collection fails on a file-name collision or an unexpected file
+  count (11); tag builds do not restore the rust-cache from `main`.
+
+#### Security / compliance
+- Untested until the first tag runs. Depends on public Sigstore (Fulcio,
+  Rekor). apt/dnf repository metadata is not signed and nothing enforces
+  signatures at install (POAM-044). `v*` tags protected by ruleset 26491202.
+- No config-schema or log-schema change (`LOG_SCHEMA_VERSION` stays 8).
+
 ### SBOM and CBOM in CI (CM-8, SR-3, SR-4, RA-5); version 0.2.0
 
 #### Added
@@ -41,8 +70,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
   prerequisites and accepted certificate algorithms change).
 
 #### Security / compliance
-- SI-7 gap narrowed: SBOM now produced in CI; packages and SBOMs remain
-  unsigned.
+- SI-7 gap narrowed: SBOM now produced in CI (signed on tags, see above).
 - No config-schema or log-schema change (`LOG_SCHEMA_VERSION` stays 8; no
   SIEM parser action).
 

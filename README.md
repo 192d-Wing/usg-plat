@@ -45,7 +45,32 @@ or restarted by the package: edit the config, then enable a time-wait unit,
 `plat-fwguard.timer` and `platd` as in the manual steps below. The
 nftables drop-in is active as soon as the package is installed, so an
 nftables start or reload turns forwarding off until `platd` has set up its
-policy. Packages are not signed yet (SI-7).
+policy. Tagged releases are signed with Sigstore cosign keyless; see
+"Verifying a release". There is no signed apt/dnf repository.
+
+### Verifying a release
+
+Download every file of a GitHub Release (for example
+`gh release download v0.2.0 -D dl`), then run
+`scripts/verify-release.sh dl v0.2.0` (or `make verify-release DIR=dl TAG=v0.2.0`).
+It needs cosign v3.0.3 or later (the script checks `cosign version`) and network access to the public Sigstore
+trust root. For one file it runs:
+
+```sh
+cosign verify-blob --bundle <file>.sigstore.json \
+  --certificate-identity https://github.com/192d-Wing/usg-plat/.github/workflows/packages.yml@refs/tags/v0.2.0 \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  <file>
+```
+
+Every bundle is checked against the exact tag, and every file against
+`SHA256SUMS`. A signature proves the file was built by this repository's
+`packages.yml` on a `v*` tag; it relies on GitHub's OIDC issuer and the
+public Fulcio/Rekor services. When `gh` is installed the script also checks the build
+provenance attestations with `gh attestation verify <file> --repo 192d-Wing/usg-plat
+--signer-workflow 192d-Wing/usg-plat/.github/workflows/packages.yml
+--source-ref refs/tags/v0.2.0`. Nothing enforces verification at install time. The signing
+path is untested until the first tag runs.
 
 ### Manual install
 
