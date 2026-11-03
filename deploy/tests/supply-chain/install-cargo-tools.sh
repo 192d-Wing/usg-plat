@@ -23,7 +23,8 @@ cargo-audit 0.22.2 700c2b240f7fd330c24b675fe429f73a5b676531fcc6300400b2b67f155ba
 "
 
 sha256() {
-	if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi
+	local file="$1"
+	if command -v sha256sum >/dev/null; then sha256sum "$file" | cut -d" " -f1; else shasum -a 256 "$file" | cut -d" " -f1; fi
 }
 
 want=("$@")
@@ -31,8 +32,8 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
 while read -r name version sum; do
-	[ -n "$name" ] || continue
-	if [ ${#want[@]} -gt 0 ] && ! printf '%s\n' "${want[@]}" | grep -qx "$name"; then continue; fi
+	[[ -n "$name" ]] || continue
+	if [[ ${#want[@]} -gt 0 ]] && ! printf '%s\n' "${want[@]}" | grep -qx "$name"; then continue; fi
 	if cargo install --list | grep -qx "$name v$version:"; then
 		echo "$name $version already installed"
 		continue
@@ -40,7 +41,7 @@ while read -r name version sum; do
 	crate="$work/$name-$version.crate"
 	curl --proto '=https' --tlsv1.2 -sSfL -o "$crate" "https://static.crates.io/crates/$name/$name-$version.crate"
 	got=$(sha256 "$crate")
-	if [ "$got" != "$sum" ]; then
+	if [[ "$got" != "$sum" ]]; then
 		echo "ERROR: $name $version checksum mismatch: got $got, pinned $sum" >&2
 		exit 1
 	fi

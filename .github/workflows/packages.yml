@@ -80,10 +80,11 @@ jobs:
         run: |
           set -eu
           check_tree() {
+            local root="$1"
             for f in sbom:target/sbom/platd-sbom.cdx.json cbom:docs/compliance/cbom.cdx.json; do
-              cmp "$1/usr/share/doc/platd/${f%%:*}.cdx.json" "${f#*:}"
+              cmp "$root/usr/share/doc/platd/${f%%:*}.cdx.json" "${f#*:}"
             done
-            cargo audit bin "$1/usr/bin/platd" "$1/usr/libexec/plat/plat-xdp-loader"
+            cargo audit bin "$root/usr/bin/platd" "$root/usr/libexec/plat/plat-xdp-loader"
           }
           deb=$(mktemp -d); dpkg-deb -x target/debian/*.deb "$deb"; check_tree "$deb"
           rpm=$(mktemp -d); (cd "$rpm" && rpm2cpio "$GITHUB_WORKSPACE"/target/generate-rpm/*.rpm | cpio -id --quiet); check_tree "$rpm"
