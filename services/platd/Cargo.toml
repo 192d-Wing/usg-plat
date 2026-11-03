@@ -97,7 +97,7 @@ assets = [
     ["../../deploy/systemd/platd.service.d.example/xdp.conf", "usr/share/doc/platd/examples/platd.service.d/", "644"],
     # CM-8/SR-4: CycloneDX SBOM of this build (`make sbom`, run by `make deb`)
     # and the CBOM (docs/compliance/cbom.cdx.json).
-    ["target/sbom/platd-sbom.cdx.json", "usr/share/doc/platd/sbom.cdx.json", "644"],
+    ["../../target/sbom/platd-sbom.cdx.json", "usr/share/doc/platd/sbom.cdx.json", "644"],
     ["../../docs/compliance/cbom.cdx.json", "usr/share/doc/platd/cbom.cdx.json", "644"],
 ]
 
