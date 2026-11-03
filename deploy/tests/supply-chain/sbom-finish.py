@@ -195,7 +195,9 @@ def dep_v0(binary):
     """Decoded cargo-auditable data, or None if the section is absent."""
     with tempfile.TemporaryDirectory() as d:
         out = Path(d) / "dep-v0"
-        r = subprocess.run(["objcopy", "-O", "binary", "--only-section=.dep-v0", str(binary), str(out)],
+        # --dump-section, not -O binary: .dep-v0 is not SHF_ALLOC, so -O binary
+        # writes an empty file. The section-less output copy is discarded.
+        r = subprocess.run(["objcopy", f"--dump-section=.dep-v0={out}", str(binary), str(Path(d) / "copy")],
                            capture_output=True)
         if r.returncode != 0 or not out.is_file() or out.stat().st_size == 0:
             return None
