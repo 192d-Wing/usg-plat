@@ -21,7 +21,8 @@ Steps (plan §1.1, §1.1b, §1.1c):
     are present.
  5. T7 (--auditable, Linux): the cargo-auditable `.dep-v0` section of each
     binary is present; it records every registry package the binary links
-    (normal-edge closure) and nothing outside the shipped build closure.
+    (normal-edge closure) and nothing outside the `cargo metadata` resolve
+    for the target (which, like cargo-cyclonedx, keeps unbuilt optional deps).
  6. T8 (--xdp-object): adds the eBPF object as a component with its SHA-256,
     nested crates (bpfel graph and build-std from the sysroot lock) and the
     build formulation; the hash must equal `<obj>.sha256` and the newest
@@ -204,21 +205,34 @@ def dep_v0(binary):
         return json.loads(zlib.decompress(out.read_bytes()))
 
 
+def metadata_registry(target):
+    """Registry packages in the `cargo metadata` resolve for `target`. This
+    is what cargo-auditable records: like cargo-cyclonedx it keeps optional
+    dependencies whose features are never activated (e.g. ring through
+    rustls-webpki), so it is a superset of what cargo builds."""
+    d = json.loads(run(["cargo", "metadata", "--locked", "--offline", "--format-version", "1",
+                        "--filter-platform", target]))
+    ids = {n["id"] for n in d["resolve"]["nodes"]}
+    return {(p["name"], p["version"]) for p in d["packages"]
+            if p["id"] in ids and (p.get("source") or "").startswith("registry+")}
+
+
 def auditable_check(info, normal, full):
     """info: decoded .dep-v0; normal: the binary's own normal-edge registry
-    closure; full: the registry closure of the whole shipped build.
+    closure; full: the `cargo metadata` registry resolve for the target.
 
     cargo-auditable records a cargo-metadata view of one `cargo auditable
     build` invocation: proc-macros are filed as build packages, and the
     build tools of every package in that invocation can appear under each
-    binary. So the check is containment, not equality: everything the binary
+    binary, and optional dependencies that are never built are kept. So the
+    check is containment, not equality: everything the binary
     links is recorded (cargo audit bin sees it), and nothing is recorded that
-    the shipped build does not resolve."""
+    cargo metadata does not resolve for the target (`full`)."""
     if info is None:
         return ["T7: no .dep-v0 section (binary not built with cargo auditable)"]
     rec = {(p["name"], p["version"]) for p in info["packages"] if p.get("source") == "crates.io"}
     errs = [f"T7: package {x} is linked but missing from .dep-v0" for x in sorted(normal - rec)]
-    errs += [f"T7: package {x} in .dep-v0 is not in the shipped build closure" for x in sorted(rec - full)]
+    errs += [f"T7: package {x} in .dep-v0 is not in the cargo metadata resolve" for x in sorted(rec - full)]
     return errs
 
 
@@ -431,6 +445,7 @@ def main(argv):
     bom = prune(bom, want)
     errs = cross_check(bom, want)
 
+    resolved = metadata_registry(a.target) if a.auditable else set()
     for b in a.auditable:
         if platform.system() != "Linux" or not shutil.which("objcopy"):
             print(f"T7: skipped for {b} (needs Linux and objcopy)", file=sys.stderr)
@@ -438,7 +453,7 @@ def main(argv):
         name = Path(b).name
         own = [f for f in feats if f.startswith(f"{name}/")]
         normal = set(cargo_tree([name], "normal", a.target, own))
-        errs += [f"{b}: {e}" for e in auditable_check(dep_v0(b), normal, want)]
+        errs += [f"{b}: {e}" for e in auditable_check(dep_v0(b), normal, resolved)]
 
     if a.xdp_object:
         version = bom["metadata"]["component"].get("version", "0.0.0")
