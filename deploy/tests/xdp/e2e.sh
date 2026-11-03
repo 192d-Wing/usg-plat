@@ -676,7 +676,8 @@ while time.time() < end:
 }
 
 dm_capture() {
-    nsenter --net="/run/netns/$NS_S" tcpdump --immediate-mode -s 96 -U -ni s0 -w "$1" udp dst port 7 >/dev/null 2>&1 </dev/null &
+    dm_out=$1
+    nsenter --net="/run/netns/$NS_S" tcpdump --immediate-mode -s 96 -U -ni s0 -w "$dm_out" udp dst port 7 >/dev/null 2>&1 </dev/null &
     pcap_s=$! pcap_c=
     sleep 1
 }
@@ -792,9 +793,10 @@ X
 # threshold of 1260 B total), each echoed; captures at both receivers.
 # $1 = label.
 cmp_traffic() {
-    nsenter --net="/run/netns/$NS_S" tcpdump --immediate-mode -s 0 -U -ni s0 -w "$work/cmp-$1-s0.pcap" udp dst port 7 >/dev/null 2>&1 </dev/null &
+    cmp_label=$1
+    nsenter --net="/run/netns/$NS_S" tcpdump --immediate-mode -s 0 -U -ni s0 -w "$work/cmp-$cmp_label-s0.pcap" udp dst port 7 >/dev/null 2>&1 </dev/null &
     pcap_s=$!
-    nsenter --net="/run/netns/$NS_C" tcpdump --immediate-mode -s 0 -U -ni c0 -w "$work/cmp-$1-c0.pcap" udp dst port 40002 >/dev/null 2>&1 </dev/null &
+    nsenter --net="/run/netns/$NS_C" tcpdump --immediate-mode -s 0 -U -ni c0 -w "$work/cmp-$cmp_label-c0.pcap" udp dst port 40002 >/dev/null 2>&1 </dev/null &
     pcap_c=$!
     sleep 1
     cf0=$(metric 'plat_xdp_packets_total{dir="v6_to_v4"}')
@@ -822,11 +824,11 @@ print(ok)
     wait "$pcap_s" "$pcap_c" 2>/dev/null || true
     pcap_s=
     cf1=$(metric 'plat_xdp_packets_total{dir="v6_to_v4"}')
-    echo "e2e: capture_compare ($1): $ok/45 echoes, fast path v6->v4 +$((cf1 - cf0))" >&2
-    [ "$ok" -eq 45 ] || die "capture_compare: $ok/45 echoes ($1)"
+    echo "e2e: capture_compare ($cmp_label): $ok/45 echoes, fast path v6->v4 +$((cf1 - cf0))" >&2
+    [ "$ok" -eq 45 ] || die "capture_compare: $ok/45 echoes ($cmp_label)"
     # The xdp run: all but the first datagram on the fast path; the TUN
     # run: none (no [xdp]: the series is absent or 0).
-    if [ "$1" = xdp ]; then
+    if [ "$cmp_label" = xdp ]; then
         [ $((cf1 - cf0)) -ge 44 ] || die "capture_compare: only $((cf1 - cf0)) of 45 on the fast path"
     else
         [ "$cf1" -le 0 ] || die "capture_compare: TUN-only run reports fast-path packets ($cf1)"
