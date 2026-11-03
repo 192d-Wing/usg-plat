@@ -1011,6 +1011,11 @@ units_cleanup() {
     systemctl reset-failed platd.service plat-xdp.service plat-fwguard.service run-plat-bpf.mount 2>/dev/null || true
     rm -rf /run/plat-e2e
     [ -n "${E2E_KEEP:-}" ] || rm -f /var/log/plat/e2e-audit.jsonl*
+    # fwguard_swapped stops the timer; restore it if that case died early.
+    if [ "${FWTIMER_WAS:-}" = active ]; then
+        systemctl start plat-fwguard.timer 2>/dev/null || true
+        FWTIMER_WAS=
+    fi
 }
 
 journal() {
@@ -1137,13 +1142,14 @@ X
     if [ -z "$other" ] || [ "$other" = "$(state_id)" ]; then die "fwguard_swapped: no other program on p6"; fi
     # The timer (pulled in by platd.service) must not run the host's guard
     # in place of this one.
-    fwtimer=$(systemctl is-active plat-fwguard.timer || true)
+    FWTIMER_WAS=$(systemctl is-active plat-fwguard.timer || true)
     systemctl stop plat-fwguard.timer
     while [ "$(systemctl is-active plat-fwguard.service)" = activating ]; do sleep 0.2; done
     fwguard_in_ns on
     systemctl start plat-fwguard.service || true
     fwguard_in_ns off
-    [ "$fwtimer" != active ] || systemctl start plat-fwguard.timer
+    [ "$FWTIMER_WAS" != active ] || systemctl start plat-fwguard.timer
+    FWTIMER_WAS=
     msg=$(journalctl -u plat-fwguard.service --since "@$t0" --no-pager -o cat | grep 'xdp-program-swapped' | tail -n 1)
     [ -n "$msg" ] || { journal; die "fwguard_swapped: not reported"; }
     [ -z "$(xdp_prog_on p6)" ] || die "fwguard_swapped: program $other still attached"

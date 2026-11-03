@@ -272,7 +272,10 @@ pub enum Fault {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transition {
     /// Heartbeats withheld: the deadline runs out and the fast path stops.
-    Stalled,
+    /// `lapsed_ns`: `Some(now - deadline)` when a stored deadline ran out
+    /// before this thread beat again (it did not run in time); `None` when
+    /// the health check failed.
+    Stalled { lapsed_ns: Option<u64> },
     /// Health came back: heartbeats resumed.
     Resumed,
     /// Disabled for good (`CONTROL.enabled = 0`).
@@ -317,6 +320,9 @@ pub struct ControlState {
     grace_failed: u32,
     /// The deadline last stored in `CONTROL` (0: none yet).
     last_deadline: u64,
+    /// `last_deadline` was shortened by the cap (lease fence): its lapse is
+    /// the fence, audited by the cluster records, not a missed heartbeat.
+    capped: bool,
 }
 
 impl ControlState {
@@ -348,16 +354,19 @@ impl ControlState {
         // - NIST 800-53: SC-24 (Fail in Known State) - the program stops
         //   forwarding at `now >= deadline_ns` (`decide`); the same test on
         //   the same clock (`CLOCK_MONOTONIC_COARSE`) is applied here
-        if !self.stalled && self.last_deadline != 0 && now_ns >= self.last_deadline {
+        // - NIST 800-53: AU-4/SC-5 - a cap-bound deadline (fenced or
+        //   minority member) is never a heartbeat lapse, so a fenced node
+        //   does not emit a Stalled+Resumed pair per beat (SEC-V01)
+        if !self.stalled && !self.capped && self.last_deadline != 0 && now_ns >= self.last_deadline {
             c.heartbeat_stalls.fetch_add(1, Ordering::Relaxed);
             self.stalled = true;
-            notify(Transition::Stalled);
+            notify(Transition::Stalled { lapsed_ns: Some(now_ns - self.last_deadline) });
         }
         if !healthy {
             c.heartbeat_stalls.fetch_add(1, Ordering::Relaxed);
             if !self.stalled {
                 self.stalled = true;
-                notify(Transition::Stalled);
+                notify(Transition::Stalled { lapsed_ns: None });
             }
             return None;
         }
@@ -366,7 +375,9 @@ impl ControlState {
             notify(Transition::Resumed);
         }
         let d = now_ns.saturating_add(t.deadline.as_nanos() as u64);
-        let d = cap.map_or(d, |c| d.min(c));
+        let capped = cap.is_some_and(|c| c < d);
+        let d = if capped { cap.unwrap_or(d) } else { d };
+        self.capped = capped;
         self.last_deadline = d;
         Some(d)
     }
@@ -575,7 +586,7 @@ mod tests {
         assert_eq!(c.heartbeat_stalls.load(Ordering::Relaxed), 2);
         assert_eq!(
             seen,
-            [Transition::Stalled, Transition::Resumed, Transition::Fault(Fault::ConfigMismatch)],
+            [Transition::Stalled { lapsed_ns: None }, Transition::Resumed, Transition::Fault(Fault::ConfigMismatch)],
             "one record per transition"
         );
         let mut g = ControlState::default();
@@ -605,7 +616,7 @@ mod tests {
         assert!(st.beat(true, 5_250_000_000, &t, None, &c, &mut n).is_some());
         assert_eq!(c.heartbeat_stalls.load(Ordering::Relaxed), 1);
         drop(n);
-        assert_eq!(seen, [Transition::Stalled, Transition::Resumed]);
+        assert_eq!(seen, [Transition::Stalled { lapsed_ns: Some(3_749_999_001) }, Transition::Resumed]);
     }
 
     #[test]
@@ -623,9 +634,75 @@ mod tests {
         let mut st2 = ControlState::with_deadline(100);
         assert_eq!(st2.beat(false, 200, &t, None, &c, &mut n), None);
         drop(n);
-        assert_eq!(seen, [Transition::Stalled, Transition::Resumed, Transition::Stalled]);
+        assert_eq!(
+            seen,
+            [
+                Transition::Stalled { lapsed_ns: Some(0) },
+                Transition::Resumed,
+                Transition::Stalled { lapsed_ns: Some(100) }
+            ]
+        );
         assert_eq!(c.heartbeat_stalls.load(Ordering::Relaxed), 3, "lapse + lapse + unhealthy tick");
         assert_eq!(ControlState::with_deadline(1).last_deadline, 0, "claim mark ignored");
+    }
+
+    /// QA (L29): a lapse during an unhealthy stall is not reported twice;
+    /// a cap-bound deadline never counts as a heartbeat lapse; a faulted state
+    /// ignores lapses; unset seeds (0) never report a lapse.
+    #[test]
+    fn lapse_edge_cases() {
+        let t = ControlTiming { heartbeat: Duration::from_millis(250), deadline: Duration::from_millis(1000) };
+        let c = ControlCounters::default();
+        let mut seen = Vec::new();
+        let mut n = |x| seen.push(x);
+        // Unhealthy (stalled) across the deadline, then healthy: one pair.
+        let mut st = ControlState::with_deadline(1_000);
+        assert_eq!(st.beat(false, 500, &t, None, &c, &mut n), None);
+        assert_eq!(st.beat(false, 2_000, &t, None, &c, &mut n), None);
+        assert_eq!(st.beat(true, 3_000, &t, None, &c, &mut n), Some(1_000_003_000));
+        assert_eq!(c.heartbeat_stalls.load(Ordering::Relaxed), 2, "two unhealthy ticks, lapse not added");
+        // A cap-bound deadline that lapses is the fence, not a lapse
+        // (SEC-V01); the next uncapped deadline is checked again.
+        assert_eq!(st.beat(true, 4_000, &t, Some(5_000), &c, &mut n), Some(5_000));
+        assert!(st.beat(true, 5_000, &t, None, &c, &mut n).is_some());
+        assert_eq!(c.heartbeat_stalls.load(Ordering::Relaxed), 2);
+        assert!(st.beat(true, 2_000_000_000, &t, None, &c, &mut n).is_some(), "uncapped lapse");
+        assert_eq!(c.heartbeat_stalls.load(Ordering::Relaxed), 3);
+        // Faulted: no lapse report.
+        assert!(st.fault(Fault::MapsUnavailable, &mut n));
+        assert_eq!(st.beat(true, u64::MAX, &t, None, &c, &mut n), None);
+        // Seed 0: no lapse at any time; deadline saturates.
+        let mut z = ControlState::with_deadline(0);
+        assert_eq!(z.beat(true, u64::MAX, &t, None, &c, &mut n), Some(u64::MAX));
+        drop(n);
+        assert_eq!(
+            seen,
+            [
+                Transition::Stalled { lapsed_ns: None },
+                Transition::Resumed,
+                Transition::Stalled { lapsed_ns: Some(999_995_000) },
+                Transition::Resumed,
+                Transition::Fault(Fault::MapsUnavailable)
+            ]
+        );
+        assert_eq!(c.heartbeat_stalls.load(Ordering::Relaxed), 3);
+    }
+
+    /// SEC-V01: a fenced member (cap == now) beats with a deadline already
+    /// past; no beat reports a lapse and the stall counter stays put.
+    #[test]
+    fn a_fenced_member_reports_no_lapse() {
+        let t = ControlTiming { heartbeat: Duration::from_millis(250), deadline: Duration::from_millis(1000) };
+        let c = ControlCounters::default();
+        let mut seen = Vec::new();
+        let mut n = |x| seen.push(x);
+        let mut st = ControlState::with_deadline(1_000);
+        for now in [500u64, 250_000_500, 500_000_500, 750_000_500, 1_000_000_500] {
+            assert_eq!(st.beat(true, now, &t, Some(now), &c, &mut n), Some(now));
+        }
+        drop(n);
+        assert!(seen.is_empty(), "{seen:?}");
+        assert_eq!(c.heartbeat_stalls.load(Ordering::Relaxed), 0);
     }
 
     #[test]
