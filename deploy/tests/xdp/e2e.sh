@@ -737,7 +737,7 @@ X
     [ "$((st1 - st0))" -ge 1 ] || die "deadman_stop: heartbeat stalls did not move ($st0 -> $st1)"
     # deadline_ms = 1000; heartbeat_ms = 250, so the deadline is 750..1000
     # ms after the signal; 60 ms for the coarse clock and capture latency.
-    [ "$1" -ge 0 ] && [ "$1" -le 1060 ] || die "deadman_stop: forwarding $1 ms after SIGSTOP (deadline_ms 1000)"
+    if ! { [ "$1" -ge 0 ] && [ "$1" -le 1060 ]; }; then die "deadman_stop: forwarding $1 ms after SIGSTOP (deadline_ms 1000)"; fi
     [ "$2" -gt 0 ] || die "deadman_stop: nothing forwarded right after SIGSTOP (fast path not in use?)"
     [ "$((dl1 - dl0))" -gt 100 ] || die "deadman_stop: pass deadline did not move ($dl0 -> $dl1)"
     [ "$3" -gt 100 ] || die "deadman_stop: $3 arrivals after SIGCONT"
@@ -768,7 +768,7 @@ X
     set -- "$dm_last" "$dm_early" "$dm_after"
     echo "e2e: SIGKILL: last arrival $1 ms after the signal ($2 in the first 500 ms); program still attached: ${attached:-none}" >&2
     [ -n "$attached" ] || die "deadman_kill9: program detached (the case needs it left attached)"
-    [ "$1" -ge 0 ] && [ "$1" -le 1060 ] || die "deadman_kill9: forwarding $1 ms after SIGKILL (deadline_ms 1000)"
+    if ! { [ "$1" -ge 0 ] && [ "$1" -le 1060 ]; }; then die "deadman_kill9: forwarding $1 ms after SIGKILL (deadline_ms 1000)"; fi
     [ "$2" -gt 0 ] || die "deadman_kill9: nothing forwarded right after SIGKILL"
     nsx "$NS_P" "$loader" detach || die "deadman_kill9: detach failed"
     nsx "$NS_P" "$loader" attach -c "$cfg" || die "deadman_kill9: re-attach failed"
@@ -847,7 +847,7 @@ $(python3 -I "$work/pcap.py" cmp "$work/cmp-xdp-$side.pcap" "$work/cmp-tun-$side
 X
         set -- "$c1" "$c2" "$c3" "$c4"
         echo "e2e: capture_compare $side: fast path $1 frames, TUN only $2, equal $3 (DF set: $4, compared with the ID)" >&2
-        [ "$1" -eq 45 ] && [ "$2" -eq 45 ] && [ "$3" -eq 45 ] || die "capture_compare: $side frames differ"
+        if ! { [ "$1" -eq 45 ] && [ "$2" -eq 45 ] && [ "$3" -eq 45 ]; }; then die "capture_compare: $side frames differ"; fi
     done
     echo "e2e: PASS capture_compare (receiver frames byte-equal except the IPv4 ID / header checksum when DF = 0; pool port of the TUN run mapped onto the fast-path run's)" >&2
 }
@@ -922,7 +922,7 @@ X
     f64=$(metric 'plat_xdp_packets_total{dir="v6_to_v4"}')
     s64=$(metric plat_v6_to_v4_total)
     [ "$(metric plat_sessions)" -eq 5000 ] || die "map_full: $(metric plat_sessions) sessions, want 5000"
-    [ "$xs" -le 4096 ] && [ "$xs" -ge 3000 ] || die "map_full: $xs fast-path sessions (want 3000..4096)"
+    if ! { [ "$xs" -le 4096 ] && [ "$xs" -ge 3000 ]; }; then die "map_full: $xs fast-path sessions (want 3000..4096)"; fi
     [ "$fl" -gt 0 ] || die "map_full: no install failure counted"
     # Rounds 2 and 3: fast-path flows on the fast path, the rest on the
     # slow path.
@@ -934,11 +934,11 @@ X
     bad=$({ tcpdump -nvv -r "$work/mf-s0.pcap" 2>/dev/null; tcpdump -nvv -r "$work/mf-c0.pcap" 2>/dev/null; } | grep -c 'bad udp cksum' || true)
     okc=$({ tcpdump -nvv -r "$work/mf-s0.pcap" 2>/dev/null; tcpdump -nvv -r "$work/mf-c0.pcap" 2>/dev/null; } | grep -c 'udp sum ok' || true)
     echo "e2e: map_full receiver captures: $okc verified UDP checksums, $bad bad" >&2
-    [ "$bad" -eq 0 ] && [ "$okc" -ge 30000 ] || die "map_full: checksums ($okc ok, $bad bad)"
+    if ! { [ "$bad" -eq 0 ] && [ "$okc" -ge 30000 ]; }; then die "map_full: checksums ($okc ok, $bad bad)"; fi
     echo "e2e: PASS map_full overflow (every flow served, overflow on the slow path)" >&2
     sleep 125
     echo "e2e: map_full after 125 s idle: $(mf_counters)" >&2
-    [ "$(metric plat_sessions)" -eq 0 ] && [ "$(metric plat_xdp_sessions)" -eq 0 ] || die "map_full: sessions not expired"
+    if ! { [ "$(metric plat_sessions)" -eq 0 ] && [ "$(metric plat_xdp_sessions)" -eq 0 ]; }; then die "map_full: sessions not expired"; fi
     i0=$(metric plat_xdp_installs_total)
     f0=$(metric 'plat_xdp_packets_total{dir="v6_to_v4"}')
     read -r r1 r2 r3 <<X
@@ -1118,7 +1118,7 @@ $(dm_summary "$work/dm-kill.pcap" "$ar_a" "$ar_p" "$dm_t" "$(awk -v t="$dm_t" 'B
 X
     wait_reattached 40 "$id" || { journal; die "auto_restart_reattach: no fresh attach after SIGKILL (prog id $id)"; }
     echo "e2e: SIGKILL under the units: last arrival from $ar_a:$ar_p within 1.9 s: $dm_last ms after the signal ($dm_early in the first 500 ms; $dm_after later, after the restart)" >&2
-    [ "$dm_last" -ge 0 ] && [ "$dm_last" -le 1060 ] || die "auto_restart_reattach: forwarding $dm_last ms after SIGKILL (deadline_ms 1000)"
+    if ! { [ "$dm_last" -ge 0 ] && [ "$dm_last" -le 1060 ]; }; then die "auto_restart_reattach: forwarding $dm_last ms after SIGKILL (deadline_ms 1000)"; fi
     [ "$dm_early" -gt 0 ] || die "auto_restart_reattach: nothing forwarded right after SIGKILL"
     echo "e2e: PASS auto_restart_reattach deadman_kill9 (prog id $id -> $(state_id))" >&2
 
