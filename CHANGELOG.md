@@ -4,6 +4,48 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 
 ## [Unreleased]
 
+### SBOM and CBOM in CI (CM-8, SR-3, SR-4, RA-5); version 0.2.0
+
+#### Added
+- CycloneDX 1.5 JSON SBOM of `platd` and `plat-xdp-loader` per architecture
+  (`make sbom`, `make sbom XDP=1` with the eBPF object as a nested component),
+  cross-checked against `cargo metadata` and the embedded dependency data.
+  Deterministic: timestamp from `SOURCE_DATE_EPOCH` (or commit time),
+  `serialNumber` is a UUIDv5 of (commit, triple, variant, tool).
+- Cryptography Bill of Materials `docs/compliance/cbom.cdx.json` with drift
+  checks: T1 in `make test` (`plat-tls/tests/cbom.rs`), T2 the cargo-deny
+  crypto `deny`/`wrappers` list, T3-T5 and the negative drift cases
+  (`test_drift_negative.py`) in `make cbom-check`.
+- Shipped binaries built with `cargo auditable`; CI runs `cargo audit bin`
+  on dist binaries and on the binaries extracted from the .deb/.rpm.
+- .deb/.rpm install `/usr/share/doc/platd/sbom.cdx.json` and
+  `/usr/share/doc/platd/cbom.cdx.json`; both are also workflow artifacts.
+- New `sbom-xdp` job (x86_64, aarch64) in `packages.yml`.
+- `deploy/tests/supply-chain/install-cargo-tools.sh`: installs cargo tools
+  pinned by version and `.crate` SHA-256.
+- Control-plane TLS handshake cost bench (`plat-tls` bench `handshake`).
+
+#### Changed
+- **Behaviour change (SEC-001):** the TLS signature-verification set is now
+  limited to ECDSA P-256/P-384 and RSA (PSS and PKCS#1, SHA-256/384/512),
+  the set the OCSP/CRL verifier supports. Certificates or CertificateVerify
+  signatures using **ML-DSA, Ed25519 or ECDSA P-521** are now refused on
+  syslog TLS, mTLS management and the cluster peer channel (POAM-041).
+  Reissue any such certificates before upgrading.
+- `deny.toml` refuses second crypto providers and pure-Rust primitive crates;
+  allowed crypto crates are restricted to listed parents.
+- **New packaging prerequisites:** `make deb`/`make rpm` now build the SBOM
+  first and need cargo-cyclonedx 0.5.9 and cargo-auditable 0.7.7 (install
+  with `deploy/tests/supply-chain/install-cargo-tools.sh`).
+- Workspace version 0.1.0 -> 0.2.0 (minor: package contents, packaging
+  prerequisites and accepted certificate algorithms change).
+
+#### Security / compliance
+- SI-7 gap narrowed: SBOM now produced in CI; packages and SBOMs remain
+  unsigned.
+- No config-schema or log-schema change (`LOG_SCHEMA_VERSION` stays 8; no
+  SIEM parser action).
+
 ### XDP Linux verification (branch `test/xdp-linux-verification`)
 
 - `deploy/tests/xdp/e2e.sh`: new cases `frag_needed_revalidate`,

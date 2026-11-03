@@ -10,6 +10,7 @@ names a code location and a test. Source annotations use
 | [NIST 800-53 mapping](NIST_800-53_MAPPING.md) | Control-by-control implementation status, with an indicative NIAP NDcPP cross-reference |
 | [RFC compliance](RFC_COMPLIANCE.md) | RFC 6052, 6146, 7915, 4787, 5382, 7857 and related MUST/SHOULD conformance |
 | [SIEM logging](SIEM_LOGGING.md) | Audit record schema, SIEM correlation fields, hash chain and retention |
+| [Cryptographic inventory](CRYPTO_INVENTORY.md) | CBOM summary, quantum classification, migration targets, crypto-agility and hybrid handshake cost ([`cbom.cdx.json`](cbom.cdx.json)) |
 | [POA&M](POAM.md) | Plan of Action and Milestones: open findings and known gaps |
 | [Linux verification](LINUX_VERIFICATION.md) | Linux-only checks (unit sandbox, forward policy, TUN) not yet run |
 

@@ -1,0 +1,155 @@
+# Crypto-relevant crates allowed in the dependency graph (T3 of the CBOM
+# drift checks, deploy/tests/supply-chain/check-cbom.py --graph).
+#
+# check-cbom.py flags every resolved, activated crate with a crates.io
+# category "cryptography*" or a crypto keyword. Each flagged crate must be
+# listed here with:
+#   class     provider | primitive | protocol | parsing | non-crypto | test-only
+#   rationale why it is in the graph
+#   normal / build / dev   the allowed DIRECT dependents per edge kind
+# A new flagged crate, or a new direct dependent, fails the check. A
+# `test-only` crate must not be reachable from platd or plat-xdp-loader over
+# normal/build edges. Changing this file is a reviewed change to the CBOM
+# (docs/compliance/cbom.cdx.json) and to deny.toml [bans].
+#
+# COMPLIANCE MAPPING:
+# - NIST 800-53: SR-3 (Supply Chain Controls), CM-8 (System Component
+#   Inventory), SC-13 (Cryptographic Protection)
+
+[crate.aws-lc-rs]
+class = "provider"
+rationale = "Rust API over the AWS-LC FIPS module (installed provider, CBOM lib/aws-lc-rs)"
+normal = ["plat-tls", "rcgen", "rustls", "rustls-webpki", "x509-parser"]
+
+[crate.rustls]
+class = "protocol"
+rationale = "TLS 1.3 (CBOM lib/rustls); plat-audit and platd use connection types only"
+normal = ["plat-audit", "plat-tls", "platd"]
+dev = ["plat-audit", "platd"]
+
+[crate.rustls-webpki]
+class = "protocol"
+rationale = "X.509 path validation through the FIPS provider (CBOM lib/rustls-webpki)"
+normal = ["rustls"]
+
+[crate.rustls-pki-types]
+class = "parsing"
+rationale = "certificate/key DER container types, no cryptography"
+normal = ["plat-audit", "plat-tls", "rcgen", "rustls", "rustls-webpki"]
+dev = ["plat-audit", "platd"]
+
+[crate.sha2]
+class = "primitive"
+rationale = "integrity digests: audit chain, cluster config, XDP object/CONFIG (CBOM crypto/algorithm/sha-256/rustcrypto-sha2)"
+normal = ["plat-audit", "plat-cluster", "plat-xdp"]
+dev = ["platd"]
+
+[crate.digest]
+class = "primitive"
+rationale = "trait crate of sha2"
+normal = ["sha2"]
+
+[crate.block-buffer]
+class = "primitive"
+rationale = "buffering for sha2 (via digest)"
+normal = ["digest"]
+
+[crate.crypto-common]
+class = "primitive"
+rationale = "trait crate of sha2 (via digest)"
+normal = ["digest"]
+
+[crate.subtle]
+class = "primitive"
+rationale = "constant-time comparisons in rustls"
+normal = ["rustls"]
+
+[crate.zeroize]
+class = "primitive"
+rationale = "secret wiping (plat-tls key material, rustls, aws-lc-rs)"
+normal = ["aws-lc-rs", "der", "plat-tls", "rustls", "rustls-pki-types", "tls_codec"]
+
+[crate.zeroize_derive]
+class = "primitive"
+rationale = "derive macro of zeroize"
+normal = ["zeroize"]
+
+[crate.der]
+class = "parsing"
+rationale = "DER for OCSP/CRL parsing in plat-tls"
+normal = ["plat-tls", "spki", "x509-cert", "x509-ocsp"]
+
+[crate.der_derive]
+class = "parsing"
+rationale = "derive macro of der"
+normal = ["der"]
+
+[crate.const-oid]
+class = "parsing"
+rationale = "OID constants"
+normal = ["der", "digest", "x509-cert", "x509-ocsp"]
+
+[crate.spki]
+class = "parsing"
+rationale = "SubjectPublicKeyInfo types"
+normal = ["x509-cert", "x509-ocsp"]
+
+[crate.x509-cert]
+class = "parsing"
+rationale = "certificate and CRL types for revocation"
+normal = ["plat-tls", "x509-ocsp"]
+
+[crate.x509-ocsp]
+class = "parsing"
+rationale = "RFC 6960 OCSP types (no builder; signatures verified in plat-tls sig.rs)"
+normal = ["plat-tls"]
+
+[crate.pem-rfc7468]
+class = "parsing"
+rationale = "PEM decoding for der"
+normal = ["der"]
+
+[crate.base64ct]
+class = "parsing"
+rationale = "constant-time base64 for PEM"
+normal = ["pem-rfc7468", "spki"]
+
+[crate.ahash]
+class = "non-crypto"
+rationale = "randomly keyed HashDoS-resistant hashing (SC-5), not an SC-13 claim (CRYPTO_INVENTORY.md#excluded)"
+normal = ["plat-nat64"]
+
+[crate.foldhash]
+class = "non-crypto"
+rationale = "hashbrown default hasher (aya, Linux XDP loader); HashDoS resistance only"
+normal = ["hashbrown"]
+
+[crate.hashbrown]
+class = "non-crypto"
+rationale = "hash table"
+normal = ["aya", "indexmap", "object"]
+
+[crate.rustc-hash]
+class = "non-crypto"
+rationale = "fast non-keyed hash in bindgen (build-time only)"
+normal = ["bindgen"]
+
+[crate.crc32fast]
+class = "non-crypto"
+rationale = "CRC32 checksum in object (ELF parsing, build/XDP tooling)"
+normal = ["object"]
+
+[crate.pem]
+class = "test-only"
+rationale = "PEM in rcgen (test PKI)"
+normal = ["rcgen"]
+
+[crate.x509-parser]
+class = "test-only"
+rationale = "rcgen certificate parsing (test PKI)"
+normal = ["rcgen"]
+
+[crate.chacha20]
+class = "test-only"
+rationale = "proptest RNG (rand_chacha); not a security function"
+normal = ["proptest"]

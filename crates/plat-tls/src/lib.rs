@@ -39,7 +39,7 @@ pub use identity::{AllowList, CertSummary, PeerIdentity, cert_summary, peer_iden
 pub use load::{check_cache_dir, check_key_file, load_certs, load_key};
 pub use policy::{
     ClientSettings, PeerConfigs, PeerSettings, ServerSettings, client_config, peer_configs, peer_server_name,
-    server_config,
+    server_config, signature_scheme_names,
 };
 pub use revocation::{
     CacheStats, RefreshHook, RefreshRecord, RevocationChecker, RevocationHook, RevocationRecord, RevocationSettings,

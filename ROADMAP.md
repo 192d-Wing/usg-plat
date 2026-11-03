@@ -88,6 +88,13 @@ Ordered by value for the effort, with what each needs.
   literals or a local resolver meanwhile), plus two bounded residuals.
 - POAM-026: CMVP validation of AWS-LC-FIPS 4.x pending; re-pin to a
   validated module when a certificate covers it.
+- POAM-042: CNSA 2.0 applicability decision (AO / system owner). If it
+  applies: a `tls` profile option (AES-256 only, SHA-384, ML-KEM-1024 or a
+  P-384 + ML-KEM-1024 hybrid once FIPS-approved, ML-DSA-87 per POAM-041) and
+  a matching CBOM variant, on the AO's transition dates.
+- POAM-041: ML-DSA (and Ed25519 / P-521) certificates are refused today; add
+  them only with `sig.rs` OCSP/CRL rows, confirmed FIPS approval and an
+  operator PKI.
 
 ### Boundary and protocol
 

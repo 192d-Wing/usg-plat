@@ -28,6 +28,7 @@
 //! - RFC 7739 §5.3 - `IDENT_KEY` and every per-CPU `IDENT` counter and step
 //!   generator seeded from `getrandom` (generators never zero)
 
+// CBOM: crypto/algorithm/sha-256/rustcrypto-sha2
 use sha2::{Digest, Sha256};
 
 use plat_common::config::{Config, Partition};

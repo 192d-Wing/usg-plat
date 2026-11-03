@@ -12,6 +12,7 @@
 //! - NIST 800-53: IA-3, IA-5(2)(a)(2) - map the authenticated identity to
 //!   an account (allow-list entry)
 
+// CBOM: crypto/algorithm/sha-256/aws-lc-fips
 use der::asn1::ObjectIdentifier as Oid;
 use der::{Decode, Tagged};
 use rustls_pki_types::CertificateDer;

@@ -101,6 +101,10 @@ fn run() -> Result<(), String> {
         .stderr(Stdio::inherit());
     // The outer build's compiler wrappers and build-script variables must
     // not reach the nested build (aya-build removes the first two too).
+    // `cargo auditable` (make dist) works through RUSTC_WORKSPACE_WRAPPER;
+    // removing it keeps the embedded object identical to the gated one.
+    // COMPLIANCE MAPPING:
+    // - NIST 800-53: SI-7 (Software Integrity) - embedded == gated object
     for k in [
         "RUSTC",
         "RUSTC_WORKSPACE_WRAPPER",

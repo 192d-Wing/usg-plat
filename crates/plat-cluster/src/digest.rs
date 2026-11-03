@@ -8,6 +8,7 @@
 //! - NIST 800-53: CM-6 (Configuration Settings) - cluster-relevant settings
 //!   cross-checked between members; CM-2/CM-3 - digest recorded at start
 
+// CBOM: crypto/algorithm/sha-256/rustcrypto-sha2
 use plat_common::Ipv4Cidr;
 use sha2::{Digest, Sha256};
 
