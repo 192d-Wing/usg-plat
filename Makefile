@@ -272,10 +272,12 @@ sbom: dist
 
 # CBOM drift checks T3-T5 (dependency graph, // CBOM: markers, structure and
 # schema), the self-tests of both supply-chain scripts and the T3 negative
-# cases (test_drift_negative.py). T1 runs in `make test`.
+# cases (test_drift_negative.py). T1 runs in `make test`. `cargo fetch`
+# fills the registry cache first so the scripts can stay `--offline`.
 # COMPLIANCE MAPPING:
 # - NIST 800-53: CM-8, SR-3 (Supply Chain Controls), SA-11 (Developer Testing)
 cbom-check:
+	cargo fetch --locked
 	python3 -I deploy/tests/supply-chain/check-cbom.py --self-test --all
 	python3 -I deploy/tests/supply-chain/sbom-finish.py --self-test
 	python3 -I deploy/tests/supply-chain/test_drift_negative.py
