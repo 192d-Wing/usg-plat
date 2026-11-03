@@ -35,8 +35,11 @@ Ordered by value for the effort, with what each needs.
    Measures the actual speed-up over TUN, the `bib4` maximum hold ≤ 20 µs
    criterion, and L27 on a real NIC. This is the evidence POAM-016 exists
    for.
-3. **First release.** Decide the version, cut `CHANGELOG.md`, tag, and
-   publish signed packages (packages are unsigned today, SI-7).
+3. **First release (v0.2.0).** CHANGELOG cut and tag-only cosign keyless
+   signing and GitHub Release publishing are in `packages.yml`. Left: push
+   the `v0.2.0` tag, confirm the `release` job and `scripts/verify-release.sh`
+   pass on the published release (untested until then), and decide on
+   apt/dnf repository signing (POAM-044).
 4. **HA verification (POAM-007).** Three-VM runs with a real BGP/BFD peer
    (L19–L23) and the takeover-time target.
 
