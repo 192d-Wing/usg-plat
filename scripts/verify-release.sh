@@ -14,9 +14,9 @@ usage="usage: verify-release.sh <dir> <tag>"
 dir=${1:?$usage}
 tag=${2:?$usage}
 case $tag in v[0-9]*) ;; *) echo "tag must look like v<x.y.z>" >&2; exit 2 ;; esac
-case $tag in *[!A-Za-z0-9._-]*) echo "tag contains unexpected characters" >&2; exit 2 ;; esac
+case $tag in *[!A-Za-z0-9._-]*) echo "tag contains unexpected characters" >&2; exit 2 ;; *) ;; esac
 repo=${PLAT_REPO:-192d-Wing/usg-plat}
-case $repo in */*/*|*[!A-Za-z0-9._/-]*) echo "bad PLAT_REPO" >&2; exit 2 ;; esac
+case $repo in */*/*|*[!A-Za-z0-9._/-]*) echo "bad PLAT_REPO" >&2; exit 2 ;; *) ;; esac
 workflow=.github/workflows/packages.yml
 # Exact identity: this repository's packages.yml at this tag (no regexp).
 identity="https://github.com/$repo/$workflow@refs/tags/$tag"
@@ -32,8 +32,9 @@ fi
 cd "$dir"
 [ -f SHA256SUMS ] || { echo "SHA256SUMS missing in $dir" >&2; exit 1; }
 verify() {
-  cosign verify-blob --bundle "$1.sigstore.json" \
-    --certificate-identity "$identity" --certificate-oidc-issuer "$issuer" "$1"
+  vf=$1
+  cosign verify-blob --bundle "$vf.sigstore.json" \
+    --certificate-identity "$identity" --certificate-oidc-issuer "$issuer" "$vf"
 }
 verify SHA256SUMS
 sha256sum -c SHA256SUMS 2>/dev/null || shasum -a 256 -c SHA256SUMS
