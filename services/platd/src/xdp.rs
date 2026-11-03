@@ -325,7 +325,15 @@ mod imp {
                     cursor = next;
                 }),
                 notify: Box::new(move |t| match t {
-                    Transition::Stalled => {
+                    Transition::Stalled { lapsed_ns: Some(l) } => {
+                        tracing::warn!(
+                            lapsed_ms = l / 1_000_000,
+                            "XDP deadline lapsed: control thread did not run for {} ms past the deadline",
+                            l / 1_000_000
+                        );
+                        emit(&ns, XdpState::Disabled, XdpReason::HeartbeatStalled);
+                    }
+                    Transition::Stalled { lapsed_ns: None } => {
                         tracing::warn!(
                             "XDP heartbeat withheld: the sweeper, a worker or the mirror publisher made no progress"
                         );
