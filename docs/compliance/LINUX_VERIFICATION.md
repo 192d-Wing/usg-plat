@@ -694,13 +694,25 @@ Result: **PASS** (one Ubuntu 24.04 / 6.8 aarch64 host).
     `lookup4_session`) is not controllable end to end; the
     `lookup4_session` branch is covered by
     `crates/plat-nat64/tests/mirror.rs::expiry_retires_and_seen_read_back_extends`.
-  - Runs: `frag_needed_revalidate` passed in 9 of 11 runs, intermittent (by hand native
-    ×3 and generic, units ×2, and the three L29 re-runs: native ×2,
-    generic); one units run on `plat-linux` right after
-    the VM timer jump got no Packet Too Big at the client while `platd`
-    counted 7 packets in and 3 out; not reproduced, cause unknown (the
-    case now also captures on the TUN to tell on a recurrence). A second
-    native run failed during the L29 re-run (see L29 below); also unexplained.
+  - Runs: `frag_needed_revalidate` passed in 9 of 11 runs at first (by
+    hand native ×3 and generic, units ×2, and the three L29 re-runs); two
+    runs got no Packet Too Big at the client. Cause (2026-11-03, test
+    bug, not the product): the client capture was stopped by SIGTERM one
+    second after the Frag Needed, and tcpdump without `--immediate-mode`
+    (libpcap TPACKET_V3, 1 s block timeout) drops packets still in an
+    unretired ring block when it exits. Evidence: a passing run's
+    counters after the case are the failing run's `rx 7 / tx 3` (4
+    `hop_limit` drops of kernel IPv6 traffic on the TUN, the first
+    datagram, its echo, the Frag Needed; `plat_icmp_errors_translated_total`
+    1), so `platd` had translated and written the Packet Too Big; a
+    standalone loopback test lost a packet sent 1.2 s after tcpdump start
+    and 0.2 to 0.8 s before SIGTERM in 18 of 18 tries, and none in 60
+    with `--immediate-mode`. Fix: every e2e capture uses
+    `--immediate-mode`, and the case waits up to 5 s for the Packet Too
+    Big before it stops the capture. With the old script 14 of 14 runs
+    passed (no recurrence); with the fix 20 of 20 consecutive full runs
+    passed (native ×10, generic ×10, idle skipped, by hand, kernel
+    6.8.0-147).
 - Through the units (2026-11-03, `E2E_UNITS=1`, native, idle skipped):
   every case PASS, including `frag_needed_revalidate`, `deadman_stop` (before the L29
   fix; `deadman_stop` did not yet check audit records)
@@ -780,8 +792,9 @@ Result: **PASS** (veth, 6.8.0-147, systemd 255).
   `heartbeat stalls 0 -> 1`; `xdp_fastpath_state since start: enabled:start
   disabled:heartbeat_stalled enabled:heartbeat_resumed`. Not re-run under
   the units (the fix is in the control thread, which is the same in both).
-  One other native run failed earlier in `frag_needed_revalidate` (the
-  known intermittent failure) before reaching `deadman_stop`.
+  One other native run failed earlier in `frag_needed_revalidate` before
+  reaching `deadman_stop` (a capture race in the test, since fixed; see
+  the capture comparison item above).
 
 Result: **PASS**.
 
