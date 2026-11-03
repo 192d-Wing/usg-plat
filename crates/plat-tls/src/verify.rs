@@ -21,6 +21,8 @@
 //! - NIST 800-53: SC-8, SC-23 (Session Authenticity)
 //! - RFC 5425 §5.2, RFC 6125 - server name verified by webpki
 
+// CBOM: crypto/algorithm/sig/*
+// CBOM: crypto/material/x509-certificate
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;

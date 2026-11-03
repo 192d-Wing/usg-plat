@@ -38,6 +38,7 @@
 //! - NIST 800-53: AU-4, AU-11 - rotation size and `max_files` retention,
 //!   each deletion audited (`audit_retention_prune`).
 
+// CBOM: crypto/algorithm/sha-256/rustcrypto-sha2
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};

@@ -50,6 +50,7 @@ pub mod stats;
 #[path = "../../plat-nat64/tests/common/mod.rs"]
 mod nat64_fixtures;
 
+// CBOM: crypto/algorithm/sha-256/rustcrypto-sha2
 use sha2::{Digest, Sha256};
 
 /// The pin directory: a dedicated bpffs instance (plan §7,

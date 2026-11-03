@@ -5,3 +5,5 @@
 target/
 __pycache__/
 .DS_Store
+# cargo-cyclonedx writes next to each manifest; `make sbom` moves them to target/sbom/raw.
+*_bin.cdx.json

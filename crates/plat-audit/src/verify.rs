@@ -36,6 +36,7 @@
 //! file is not detectable locally. The syslog copy on a separate system
 //! covers both (NIST 800-53 AU-9(2)); keyed checkpoints are POAM-003.
 
+// CBOM: crypto/algorithm/sha-256/rustcrypto-sha2
 use std::io::BufRead;
 
 use sha2::{Digest, Sha256};

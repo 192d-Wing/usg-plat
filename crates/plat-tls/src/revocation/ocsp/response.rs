@@ -13,6 +13,8 @@
 //! - NIST 800-53: SI-10 - strict DER, unknown critical extensions refused
 //! - RFC 6960 §3.2 (acceptance), §4.2.2.2 (authorized responders), RFC 8954
 
+// CBOM: crypto/algorithm/sha-1/aws-lc-fips-legacy
+// CBOM: crypto/algorithm/x509sig/*
 use aws_lc_rs::digest;
 use der::asn1::{ObjectIdentifier as Oid, OctetString};
 use der::{Decode, Encode};

@@ -24,6 +24,7 @@ nav = [
     { "NIST 800-53 mapping" = "compliance/NIST_800-53_MAPPING.md" },
     { "RFC compliance" = "compliance/RFC_COMPLIANCE.md" },
     { "SIEM logging" = "compliance/SIEM_LOGGING.md" },
+    { "Cryptographic inventory" = "compliance/CRYPTO_INVENTORY.md" },
     { "POA&M" = "compliance/POAM.md" },
     { "Linux verification" = "compliance/LINUX_VERIFICATION.md" },
   ] },

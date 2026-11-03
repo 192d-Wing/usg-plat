@@ -36,6 +36,7 @@ pub mod cache;
 pub mod disk;
 pub mod parse;
 
+// CBOM: crypto/algorithm/sha-256/aws-lc-fips
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

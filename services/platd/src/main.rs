@@ -774,6 +774,7 @@ mod tests {
         use plat_audit::logger::{chain_seed, chain_step};
         use plat_audit::verify::verify;
         use plat_audit::{AuditSink, Event, LifecycleKind, Logger, NodeIdent};
+        // CBOM: crypto/algorithm/sha-256/rustcrypto-sha2
         use sha2::{Digest, Sha256};
         let dir = std::env::temp_dir().join(format!("platd-verify-gap-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

@@ -21,6 +21,8 @@
 //!   §5.2.4 (delta), §5.2.5 (IDP), §5.3.1 (reasonCode), §5.3.3
 //!   (certificateIssuer), §6.3.3 (CRL processing)
 
+// CBOM: crypto/algorithm/sha-256/aws-lc-fips
+// CBOM: crypto/algorithm/x509sig/*
 use std::collections::HashMap;
 
 use der::asn1::{BitString, ObjectIdentifier as Oid};

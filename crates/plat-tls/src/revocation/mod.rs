@@ -43,6 +43,8 @@ pub mod ocsp;
 pub mod refresher;
 pub mod sig;
 
+// CBOM: crypto/algorithm/sha-256/aws-lc-fips
+// CBOM: crypto/algorithm/ctr-drbg
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;

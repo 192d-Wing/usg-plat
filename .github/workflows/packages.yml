@@ -3,7 +3,14 @@
 # architecture, so the AWS-LC FIPS module is compiled by the host toolchain
 # and never cross-linked (SC-13). Every third-party action is pinned to a full
 # commit SHA (tag in trailing comment); packaging tools are pinned versions.
-# The packages are not signed yet (SI-7 gap in NIST_800-53_MAPPING.md).
+# SBOM (CycloneDX, per architecture; default and xdp builds) and CBOM are
+# attached as artifacts and installed in the packages under
+# /usr/share/doc/platd/; the shipped binaries carry cargo-auditable data and
+# `cargo audit bin` must pass on them. Packages and SBOMs are still unsigned
+# (SI-7 gap in NIST_800-53_MAPPING.md).
+# COMPLIANCE MAPPING:
+# - NIST 800-53: CM-8 (System Component Inventory), SR-4 (Provenance), RA-5
+#   (Vulnerability Monitoring and Scanning), SI-7 (Software Integrity)
 name: Packages
 
 on:
@@ -47,19 +54,112 @@ jobs:
         with:
           key: packages-${{ matrix.arch }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Install AWS-LC FIPS build deps (CMake, Go, clang) and dpkg-dev
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake golang-go clang dpkg-dev
-      - name: Install packaging tools (pinned)
-        run: cargo install --locked cargo-deb@3.8.0 cargo-generate-rpm@0.21.1
+      - name: PLAT_CBOM_BLESS is unset (the CBOM is never re-blessed in CI)
+        run: |
+          if [ -n "${PLAT_CBOM_BLESS+set}" ]; then
+            echo "::error::PLAT_CBOM_BLESS is set; re-bless docs/compliance/cbom.cdx.json locally and review the diff"
+            exit 1
+          fi
+      - name: Install AWS-LC FIPS build deps (CMake, Go, clang), dpkg-dev, rpm2cpio and binutils
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake golang-go clang dpkg-dev rpm2cpio cpio binutils
+      - name: Install packaging, SBOM and audit tools (version- and checksum-pinned)
+        run: deploy/tests/supply-chain/install-cargo-tools.sh
+      - name: Install check-jsonschema (version- and hash-pinned, wheels only)
+        run: |
+          python3 -m venv "$RUNNER_TEMP/cj"
+          "$RUNNER_TEMP/cj/bin/pip" install --require-hashes --only-binary :all: -r deploy/tests/supply-chain/requirements-jsonschema.txt
+          echo "CHECK_JSONSCHEMA=$RUNNER_TEMP/cj/bin/check-jsonschema" >> "$GITHUB_ENV"
       - run: make packages
       - name: Show package metadata and contents
         run: |
           for f in target/debian/*.deb; do dpkg-deb --info "$f"; dpkg-deb --contents "$f"; done
           ls -l target/generate-rpm/*.rpm
+      - name: cargo audit bin on the dist binaries (fails on an advisory)
+        run: cargo audit bin target/dist/platd target/dist/plat-xdp-loader
+      - name: Packages carry the SBOM and CBOM, byte-equal, and auditable binaries
+        run: |
+          set -eu
+          check_tree() {
+            for f in sbom:target/sbom/platd-sbom.cdx.json cbom:docs/compliance/cbom.cdx.json; do
+              cmp "$1/usr/share/doc/platd/${f%%:*}.cdx.json" "${f#*:}"
+            done
+            cargo audit bin "$1/usr/bin/platd" "$1/usr/libexec/plat/plat-xdp-loader"
+          }
+          deb=$(mktemp -d); dpkg-deb -x target/debian/*.deb "$deb"; check_tree "$deb"
+          rpm=$(mktemp -d); (cd "$rpm" && rpm2cpio "$GITHUB_WORKSPACE"/target/generate-rpm/*.rpm | cpio -id --quiet); check_tree "$rpm"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: platd-packages-${{ matrix.arch }}
           path: |
             target/debian/*.deb
             target/generate-rpm/*.rpm
+            target/sbom/*.cdx.json
+            docs/compliance/cbom.cdx.json
+          if-no-files-found: error
+
+  # SBOM of the `xdp` build: platd and plat-xdp-loader with --features xdp
+  # and the eBPF object as a nested component (hash = gated = embedded, T8).
+  # Runs on every PR and is a required check (user decision N1).
+  sbom-xdp:
+    name: sbom xdp (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: The workspace build environment has no RUSTC_BOOTSTRAP
+        run: |
+          if [ -n "${RUSTC_BOOTSTRAP+set}" ]; then
+            echo "::error::RUSTC_BOOTSTRAP is set for the workspace build (plan §15)"
+            exit 1
+          fi
+      - name: PLAT_CBOM_BLESS is unset (the CBOM is never re-blessed in CI)
+        run: |
+          if [ -n "${PLAT_CBOM_BLESS+set}" ]; then
+            echo "::error::PLAT_CBOM_BLESS is set; re-bless docs/compliance/cbom.cdx.json locally and review the diff"
+            exit 1
+          fi
+      - name: Install pinned toolchain from rust-toolchain.toml (incl. rust-src)
+        run: rustup toolchain install && rustup show
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: sbom-xdp-${{ matrix.arch }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install AWS-LC FIPS build deps (CMake, Go, clang), zstd and binutils
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake golang-go clang zstd binutils
+      - name: Install bpf-linker 0.12.0 (release tarball, sha256-pinned)
+        run: |
+          deploy/tests/xdp/install-bpf-linker.sh "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: rustc and bpf-linker share one LLVM major
+        run: deploy/tests/xdp/check-llvm-major.sh "$HOME/.local/bin/bpf-linker"
+      - name: Install packaging, SBOM and audit tools (version- and checksum-pinned)
+        run: deploy/tests/supply-chain/install-cargo-tools.sh
+      - name: Install check-jsonschema (version- and hash-pinned, wheels only)
+        run: |
+          python3 -m venv "$RUNNER_TEMP/cj"
+          "$RUNNER_TEMP/cj/bin/pip" install --require-hashes --only-binary :all: -r deploy/tests/supply-chain/requirements-jsonschema.txt
+          echo "CHECK_JSONSCHEMA=$RUNNER_TEMP/cj/bin/check-jsonschema" >> "$GITHUB_ENV"
+      - name: make xdp (gated eBPF object and its checks)
+        run: make xdp
+      - name: make sbom XDP=1 (auditable dist build with xdp, T6-T8)
+        run: make sbom XDP=1
+      - name: cargo audit bin on the xdp dist binaries (fails on an advisory)
+        run: cargo audit bin target/dist/platd target/dist/plat-xdp-loader
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: platd-sbom-xdp-${{ matrix.arch }}
+          path: |
+            target/sbom/platd-xdp-*.cdx.json
+            target/xdp/plat-xdp-ebpf.sha256
+            docs/compliance/cbom.cdx.json
           if-no-files-found: error

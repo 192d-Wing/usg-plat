@@ -7,11 +7,23 @@
 //! are decoded structurally and must be MGF1 with the same hash, salt length
 //! = hash length, trailer absent (default 1); see `pss_algorithm`.
 //!
+//! The accepted set is table-driven (`ACCEPTED`, `PSS_HASHES`) so a successor
+//! algorithm is one row, and `accepted_signature_algorithms` enumerates it
+//! for the CBOM drift test (`tests/cbom.rs`).
+//!
+//! CBOM: crypto/algorithm/x509sig/* (one bom-ref per table name)
+//!
 //! COMPLIANCE MAPPING:
 //! - NIST 800-53: SC-13 (Cryptographic Protection) - FIPS 186-5 signature
-//!   verification in the validated module; SHA-1 refused (SP 800-131A).
+//!   verification in the FIPS module (CMVP in process, POAM-026); SHA-1 refused (SP 800-131A).
+//! - NIST 800-53: SA-8 (crypto-agility: table-driven algorithm set)
 //! - RFC 5280 §4.1.1.2, RFC 4055 §3.1 (PSS parameters), RFC 5758 §3.2
+//!
+//! POAM: POAM-041 classical signatures only (no ML-DSA / SLH-DSA rows yet).
 
+// CBOM: crypto/algorithm/sha-256/aws-lc-fips
+// CBOM: crypto/algorithm/sha-384/aws-lc-fips
+// CBOM: crypto/algorithm/sha-512/aws-lc-fips
 use aws_lc_rs::digest;
 use aws_lc_rs::signature::{self, UnparsedPublicKey, VerificationAlgorithm};
 use der::asn1::{ContextSpecific, ObjectIdentifier as Oid};
@@ -46,13 +58,98 @@ const RSA_ENCRYPTION: Oid = Oid::new_unwrap("1.2.840.113549.1.1.1");
 const SECP256R1: Oid = Oid::new_unwrap("1.2.840.10045.3.1.7");
 const SECP384R1: Oid = Oid::new_unwrap("1.3.132.0.34");
 
-/// Hashes accepted inside RSASSA-PSS-params, with the matching aws-lc-rs
-/// digest (for the salt length) and verification algorithm.
-const PSS_HASHES: [(Oid, &digest::Algorithm, &signature::RsaParameters); 3] = [
-    (ID_SHA_256, &digest::SHA256, &signature::RSA_PSS_2048_8192_SHA256),
-    (ID_SHA_384, &digest::SHA384, &signature::RSA_PSS_2048_8192_SHA384),
-    (ID_SHA_512, &digest::SHA512, &signature::RSA_PSS_2048_8192_SHA512),
+/// Public key type a table row applies to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeyType {
+    /// `id-ecPublicKey` on the named curve.
+    Ec(Oid),
+    /// `rsaEncryption` (parameters absent or NULL).
+    Rsa,
+}
+
+/// One accepted (signature OID, key type) pair, its CBOM name and the
+/// aws-lc-rs verification algorithm.
+struct Accepted {
+    sig: Oid,
+    key: KeyType,
+    name: &'static str,
+    alg: &'static dyn VerificationAlgorithm,
+}
+
+// CBOM: crypto/algorithm/x509sig/*
+/// Signature algorithms with fixed parameters (ECDSA: parameters absent,
+/// RFC 5758 §3.2; PKCS#1 v1.5: absent or NULL). RSASSA-PSS is in `PSS_HASHES`.
+static ACCEPTED: [Accepted; 9] = [
+    Accepted {
+        sig: ECDSA_SHA256,
+        key: KeyType::Ec(SECP256R1),
+        name: "ecdsa-p256-sha256",
+        alg: &signature::ECDSA_P256_SHA256_ASN1,
+    },
+    Accepted {
+        sig: ECDSA_SHA384,
+        key: KeyType::Ec(SECP256R1),
+        name: "ecdsa-p256-sha384",
+        alg: &signature::ECDSA_P256_SHA384_ASN1,
+    },
+    Accepted {
+        sig: ECDSA_SHA512,
+        key: KeyType::Ec(SECP256R1),
+        name: "ecdsa-p256-sha512",
+        alg: &signature::ECDSA_P256_SHA512_ASN1,
+    },
+    Accepted {
+        sig: ECDSA_SHA256,
+        key: KeyType::Ec(SECP384R1),
+        name: "ecdsa-p384-sha256",
+        alg: &signature::ECDSA_P384_SHA256_ASN1,
+    },
+    Accepted {
+        sig: ECDSA_SHA384,
+        key: KeyType::Ec(SECP384R1),
+        name: "ecdsa-p384-sha384",
+        alg: &signature::ECDSA_P384_SHA384_ASN1,
+    },
+    Accepted {
+        sig: ECDSA_SHA512,
+        key: KeyType::Ec(SECP384R1),
+        name: "ecdsa-p384-sha512",
+        alg: &signature::ECDSA_P384_SHA512_ASN1,
+    },
+    Accepted {
+        sig: RSA_SHA256,
+        key: KeyType::Rsa,
+        name: "rsa-pkcs1-sha256",
+        alg: &signature::RSA_PKCS1_2048_8192_SHA256,
+    },
+    Accepted {
+        sig: RSA_SHA384,
+        key: KeyType::Rsa,
+        name: "rsa-pkcs1-sha384",
+        alg: &signature::RSA_PKCS1_2048_8192_SHA384,
+    },
+    Accepted {
+        sig: RSA_SHA512,
+        key: KeyType::Rsa,
+        name: "rsa-pkcs1-sha512",
+        alg: &signature::RSA_PKCS1_2048_8192_SHA512,
+    },
 ];
+
+// CBOM: crypto/algorithm/x509sig/*
+/// Hashes accepted inside RSASSA-PSS-params, with the CBOM name, the matching
+/// aws-lc-rs digest (for the salt length) and verification algorithm.
+const PSS_HASHES: [(Oid, &str, &digest::Algorithm, &signature::RsaParameters); 3] = [
+    (ID_SHA_256, "rsa-pss-sha256", &digest::SHA256, &signature::RSA_PSS_2048_8192_SHA256),
+    (ID_SHA_384, "rsa-pss-sha384", &digest::SHA384, &signature::RSA_PSS_2048_8192_SHA384),
+    (ID_SHA_512, "rsa-pss-sha512", &digest::SHA512, &signature::RSA_PSS_2048_8192_SHA512),
+];
+
+/// Names of every accepted certificate/OCSP/CRL signature algorithm, in table
+/// order (the CBOM `crypto/algorithm/x509sig/<name>` bom-refs).
+pub fn accepted_signature_algorithms() -> impl Iterator<Item = &'static str> {
+    ACCEPTED.iter().map(|a| a.name).chain(PSS_HASHES.iter().map(|&(_, n, _, _)| n))
+}
 
 /// Reads the explicitly tagged `[number]` field if it is next, else `None`.
 fn explicit_field<'a, T: Decode<'a>>(r: &mut SliceReader<'a>, number: u8) -> der::Result<Option<T>> {
@@ -101,7 +198,7 @@ fn pss_algorithm(params: &der::Any) -> Option<&'static signature::RsaParameters>
     if !r.is_finished() {
         return None;
     }
-    let &(_, dig, alg) = PSS_HASHES.iter().find(|(oid, _, _)| *oid == hash.oid)?;
+    let &(_, _, dig, alg) = PSS_HASHES.iter().find(|(oid, _, _, _)| *oid == hash.oid)?;
     if !ref_absent_or_null(&hash) || mgf.oid != ID_MGF_1 {
         return None;
     }
@@ -134,33 +231,22 @@ fn algorithm(
     if [ECDSA_SHA1, RSA_SHA1, DSA_SHA1].contains(&oid) {
         return Err(SigError::Sha1);
     }
-    if [ECDSA_SHA256, ECDSA_SHA384, ECDSA_SHA512].contains(&oid) {
+    if let Some(curve) = ec_curve(spki) {
+        // RFC 5758 §3.2: ECDSA signature parameters MUST be absent.
         if alg.parameters.is_some() {
             return Err(SigError::Unsupported);
         }
-        let curve = ec_curve(spki).ok_or(SigError::Unsupported)?;
-        return Ok(match (curve, oid) {
-            (SECP256R1, ECDSA_SHA256) => &signature::ECDSA_P256_SHA256_ASN1,
-            (SECP256R1, ECDSA_SHA384) => &signature::ECDSA_P256_SHA384_ASN1,
-            (SECP256R1, ECDSA_SHA512) => &signature::ECDSA_P256_SHA512_ASN1,
-            (SECP384R1, ECDSA_SHA256) => &signature::ECDSA_P384_SHA256_ASN1,
-            (SECP384R1, ECDSA_SHA384) => &signature::ECDSA_P384_SHA384_ASN1,
-            (SECP384R1, ECDSA_SHA512) => &signature::ECDSA_P384_SHA512_ASN1,
-            _ => return Err(SigError::Unsupported),
-        });
+        return ACCEPTED
+            .iter()
+            .find(|a| a.sig == oid && a.key == KeyType::Ec(curve))
+            .map(|a| a.alg)
+            .ok_or(SigError::Unsupported);
     }
     if spki.algorithm.oid != RSA_ENCRYPTION || !absent_or_null(&spki.algorithm) {
         return Err(SigError::Unsupported);
     }
-    if [RSA_SHA256, RSA_SHA384, RSA_SHA512].contains(&oid) {
-        if !absent_or_null(alg) {
-            return Err(SigError::Unsupported);
-        }
-        return Ok(match oid {
-            RSA_SHA256 => &signature::RSA_PKCS1_2048_8192_SHA256,
-            RSA_SHA384 => &signature::RSA_PKCS1_2048_8192_SHA384,
-            _ => &signature::RSA_PKCS1_2048_8192_SHA512,
-        });
+    if let Some(a) = ACCEPTED.iter().find(|a| a.sig == oid && a.key == KeyType::Rsa) {
+        return if absent_or_null(alg) { Ok(a.alg) } else { Err(SigError::Unsupported) };
     }
     if oid == RSA_PSS {
         return alg
@@ -360,6 +446,61 @@ mod tests {
         assert!(matches!(algorithm(&spki, &alg), Err(SigError::Unsupported)));
     }
 
+    fn spki(key: KeyType) -> SubjectPublicKeyInfoOwned {
+        let algorithm = match key {
+            KeyType::Ec(curve) => AlgorithmIdentifierOwned {
+                oid: EC_PUBLIC_KEY,
+                parameters: Some(der::Any::encode_from(&curve).unwrap()),
+            },
+            KeyType::Rsa => AlgorithmIdentifierOwned { oid: RSA_ENCRYPTION, parameters: None },
+        };
+        SubjectPublicKeyInfoOwned { algorithm, subject_public_key: der::asn1::BitString::from_bytes(&[0]).unwrap() }
+    }
+
+    #[test]
+    fn table_rows_round_trip() {
+        for a in &ACCEPTED {
+            let alg = AlgorithmIdentifierOwned { oid: a.sig, parameters: None };
+            let got = algorithm(&spki(a.key), &alg).unwrap_or_else(|e| panic!("{}: {e:?}", a.name));
+            assert_eq!(format!("{got:?}"), format!("{:?}", a.alg), "{}", a.name);
+        }
+        for (der, (_, name, _, want)) in
+            [&WEBPKI_SHA256[..], &WEBPKI_SHA384, &WEBPKI_SHA512].into_iter().zip(PSS_HASHES)
+        {
+            let alg = AlgorithmIdentifierOwned { oid: RSA_PSS, parameters: Some(der::Any::from_der(der).unwrap()) };
+            let got = algorithm(&spki(KeyType::Rsa), &alg).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            assert_eq!(format!("{got:?}"), format!("{want:?}"), "{name}");
+        }
+        let names: Vec<_> = accepted_signature_algorithms().collect();
+        assert_eq!(names.len(), ACCEPTED.len() + PSS_HASHES.len());
+        assert!(names.iter().all(|n| !n.contains("sha1")), "{names:?}");
+    }
+
+    #[test]
+    fn table_refuses_sha1_dsa_unknown_and_wrong_key() {
+        let p256 = spki(KeyType::Ec(SECP256R1));
+        let rsa = spki(KeyType::Rsa);
+        for (key, oid) in [(&p256, ECDSA_SHA1), (&rsa, RSA_SHA1), (&rsa, DSA_SHA1)] {
+            let alg = AlgorithmIdentifierOwned { oid, parameters: None };
+            assert_eq!(algorithm(key, &alg).err(), Some(SigError::Sha1));
+        }
+        let unknown = Oid::new_unwrap("1.2.840.10045.4.3.1"); // ecdsa-with-SHA224
+        for (key, oid) in [(&p256, unknown), (&p256, RSA_SHA256), (&rsa, ECDSA_SHA256), (&rsa, unknown)] {
+            let alg = AlgorithmIdentifierOwned { oid, parameters: None };
+            assert_eq!(algorithm(key, &alg).err(), Some(SigError::Unsupported));
+        }
+        // P-521 is not in the table; ECDSA parameters must be absent.
+        let p521 = spki(KeyType::Ec(Oid::new_unwrap("1.3.132.0.35")));
+        let alg = AlgorithmIdentifierOwned { oid: ECDSA_SHA256, parameters: None };
+        assert_eq!(algorithm(&p521, &alg).err(), Some(SigError::Unsupported));
+        let alg = AlgorithmIdentifierOwned { oid: ECDSA_SHA256, parameters: Some(der::Any::null()) };
+        assert_eq!(algorithm(&p256, &alg).err(), Some(SigError::Unsupported));
+        // PKCS#1 v1.5 parameters other than absent/NULL are refused.
+        let alg =
+            AlgorithmIdentifierOwned { oid: RSA_SHA256, parameters: Some(der::Any::encode_from(&SECP256R1).unwrap()) };
+        assert_eq!(algorithm(&rsa, &alg).err(), Some(SigError::Unsupported));
+    }
+
     #[test]
     fn sha1_refused() {
         let spki = SubjectPublicKeyInfoOwned {
@@ -370,5 +511,141 @@ mod tests {
         assert_eq!(verify(&spki, &alg, b"m", b"s"), Err(SigError::Sha1));
         let alg = AlgorithmIdentifierOwned { oid: ECDSA_SHA256, parameters: None };
         assert_eq!(verify(&spki, &alg, b"m", b"s"), Err(SigError::Unsupported));
+    }
+
+    // --- QA (run 20261103-081215-sbom-cbom): end-to-end per-row coverage ---
+
+    const SECP384R1_T: Oid = Oid::new_unwrap("1.3.132.0.34");
+
+    /// aws-lc-rs 1.19 only exposes the curve-native ECDSA signers; the
+    /// cross-hash rows (p256-sha384, ...) are covered by dispatch tests and
+    /// by checking that a curve-native signature does not verify under them.
+    fn ec_signer(row: &str) -> Option<&'static signature::EcdsaSigningAlgorithm> {
+        match row {
+            "ecdsa-p256-sha256" => Some(&signature::ECDSA_P256_SHA256_ASN1_SIGNING),
+            "ecdsa-p384-sha384" => Some(&signature::ECDSA_P384_SHA384_ASN1_SIGNING),
+            r if r.starts_with("ecdsa-p256") => None,
+            r if r.starts_with("ecdsa-p384") => None,
+            other => panic!("no signer for {other}"),
+        }
+    }
+
+    fn native(key: KeyType) -> &'static signature::EcdsaSigningAlgorithm {
+        if key == KeyType::Ec(SECP256R1) {
+            &signature::ECDSA_P256_SHA256_ASN1_SIGNING
+        } else {
+            &signature::ECDSA_P384_SHA384_ASN1_SIGNING
+        }
+    }
+
+    fn spki_with_key(key: KeyType, pk: &[u8]) -> SubjectPublicKeyInfoOwned {
+        let mut s = spki(key);
+        s.subject_public_key = der::asn1::BitString::from_bytes(pk).unwrap();
+        s
+    }
+
+    /// Every ECDSA row verifies a real signature, rejects a tampered message,
+    /// and the same key is refused under SHA-1.
+    #[test]
+    fn every_ecdsa_row_verifies_real_signature() {
+        use aws_lc_rs::rand::SystemRandom;
+        use aws_lc_rs::signature::{EcdsaKeyPair, KeyPair};
+        let rng = SystemRandom::new();
+        let mut n = 0;
+        for a in ACCEPTED.iter().filter(|a| matches!(a.key, KeyType::Ec(_))) {
+            let kp = EcdsaKeyPair::generate(ec_signer(a.name).unwrap_or(native(a.key))).unwrap();
+            let sig = kp.sign(&rng, b"tbs").unwrap();
+            let spki = spki_with_key(a.key, kp.public_key().as_ref());
+            let alg = AlgorithmIdentifierOwned { oid: a.sig, parameters: None };
+            if ec_signer(a.name).is_some() {
+                assert_eq!(verify(&spki, &alg, b"tbs", sig.as_ref()), Ok(()), "{}", a.name);
+                assert_eq!(verify(&spki, &alg, b"tbX", sig.as_ref()), Err(SigError::BadSignature), "{}", a.name);
+            } else {
+                // Dispatch reaches aws-lc with this row's hash: native-hash signature fails.
+                assert_eq!(verify(&spki, &alg, b"tbs", sig.as_ref()), Err(SigError::BadSignature), "{}", a.name);
+            }
+            let sha1 = AlgorithmIdentifierOwned { oid: ECDSA_SHA1, parameters: None };
+            assert_eq!(verify(&spki, &sha1, b"tbs", sig.as_ref()), Err(SigError::Sha1), "{}", a.name);
+            n += 1;
+        }
+        assert_eq!(n, 6);
+    }
+
+    /// Every RSA PKCS#1 v1.5 and PSS row verifies a real 2048-bit signature;
+    /// a signature under one hash does not verify under another row.
+    #[test]
+    fn every_rsa_row_verifies_real_signature() {
+        use aws_lc_rs::rand::SystemRandom;
+        use aws_lc_rs::rsa::KeySize;
+        use aws_lc_rs::signature::{KeyPair, RsaKeyPair};
+        let rng = SystemRandom::new();
+        let kp = RsaKeyPair::generate(KeySize::Rsa2048).unwrap();
+        let spki = spki_with_key(KeyType::Rsa, kp.public_key().as_ref());
+        let pkcs1: [(&str, &'static dyn signature::RsaEncoding); 3] = [
+            ("rsa-pkcs1-sha256", &signature::RSA_PKCS1_SHA256),
+            ("rsa-pkcs1-sha384", &signature::RSA_PKCS1_SHA384),
+            ("rsa-pkcs1-sha512", &signature::RSA_PKCS1_SHA512),
+        ];
+        let mut sigs = Vec::new();
+        for (name, pad) in pkcs1 {
+            let a = ACCEPTED.iter().find(|a| a.name == name).unwrap();
+            let mut sig = vec![0; kp.public_modulus_len()];
+            kp.sign(pad, &rng, b"tbs", &mut sig).unwrap();
+            for params in [None, Some(der::Any::null())] {
+                let alg = AlgorithmIdentifierOwned { oid: a.sig, parameters: params };
+                assert_eq!(verify(&spki, &alg, b"tbs", &sig), Ok(()), "{name}");
+            }
+            sigs.push((a.sig, sig));
+        }
+        // Cross-row: sha256 signature under the sha384 OID fails.
+        let alg = AlgorithmIdentifierOwned { oid: sigs[1].0, parameters: None };
+        assert_eq!(verify(&spki, &alg, b"tbs", &sigs[0].1), Err(SigError::BadSignature));
+        // SHA-1 refused with a valid RSA key.
+        let alg = AlgorithmIdentifierOwned { oid: RSA_SHA1, parameters: None };
+        assert_eq!(verify(&spki, &alg, b"tbs", &sigs[0].1), Err(SigError::Sha1));
+
+        let pss: [(&[u8], &'static dyn signature::RsaEncoding); 3] = [
+            (&WEBPKI_SHA256, &signature::RSA_PSS_SHA256),
+            (&WEBPKI_SHA384, &signature::RSA_PSS_SHA384),
+            (&WEBPKI_SHA512, &signature::RSA_PSS_SHA512),
+        ];
+        for (i, (params, pad)) in pss.iter().enumerate() {
+            let mut sig = vec![0; kp.public_modulus_len()];
+            kp.sign(*pad, &rng, b"tbs", &mut sig).unwrap();
+            let alg = AlgorithmIdentifierOwned { oid: RSA_PSS, parameters: Some(der::Any::from_der(params).unwrap()) };
+            assert_eq!(verify(&spki, &alg, b"tbs", &sig), Ok(()), "pss row {i}");
+            assert_eq!(verify(&spki, &alg, b"tbX", &sig), Err(SigError::BadSignature), "pss row {i}");
+            let other = pss[(i + 1) % 3].0;
+            let alg = AlgorithmIdentifierOwned { oid: RSA_PSS, parameters: Some(der::Any::from_der(other).unwrap()) };
+            assert_eq!(verify(&spki, &alg, b"tbs", &sig), Err(SigError::BadSignature), "pss cross {i}");
+        }
+    }
+
+    /// Unsupported curves and malformed key parameters are refused before any
+    /// verification: P-521, secp256k1, brainpoolP256r1, EC key without curve,
+    /// RSA key with non-NULL parameters, and a curve/hash row swap.
+    #[test]
+    fn unsupported_curves_and_params_refused() {
+        let alg = |oid| AlgorithmIdentifierOwned { oid, parameters: None };
+        for curve in ["1.3.132.0.35", "1.3.132.0.10", "1.3.36.3.3.2.8.1.1.7"] {
+            let k = spki(KeyType::Ec(Oid::new_unwrap(curve)));
+            for oid in [ECDSA_SHA256, ECDSA_SHA384, ECDSA_SHA512] {
+                assert_eq!(algorithm(&k, &alg(oid)).err(), Some(SigError::Unsupported), "{curve}");
+            }
+            assert_eq!(algorithm(&k, &alg(ECDSA_SHA1)).err(), Some(SigError::Sha1), "{curve}");
+        }
+        let mut no_curve = spki(KeyType::Ec(SECP256R1));
+        no_curve.algorithm.parameters = None;
+        assert_eq!(algorithm(&no_curve, &alg(ECDSA_SHA256)).err(), Some(SigError::Unsupported));
+        let mut rsa_params = spki(KeyType::Rsa);
+        rsa_params.algorithm.parameters = Some(der::Any::encode_from(&SECP256R1).unwrap());
+        assert_eq!(algorithm(&rsa_params, &alg(RSA_SHA256)).err(), Some(SigError::Unsupported));
+        // RSA signature OIDs on a P-384 key and PSS on an EC key.
+        let p384 = spki(KeyType::Ec(SECP384R1_T));
+        for oid in [RSA_SHA256, RSA_SHA384, RSA_SHA512, RSA_PSS] {
+            assert_eq!(algorithm(&p384, &alg(oid)).err(), Some(SigError::Unsupported));
+        }
+        // RSA-PSS with absent parameters is refused.
+        assert_eq!(algorithm(&spki(KeyType::Rsa), &alg(RSA_PSS)).err(), Some(SigError::Unsupported));
     }
 }

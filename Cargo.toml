@@ -19,7 +19,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["usg-plat Contributors"]
 license = "Apache-2.0"
@@ -28,18 +28,18 @@ rust-version = "1.88"
 publish = false
 
 [workspace.dependencies]
-plat-common = { path = "crates/plat-common", version = "0.1.0" }
-plat-packet = { path = "crates/plat-packet", version = "0.1.0" }
-plat-xlat = { path = "crates/plat-xlat", version = "0.1.0" }
-plat-nat64 = { path = "crates/plat-nat64", version = "0.1.0" }
+plat-common = { path = "crates/plat-common", version = "0.2.0" }
+plat-packet = { path = "crates/plat-packet", version = "0.2.0" }
+plat-xlat = { path = "crates/plat-xlat", version = "0.2.0" }
+plat-nat64 = { path = "crates/plat-nat64", version = "0.2.0" }
 # Default features off here: data-plane crates get plat-audit without TLS;
 # platd enables `plat-audit/tls` through its own `tls` feature.
-plat-audit = { path = "crates/plat-audit", version = "0.1.0", default-features = false }
-plat-io = { path = "crates/plat-io", version = "0.1.0" }
-plat-cluster = { path = "crates/plat-cluster", version = "0.1.0" }
-plat-tls = { path = "crates/plat-tls", version = "0.1.0" }
-plat-xdp-core = { path = "crates/plat-xdp-core", version = "0.1.0" }
-plat-xdp = { path = "crates/plat-xdp", version = "0.1.0" }
+plat-audit = { path = "crates/plat-audit", version = "0.2.0", default-features = false }
+plat-io = { path = "crates/plat-io", version = "0.2.0" }
+plat-cluster = { path = "crates/plat-cluster", version = "0.2.0" }
+plat-tls = { path = "crates/plat-tls", version = "0.2.0" }
+plat-xdp-core = { path = "crates/plat-xdp-core", version = "0.2.0" }
+plat-xdp = { path = "crates/plat-xdp", version = "0.2.0" }
 
 ahash = "0.8"
 clap = { version = "4", features = ["derive"] }
@@ -54,6 +54,8 @@ proptest = "1"
 # Peer credentials, poll(2), process groups (cluster runtime; safe wrappers).
 rustix = { version = "1.1", default-features = false, features = ["std", "event", "net", "process"] }
 serde = { version = "1", features = ["derive"] }
+# Test-only (CBOM drift test); already in the lock through other dev-deps.
+serde_json = "1"
 sha2 = "0.11"
 signal-hook = "0.4"
 thiserror = "2"

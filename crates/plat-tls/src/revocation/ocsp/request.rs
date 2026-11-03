@@ -6,6 +6,9 @@
 //!   RFC 5019 responders; identification, not a signature), DRBG nonce
 //! - RFC 6960 §4.1.1, §4.4.1; RFC 8954 (nonce length 32)
 
+// CBOM: crypto/algorithm/sha-256/aws-lc-fips
+// CBOM: crypto/algorithm/sha-1/aws-lc-fips-legacy
+// CBOM: crypto/algorithm/ctr-drbg
 use aws_lc_rs::digest;
 use der::Encode;
 use der::asn1::{Null, ObjectIdentifier as Oid, OctetString};

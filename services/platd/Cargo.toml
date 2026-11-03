@@ -95,6 +95,10 @@ assets = [
     ["../../deploy/systemd/run-plat-bpf.mount", "usr/lib/systemd/system/", "644"],
     ["../../deploy/systemd/plat-xdp.tmpfiles.conf", "usr/lib/tmpfiles.d/plat-xdp.conf", "644"],
     ["../../deploy/systemd/platd.service.d.example/xdp.conf", "usr/share/doc/platd/examples/platd.service.d/", "644"],
+    # CM-8/SR-4: CycloneDX SBOM of this build (`make sbom`, run by `make deb`)
+    # and the CBOM (docs/compliance/cbom.cdx.json).
+    ["target/sbom/platd-sbom.cdx.json", "usr/share/doc/platd/sbom.cdx.json", "644"],
+    ["../../docs/compliance/cbom.cdx.json", "usr/share/doc/platd/cbom.cdx.json", "644"],
 ]
 
 [package.metadata.generate-rpm]
@@ -125,4 +129,6 @@ assets = [
     { source = "../../deploy/systemd/run-plat-bpf.mount", dest = "/usr/lib/systemd/system/run-plat-bpf.mount", mode = "644" },
     { source = "../../deploy/systemd/plat-xdp.tmpfiles.conf", dest = "/usr/lib/tmpfiles.d/plat-xdp.conf", mode = "644" },
     { source = "../../deploy/systemd/platd.service.d.example/xdp.conf", dest = "/usr/share/doc/platd/examples/platd.service.d/xdp.conf", mode = "644", doc = true },
+    { source = "../../target/sbom/platd-sbom.cdx.json", dest = "/usr/share/doc/platd/sbom.cdx.json", mode = "644", doc = true },
+    { source = "../../docs/compliance/cbom.cdx.json", dest = "/usr/share/doc/platd/cbom.cdx.json", mode = "644", doc = true },
 ]

@@ -39,6 +39,13 @@ rustix = { version = "1", default-features = false, features = ["fs", "process",
 [dev-dependencies]
 rcgen.workspace = true
 proptest.workspace = true
+# CBOM drift test (tests/cbom.rs) and the control-plane handshake bench.
+serde_json.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "handshake"
+harness = false
 
 [lints]
 workspace = true

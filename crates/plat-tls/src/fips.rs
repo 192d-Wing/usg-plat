@@ -7,6 +7,8 @@
 //! - FIPS 140-3: the module runs its power-on self tests when first used;
 //!   `aws_lc_rs::try_fips_mode` reports the module's own status.
 
+// CBOM: lib/aws-lc-fips
+// CBOM: crypto/protocol/tls13
 use std::sync::OnceLock;
 #[cfg(feature = "test-hooks")]
 use std::sync::atomic::{AtomicBool, Ordering};

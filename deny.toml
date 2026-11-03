@@ -42,6 +42,56 @@ multiple-versions = "warn"
 wildcards = "deny"
 # Internal path dependencies carry a version and every crate is publish = false.
 allow-wildcard-paths = true
+# Crypto-dependency rule (T2 of the CBOM drift checks; T3 in
+# deploy/tests/supply-chain/check-cbom.py is the catch-all for crates not
+# named here). All C/FFI crypto stays behind plat-tls with the AWS-LC FIPS
+# provider (CLAUDE.md); a second provider or a pure-Rust primitive crate is
+# refused, and each allowed crypto crate may only be pulled in by the listed
+# direct parents (`wrappers`). Changing this list changes
+# docs/compliance/cbom.cdx.json in the same review.
+# COMPLIANCE MAPPING:
+# - NIST 800-53: SR-3 (Supply Chain Controls), CM-8 (System Component
+#   Inventory), SC-13 (Cryptographic Protection)
+deny = [
+    { crate = "ring", reason = "no second crypto provider (CLAUDE.md)" },
+    { crate = "openssl", reason = "no second crypto provider (CLAUDE.md)" },
+    { crate = "openssl-sys", reason = "no second crypto provider (CLAUDE.md)" },
+    { crate = "native-tls", reason = "no second crypto provider (CLAUDE.md)" },
+    { crate = "boring", reason = "no second crypto provider (CLAUDE.md)" },
+    { crate = "boring-sys", reason = "no second crypto provider (CLAUDE.md)" },
+    { crate = "rustls-openssl", reason = "no second crypto provider (CLAUDE.md)" },
+    { crate = "rustls-rustcrypto", reason = "no second crypto provider (CLAUDE.md)" },
+    { crate = "rustls-post-quantum", reason = "no second crypto provider (CLAUDE.md)" },
+    { crate = "rustls-symcrypt", reason = "no second crypto provider (CLAUDE.md)" },
+    { crate = "rustls-graviola", reason = "no second crypto provider (CLAUDE.md)" },
+    { crate = "p256", reason = "primitives come from the FIPS module only" },
+    { crate = "p384", reason = "primitives come from the FIPS module only" },
+    { crate = "ecdsa", reason = "primitives come from the FIPS module only" },
+    { crate = "rsa", reason = "primitives come from the FIPS module only" },
+    { crate = "ed25519-dalek", reason = "primitives come from the FIPS module only" },
+    { crate = "x25519-dalek", reason = "primitives come from the FIPS module only" },
+    { crate = "curve25519-dalek", reason = "primitives come from the FIPS module only" },
+    { crate = "aes", reason = "primitives come from the FIPS module only" },
+    { crate = "aes-gcm", reason = "primitives come from the FIPS module only" },
+    { crate = "chacha20poly1305", reason = "primitives come from the FIPS module only" },
+    { crate = "hmac", reason = "primitives come from the FIPS module only" },
+    { crate = "sha1", reason = "primitives come from the FIPS module only" },
+    { crate = "md-5", reason = "primitives come from the FIPS module only" },
+    { crate = "blake3", reason = "primitives come from the FIPS module only" },
+    { crate = "ml-kem", reason = "primitives come from the FIPS module only" },
+    { crate = "ml-dsa", reason = "primitives come from the FIPS module only" },
+    { crate = "pqcrypto", reason = "primitives come from the FIPS module only" },
+    { crate = "pqcrypto-traits", reason = "primitives come from the FIPS module only" },
+    # Allowed crypto crates, only through the listed direct parents.
+    { crate = "aws-lc-rs", wrappers = ["plat-tls", "rustls", "rustls-webpki", "rcgen"], reason = "FIPS provider API behind plat-tls" },
+    { crate = "aws-lc-fips-sys", wrappers = ["aws-lc-rs", "plat-tls"], reason = "the FIPS module (POAM-026)" },
+    { crate = "aws-lc-sys", wrappers = ["aws-lc-rs"], reason = "linked, never installed as provider (NIST-006)" },
+    { crate = "rustls", wrappers = ["plat-tls", "plat-audit", "platd"], reason = "TLS 1.3 behind the plat-tls policy" },
+    { crate = "rustls-webpki", wrappers = ["rustls"], reason = "path validation via the FIPS provider" },
+    { crate = "sha2", wrappers = ["plat-audit", "plat-cluster", "plat-xdp", "platd"], reason = "integrity digests listed in the CBOM" },
+    { crate = "ahash", wrappers = ["plat-nat64"], reason = "keyed HashDoS hashing (SC-5), not SC-13" },
+    { crate = "rcgen", wrappers = ["plat-tls", "plat-audit", "platd"], reason = "test PKI only (dev-dependency)" },
+]
 
 [sources]
 unknown-registry = "deny"

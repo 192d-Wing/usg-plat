@@ -2,7 +2,7 @@
 LINUX_TARGET ?= aarch64-unknown-linux-gnu
 ZENSICAL ?= uvx zensical@0.0.73
 
-.PHONY: all check fmt clippy check-linux check-notls test test-deploy bench ir security compliance-annotations release dist deb rpm packages docs docs-serve
+.PHONY: all check fmt clippy check-linux check-notls test test-deploy bench ir security compliance-annotations release dist deb rpm packages docs docs-serve sbom cbom-check
 
 all: check test
 
@@ -32,7 +32,7 @@ check-notls:
 
 # xdp-env (defined below) refuses a pre-set RUSTC_BOOTSTRAP, so the required
 # CI jobs (which run these targets) assert it too (SEC-004 / NIST-007).
-check: xdp-env fmt clippy check-linux check-notls codex-agents-check
+check: xdp-env fmt clippy check-linux check-notls codex-agents-check cbom-check
 
 # Codex agent definitions (.codex/agents/*.toml) are generated from the Claude
 # Code ones (.claude/agents/*.md); check fails when they have drifted.
@@ -58,7 +58,7 @@ test-deploy:
 	sh deploy/tests/deploy-scripts-test.sh
 
 bench:
-	cargo bench -p plat-xlat -p plat-nat64 -p plat-audit -p plat-xdp-core --bench xlat --bench nat64 --bench audit --bench decide
+	cargo bench -p plat-xlat -p plat-nat64 -p plat-audit -p plat-xdp-core -p plat-tls --bench xlat --bench nat64 --bench audit --bench decide --bench handshake
 
 # XDP fast path (POAM-016 Phase 1, plan §15). Not part of check/test: those need
 # no bpf-linker and no Linux VM. The crates arrive in later work units, so each
@@ -216,13 +216,74 @@ release:
 # XDP=1 builds platd and the loader with the `xdp` feature (bpf-linker
 # required, see `make xdp`).
 DIST_FEATURES := $(if $(XDP),--features platd/xdp --features plat-xdp-loader/xdp)
-dist:
-	cargo build --profile dist -p platd -p plat-xdp-loader $(DIST_FEATURES)
+#
+# Shipped binaries are built with `cargo auditable` (pinned below), which
+# embeds the dependency list in a .dep-v0 section (`cargo audit bin`, T7).
+# AUDITABLE=0 falls back to a plain build for local development only and is
+# refused when CI=true.
+# COMPLIANCE MAPPING:
+# - NIST 800-53: CM-8 (System Component Inventory), SR-4 (Provenance), RA-5
+#   (Vulnerability Monitoring and Scanning), CM-2 (pinned tools)
+CARGO_AUDITABLE_VERSION ?= 0.7.7
+CARGO_CYCLONEDX_VERSION ?= 0.5.9
+CHECK_JSONSCHEMA_VERSION ?= 0.39.0
+# Schema validation: CI installs the hash-locked check-jsonschema and sets
+# CHECK_JSONSCHEMA=check-jsonschema; locally uvx is used when present (the
+# scripts skip with a warning without it, and fail without it when CI=true).
+CHECK_JSONSCHEMA ?= $(if $(shell command -v uvx 2>/dev/null),uvx --from check-jsonschema==$(CHECK_JSONSCHEMA_VERSION) check-jsonschema)
+export CHECK_JSONSCHEMA
+# Fails unless `cargo install --list` shows tool $(1) at version $(2).
+tool-pin = cargo install --list | grep -qx '$(1) v$(2):' || { echo "ERROR: $(1) $(2) required: deploy/tests/supply-chain/install-cargo-tools.sh $(1)" >&2; exit 1; }
 
-deb: dist
+dist:
+ifeq ($(AUDITABLE),0)
+	@if [ "$$CI" = true ]; then echo "ERROR: AUDITABLE=0 is refused in CI (shipped binaries must be auditable)" >&2; exit 1; fi
+	@echo "WARNING: AUDITABLE=0: plain cargo build, the binaries carry no .dep-v0 dependency data" >&2
+	cargo build --profile dist -p platd -p plat-xdp-loader $(DIST_FEATURES)
+else
+	@$(call tool-pin,cargo-auditable,$(CARGO_AUDITABLE_VERSION))
+	cargo auditable build --profile dist -p platd -p plat-xdp-loader $(DIST_FEATURES)
+endif
+
+# CycloneDX SBOM (1.5 JSON; cargo-cyclonedx emits <= 1.5) of the shipped
+# binaries for the host triple, finished and cross-checked by sbom-finish.py
+# (T6 against cargo metadata, T7 against the .dep-v0 data on Linux, and with
+# XDP=1 T8: the eBPF object from `make xdp` with its hash and build
+# formulation). Writes target/sbom/platd[-xdp]-<version>-<arch>.cdx.json and
+# the fixed-name copy target/sbom/platd-sbom.cdx.json the packages install.
+HOST_TRIPLE := $(shell rustc -vV 2>/dev/null | sed -n 's/^host: //p')
+WS_VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+SBOM_NAME := platd$(if $(XDP),-xdp)-$(WS_VERSION)-$(firstword $(subst -, ,$(HOST_TRIPLE))).cdx.json
+comma := ,
+SBOM_RAW := services/platd/platd_bin.cdx.json services/plat-xdp-loader/plat-xdp-loader_bin.cdx.json
+sbom: dist
+	@$(call tool-pin,cargo-cyclonedx,$(CARGO_CYCLONEDX_VERSION))
+	@if [ -n "$(XDP)" ] && [ ! -f $(XDP_OBJ).sha256 ]; then echo "ERROR: sbom XDP=1 needs the gated object: run make xdp first" >&2; exit 1; fi
+	rm -f $(SBOM_RAW) && mkdir -p target/sbom/raw
+	cargo cyclonedx --manifest-path services/platd/Cargo.toml -f json --spec-version 1.5 --describe binaries -q \
+	  --target $(HOST_TRIPLE) $(if $(XDP),-F platd/xdp$(comma)plat-xdp-loader/xdp)
+	mv $(SBOM_RAW) target/sbom/raw/
+	find crates services -maxdepth 2 -name '*_bin.cdx.json' -delete
+	python3 -I deploy/tests/supply-chain/sbom-finish.py --target $(HOST_TRIPLE) --out target/sbom/$(SBOM_NAME) \
+	  --raw target/sbom/raw/platd_bin.cdx.json --raw target/sbom/raw/plat-xdp-loader_bin.cdx.json \
+	  --auditable target/dist/platd --auditable target/dist/plat-xdp-loader \
+	  --tool "cargo-cyclonedx $(CARGO_CYCLONEDX_VERSION)" $(if $(XDP),--features xdp --xdp-object $(XDP_OBJ))
+	cp target/sbom/$(SBOM_NAME) target/sbom/platd-sbom.cdx.json
+
+# CBOM drift checks T3-T5 (dependency graph, // CBOM: markers, structure and
+# schema), the self-tests of both supply-chain scripts and the T3 negative
+# cases (test_drift_negative.py). T1 runs in `make test`.
+# COMPLIANCE MAPPING:
+# - NIST 800-53: CM-8, SR-3 (Supply Chain Controls), SA-11 (Developer Testing)
+cbom-check:
+	python3 -I deploy/tests/supply-chain/check-cbom.py --self-test --all
+	python3 -I deploy/tests/supply-chain/sbom-finish.py --self-test
+	python3 -I deploy/tests/supply-chain/test_drift_negative.py
+
+deb: sbom
 	cargo deb -p platd --no-build --no-strip --profile dist
 
-rpm: dist
+rpm: sbom
 	cargo generate-rpm -p services/platd --profile dist
 
 packages: deb rpm

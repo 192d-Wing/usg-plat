@@ -15,6 +15,7 @@
 //! - NIST 800-53: SC-5 - depth 8, at most 64 signature verifications
 //! - RFC 5280 §6.1 (path), §4.1.2.4/§4.1.2.6 (issuer/subject names)
 
+// CBOM: crypto/algorithm/sha-256/aws-lc-fips
 use std::fmt;
 
 use der::asn1::ObjectIdentifier as Oid;

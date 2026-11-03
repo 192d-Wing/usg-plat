@@ -648,6 +648,12 @@ for f in deploy/systemd/plat-xdp.service deploy/systemd/run-plat-bpf.mount deplo
     [ "$(grep -c "$f\"" "$PKG")" -eq 2 ] || { fail "packaging: $f not in both the deb and the rpm assets"; pkg_ok=0; }
 done
 [ "$pkg_ok" = 0 ] || pass "packaging lists the loader and the XDP units (deb and rpm)"
+# CM-8/SR-4: the SBOM (make sbom) and the CBOM are installed by both packages.
+pkg_ok=1
+for f in target/sbom/platd-sbom.cdx.json docs/compliance/cbom.cdx.json; do
+    [ "$(grep -c "$f\"" "$PKG")" -eq 2 ] || { fail "packaging: $f not in both the deb and the rpm assets"; pkg_ok=0; }
+done
+[ "$pkg_ok" = 0 ] || pass "packaging installs the SBOM and the CBOM (deb and rpm)"
 
 # --- 5. cluster announce/withdraw hooks (deploy/hooks) ------------------------
 ANNOUNCE=$ROOT/deploy/hooks/frr-announce.sh

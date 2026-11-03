@@ -10,22 +10,38 @@
 //!   session cache; the client does not resume. Every connection runs full
 //!   certificate verification (and revocation). No 0-RTT.
 //!
+//! Every algorithm here is inventoried in `docs/compliance/cbom.cdx.json`
+//! and checked against it by `tests/cbom.rs` (re-bless on any change).
+//!
+//! CBOM: crypto/protocol/tls13
+//!
 //! COMPLIANCE MAPPING:
 //! - NIST 800-53: SC-13, SC-8(1) - FIPS-approved suites and groups only
 //! - NIST SP 800-52 Rev 2 §3.1 (TLS 1.3 supported), RFC 9325 §4.1, §4.2
 //! - RFC 8446 §2.3 / §4.2.10 - no 0-RTT early data
+//!
+//! - Signature verification (CertificateVerify and chain signatures):
+//!   restricted to exactly the set `revocation::sig` verifies for OCSP/CRL
+//!   (ECDSA P-256/P-384, RSA PKCS#1 v1.5 and RSASSA-PSS, SHA-256/384/512).
+//!   Ed25519, ECDSA P-521 and ML-DSA certificates are refused, so a chain
+//!   whose revocation data could not be verified is never accepted.
+//!
+//! POAM: POAM-041 authentication is classical only: ML-DSA (and Ed25519,
+//! P-521) are removed from the verification set until `sig.rs` verifies them
+//! for OCSP/CRL, their FIPS approval in this module is confirmed and an
+//! ML-DSA operator PKI exists.
 
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use plat_common::config::{ClusterTlsConfig, ManagementTlsConfig, SyslogTlsConfig};
 use rustls::client::Resumption;
-use rustls::crypto::CryptoProvider;
 use rustls::crypto::aws_lc_rs::kx_group;
+use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms};
 use rustls::server::NoServerSessionStorage;
 use rustls::{ClientConfig, ServerConfig, SupportedProtocolVersion};
-use rustls_pki_types::ServerName;
+use rustls_pki_types::{AlgorithmIdentifier, ServerName, alg_id};
 
 use crate::TlsError;
 use crate::load::{load_certs, load_key};
@@ -36,9 +52,64 @@ use crate::verify::{
 
 static VERSIONS: &[&SupportedProtocolVersion] = &[&rustls::version::TLS13];
 
-/// The FIPS provider restricted to the policy's suites and groups.
+// CBOM: crypto/algorithm/x25519mlkem768
+// CBOM: crypto/algorithm/ecdh-p256
+// CBOM: crypto/algorithm/ecdh-p384
+// CBOM: crypto/algorithm/aes-128-gcm
+// CBOM: crypto/algorithm/aes-256-gcm
+// CBOM: crypto/algorithm/ml-kem-768
+// CBOM: crypto/algorithm/x25519
+// CBOM: crypto/algorithm/hkdf-sha256
+// CBOM: crypto/algorithm/hkdf-sha384
+// CBOM: crypto/algorithm/sha-256/aws-lc-fips
+// CBOM: crypto/algorithm/sha-384/aws-lc-fips
+// CBOM: crypto/algorithm/ctr-drbg
+/// Public-key algorithms `revocation::sig` can verify (OCSP/CRL). TLS
+/// chain and CertificateVerify verification is restricted to the same keys.
+const SIG_KEY_ALGS: [AlgorithmIdentifier; 3] = [alg_id::ECDSA_P256, alg_id::ECDSA_P384, alg_id::RSA_ENCRYPTION];
+
+/// TLS 1.3 signature schemes accepted, in preference order.
+const SIG_SCHEMES: [rustls::SignatureScheme; 8] = [
+    rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+    rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+    rustls::SignatureScheme::RSA_PSS_SHA512,
+    rustls::SignatureScheme::RSA_PSS_SHA384,
+    rustls::SignatureScheme::RSA_PSS_SHA256,
+    rustls::SignatureScheme::RSA_PKCS1_SHA512,
+    rustls::SignatureScheme::RSA_PKCS1_SHA384,
+    rustls::SignatureScheme::RSA_PKCS1_SHA256,
+];
+
+// COMPLIANCE MAPPING:
+// - NIST 800-53: IA-5(2)(b)(1), SC-13 - certificate signature algorithms
+//   limited to those whose revocation data can also be verified (`sig.rs`):
+//   no chain is accepted whose OCSP/CRL signatures cannot be checked.
+/// The provider's verification set filtered to `SIG_SCHEMES` and
+/// `SIG_KEY_ALGS`. Built once per process (the rustls type needs `'static`
+/// slices); the one-time leak is bounded.
+fn sig_algs(default: &WebPkiSupportedAlgorithms) -> WebPkiSupportedAlgorithms {
+    static ALGS: OnceLock<WebPkiSupportedAlgorithms> = OnceLock::new();
+    *ALGS.get_or_init(|| {
+        let ok =
+            |a: &&dyn rustls::pki_types::SignatureVerificationAlgorithm| SIG_KEY_ALGS.contains(&a.public_key_alg_id());
+        let all: Vec<_> = default.all.iter().copied().filter(ok).collect();
+        let mapping: Vec<_> = SIG_SCHEMES
+            .iter()
+            .filter_map(|want| {
+                let (scheme, algs) = default.mapping.iter().find(|(s, _)| s == want)?;
+                let algs: Vec<_> = algs.iter().copied().filter(ok).collect();
+                Some((*scheme, &*Vec::leak(algs)))
+            })
+            .collect();
+        WebPkiSupportedAlgorithms { all: Vec::leak(all), mapping: Vec::leak(mapping) }
+    })
+}
+
+/// The FIPS provider restricted to the policy's suites, groups and
+/// signature algorithms.
 pub fn fips_provider(pq_hybrid: bool) -> Result<Arc<CryptoProvider>, TlsError> {
     let mut p = rustls::crypto::default_fips_provider();
+    p.signature_verification_algorithms = sig_algs(&p.signature_verification_algorithms);
     p.cipher_suites.retain(|s| s.version() == &rustls::version::TLS13 && s.fips());
     let mut groups = Vec::with_capacity(3);
     if pq_hybrid {
@@ -46,6 +117,9 @@ pub fn fips_provider(pq_hybrid: bool) -> Result<Arc<CryptoProvider>, TlsError> {
     }
     groups.extend([kx_group::SECP256R1, kx_group::SECP384R1]);
     p.kx_groups = groups.into_iter().filter(|g| g.fips()).collect();
+    if p.signature_verification_algorithms.mapping.len() != SIG_SCHEMES.len() {
+        return Err(TlsError::NotFips("provider lacks a policy signature scheme".into()));
+    }
     if p.cipher_suites.is_empty() || p.kx_groups.is_empty() || !p.fips() {
         return Err(TlsError::NotFips("provider offers no FIPS TLS 1.3 suites/groups".into()));
     }
@@ -64,6 +138,18 @@ pub fn kx_group_names(pq_hybrid: bool) -> Result<Vec<String>, TlsError> {
 /// Names of the offered cipher suites (`check-config`).
 pub fn cipher_suite_names() -> Result<Vec<String>, TlsError> {
     Ok(fips_provider(false)?.cipher_suites.iter().map(|s| format!("{:?}", s.suite())).collect())
+}
+
+// CBOM: crypto/algorithm/sig/*
+/// Names of the TLS 1.3 signature schemes the policy verifies
+/// (CertificateVerify and webpki chain signatures), in preference order.
+pub fn signature_scheme_names() -> Result<Vec<String>, TlsError> {
+    Ok(fips_provider(true)?
+        .signature_verification_algorithms
+        .mapping
+        .iter()
+        .map(|(scheme, _)| format!("{scheme:?}"))
+        .collect())
 }
 
 /// Validates a syslog `server_name` (DNS name or IP literal).
@@ -124,8 +210,9 @@ pub fn client_config(s: &ClientSettings) -> Result<Arc<ClientConfig>, TlsError> 
     // - NIST 800-53: IA-3, IA-5(2)(b)(1) - rustls 0.23 accepts a custom server
     //   verifier only through this builder. The verifier is not permissive:
     //   it delegates to `WebPkiServerVerifier` (configured CA only) first
-    //   and only adds the revocation check. This is the only use in the
-    //   workspace.
+    //   and only adds the revocation check. One of exactly two uses in the
+    //   workspace (the other is the client side of `peer_configs`); the
+    //   count is enforced by `tests::dangerous_call_count`.
     let builder = ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(VERSIONS)?
         .dangerous()
@@ -266,6 +353,66 @@ mod tests {
         assert_eq!(kx_group_names(false).unwrap(), ["secp256r1", "secp384r1"]);
         let suites = cipher_suite_names().unwrap();
         assert!(suites.iter().all(|s| s.starts_with("TLS13_AES_")), "{suites:?}");
+    }
+
+    #[test]
+    fn signature_schemes() {
+        assert_eq!(
+            signature_scheme_names().unwrap(),
+            [
+                "ECDSA_NISTP384_SHA384",
+                "ECDSA_NISTP256_SHA256",
+                "RSA_PSS_SHA512",
+                "RSA_PSS_SHA384",
+                "RSA_PSS_SHA256",
+                "RSA_PKCS1_SHA512",
+                "RSA_PKCS1_SHA384",
+                "RSA_PKCS1_SHA256",
+            ]
+        );
+        for pq in [true, false] {
+            let algs = fips_provider(pq).unwrap().signature_verification_algorithms;
+            assert!(algs.fips());
+            // Chain algorithms: ECDSA P-256/P-384 x SHA-256/384/512, RSA
+            // PKCS#1 x 3 (NULL and absent params), RSA-PSS x 3. No Ed25519,
+            // P-521 or ML-DSA key.
+            assert_eq!(algs.all.len(), 15);
+            let keys = algs.all.iter().chain(algs.mapping.iter().flat_map(|(_, a)| a.iter()));
+            for a in keys {
+                assert!(SIG_KEY_ALGS.contains(&a.public_key_alg_id()));
+            }
+        }
+    }
+
+    /// CLAUDE.md rule 9: the rustls `dangerous` builder only for the two webpki-first
+    /// verifier wrappers in this file. Counts source occurrences across the
+    /// workspace's crates and services.
+    #[test]
+    fn dangerous_call_count() {
+        fn walk(dir: &std::path::Path, hits: &mut Vec<String>) {
+            let Ok(rd) = std::fs::read_dir(dir) else { return };
+            for e in rd.flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    if path.file_name().is_some_and(|n| n != "target") {
+                        walk(&path, hits);
+                    }
+                } else if path.extension().is_some_and(|x| x == "rs") {
+                    let text = std::fs::read_to_string(&path).unwrap_or_default();
+                    let needle = concat!(".danger", "ous()");
+                    for _ in text.matches(needle) {
+                        hits.push(path.display().to_string());
+                    }
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut hits = Vec::new();
+        for sub in ["crates", "services"] {
+            walk(&root.join(sub), &mut hits);
+        }
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert!(hits.iter().all(|h| h.ends_with("plat-tls/src/policy.rs")), "{hits:?}");
     }
 
     #[test]

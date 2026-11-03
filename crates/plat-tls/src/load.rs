@@ -12,6 +12,8 @@
 //!   key bytes zeroized after use.
 //! - NIST 800-53: SC-5 - every file read is size-capped.
 
+// CBOM: crypto/material/private-key
+// CBOM: crypto/material/x509-certificate
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;

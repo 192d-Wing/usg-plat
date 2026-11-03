@@ -1,0 +1,2128 @@
+{
+  "bomFormat": "CycloneDX",
+  "components": [
+    {
+      "bom-ref": "crypto/algorithm/x25519mlkem768",
+      "cryptoProperties": {
+        "algorithmProperties": {
+          "certificationLevel": [
+            "none"
+          ],
+          "cryptoFunctions": [
+            "keygen",
+            "encapsulate",
+            "decapsulate"
+          ],
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "generic",
+          "nistQuantumSecurityLevel": 3,
+          "parameterSetIdentifier": "768",
+          "primitive": "kem"
+        },
+        "assetType": "algorithm"
+      },
+      "evidence": {
+        "occurrences": [
+          {
+            "location": "crates/plat-tls/src/policy.rs",
+            "symbol": "plat_tls::policy::fips_provider"
+          }
+        ]
+      },
+      "name": "X25519MLKEM768",
+      "properties": [
+        {
+          "name": "usg-plat:quantum-vulnerability",
+          "value": "pq-resistant"
+        },
+        {
+          "name": "usg-plat:pqc-migration-target",
+          "value": "ML-KEM-1024 or a P-384 + ML-KEM-1024 hybrid if CNSA 2.0 applies (POAM-042)"
+        },
+        {
+          "name": "usg-plat:cmvp-status",
+          "value": "modules-in-process (POAM-026)"
+        },
+        {
+          "name": "usg-plat:hybrid-of",
+          "value": "crypto/algorithm/x25519,crypto/algorithm/ml-kem-768"
+        },
+        {
+          "name": "usg-plat:config",
+          "value": "tls.pq_hybrid (default true)"
+        },
+        {
+          "name": "usg-plat:tls-codepoint",
+          "value": "0x11EC (draft-ietf-tls-ecdhe-mlkem)"
+        }
+      ],
+      "type": "cryptographic-asset"
+    },
+    {
+      "bom-ref": "crypto/algorithm/ml-kem-768",
+      "cryptoProperties": {
+        "algorithmProperties": {
+          "certificationLevel": [
+            "none"
+          ],
+          "cryptoFunctions": [
+            "keygen",
+            "encapsulate",
+            "decapsulate"
+          ],
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "generic",
+          "nistQuantumSecurityLevel": 3,
+          "parameterSetIdentifier": "768",
+          "primitive": "kem"
+        },
+        "assetType": "algorithm",
+        "oid": "2.16.840.1.101.3.4.4.2"
+      },
+      "evidence": {
+        "occurrences": [
+          {
+            "location": "crates/plat-tls/src/policy.rs",
+            "symbol": "plat_tls::policy::fips_provider"
+          }
+        ]
+      },
+      "name": "ML-KEM-768",
+      "properties": [
+        {
+          "name": "usg-plat:quantum-vulnerability",
+          "value": "pq-resistant"
+        },
+        {
+          "name": "usg-plat:pqc-migration-target",
+          "value": "ML-KEM-1024 if CNSA 2.0 applies (POAM-042)"
+        },
+        {
+          "name": "usg-plat:cmvp-status",
+          "value": "modules-in-process (POAM-026)"
+        },
+        {
+          "name": "usg-plat:standard",
+          "value": "FIPS 203"
+        }
+      ],
+      "type": "cryptographic-asset"
+    },
+    {
+      "bom-ref": "crypto/algorithm/x25519",
+      "cryptoProperties": {
+        "algorithmProperties": {
+          "certificationLevel": [
+            "none"
+          ],
+          "cryptoFunctions": [
+            "keygen",
+            "keyderive"
+          ],
+          "curve": "x25519",
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "generic",
+          "nistQuantumSecurityLevel": 0,
+          "primitive": "key-agree"
+        },
+        "assetType": "algorithm"
+      },
+      "evidence": {
+        "occurrences": [
+          {
+            "location": "crates/plat-tls/src/policy.rs",
+            "symbol": "plat_tls::policy::fips_provider"
+          }
+        ]
+      },
+      "name": "X25519",
+      "properties": [
+        {
+          "name": "usg-plat:quantum-vulnerability",
+          "value": "shor-broken"
+        },
+        {
+          "name": "usg-plat:pqc-migration-target",
+          "value": "keep as the hybrid's classical half; pure ML-KEM only if policy requires (POAM-042)"
+        },
+        {
+          "name": "usg-plat:cmvp-status",
+          "value": "modules-in-process (POAM-026)"
+        },
+        {
+          "name": "usg-plat:use",
+          "value": "only inside X25519MLKEM768; never offered alone"
+        }
+      ],
+      "type": "cryptographic-asset"
+    },
+    {
+      "bom-ref": "crypto/algorithm/ecdh-p256",
+      "cryptoProperties": {
+        "algorithmProperties": {
+          "certificationLevel": [
+            "none"
+          ],
+          "cryptoFunctions": [
+            "keygen",
+            "keyderive"
+          ],
+          "curve": "secp256r1",
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "generic",
+          "nistQuantumSecurityLevel": 0,
+          "primitive": "key-agree"
+        },
+        "assetType": "algorithm"
+      },
+      "evidence": {
+        "occurrences": [
+          {
+            "location": "crates/plat-tls/src/policy.rs",
+            "symbol": "plat_tls::policy::fips_provider"
+          }
+        ]
+      },
+      "name": "ECDHE-P256",
+      "properties": [
+        {
+          "name": "usg-plat:quantum-vulnerability",
+          "value": "shor-broken"
+        },
+        {
+          "name": "usg-plat:pqc-migration-target",
+          "value": "X25519MLKEM768 (default); ML-KEM-1024 hybrid if CNSA 2.0 applies (POAM-042)"
+        },
+        {
+          "name": "usg-plat:cmvp-status",
+          "value": "modules-in-process (POAM-026)"
+        },
+        {
+          "name": "usg-plat:exposure",
+          "value": "harvest-now-decrypt-later when negotiated (pq_hybrid=false or HRR to a classical peer)"
+        }
+      ],
+      "type": "cryptographic-asset"
+    },
+    {
+      "bom-ref": "crypto/algorithm/ecdh-p384",
+      "cryptoProperties": {
+        "algorithmProperties": {
+          "certificationLevel": [
+            "none"
+          ],
+          "cryptoFunctions": [
+            "keygen",
+            "keyderive"
+          ],
+          "curve": "secp384r1",
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "generic",
+          "nistQuantumSecurityLevel": 0,
+          "primitive": "key-agree"
+        },
+        "assetType": "algorithm"
+      },
+      "evidence": {
+        "occurrences": [
+          {
+            "location": "crates/plat-tls/src/policy.rs",
+            "symbol": "plat_tls::policy::fips_provider"
+          }
+        ]
+      },
+      "name": "ECDHE-P384",
+      "properties": [
+        {
+          "name": "usg-plat:quantum-vulnerability",
+          "value": "shor-broken"
+        },
+        {
+          "name": "usg-plat:pqc-migration-target",
+          "value": "X25519MLKEM768 (default); ML-KEM-1024 hybrid if CNSA 2.0 applies (POAM-042)"
+        },
+        {
+          "name": "usg-plat:cmvp-status",
+          "value": "modules-in-process (POAM-026)"
+        },
+        {
+          "name": "usg-plat:exposure",
+          "value": "harvest-now-decrypt-later when negotiated (pq_hybrid=false or HRR to a classical peer)"
+        }
+      ],
+      "type": "cryptographic-asset"
+    },
+    {
+      "bom-ref": "crypto/algorithm/aes-128-gcm",
+      "cryptoProperties": {
+        "algorithmProperties": {
+          "certificationLevel": [
+            "none"
+          ],
+          "cryptoFunctions": [
+            "encrypt",
+            "decrypt"
+          ],
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "generic",
+          "mode": "gcm",
+          "nistQuantumSecurityLevel": 1,
+          "parameterSetIdentifier": "128",
+          "primitive": "ae"
+        },
+        "assetType": "algorithm"
+      },
+      "evidence": {
+        "occurrences": [
+          {
+            "location": "crates/plat-tls/src/policy.rs",
+            "symbol": "plat_tls::policy::fips_provider"
+          }
+        ]
+      },
+      "name": "AES-128-GCM",
+      "properties": [
+        {
+          "name": "usg-plat:quantum-vulnerability",
+          "value": "grover-reduced"
+        },
+        {
+          "name": "usg-plat:pqc-migration-target",
+          "value": "AES-256-only suite list if CNSA applies (POAM-042)"
+        },
+        {
+          "name": "usg-plat:cmvp-status",
+          "value": "modules-in-process (POAM-026)"
+        }
+      ],
+      "type": "cryptographic-asset"
+    },
+    {
+      "bom-ref": "crypto/algorithm/aes-256-gcm",
+      "cryptoProperties": {
+        "algorithmProperties": {
+          "certificationLevel": [
+            "none"
+          ],
+          "cryptoFunctions": [
+            "encrypt",
+            "decrypt"
+          ],
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "generic",
+          "mode": "gcm",
+          "nistQuantumSecurityLevel": 5,
+          "parameterSetIdentifier": "256",
+          "primitive": "ae"
+        },
+        "assetType": "algorithm"
+      },
+      "evidence": {
+        "occurrences": [
+          {
+            "location": "crates/plat-tls/src/policy.rs",
+            "symbol": "plat_tls::policy::fips_provider"
+          }
+        ]
+      },
+      "name": "AES-256-GCM",
+      "properties": [
+        {
+          "name": "usg-plat:quantum-vulnerability",
+          "value": "grover-reduced"
+        },
+        {
+          "name": "usg-plat:pqc-migration-target",
+          "value": "none"
+        },
+        {
+          "name": "usg-plat:cmvp-status",
+          "value": "modules-in-process (POAM-026)"
+        }
+      ],
+      "type": "cryptographic-asset"
+    },
+    {
+      "bom-ref": "crypto/algorithm/hkdf-sha256",
+      "cryptoProperties": {
+        "algorithmProperties": {
+          "certificationLevel": [
+            "none"
+          ],
+          "cryptoFunctions": [
+            "keyderive"
+          ],
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "generic",
+          "nistQuantumSecurityLevel": 2,
+          "primitive": "kdf"
+        },
+        "assetType": "algorithm"
+      },
+      "evidence": {
+        "occurrences": [
+          {
+            "location": "crates/plat-tls/src/policy.rs",
+            "symbol": "plat_tls::policy::fips_provider"
+          }
+        ]
+      },
+      "name": "HKDF-SHA256",
+      "properties": [
+        {
+          "name": "usg-plat:quantum-vulnerability",
+          "value": "grover-reduced"
+        },
+        {
+          "name": "usg-plat:pqc-migration-target",
+          "value": "SHA-384 key schedule only if CNSA applies (POAM-042)"
+        },
+        {
+          "name": "usg-plat:cmvp-status",
+          "value": "modules-in-process (POAM-026)"
+        },
+        {
+          "name": "usg-plat:use",
+          "value": "TLS 1.3 key schedule (RFC 8446 §7.1)"
+        }
+      ],
+      "type": "cryptographic-asset"
+    },
+    {
+      "bom-ref": "crypto/algorithm/hkdf-sha384",
+      "cryptoProperties": {
+        "algorithmProperties": {
+          "certificationLevel": [
+            "none"
+          ],
+          "cryptoFunctions": [
+            "keyderive"
+          ],
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "generic",
+          "nistQuantumSecurityLevel": 4,
+          "primitive": "kdf"
+        },
+        "assetType": "algorithm"
+      },
+      "evidence": {
+        "occurrences": [
+          {
+            "location": "crates/plat-tls/src/policy.rs",
+            "symbol": "plat_tls::policy::fips_provider"
+          }
+        ]
+      },
+      "name": "HKDF-SHA384",
+      "properties": [
+        {
+          "name": "usg-plat:quantum-vulnerability",
+          "value": "grover-reduced"
+        },
+        {
+          "name": "usg-plat:pqc-migration-target",
+          "value": "none"
+        },
+        {
+          "name": "usg-plat:cmvp-status",
+          "value": "modules-in-process (POAM-026)"
+        },
+        {
+          "name": "usg-plat:use",
+          "value": "TLS 1.3 key schedule (RFC 8446 §7.1)"
+        }
+      ],
+      "type": "cryptographic-asset"
+    },
+    {
+      "bom-ref": "crypto/algorithm/sha-256/aws-lc-fips",
+      "cryptoProperties": {
+        "algorithmProperties": {
+          "certificationLevel": [
+            "none"
+          ],
+          "cryptoFunctions": [
+            "digest"
+          ],
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "generic",
+          "nistQuantumSecurityLevel": 2,
+          "primitive": "hash"
+        },
+        "assetType": "algorithm"
+      },
+      "evidence": {
+        "occurrences": [
+          {
+            "location": "crates/plat-tls/src/policy.rs",
+            "symbol": "plat_tls::policy::fips_provider"
+          },
+          {
+            "location": "crates/plat-tls/src/identity.rs",
+            "symbol": "plat_tls::identity"
+          },
+          {
+            "location": "crates/plat-tls/src/revocation/mod.rs",
+            "symbol": "plat_tls::revocation"
+          },
+          {
+            "location": "crates/plat-tls/src/revocation/chain.rs",
+            "symbol": "plat_tls::revocation::chain"
+          },
+          {
+            "location": "crates/plat-tls/src/revocation/crl/mod.rs",
+            "symbol": "plat_tls::revocation::crl"
+          },
+          {
+            "location": "crates/plat-tls/src/revocation/crl/parse.rs",
+            "symbol": "plat_tls::revocation::crl::parse"
+          },
+          {
+            "location": "crates/plat-tls/src/revocation/ocsp/request.rs",
+            "symbol": "plat_tls::revocation::ocsp::request"
+          },
+          {
+            "location": "crates/plat-tls/src/revocation/sig.rs",
+            "symbol": "plat_tls::revocation::sig::PSS_HASHES"
+          }
+        ]
+      },
+      "name": "SHA-256",
+      "properties": [
+        {
+          "name": "usg-plat:quantum-vulnerability",
+          "value": "grover-reduced"
+        },
+        {
+          "name": "usg-plat:pqc-migration-target",
+          "value": "SHA-384 only under CNSA (POAM-042)"
+        },
+        {
+          "name": "usg-plat:cmvp-status",
+          "value": "modules-in-process (POAM-026)"
+        },
+        {
+          "name": "usg-plat:use",
+          "value": "TLS transcript/PRF, OCSP CertID (default), certificate fingerprints (sha256: allow-list), revocation cache keys"
+        }
+      ],
+      "type": "cryptographic-asset"
+    },
+    {
+      "bom-ref": "crypto/algorithm/sha-384/aws-lc-fips",
+      "cryptoProperties": {
+        "algorithmProperties": {
+          "certificationLevel": [
+            "none"
+          ],
+          "cryptoFunctions": [
+            "digest"
+          ],
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "generic",
+          "nistQuantumSecurityLevel": 4,
+          "primitive": "hash"
+        },
+        "assetType": "algorithm"
+      },
+      "evidence": {
+        "occurrences": [
+          {
+            "location": "crates/plat-tls/src/policy.rs",
+            "symbol": "plat_tls::policy::fips_provider"
+          },
+          {
+            "location": "crates/plat-tls/src/revocation/sig.rs",
+            "symbol": "plat_tls::revocation::sig::PSS_HASHES"
+          }
+        ]
+      },
+      "name": "SHA-384",
+      "properties": [
+        {
+          "name": "usg-plat:quantum-vulnerability",
+          "value": "grover-reduced"
+        },
+        {
+          "name": "usg-plat:pqc-migration-target",
+          "value": "none"
+        },
+        {
+          "name": "usg-plat:cmvp-status",
+          "value": "modules-in-process (POAM-026)"
+        },
+        {
+          "name": "usg-plat:use",
+          "value": "TLS suites and X.509/OCSP/CRL signature digests"
+        }
+      ],
+      "type": "cryptographic-asset"
+    },
+    {
+      "bom-ref": "crypto/algorithm/sha-512/aws-lc-fips",
+      "cryptoProperties": {
+        "algorithmProperties": {
+          "certificationLevel": [
+            "none"
+          ],
+          "cryptoFunctions": [
+            "digest"
+          ],
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "generic",
+          "nistQuantumSecurityLevel": 5,
+          "primitive": "hash"
+        },
+        "assetType": "algorithm"
+      },
+      "evidence": {
+        "occurrences": [
+          {
+            "location": "crates/plat-tls/src/revocation/sig.rs",
+            "symbol": "plat_tls::revocation::sig::PSS_HASHES"
+          }
+        ]
+      },
+      "name": "SHA-512",
+      "properties": [
+        {
+          "name": "usg-plat:quantum-vulnerability",
+          "value": "grover-reduced"
+        },
+        {
+          "name": "usg-plat:pqc-migration-target",
+          "value": "none"
+        },
+        {
+          "name": "usg-plat:cmvp-status",
+          "value": "modules-in-process (POAM-026)"
+        },
+        {
+          "name": "usg-plat:use",
+          "value": "TLS suites and X.509/OCSP/CRL signature digests"
+        }
+      ],
+      "type": "cryptographic-asset"
+    },
+    {
+      "bom-ref": "crypto/algorithm/sha-1/aws-lc-fips-legacy",
+      "cryptoProperties": {
+        "algorithmProperties": {
+          "certificationLevel": [
+            "none"
+          ],
+          "cryptoFunctions": [
+            "digest"
+          ],
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "generic",
+          "nistQuantumSecurityLevel": 0,
+          "primitive": "hash"
+        },
+        "assetType": "algorithm"
+      },
+      "evidence": {
+        "occurrences": [
+          {
+            "location": "crates/plat-tls/src/revocation/ocsp/request.rs",
+            "symbol": "plat_tls::revocation::ocsp::request::cert_id_hash"
+          },
+          {
+            "location": "crates/plat-tls/src/revocation/ocsp/response.rs",
+            "symbol": "plat_tls::revocation::ocsp::response"
+          }
+        ]
+      },
+      "name": "SHA-1",
+      "properties": [
+        {
+          "name": "usg-plat:quantum-vulnerability",
+          "value": "classically-weak"
+        },
+        {
+          "name": "usg-plat:pqc-migration-target",
+          "value": "SHA-256 CertID is the default; remove the sha1 option at the next config-breaking release"
+        },
+        {
+          "name": "usg-plat:cmvp-status",
+          "value": "modules-in-process (POAM-026)"
+        },
+        {
+          "name": "usg-plat:use",
+          "value": "identification only: OCSP CertID (opt-in revocation.ocsp.cert_id_hash = \"sha1\") and ResponderID byKey matching (RFC 6960 §4.2.1 mandates SHA-1)"
+        },
+        {
+          "name": "usg-plat:security-function",
+          "value": "none"
+        }
+      ],
+      "type": "cryptographic-asset"
+    },
+    {
+      "bom-ref": "crypto/algorithm/ctr-drbg",
+      "cryptoProperties": {
+        "algorithmProperties": {
+          "certificationLevel": [
+            "none"
+          ],
+          "cryptoFunctions": [
+            "generate"
+          ],
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "generic",
+          "primitive": "drbg"
+        },
+        "assetType": "algorithm"
+      },
+      "evidence": {
+        "occurrences": [
+          {
+            "location": "crates/plat-tls/src/revocation/ocsp/request.rs",
+            "symbol": "plat_tls::revocation::ocsp::request (nonce)"
+          },
+          {
+            "location": "crates/plat-tls/src/revocation/mod.rs",
+            "symbol": "plat_tls::revocation"
+          },
+          {
+            "location": "crates/plat-tls/src/policy.rs",
+            "symbol": "plat_tls::policy::fips_provider"
+          }
+        ]
+      },
+      "name": "CTR_DRBG (AES-256)",
+      "properties": [
+        {
+          "name": "usg-plat:quantum-vulnerability",
+          "value": "pq-resistant"
+        },
+        {
+          "name": "usg-plat:pqc-migration-target",
+          "value": "none"
+        },
+        {
+          "name": "usg-plat:cmvp-status",
+          "value": "modules-in-process (POAM-026)"
+        },
+        {
+          "name": "usg-plat:use",
+          "value": "TLS randoms and key shares, OCSP nonce (SP 800-90A)"
+        }
+      ],
+      "type": "cryptographic-asset"
+    },
+    {
+      "bom-ref": "crypto/algorithm/sha-256/rustcrypto-sha2",
+      "cryptoProperties": {
+        "algorithmProperties": {
+          "certificationLevel": [
+            "none"
+          ],
+          "cryptoFunctions": [
+            "digest"
+          ],
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "generic",
+          "nistQuantumSecurityLevel": 2,
+          "primitive": "hash"
+        },
+        "assetType": "algorithm"
+      },
+      "evidence": {
+        "occurrences": [
+          {
+            "location": "crates/plat-audit/src/logger.rs",
+            "symbol": "plat_audit::logger (audit hash chain)"
+          },
+          {
+            "location": "crates/plat-audit/src/verify.rs",
+            "symbol": "plat_audit::verify (verify-log)"
+          },
+          {
+            "location": "crates/plat-cluster/src/digest.rs",
+            "symbol": "plat_cluster::digest (cluster config digest)"
+          },
+          {
+            "location": "crates/plat-xdp/src/lib.rs",
+            "symbol": "plat_xdp (eBPF object SHA-256)"
+          },
+          {
+            "location": "crates/plat-xdp/src/load.rs",
+            "symbol": "plat_xdp::load (CONFIG digest)"
+          },
+          {
+            "location": "services/platd/src/main.rs",
+            "symbol": "platd verify-log fixtures"
+          }
+        ]
+      },
+      "name": "SHA-256 (RustCrypto sha2)",
+      "properties": [
+        {
+          "name": "usg-plat:quantum-vulnerability",
+          "value": "grover-reduced"
+        },
+        {
+          "name": "usg-plat:pqc-migration-target",
+          "value": "chain v3 with explicit algorithm id together with POAM-003; SHA-384 only under CNSA (POAM-042/043)"
+        },
+        {
+          "name": "usg-plat:use",
+          "value": "audit-hash-chain (POAM-003, unkeyed, integrity not SC-13),cluster-config-digest,xdp-object-digest,xdp-config-digest,verify-log"
+        },
+        {
+          "name": "usg-plat:security-function",
+          "value": "integrity-only (not an SC-13 claim)"
+        }
+      ],
+      "type": "cryptographic-asset"
+    },
+    {
+      "bom-ref": "crypto/algorithm/sig/ECDSA_NISTP384_SHA384",
+      "cryptoProperties": {
+        "algorithmProperties": {
+          "certificationLevel": [
+            "none"
+          ],
+          "cryptoFunctions": [
+            "verify"
+          ],
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "generic",
+          "nistQuantumSecurityLevel": 0,
+          "primitive": "signature"
+        },
+        "assetType": "algorithm"
+      },
+      "evidence": {
+        "occurrences": [
+          {
+            "location": "crates/plat-tls/src/verify.rs",
+            "symbol": "plat_tls::verify"
+          },
+          {
+            "location": "crates/plat-tls/src/policy.rs",
+            "symbol": "plat_tls::policy::fips_provider"
+          }
+        ]
+      },
+      "name": "ECDSA_NISTP384_SHA384",
+      "properties": [
+        {
+          "name": "usg-plat:quantum-vulnerability",
+          "value": "shor-broken"
+        },
+        {
+          "name": "usg-plat:pqc-migration-target",
+          "value": "ML-DSA-65/87 or composite certificates (POAM-041)"
+        },
+        {
+          "name": "usg-plat:cmvp-status",
+          "value": "modules-in-process (POAM-026)"
+        },
+        {
+          "name": "usg-plat:use",
+          "value": "TLS 1.3 CertificateVerify and webpki chain signatures (provider verification set)"
+        }
+      ],
+      "type": "cryptographic-asset"
+    },
+    {
+      "bom-ref": "crypto/algorithm/sig/ECDSA_NISTP256_SHA256",
+      "cryptoProperties": {
+        "algorithmProperties": {
+          "certificationLevel": [
+            "none"
+          ],
+          "cryptoFunctions": [
+            "verify"
+          ],
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "generic",
+          "nistQuantumSecurityLevel": 0,
+          "primitive": "signature"
+        },
+        "assetType": "algorithm"
+      },
+      "evidence": {
+        "occurrences": [
+          {
+            "location": "crates/plat-tls/src/verify.rs",
+            "symbol": "plat_tls::verify"
+          },
+          {
+            "location": "crates/plat-tls/src/policy.rs",
+            "symbol": "plat_tls::policy::fips_provider"
+          }
+        ]
+      },
+      "name": "ECDSA_NISTP256_SHA256",
+      "properties": [
+        {
+          "name": "usg-plat:quantum-vulnerability",
+          "value": "shor-broken"
+        },
+        {
+          "name": "usg-plat:pqc-migration-target",
+          "value": "ML-DSA-65/87 or composite certificates (POAM-041)"
+        },
+        {
+          "name": "usg-plat:cmvp-status",
+          "value": "modules-in-process (POAM-026)"
+        },
+        {
+          "name": "usg-plat:use",
+          "value": "TLS 1.3 CertificateVerify and webpki chain signatures (provider verification set)"
+        }
+      ],
+      "type": "cryptographic-asset"
+    },
+    {
+      "bom-ref": "crypto/algorithm/sig/RSA_PSS_SHA512",
+      "cryptoProperties": {
+        "algorithmProperties": {
+          "certificationLevel": [
+            "none"
+          ],
+          "cryptoFunctions": [
+            "verify"
+          ],
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "generic",
+          "nistQuantumSecurityLevel": 0,
+          "primitive": "signature"
+        },
+        "assetType": "algorithm"
+      },
+      "evidence": {
+        "occurrences": [
+          {
+            "location": "crates/plat-tls/src/verify.rs",
+            "symbol": "plat_tls::verify"
+          },
+          {
+            "location": "crates/plat-tls/src/policy.rs",
+            "symbol": "plat_tls::policy::fips_provider"
+          }
+        ]
+      },
+      "name": "RSA_PSS_SHA512",
+      "properties": [
+        {
+          "name": "usg-plat:quantum-vulnerability",
+          "value": "shor-broken"
+        },
+        {
+          "name": "usg-plat:pqc-migration-target",
+          "value": "ML-DSA-65/87 or composite certificates (POAM-041)"
+        },
+        {
+          "name": "usg-plat:cmvp-status",
+          "value": "modules-in-process (POAM-026)"
+        },
+        {
+          "name": "usg-plat:use",
+          "value": "TLS 1.3 CertificateVerify and webpki chain signatures (provider verification set)"
+        }
+      ],
+      "type": "cryptographic-asset"
+    },
+    {
+      "bom-ref": "crypto/algorithm/sig/RSA_PSS_SHA384",
+      "cryptoProperties": {
+        "algorithmProperties": {
+          "certificationLevel": [
+            "none"
+          ],
+          "cryptoFunctions": [
+            "verify"
+          ],
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "generic",
+          "nistQuantumSecurityLevel": 0,
+          "primitive": "signature"
+        },
+        "assetType": "algorithm"
+      },
+      "evidence": {
+        "occurrences": [
+          {
+            "location": "crates/plat-tls/src/verify.rs",
+            "symbol": "plat_tls::verify"
+          },
+          {
+            "location": "crates/plat-tls/src/policy.rs",
+            "symbol": "plat_tls::policy::fips_provider"
+          }
+        ]
+      },
+      "name": "RSA_PSS_SHA384",
+      "properties": [
+        {
+          "name": "usg-plat:quantum-vulnerability",
+          "value": "shor-broken"
+        },
+        {
+          "name": "usg-plat:pqc-migration-target",
+          "value": "ML-DSA-65/87 or composite certificates (POAM-041)"
+        },
+        {
+          "name": "usg-plat:cmvp-status",
+          "value": "modules-in-process (POAM-026)"
+        },
+        {
+          "name": "usg-plat:use",
+          "value": "TLS 1.3 CertificateVerify and webpki chain signatures (provider verification set)"
+        }
+      ],
+      "type": "cryptographic-asset"
+    },
+    {
+      "bom-ref": "crypto/algorithm/sig/RSA_PSS_SHA256",
+      "cryptoProperties": {
+        "algorithmProperties": {
+          "certificationLevel": [
+            "none"
+          ],
+          "cryptoFunctions": [
+            "verify"
+          ],
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "generic",
+          "nistQuantumSecurityLevel": 0,
+          "primitive": "signature"
+        },
+        "assetType": "algorithm"
+      },
+      "evidence": {
+        "occurrences": [
+          {
+            "location": "crates/plat-tls/src/verify.rs",
+            "symbol": "plat_tls::verify"
+          },
+          {
+            "location": "crates/plat-tls/src/policy.rs",
+            "symbol": "plat_tls::policy::fips_provider"
+          }
+        ]
+      },
+      "name": "RSA_PSS_SHA256",
+      "properties": [
+        {
+          "name": "usg-plat:quantum-vulnerability",
+          "value": "shor-broken"
+        },
+        {
+          "name": "usg-plat:pqc-migration-target",
+          "value": "ML-DSA-65/87 or composite certificates (POAM-041)"
+        },
+        {
+          "name": "usg-plat:cmvp-status",
+          "value": "modules-in-process (POAM-026)"
+        },
+        {
+          "name": "usg-plat:use",
+          "value": "TLS 1.3 CertificateVerify and webpki chain signatures (provider verification set)"
+        }
+      ],
+      "type": "cryptographic-asset"
+    },
+    {
+      "bom-ref": "crypto/algorithm/sig/RSA_PKCS1_SHA512",
+      "cryptoProperties": {
+        "algorithmProperties": {
+          "certificationLevel": [
+            "none"
+          ],
+          "cryptoFunctions": [
+            "verify"
+          ],
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "generic",
+          "nistQuantumSecurityLevel": 0,
+          "primitive": "signature"
+        },
+        "assetType": "algorithm"
+      },
+      "evidence": {
+        "occurrences": [
+          {
+            "location": "crates/plat-tls/src/verify.rs",
+            "symbol": "plat_tls::verify"
+          },
+          {
+            "location": "crates/plat-tls/src/policy.rs",
+            "symbol": "plat_tls::policy::fips_provider"
+          }
+        ]
+      },
+      "name": "RSA_PKCS1_SHA512",
+      "properties": [
+        {
+          "name": "usg-plat:quantum-vulnerability",
+          "value": "shor-broken"
+        },
+        {
+          "name": "usg-plat:pqc-migration-target",
+          "value": "ML-DSA-65/87 or composite certificates (POAM-041)"
+        },
+        {
+          "name": "usg-plat:cmvp-status",
+          "value": "modules-in-process (POAM-026)"
+        },
+        {
+          "name": "usg-plat:use",
+          "value": "TLS 1.3 CertificateVerify and webpki chain signatures (provider verification set)"
+        }
+      ],
+      "type": "cryptographic-asset"
+    },
+    {
+      "bom-ref": "crypto/algorithm/sig/RSA_PKCS1_SHA384",
+      "cryptoProperties": {
+        "algorithmProperties": {
+          "certificationLevel": [
+            "none"
+          ],
+          "cryptoFunctions": [
+            "verify"
+          ],
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "generic",
+          "nistQuantumSecurityLevel": 0,
+          "primitive": "signature"
+        },
+        "assetType": "algorithm"
+      },
+      "evidence": {
+        "occurrences": [
+          {
+            "location": "crates/plat-tls/src/verify.rs",
+            "symbol": "plat_tls::verify"
+          },
+          {
+            "location": "crates/plat-tls/src/policy.rs",
+            "symbol": "plat_tls::policy::fips_provider"
+          }
+        ]
+      },
+      "name": "RSA_PKCS1_SHA384",
+      "properties": [
+        {
+          "name": "usg-plat:quantum-vulnerability",
+          "value": "shor-broken"
+        },
+        {
+          "name": "usg-plat:pqc-migration-target",
+          "value": "ML-DSA-65/87 or composite certificates (POAM-041)"
+        },
+        {
+          "name": "usg-plat:cmvp-status",
+          "value": "modules-in-process (POAM-026)"
+        },
+        {
+          "name": "usg-plat:use",
+          "value": "TLS 1.3 CertificateVerify and webpki chain signatures (provider verification set)"
+        }
+      ],
+      "type": "cryptographic-asset"
+    },
+    {
+      "bom-ref": "crypto/algorithm/sig/RSA_PKCS1_SHA256",
+      "cryptoProperties": {
+        "algorithmProperties": {
+          "certificationLevel": [
+            "none"
+          ],
+          "cryptoFunctions": [
+            "verify"
+          ],
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "generic",
+          "nistQuantumSecurityLevel": 0,
+          "primitive": "signature"
+        },
+        "assetType": "algorithm"
+      },
+      "evidence": {
+        "occurrences": [
+          {
+            "location": "crates/plat-tls/src/verify.rs",
+            "symbol": "plat_tls::verify"
+          },
+          {
+            "location": "crates/plat-tls/src/policy.rs",
+            "symbol": "plat_tls::policy::fips_provider"
+          }
+        ]
+      },
+      "name": "RSA_PKCS1_SHA256",
+      "properties": [
+        {
+          "name": "usg-plat:quantum-vulnerability",
+          "value": "shor-broken"
+        },
+        {
+          "name": "usg-plat:pqc-migration-target",
+          "value": "ML-DSA-65/87 or composite certificates (POAM-041)"
+        },
+        {
+          "name": "usg-plat:cmvp-status",
+          "value": "modules-in-process (POAM-026)"
+        },
+        {
+          "name": "usg-plat:use",
+          "value": "TLS 1.3 CertificateVerify and webpki chain signatures (provider verification set)"
+        }
+      ],
+      "type": "cryptographic-asset"
+    },
+    {
+      "bom-ref": "crypto/algorithm/x509sig/ecdsa-p256-sha256",
+      "cryptoProperties": {
+        "algorithmProperties": {
+          "certificationLevel": [
+            "none"
+          ],
+          "cryptoFunctions": [
+            "verify"
+          ],
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "generic",
+          "nistQuantumSecurityLevel": 0,
+          "primitive": "signature"
+        },
+        "assetType": "algorithm"
+      },
+      "evidence": {
+        "occurrences": [
+          {
+            "location": "crates/plat-tls/src/revocation/sig.rs",
+            "symbol": "plat_tls::revocation::sig::ACCEPTED"
+          }
+        ]
+      },
+      "name": "ecdsa-p256-sha256",
+      "properties": [
+        {
+          "name": "usg-plat:quantum-vulnerability",
+          "value": "shor-broken"
+        },
+        {
+          "name": "usg-plat:pqc-migration-target",
+          "value": "ML-DSA rows in the sig.rs table (POAM-041)"
+        },
+        {
+          "name": "usg-plat:cmvp-status",
+          "value": "modules-in-process (POAM-026)"
+        },
+        {
+          "name": "usg-plat:use",
+          "value": "OCSP response, CRL and revocation chain signatures"
+        },
+        {
+          "name": "usg-plat:constraints",
+          "value": "RSA modulus 2048-8192 bits; SHA-1 refused"
+        }
+      ],
+      "type": "cryptographic-asset"
+    },
+    {
+      "bom-ref": "crypto/algorithm/x509sig/ecdsa-p256-sha384",
+      "cryptoProperties": {
+        "algorithmProperties": {
+          "certificationLevel": [
+            "none"
+          ],
+          "cryptoFunctions": [
+            "verify"
+          ],
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "generic",
+          "nistQuantumSecurityLevel": 0,
+          "primitive": "signature"
+        },
+        "assetType": "algorithm"
+      },
+      "evidence": {
+        "occurrences": [
+          {
+            "location": "crates/plat-tls/src/revocation/sig.rs",
+            "symbol": "plat_tls::revocation::sig::ACCEPTED"
+          }
+        ]
+      },
+      "name": "ecdsa-p256-sha384",
+      "properties": [
+        {
+          "name": "usg-plat:quantum-vulnerability",
+          "value": "shor-broken"
+        },
+        {
+          "name": "usg-plat:pqc-migration-target",
+          "value": "ML-DSA rows in the sig.rs table (POAM-041)"
+        },
+        {
+          "name": "usg-plat:cmvp-status",
+          "value": "modules-in-process (POAM-026)"
+        },
+        {
+          "name": "usg-plat:use",
+          "value": "OCSP response, CRL and revocation chain signatures"
+        },
+        {
+          "name": "usg-plat:constraints",
+          "value": "RSA modulus 2048-8192 bits; SHA-1 refused"
+        }
+      ],
+      "type": "cryptographic-asset"
+    },
+    {
+      "bom-ref": "crypto/algorithm/x509sig/ecdsa-p256-sha512",
+      "cryptoProperties": {
+        "algorithmProperties": {
+          "certificationLevel": [
+            "none"
+          ],
+          "cryptoFunctions": [
+            "verify"
+          ],
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "generic",
+          "nistQuantumSecurityLevel": 0,
+          "primitive": "signature"
+        },
+        "assetType": "algorithm"
+      },
+      "evidence": {
+        "occurrences": [
+          {
+            "location": "crates/plat-tls/src/revocation/sig.rs",
+            "symbol": "plat_tls::revocation::sig::ACCEPTED"
+          }
+        ]
+      },
+      "name": "ecdsa-p256-sha512",
+      "properties": [
+        {
+          "name": "usg-plat:quantum-vulnerability",
+          "value": "shor-broken"
+        },
+        {
+          "name": "usg-plat:pqc-migration-target",
+          "value": "ML-DSA rows in the sig.rs table (POAM-041)"
+        },
+        {
+          "name": "usg-plat:cmvp-status",
+          "value": "modules-in-process (POAM-026)"
+        },
+        {
+          "name": "usg-plat:use",
+          "value": "OCSP response, CRL and revocation chain signatures"
+        },
+        {
+          "name": "usg-plat:constraints",
+          "value": "RSA modulus 2048-8192 bits; SHA-1 refused"
+        }
+      ],
+      "type": "cryptographic-asset"
+    },
+    {
+      "bom-ref": "crypto/algorithm/x509sig/ecdsa-p384-sha256",
+      "cryptoProperties": {
+        "algorithmProperties": {
+          "certificationLevel": [
+            "none"
+          ],
+          "cryptoFunctions": [
+            "verify"
+          ],
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "generic",
+          "nistQuantumSecurityLevel": 0,
+          "primitive": "signature"
+        },
+        "assetType": "algorithm"
+      },
+      "evidence": {
+        "occurrences": [
+          {
+            "location": "crates/plat-tls/src/revocation/sig.rs",
+            "symbol": "plat_tls::revocation::sig::ACCEPTED"
+          }
+        ]
+      },
+      "name": "ecdsa-p384-sha256",
+      "properties": [
+        {
+          "name": "usg-plat:quantum-vulnerability",
+          "value": "shor-broken"
+        },
+        {
+          "name": "usg-plat:pqc-migration-target",
+          "value": "ML-DSA rows in the sig.rs table (POAM-041)"
+        },
+        {
+          "name": "usg-plat:cmvp-status",
+          "value": "modules-in-process (POAM-026)"
+        },
+        {
+          "name": "usg-plat:use",
+          "value": "OCSP response, CRL and revocation chain signatures"
+        },
+        {
+          "name": "usg-plat:constraints",
+          "value": "RSA modulus 2048-8192 bits; SHA-1 refused"
+        }
+      ],
+      "type": "cryptographic-asset"
+    },
+    {
+      "bom-ref": "crypto/algorithm/x509sig/ecdsa-p384-sha384",
+      "cryptoProperties": {
+        "algorithmProperties": {
+          "certificationLevel": [
+            "none"
+          ],
+          "cryptoFunctions": [
+            "verify"
+          ],
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "generic",
+          "nistQuantumSecurityLevel": 0,
+          "primitive": "signature"
+        },
+        "assetType": "algorithm"
+      },
+      "evidence": {
+        "occurrences": [
+          {
+            "location": "crates/plat-tls/src/revocation/sig.rs",
+            "symbol": "plat_tls::revocation::sig::ACCEPTED"
+          }
+        ]
+      },
+      "name": "ecdsa-p384-sha384",
+      "properties": [
+        {
+          "name": "usg-plat:quantum-vulnerability",
+          "value": "shor-broken"
+        },
+        {
+          "name": "usg-plat:pqc-migration-target",
+          "value": "ML-DSA rows in the sig.rs table (POAM-041)"
+        },
+        {
+          "name": "usg-plat:cmvp-status",
+          "value": "modules-in-process (POAM-026)"
+        },
+        {
+          "name": "usg-plat:use",
+          "value": "OCSP response, CRL and revocation chain signatures"
+        },
+        {
+          "name": "usg-plat:constraints",
+          "value": "RSA modulus 2048-8192 bits; SHA-1 refused"
+        }
+      ],
+      "type": "cryptographic-asset"
+    },
+    {
+      "bom-ref": "crypto/algorithm/x509sig/ecdsa-p384-sha512",
+      "cryptoProperties": {
+        "algorithmProperties": {
+          "certificationLevel": [
+            "none"
+          ],
+          "cryptoFunctions": [
+            "verify"
+          ],
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "generic",
+          "nistQuantumSecurityLevel": 0,
+          "primitive": "signature"
+        },
+        "assetType": "algorithm"
+      },
+      "evidence": {
+        "occurrences": [
+          {
+            "location": "crates/plat-tls/src/revocation/sig.rs",
+            "symbol": "plat_tls::revocation::sig::ACCEPTED"
+          }
+        ]
+      },
+      "name": "ecdsa-p384-sha512",
+      "properties": [
+        {
+          "name": "usg-plat:quantum-vulnerability",
+          "value": "shor-broken"
+        },
+        {
+          "name": "usg-plat:pqc-migration-target",
+          "value": "ML-DSA rows in the sig.rs table (POAM-041)"
+        },
+        {
+          "name": "usg-plat:cmvp-status",
+          "value": "modules-in-process (POAM-026)"
+        },
+        {
+          "name": "usg-plat:use",
+          "value": "OCSP response, CRL and revocation chain signatures"
+        },
+        {
+          "name": "usg-plat:constraints",
+          "value": "RSA modulus 2048-8192 bits; SHA-1 refused"
+        }
+      ],
+      "type": "cryptographic-asset"
+    },
+    {
+      "bom-ref": "crypto/algorithm/x509sig/rsa-pkcs1-sha256",
+      "cryptoProperties": {
+        "algorithmProperties": {
+          "certificationLevel": [
+            "none"
+          ],
+          "cryptoFunctions": [
+            "verify"
+          ],
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "generic",
+          "nistQuantumSecurityLevel": 0,
+          "primitive": "signature"
+        },
+        "assetType": "algorithm"
+      },
+      "evidence": {
+        "occurrences": [
+          {
+            "location": "crates/plat-tls/src/revocation/sig.rs",
+            "symbol": "plat_tls::revocation::sig::ACCEPTED"
+          }
+        ]
+      },
+      "name": "rsa-pkcs1-sha256",
+      "properties": [
+        {
+          "name": "usg-plat:quantum-vulnerability",
+          "value": "shor-broken"
+        },
+        {
+          "name": "usg-plat:pqc-migration-target",
+          "value": "ML-DSA rows in the sig.rs table (POAM-041)"
+        },
+        {
+          "name": "usg-plat:cmvp-status",
+          "value": "modules-in-process (POAM-026)"
+        },
+        {
+          "name": "usg-plat:use",
+          "value": "OCSP response, CRL and revocation chain signatures"
+        },
+        {
+          "name": "usg-plat:constraints",
+          "value": "RSA modulus 2048-8192 bits; SHA-1 refused"
+        }
+      ],
+      "type": "cryptographic-asset"
+    },
+    {
+      "bom-ref": "crypto/algorithm/x509sig/rsa-pkcs1-sha384",
+      "cryptoProperties": {
+        "algorithmProperties": {
+          "certificationLevel": [
+            "none"
+          ],
+          "cryptoFunctions": [
+            "verify"
+          ],
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "generic",
+          "nistQuantumSecurityLevel": 0,
+          "primitive": "signature"
+        },
+        "assetType": "algorithm"
+      },
+      "evidence": {
+        "occurrences": [
+          {
+            "location": "crates/plat-tls/src/revocation/sig.rs",
+            "symbol": "plat_tls::revocation::sig::ACCEPTED"
+          }
+        ]
+      },
+      "name": "rsa-pkcs1-sha384",
+      "properties": [
+        {
+          "name": "usg-plat:quantum-vulnerability",
+          "value": "shor-broken"
+        },
+        {
+          "name": "usg-plat:pqc-migration-target",
+          "value": "ML-DSA rows in the sig.rs table (POAM-041)"
+        },
+        {
+          "name": "usg-plat:cmvp-status",
+          "value": "modules-in-process (POAM-026)"
+        },
+        {
+          "name": "usg-plat:use",
+          "value": "OCSP response, CRL and revocation chain signatures"
+        },
+        {
+          "name": "usg-plat:constraints",
+          "value": "RSA modulus 2048-8192 bits; SHA-1 refused"
+        }
+      ],
+      "type": "cryptographic-asset"
+    },
+    {
+      "bom-ref": "crypto/algorithm/x509sig/rsa-pkcs1-sha512",
+      "cryptoProperties": {
+        "algorithmProperties": {
+          "certificationLevel": [
+            "none"
+          ],
+          "cryptoFunctions": [
+            "verify"
+          ],
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "generic",
+          "nistQuantumSecurityLevel": 0,
+          "primitive": "signature"
+        },
+        "assetType": "algorithm"
+      },
+      "evidence": {
+        "occurrences": [
+          {
+            "location": "crates/plat-tls/src/revocation/sig.rs",
+            "symbol": "plat_tls::revocation::sig::ACCEPTED"
+          }
+        ]
+      },
+      "name": "rsa-pkcs1-sha512",
+      "properties": [
+        {
+          "name": "usg-plat:quantum-vulnerability",
+          "value": "shor-broken"
+        },
+        {
+          "name": "usg-plat:pqc-migration-target",
+          "value": "ML-DSA rows in the sig.rs table (POAM-041)"
+        },
+        {
+          "name": "usg-plat:cmvp-status",
+          "value": "modules-in-process (POAM-026)"
+        },
+        {
+          "name": "usg-plat:use",
+          "value": "OCSP response, CRL and revocation chain signatures"
+        },
+        {
+          "name": "usg-plat:constraints",
+          "value": "RSA modulus 2048-8192 bits; SHA-1 refused"
+        }
+      ],
+      "type": "cryptographic-asset"
+    },
+    {
+      "bom-ref": "crypto/algorithm/x509sig/rsa-pss-sha256",
+      "cryptoProperties": {
+        "algorithmProperties": {
+          "certificationLevel": [
+            "none"
+          ],
+          "cryptoFunctions": [
+            "verify"
+          ],
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "generic",
+          "nistQuantumSecurityLevel": 0,
+          "primitive": "signature"
+        },
+        "assetType": "algorithm"
+      },
+      "evidence": {
+        "occurrences": [
+          {
+            "location": "crates/plat-tls/src/revocation/sig.rs",
+            "symbol": "plat_tls::revocation::sig::ACCEPTED"
+          }
+        ]
+      },
+      "name": "rsa-pss-sha256",
+      "properties": [
+        {
+          "name": "usg-plat:quantum-vulnerability",
+          "value": "shor-broken"
+        },
+        {
+          "name": "usg-plat:pqc-migration-target",
+          "value": "ML-DSA rows in the sig.rs table (POAM-041)"
+        },
+        {
+          "name": "usg-plat:cmvp-status",
+          "value": "modules-in-process (POAM-026)"
+        },
+        {
+          "name": "usg-plat:use",
+          "value": "OCSP response, CRL and revocation chain signatures"
+        },
+        {
+          "name": "usg-plat:constraints",
+          "value": "RSA modulus 2048-8192 bits; SHA-1 refused"
+        }
+      ],
+      "type": "cryptographic-asset"
+    },
+    {
+      "bom-ref": "crypto/algorithm/x509sig/rsa-pss-sha384",
+      "cryptoProperties": {
+        "algorithmProperties": {
+          "certificationLevel": [
+            "none"
+          ],
+          "cryptoFunctions": [
+            "verify"
+          ],
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "generic",
+          "nistQuantumSecurityLevel": 0,
+          "primitive": "signature"
+        },
+        "assetType": "algorithm"
+      },
+      "evidence": {
+        "occurrences": [
+          {
+            "location": "crates/plat-tls/src/revocation/sig.rs",
+            "symbol": "plat_tls::revocation::sig::ACCEPTED"
+          }
+        ]
+      },
+      "name": "rsa-pss-sha384",
+      "properties": [
+        {
+          "name": "usg-plat:quantum-vulnerability",
+          "value": "shor-broken"
+        },
+        {
+          "name": "usg-plat:pqc-migration-target",
+          "value": "ML-DSA rows in the sig.rs table (POAM-041)"
+        },
+        {
+          "name": "usg-plat:cmvp-status",
+          "value": "modules-in-process (POAM-026)"
+        },
+        {
+          "name": "usg-plat:use",
+          "value": "OCSP response, CRL and revocation chain signatures"
+        },
+        {
+          "name": "usg-plat:constraints",
+          "value": "RSA modulus 2048-8192 bits; SHA-1 refused"
+        }
+      ],
+      "type": "cryptographic-asset"
+    },
+    {
+      "bom-ref": "crypto/algorithm/x509sig/rsa-pss-sha512",
+      "cryptoProperties": {
+        "algorithmProperties": {
+          "certificationLevel": [
+            "none"
+          ],
+          "cryptoFunctions": [
+            "verify"
+          ],
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "generic",
+          "nistQuantumSecurityLevel": 0,
+          "primitive": "signature"
+        },
+        "assetType": "algorithm"
+      },
+      "evidence": {
+        "occurrences": [
+          {
+            "location": "crates/plat-tls/src/revocation/sig.rs",
+            "symbol": "plat_tls::revocation::sig::ACCEPTED"
+          }
+        ]
+      },
+      "name": "rsa-pss-sha512",
+      "properties": [
+        {
+          "name": "usg-plat:quantum-vulnerability",
+          "value": "shor-broken"
+        },
+        {
+          "name": "usg-plat:pqc-migration-target",
+          "value": "ML-DSA rows in the sig.rs table (POAM-041)"
+        },
+        {
+          "name": "usg-plat:cmvp-status",
+          "value": "modules-in-process (POAM-026)"
+        },
+        {
+          "name": "usg-plat:use",
+          "value": "OCSP response, CRL and revocation chain signatures"
+        },
+        {
+          "name": "usg-plat:constraints",
+          "value": "RSA modulus 2048-8192 bits; SHA-1 refused"
+        }
+      ],
+      "type": "cryptographic-asset"
+    },
+    {
+      "bom-ref": "crypto/protocol/tls13",
+      "cryptoProperties": {
+        "assetType": "protocol",
+        "protocolProperties": {
+          "cipherSuites": [
+            {
+              "algorithms": [
+                "crypto/algorithm/aes-256-gcm",
+                "crypto/algorithm/sha-384/aws-lc-fips",
+                "crypto/algorithm/hkdf-sha384"
+              ],
+              "identifiers": [
+                "0x13",
+                "0x02"
+              ],
+              "name": "TLS13_AES_256_GCM_SHA384"
+            },
+            {
+              "algorithms": [
+                "crypto/algorithm/aes-128-gcm",
+                "crypto/algorithm/sha-256/aws-lc-fips",
+                "crypto/algorithm/hkdf-sha256"
+              ],
+              "identifiers": [
+                "0x13",
+                "0x01"
+              ],
+              "name": "TLS13_AES_128_GCM_SHA256"
+            }
+          ],
+          "cryptoRefArray": [
+            "crypto/algorithm/x25519mlkem768",
+            "crypto/algorithm/ecdh-p256",
+            "crypto/algorithm/ecdh-p384",
+            "crypto/algorithm/sig/ECDSA_NISTP384_SHA384",
+            "crypto/algorithm/sig/ECDSA_NISTP256_SHA256",
+            "crypto/algorithm/sig/RSA_PSS_SHA512",
+            "crypto/algorithm/sig/RSA_PSS_SHA384",
+            "crypto/algorithm/sig/RSA_PSS_SHA256",
+            "crypto/algorithm/sig/RSA_PKCS1_SHA512",
+            "crypto/algorithm/sig/RSA_PKCS1_SHA384",
+            "crypto/algorithm/sig/RSA_PKCS1_SHA256"
+          ],
+          "type": "tls",
+          "version": "1.3"
+        }
+      },
+      "evidence": {
+        "occurrences": [
+          {
+            "location": "crates/plat-tls/src/policy.rs",
+            "symbol": "plat_tls::policy::fips_provider"
+          },
+          {
+            "location": "crates/plat-tls/src/fips.rs",
+            "symbol": "plat_tls::fips::init_fips"
+          }
+        ]
+      },
+      "name": "TLS 1.3",
+      "properties": [
+        {
+          "name": "usg-plat:kx-groups:pq_hybrid=true",
+          "value": "X25519MLKEM768,secp256r1,secp384r1"
+        },
+        {
+          "name": "usg-plat:kx-groups:pq_hybrid=false",
+          "value": "secp256r1,secp384r1"
+        },
+        {
+          "name": "usg-plat:tls13:sig-schemes",
+          "value": "ECDSA_NISTP384_SHA384,ECDSA_NISTP256_SHA256,RSA_PSS_SHA512,RSA_PSS_SHA384,RSA_PSS_SHA256,RSA_PKCS1_SHA512,RSA_PKCS1_SHA384,RSA_PKCS1_SHA256"
+        },
+        {
+          "name": "usg-plat:resumption",
+          "value": "disabled"
+        },
+        {
+          "name": "usg-plat:early-data",
+          "value": "disabled"
+        },
+        {
+          "name": "usg-plat:endpoints",
+          "value": "management-mtls,syslog-tls,cluster-peer-mtls"
+        },
+        {
+          "name": "usg-plat:key-establishment",
+          "value": "ecdhe-or-hybrid-kem-only; no ffdhe; no rsa key transport"
+        },
+        {
+          "name": "usg-plat:references",
+          "value": "RFC 8446, RFC 9325, NIST SP 800-52r2, FIPS 203, FIPS 186-5, FIPS 180-4, SP 800-90A, RFC 6960, RFC 4055"
+        }
+      ],
+      "type": "cryptographic-asset"
+    },
+    {
+      "bom-ref": "crypto/material/x509-certificate",
+      "cryptoProperties": {
+        "assetType": "certificate",
+        "certificateProperties": {
+          "certificateFormat": "X.509"
+        }
+      },
+      "evidence": {
+        "occurrences": [
+          {
+            "location": "crates/plat-tls/src/load.rs",
+            "symbol": "plat_tls::load::load_certs"
+          },
+          {
+            "location": "crates/plat-tls/src/verify.rs",
+            "symbol": "plat_tls::verify"
+          }
+        ]
+      },
+      "name": "X.509 certificates",
+      "properties": [
+        {
+          "name": "usg-plat:quantum-vulnerability",
+          "value": "shor-broken"
+        },
+        {
+          "name": "usg-plat:pqc-migration-target",
+          "value": "ML-DSA certificates from the operator PKI (POAM-041)"
+        },
+        {
+          "name": "usg-plat:provisioning",
+          "value": "operator-provisioned (IA-5(2)(a)(1))"
+        }
+      ],
+      "type": "cryptographic-asset"
+    },
+    {
+      "bom-ref": "crypto/material/private-key",
+      "cryptoProperties": {
+        "assetType": "related-crypto-material",
+        "relatedCryptoMaterialProperties": {
+          "format": "PEM (PKCS#8, SEC1, PKCS#1)",
+          "type": "private-key"
+        }
+      },
+      "evidence": {
+        "occurrences": [
+          {
+            "location": "crates/plat-tls/src/load.rs",
+            "symbol": "plat_tls::load::load_key"
+          }
+        ]
+      },
+      "name": "TLS private key",
+      "properties": [
+        {
+          "name": "usg-plat:quantum-vulnerability",
+          "value": "shor-broken"
+        },
+        {
+          "name": "usg-plat:pqc-migration-target",
+          "value": "ML-DSA keys from the operator PKI (POAM-041)"
+        },
+        {
+          "name": "usg-plat:provisioning",
+          "value": "operator-provisioned; usable only if the FIPS provider can sign with it (ECDSA P-256/P-384, RSA >= 2048)"
+        }
+      ],
+      "type": "cryptographic-asset"
+    },
+    {
+      "bom-ref": "lib/aws-lc-fips",
+      "description": "AWS-LC-FIPS 4.2.0 module vendored by aws-lc-fips-sys; the installed rustls provider. C sources are not itemised here.",
+      "name": "aws-lc-fips-sys",
+      "properties": [
+        {
+          "name": "usg-plat:module",
+          "value": "AWS-LC-FIPS"
+        },
+        {
+          "name": "usg-plat:module-version",
+          "value": "4.2.0"
+        },
+        {
+          "name": "usg-plat:cmvp-status",
+          "value": "modules-in-process (POAM-026)"
+        },
+        {
+          "name": "usg-plat:status",
+          "value": "installed-provider"
+        }
+      ],
+      "purl": "pkg:cargo/aws-lc-fips-sys@0.14.4",
+      "type": "library",
+      "version": "0.14.4"
+    },
+    {
+      "bom-ref": "lib/aws-lc-rs",
+      "description": "Rust API over the AWS-LC module",
+      "name": "aws-lc-rs",
+      "properties": [],
+      "purl": "pkg:cargo/aws-lc-rs@1.19.0",
+      "type": "library",
+      "version": "1.19.0"
+    },
+    {
+      "bom-ref": "lib/rustls",
+      "description": "TLS 1.3 protocol implementation (fips feature, no tls12)",
+      "name": "rustls",
+      "properties": [],
+      "purl": "pkg:cargo/rustls@0.23.46",
+      "type": "library",
+      "version": "0.23.46"
+    },
+    {
+      "bom-ref": "lib/rustls-webpki",
+      "description": "X.509 path validation through the provider's verification set",
+      "name": "rustls-webpki",
+      "properties": [],
+      "purl": "pkg:cargo/rustls-webpki@0.103.16",
+      "type": "library",
+      "version": "0.103.16"
+    },
+    {
+      "bom-ref": "lib/rustcrypto-sha2",
+      "description": "RustCrypto SHA-2 (not a validated module)",
+      "name": "sha2",
+      "properties": [
+        {
+          "name": "usg-plat:status",
+          "value": "non-fips-integrity-only"
+        }
+      ],
+      "purl": "pkg:cargo/sha2@0.11.1",
+      "type": "library",
+      "version": "0.11.1"
+    },
+    {
+      "bom-ref": "lib/aws-lc-nonfips",
+      "description": "Non-FIPS AWS-LC build pulled by default features; linked but never installed as the provider",
+      "name": "aws-lc-sys",
+      "properties": [
+        {
+          "name": "usg-plat:status",
+          "value": "linked-not-installed-as-provider (NIST-006)"
+        }
+      ],
+      "purl": "pkg:cargo/aws-lc-sys@0.47.0",
+      "type": "library",
+      "version": "0.47.0"
+    }
+  ],
+  "dependencies": [
+    {
+      "dependsOn": [
+        "lib/aws-lc-fips",
+        "lib/aws-lc-rs",
+        "lib/rustls",
+        "lib/rustls-webpki",
+        "lib/rustcrypto-sha2",
+        "lib/aws-lc-nonfips"
+      ],
+      "ref": "platd"
+    },
+    {
+      "dependsOn": [
+        "lib/aws-lc-rs",
+        "lib/rustls-webpki"
+      ],
+      "provides": [
+        "crypto/protocol/tls13"
+      ],
+      "ref": "lib/rustls"
+    },
+    {
+      "dependsOn": [
+        "lib/aws-lc-fips",
+        "lib/aws-lc-nonfips"
+      ],
+      "ref": "lib/aws-lc-rs"
+    },
+    {
+      "provides": [
+        "crypto/algorithm/aes-128-gcm",
+        "crypto/algorithm/aes-256-gcm",
+        "crypto/algorithm/ctr-drbg",
+        "crypto/algorithm/ecdh-p256",
+        "crypto/algorithm/ecdh-p384",
+        "crypto/algorithm/hkdf-sha256",
+        "crypto/algorithm/hkdf-sha384",
+        "crypto/algorithm/ml-kem-768",
+        "crypto/algorithm/sha-1/aws-lc-fips-legacy",
+        "crypto/algorithm/sha-256/aws-lc-fips",
+        "crypto/algorithm/sha-384/aws-lc-fips",
+        "crypto/algorithm/sha-512/aws-lc-fips",
+        "crypto/algorithm/sig/ECDSA_NISTP256_SHA256",
+        "crypto/algorithm/sig/ECDSA_NISTP384_SHA384",
+        "crypto/algorithm/sig/RSA_PKCS1_SHA256",
+        "crypto/algorithm/sig/RSA_PKCS1_SHA384",
+        "crypto/algorithm/sig/RSA_PKCS1_SHA512",
+        "crypto/algorithm/sig/RSA_PSS_SHA256",
+        "crypto/algorithm/sig/RSA_PSS_SHA384",
+        "crypto/algorithm/sig/RSA_PSS_SHA512",
+        "crypto/algorithm/x25519",
+        "crypto/algorithm/x25519mlkem768",
+        "crypto/algorithm/x509sig/ecdsa-p256-sha256",
+        "crypto/algorithm/x509sig/ecdsa-p256-sha384",
+        "crypto/algorithm/x509sig/ecdsa-p256-sha512",
+        "crypto/algorithm/x509sig/ecdsa-p384-sha256",
+        "crypto/algorithm/x509sig/ecdsa-p384-sha384",
+        "crypto/algorithm/x509sig/ecdsa-p384-sha512",
+        "crypto/algorithm/x509sig/rsa-pkcs1-sha256",
+        "crypto/algorithm/x509sig/rsa-pkcs1-sha384",
+        "crypto/algorithm/x509sig/rsa-pkcs1-sha512",
+        "crypto/algorithm/x509sig/rsa-pss-sha256",
+        "crypto/algorithm/x509sig/rsa-pss-sha384",
+        "crypto/algorithm/x509sig/rsa-pss-sha512"
+      ],
+      "ref": "lib/aws-lc-fips"
+    },
+    {
+      "provides": [
+        "crypto/algorithm/sha-256/rustcrypto-sha2"
+      ],
+      "ref": "lib/rustcrypto-sha2"
+    }
+  ],
+  "metadata": {
+    "component": {
+      "bom-ref": "platd",
+      "description": "usg-plat 464XLAT PLAT daemon: cryptographic bill of materials",
+      "name": "platd",
+      "purl": "pkg:cargo/platd@0.1.0",
+      "type": "application",
+      "version": "0.1.0"
+    },
+    "properties": [
+      {
+        "name": "usg-plat:non-crypto-exclusions",
+        "value": "docs/compliance/CRYPTO_INVENTORY.md#excluded"
+      },
+      {
+        "name": "usg-plat:drift-tests",
+        "value": "crates/plat-tls/tests/cbom.rs; deploy/tests/supply-chain/check-cbom.py"
+      }
+    ]
+  },
+  "serialNumber": "urn:uuid:5b0c7a52-6c1e-4e0f-9d4b-2a1f3c8e9b61",
+  "specVersion": "1.6",
+  "version": 1
+}
