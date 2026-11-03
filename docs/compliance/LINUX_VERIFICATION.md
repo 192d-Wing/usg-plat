@@ -67,12 +67,12 @@ each item.
 | L24 | Multiqueue TUN keeps every fragment of a datagram on one queue (Q2) | SC-5(2), SC-5 | POAM-035 | PASS (2026-10-29, performance review of `feat/protocol-completeness`): 0/64 IPv4 and 0/64 IPv6 datagrams split across 4 queues |
 | L25 | Pool-source guard rule and `cross_node_hairpin` start gate on real nftables | SC-7, SC-7(5), AC-4, CM-6 | POAM-024 | PASS (2026-10-29, kernel 6.8, nftables 1.0.9, three network namespaces): pool sources dropped from the external interface in both modes, accepted from the cluster interface only with the switch on; gate passes on real `nft list` output, refuses 4 broken snapshots |
 | L26 | XDP: privileges and sandbox (loader and `platd`) under the units (`plat-xdp.service`, `run-plat-bpf.mount`, `plat-xdp.tmpfiles.conf`, `platd.service.d/xdp.conf`) | AC-6, AC-6(1), AC-6(10), CM-7, SC-39, SC-5 | POAM-016, POAM-040 | PASS (2026-11-01, WU6, Ubuntu 24.04 aarch64, kernel 6.8.0-147, systemd 255; least-privilege load also on 6.6.13, 6.12.107, 7.2.14, refusal on 6.1): verify clean; exposure `plat-xdp` 1.6, `platd` with the drop-in 1.6 (1.5 without), `plat-fwguard` 2.1; loader CapEff/CapBnd/CapAmb `0000008000001000` (CAP_BPF + CAP_NET_ADMIN), uid 0 gid plat, NoNewPrivs 1, Seccomp 2; pins root:plat with the `MAPS` modes, mount root 2750 root:plat, `/run/plat` 0755 root, state 0644; `platd` (no capabilities, `ProtectProc=invisible`, `ProcSubset=pid`) opens the pins and reads `/proc/self/fd`; `MemoryMax` bounds map creation (8M: ENOMEM, 64M: attach). Not verified on x86_64 or bare metal |
-| L27 | XDP: end to end through the units, native and generic mode | SC-7, SC-10, SC-24, AU-12, SI-4 | POAM-016 | PARTIAL (2026-11-01, WU6, kernel 6.8.0-147, systemd 255, veth only, not real or virtio NICs): `e2e.sh run` with `E2E_UNITS=1` PASS native and generic: 150/150 echoes, 149/150 datagrams per direction on the fast path, 300 receiver checksums verified; `systemctl restart platd` and SIGKILL (`Restart=on-failure`) each re-run the loader (new program id, no `stale_maps`); stop detaches (no pins, no state file, no program). TUN-only capture comparison and `frag_needed_revalidate` not written |
+| L27 | XDP: end to end through the units, native and generic mode | SC-7, SC-10, SC-24, AU-12, SI-4 | POAM-016 | PARTIAL (2026-11-01, WU6, kernel 6.8.0-147, systemd 255, veth only, not real or virtio NICs): `e2e.sh run` with `E2E_UNITS=1` PASS native and generic: 150/150 echoes, 149/150 datagrams per direction on the fast path, 300 receiver checksums verified; `systemctl restart platd` and SIGKILL (`Restart=on-failure`) each re-run the loader (new program id, no `stale_maps`); stop detaches (no pins, no state file, no program). 2026-11-03 (verification run, kernel 6.8.0-147, veth, native and generic, by hand): the TUN-only capture comparison (45 frames per receiver byte-equal except the IPv4 ID and header checksum when DF = 0, pool port mapped) and `frag_needed_revalidate` (ICMPv6 Packet Too Big, MTU 1420, for a fast-path-only flow older than `udp_secs`) PASS, but `frag_needed_revalidate` is intermittent: 2 unexplained failures in 8 runs, cause unknown |
 | L28 | XDP: `plat-fwguard` stops a swapped program | SC-7, SC-24, SI-7 | POAM-016, POAM-037 | PASS (2026-11-01, WU6, kernel 6.8.0-147, systemd 255, veth): another program attached to an `[xdp]` interface through netlink is reported `xdp-program-swapped`, detached and forwarding turned off by `plat-fwguard.service` in its sandbox (CAP_NET_ADMIN only); a program on a foreign bpf_link cannot be detached (exit 1, forwarding stays off; POAM-037 residual, marker in `plat-fwguard.sh`) |
-| L29 | XDP: `kill -STOP` / `kill -9 platd` stops the fast path within `deadline_ms` | SC-24 | POAM-016 | NOT RUN (mechanism tested at level 1 and level 2; SIGKILL restart and reattach covered in L27) |
-| L30 | XDP: HA fence and takeover | SC-24, CP-10 | POAM-016, POAM-007 | NOT RUN (in-process tests only) |
+| L29 | XDP: `kill -STOP` / `kill -9 platd` stops the fast path within `deadline_ms` | SC-24, AU-12 | POAM-016 | PASS (2026-11-03, kernel 6.8.0-147, veth, native and generic; stop timing by hand and through the units, the audit records by hand only): forwarding stops 783–993 ms after `kill -STOP` (`deadline_ms` 1000) and resumes after `kill -CONT`; 692–945 ms after `kill -9` with the program left attached (by hand); 36–53 ms under the units (the loader unit detaches); the units re-run the loader. Audit finding of the first run fixed (`ControlState::beat` reports a missed deadline); re-run by hand only, not under the units (native ×2, generic ×1): `heartbeat_stalled` + `heartbeat_resumed` records and `plat_xdp_heartbeat_stalls_total` 0 → 1 every run |
+| L30 | XDP: HA fence and takeover | SC-24, CP-10, AU-12 | POAM-016, POAM-007 | PASS (2026-11-03, `deploy/tests/cluster/f14-xdp-fence-takeover.sh` on `plat-linux` 6.8.0-147 + `plat-linux-2` 6.8.0-142 + `plat-edge`, `[xdp]` generic on the VXLAN overlay, one run): crash of A, takeover by B in 3.4 s (10 `cluster_slice_acquire` takeover, 8 `nat_port_block_adopt`, B's SLICE entries 0/0 → Active/1, B forwards on the fast path); failback by handover: B's SLICE entries Fenced, A's Active, 0 packets of the handed-back slices from B after the last release, zero attribution overlap. Not run: traffic for a fenced slice reaching the releasing node (B's Fenced state checked by map read only; the 0 packets are because the routes moved), an operator-socket fence alone, x86_64, real NICs |
 | L31 | XDP: fast-path-only session lifetime and idle expiry under the units | SC-10, SC-5, RFC 6146 §3.5.1 | POAM-016 | PASS (2026-11-01, WU6, kernel 6.8.0-147, systemd 255, veth, native and generic): alive after 150 s of fast-path-only traffic (`udp_secs` 120), reclaimed after 125 s idle (`plat_sessions` 0, `plat_xdp_sessions` 0, 1 retire) |
-| L32 | XDP: map-full fallback | SC-5 | POAM-016 | NOT RUN (host tests only) |
+| L32 | XDP: map-full fallback | SC-5 | POAM-016 | PASS (2026-11-03, `E2E_MAPFULL=1 e2e.sh run`, kernel 6.8.0-147, veth, native, by hand): 5000 flows against `max_sessions` 4096: 5000/5000 echoes in each of 3 rounds, 4096 fast-path sessions, 162 `map_full` + 1092 `slots` install failures, overflow on the slow path, 30000 receiver checksums verified; after expiry 100 new flows all installed and on the fast path. The 1 s back-off itself is not observable from outside |
 
 ## Procedures, pass criteria and results
 
@@ -468,7 +468,8 @@ existing `plat-linux` VM is moved to the same network):
 - Throw-away test PKI generated on the edge (EC P-256, serverAuth and
   clientAuth EKU); revocation `off` for the test CA.
 - Harness: `deploy/tests/cluster/setup.sh`, `run-all.sh`, one script per
-  case (`f01-kill-platd.sh` … `f13-missteer.sh`), traffic meter `flows.py`,
+  case (`f01-kill-platd.sh` … `f13-missteer.sh`; `f14-xdp-fence-takeover.sh`
+  after `xdp-setup.sh` for L30, not in `run-all.sh`), traffic meter `flows.py`,
   attribution checker `attrib-check.sh` (no `(v4, port range)` allocated or
   adopted on two nodes with overlapping intervals; every adopt precedes the
   first translated packet from that block on the edge capture).
@@ -559,6 +560,17 @@ on the same VM (systemd 255); see "Through the units" below. x86_64 and
 bare metal were not run. Raw records:
 `target/agent-workflow/20261030-194356-xdp-phase1/` (`fixes-wu34-round-1.md`,
 `impl-notes-wu5.md`, `fixes-wu5-round-1.md`; not in the repository).
+
+The verification run of 2026-11-03 (branch `test/xdp-linux-verification`
+from `main` @ `e04d348`, `make xdp` on `plat-linux`) ran L29, L30, L32 and
+the two new e2e cases; raw records in the same directory
+(`verify-notes.md`). Environment fault seen in that run: the vz guests'
+timer jumped (RCU stall, `rcu_preempt kthread starved for 3002426905491
+jiffies`, wall clock to the year 2121 or 2209, uptime 24855 days) on
+`plat-linux-2` and later on `plat-linux`, once each; earlier F10 runs had
+left the same state on `plat-linux-2` and `plat-edge`. The cluster cannot
+form after it (the test PKI is expired at that clock), so those VMs were
+restarted; the F14 result is from a run with no jump.
 
 #### Through the units (WU6)
 
@@ -658,9 +670,43 @@ Result: **PASS** (one Ubuntu 24.04 / 6.8 aarch64 host).
 - Through the units (WU6, `E2E_UNITS=1`, native and generic): PASS, see
   "Through the units" above (150/150 echoes, 149 / 149 fast path, restart
   and SIGKILL reattach, stop detaches).
-- Not covered: real or virtio NICs; the
-  comparison with a TUN-only capture and the `frag_needed_revalidate` case
-  (not written yet).
+- Capture comparison and `frag_needed_revalidate` (2026-11-03, kernel
+  6.8.0-147, by hand, native and generic; `e2e.sh run`, cases
+  `capture_compare` and `frag_needed_revalidate`):
+  - `capture_compare`: 45 datagrams from client port 40002 (payloads 1–5,
+    63, 64, 100, 511, 1000, 1231–1233, 1300, 1400 B, three rounds), each
+    echoed, first through the fast path (44 of 45 on it), then through a
+    TUN-only `platd` (the same config without `[xdp]`, no program
+    attached). Both receivers' captures, whole Ethernet frames: 45 / 45
+    equal at the server and 45 / 45 at the client. Differences allowed:
+    the IPv4 ID and header checksum when DF = 0; the 9 DF frames are
+    compared with the ID (0 in both). Each `platd` start picks its pool
+    port afresh (the ports differed between the runs), so the comparison puts the fast-path
+    run's pool address and port into the TUN run's frames and recomputes
+    their checksums; the TTL / hop limit is the same in both (two-hop
+    model). The IPv6 frames at the client are byte-identical as captured.
+  - `frag_needed_revalidate`: after 150 s of fast-path-only traffic
+    (`udp_secs` 120), an ICMPv4 Frag Needed (MTU 1400) from the server
+    about the translated datagram reached the client as an ICMPv6 Packet
+    Too Big with MTU 1420 from `64:ff9b:1::c633:6402`. The session was
+    kept live by the seen read-back (`plat_xdp_revalidated_total` 1: the
+    sweeper revived it at expiry). Which call site revived it (sweeper or
+    `lookup4_session`) is not controllable end to end; the
+    `lookup4_session` branch is covered by
+    `crates/plat-nat64/tests/mirror.rs::expiry_retires_and_seen_read_back_extends`.
+  - Runs: `frag_needed_revalidate` passed in 9 of 11 runs, intermittent (by hand native
+    ×3 and generic, units ×2, and the three L29 re-runs: native ×2,
+    generic); one units run on `plat-linux` right after
+    the VM timer jump got no Packet Too Big at the client while `platd`
+    counted 7 packets in and 3 out; not reproduced, cause unknown (the
+    case now also captures on the TUN to tell on a recurrence). A second
+    native run failed during the L29 re-run (see L29 below); also unexplained.
+- Through the units (2026-11-03, `E2E_UNITS=1`, native, idle skipped):
+  every case PASS, including `frag_needed_revalidate`, `deadman_stop` (before the L29
+  fix; `deadman_stop` did not yet check audit records)
+  and the L28 `fwguard_swapped` with the current `plat-fwguard.sh`.
+- Not covered: real or virtio NICs; `capture_compare` under the units (it
+  runs by hand only).
 
 Result: **PARTIAL** (veth only).
 
@@ -688,25 +734,102 @@ Result: **PASS** (veth, 6.8.0-147, systemd 255).
   forwarding stops within `deadline_ms`; after `kill -CONT` it resumes
   (`heartbeat_resumed`) or, after a crash, stays off until `platd` and the
   loader restart.
-- Not run. Tested so far: the deadline and disable decisions at level 1
+- Also tested: the deadline and disable decisions at level 1
   (`crates/plat-xdp-core/tests/diff_engine.rs::disabled_or_deadline_passed_never_redirects`)
   and writer transitions on the real program at level 2
   (`test_run.rs::writer_transitions_stop_the_fast_path`, VM); the stall
   logic in `crates/plat-xdp/src/control.rs` tests
   `stall_resume_fault_transitions`, `a_stalled_source_fails_the_health_check`.
+- Run (2026-11-03, kernel 6.8.0-147, veth, `heartbeat_ms` 250,
+  `deadline_ms` 1000; `e2e.sh run` cases `deadman_stop`, `deadman_kill9`
+  and, with `E2E_UNITS=1`, `auto_restart_reattach`): 200 datagrams a second
+  on the established session, captured at the server; arrival times
+  compared with the signal time.
+  - `kill -STOP`: last fast-path arrival 783, 903, 993 (native) and 939
+    (generic) ms after the signal, 899 and 982 ms under the units; nothing more
+    until `kill -CONT`, while `plat_xdp_pass_total{reason="deadline"}`
+    rose by about 1150–1240 (the packets went to the TUN, which nobody
+    read). After `kill -CONT`: about 1220 arrivals (the TUN backlog, then
+    the fast path) and the fast path forwarded about 500 more in the next
+    3 s.
+  - `kill -9` by hand (program and maps left attached): last arrival 692
+    and 945 (native) and 773 (generic) ms after the signal; then detach, attach
+    and a new `platd` (new program id, no `stale_maps`).
+  - `kill -9` under the units: last arrival 53 and 36 ms after the signal
+    (`BindsTo=` stops `plat-xdp.service`, whose detach ends the fast path
+    before the deadline), then `Restart=on-failure` re-ran the loader (new
+    program id).
+- **Finding of the first run (fixed):** the stop left no audit trace. A
+  frozen process freezes `plat-xdp-ctl` too, so it never saw the stall;
+  after `kill -CONT` the first health check passed. The audit file held
+  only `enabled:start`; `plat_xdp_heartbeat_stalls_total` stayed 0; only
+  the per-CPU pass counter (`deadline`) showed the stop. A frozen or
+  starved process (SIGSTOP, VM pause, CPU starvation, a timer jump) is
+  the case the deadline exists for.
+- Fix: `ControlState::beat` (`crates/plat-xdp/src/control.rs`) keeps the
+  deadline it last stored (seeded from `CONTROL` at thread start) and, on
+  the next beat, if `now >= deadline` on `CLOCK_MONOTONIC_COARSE` (the
+  program's test in `decide`), counts a stall and reports
+  `heartbeat_stalled` then `heartbeat_resumed` before storing a new
+  deadline. Tests `a_missed_deadline_is_reported_once`,
+  `a_beat_at_the_deadline_is_a_lapse`. `deadman_stop` now fails without
+  both records or without a stall count.
+- Re-run (2026-11-03, `plat-linux`, kernel 6.8.0-147, by hand, `make xdp`
+  of the fix): native ×2 and generic ×1, `deadman_stop` PASS each time.
+  Last arrival 759, 759 (native), 913 (generic) ms after the signal;
+  `heartbeat stalls 0 -> 1`; `xdp_fastpath_state since start: enabled:start
+  disabled:heartbeat_stalled enabled:heartbeat_resumed`. Not re-run under
+  the units (the fix is in the control thread, which is the same in both).
+  One other native run failed earlier in `frag_needed_revalidate` (the
+  known intermittent failure) before reaching `deadman_stop`.
 
-Result: **NOT RUN**.
+Result: **PASS**.
 
 #### L30 — HA fence and takeover
 
 - Pass criteria: on fence, release and takeover the fast path stops
   forwarding the slice's sessions before the engine does, and the new
   owner forwards only sessions it created.
-- Not run on Linux (needs the three-VM bed with `[xdp]`). In-process:
+- In-process:
   `crates/plat-nat64/tests/mirror.rs::fencing_stops_the_mirror_at_once_and_generations_retire_stale_entries`,
   `crates/plat-nat64/tests/mirror_qa.rs::slice_ordering_rule_mirror_never_more_permissive_than_engine`.
+- Run (2026-11-03): the three-VM bed of L19–L23 (`plat-linux` node A
+  6.8.0-147, `plat-linux-2` node B 6.8.0-142, `plat-edge` edge and
+  witness) with `deploy/tests/cluster/xdp-setup.sh` (`[xdp]` generic on
+  `plha0`, role `both`, `deadline_ms` 1000; the units of WU6; the witness
+  updated to the same `platd`) and
+  `deploy/tests/cluster/f14-xdp-fence-takeover.sh`; flows.py traffic plus
+  32 UDP flows from the 8 subscriber /64s, 25 datagrams a second each.
+  One passing run:
+  - Before: fast path on both nodes (+5084 A, +3540 B packets in 5 s); A
+    held slices 1 2 4 5 6 7 8 10 12 13 (SLICE map).
+  - SIGKILL of A: no program on A's `plha0` and no pins (the loader unit
+    stops with `platd`); B Active on all 16 slices after 3448 ms; B's
+    audit: 10 `cluster_slice_acquire` (`takeover`), 8
+    `nat_port_block_adopt`; B's SLICE entries for A's slices went from
+    0/0 (inactive, generation 0) to 1/1 (Active, generation 1); B's fast
+    path forwarded 15487 packets in the next 10 s (33 fast-path sessions,
+    rebuilt from slow-path traffic: sessions are not replicated,
+    POAM-028).
+  - A restarted and failed back after 64 s by handover: B logged 10
+    `cluster_slice_release` (`handover`) and its SLICE entries for those
+    slices are 2/1 (Fenced), so none of its records for them can match;
+    A's are 1/1 (Active, generation 1 on its fresh maps), with 10
+    `cluster_slice_acquire` and 8 `nat_port_block_adopt`; no slice Active
+    in both SLICE maps. The edge capture shows 0 packets of the
+    handed-back slices from B's overlay MAC after the last release (+200
+    ms) and 235060 from A's.
+  - `attrib-check.sh`: 1094 allocate, 1190 adopt, 934 release, 918059
+    packets, 0 violations. UDP flows: 1–2 % loss, longest gap 2.4–4.0 s
+    (the crash takeover; lease 3 s).
+- Not covered: a fence through the operator socket without a crash or
+  failback; packets for a fenced slice reaching B after the release (the
+  routes had moved, so `plat_xdp_pass_total{reason="slice_inactive"}` on
+  B did not rise after the handover; it rose by 2128 during the
+  takeover, while the adopted slices were not yet Active); x86_64, real
+  NICs; repeated runs.
 
-Result: **NOT RUN**.
+Result: **PASS** (one run, generic mode on a VXLAN overlay).
 
 #### L31 — fast-path-only session lifetime
 
@@ -727,8 +850,22 @@ and generic mode).
 - Pass criteria: with `OUT6` / `IN4` full, new sessions stay on the slow
   path (`plat_xdp_install_failures_total{reason="map_full"}`), installs
   back off for 1 s, and traffic is unaffected.
-- Not run on Linux. Host tests: `crates/plat-xdp/src/mirror.rs` tests
+- Host tests: `crates/plat-xdp/src/mirror.rs` tests
   `map_full_backs_off`, `publish_failures_turn_failed_and_are_collectable`;
   `crates/plat-nat64/tests/mirror.rs::install_rollback_and_back_off`.
+- Run (2026-11-03, kernel 6.8.0-147, veth, native, by hand;
+  `E2E_MAPFULL=1 deploy/tests/xdp/e2e.sh run`, case `map_full`):
+  `[xdp] max_sessions` 4096 (the minimum), `max_blocks_per_subscriber` 16;
+  5000 UDP flows (one socket each) from one client, three rounds of one
+  datagram each, every echo checked: 5000 / 5000 in every round;
+  `plat_sessions` 5000, `plat_xdp_sessions` 4096, installs 4096,
+  `plat_xdp_install_failures_total` `map_full` 162 and `slots` 1092 (a
+  slot partition empties before the hash maps fill), `error` 0; fast path
+  8192 / 8602 packets, slow path 6808 / 6398 (v6→v4 / v4→v6); 30000
+  receiver checksums verified, none bad. After 125 s idle: 0 sessions, 0
+  fast-path sessions. 100 new flows: 100 / 100 echoes in every round, 100
+  installs, all on the fast path.
+- Not covered: the 1 s install back-off is not observable from outside
+  (failures during it count as `map_full` too); a full `IN4` alone.
 
-Result: **NOT RUN**.
+Result: **PASS** (veth).

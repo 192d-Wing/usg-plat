@@ -301,6 +301,24 @@ ca_file = "/etc/plat/tls/ca.crt"
 [cluster.steering]
 mode = "drop"
 CFG
+    # PLAT_XDP=1 (xdp-setup.sh, f14): the XDP fast path on the overlay, in
+    # generic mode (VXLAN has no driver XDP). deadline_ms <= lease_ms x
+    # (1 - drift_margin_pct/100) = 2700.
+    if [ "${PLAT_XDP:-0}" = 1 ]; then
+        cat <<CFG
+
+[xdp]
+enabled = true
+mode = "generic"
+allow_generic = true
+max_sessions = 65536
+heartbeat_ms = 250
+deadline_ms = 1000
+[[xdp.interfaces]]
+name = "plha0"
+role = "both"
+CFG
+    fi
 }
 
 # install_config <vm> <file>: root:plat 0640 as in the README.

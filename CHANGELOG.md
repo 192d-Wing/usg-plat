@@ -46,6 +46,26 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 - No config-schema or log-schema change (`LOG_SCHEMA_VERSION` stays 8; no
   SIEM parser action).
 
+### XDP Linux verification (branch `test/xdp-linux-verification`)
+
+- `deploy/tests/xdp/e2e.sh`: new cases `frag_needed_revalidate`,
+  `deadman_stop` and `deadman_kill9` (LINUX_VERIFICATION L29),
+  `capture_compare` (fast path vs a TUN-only `platd`, receiver frames
+  byte-equal except the IPv4 ID / header checksum when DF = 0) and, with
+  `E2E_MAPFULL=1`, `map_full` (L32); `auto_restart_reattach` under the
+  units also times the SIGKILL stop.
+- `deploy/tests/cluster/xdp-setup.sh` and `f14-xdp-fence-takeover.sh`
+  (L30): the fast path on both HA nodes, crash takeover and failback by
+  handover with SLICE map, audit and edge-capture checks; `lib.sh`
+  `gen_config` appends `[xdp]` when `PLAT_XDP=1`.
+- Results (aarch64 Lima VMs, 2026-11-03): L30, L32 and L29 PASS.
+- Fixed (L29, AU-12): a `kill -STOP` (or any freeze or starvation) of
+  `platd` ran the XDP dead-man deadline out with no `xdp_fastpath_state`
+  record. `plat-xdp-ctl` now reports a deadline it missed on its next
+  beat as `heartbeat_stalled` then `heartbeat_resumed` and counts the
+  stall (`plat_xdp_heartbeat_stalls_total`); no schema change.
+  `deadman_stop` fails without both records.
+
 ### TCP simultaneous open (branch `fix/poam-008-simultaneous-open`, closes POAM-008)
 
 - RFC 6146 §3.5.2.2: an unsolicited inbound IPv4 SYN (no ACK/RST,
