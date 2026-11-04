@@ -150,6 +150,6 @@ rationale = "rcgen certificate parsing (test PKI)"
 normal = ["rcgen"]
 
 [crate.chacha20]
-class = "test-only"
-rationale = "proptest RNG (rand_chacha); not a security function"
-normal = ["proptest"]
+class = "non-crypto"
+rationale = "ChaCha12 RNG behind rand 0.10 std_rng: proptest (tests) and hickory DNS query IDs / source ports in plat-tls revocation::dns; not SC-13 protection, outside the FIPS boundary (user decision 2026-11-03, CRYPTO_INVENTORY.md#excluded, CBOM lib/chacha20)"
+normal = ["proptest", "rand"]

@@ -1011,13 +1011,21 @@ for `nat_port_block_release` (same address and range), `service_stop`,
   first 8 bytes of the SHA-256 issuer key hash): seconds until the earliest
   nextUpdate over that issuer's verified CRLs; negative if stale. At most
   `crl.max_crls` series.
-- Counter `plat_revocation_resolve_failures_total{reason}` (`timeout`: OCSP/CRL
-  host lookup abandoned at the per-chain deadline; `saturated`: refused
-  because 8 resolver helper threads, or one for the same host name, were
-  already in flight; alert on it; `spawn_failed`: helper thread could not
-  be started) and gauge
-  `plat_revocation_resolver_threads` (helpers alive, abandoned ones
-  included). Prometheus only; no audit field (schema unchanged).
+- Counter `plat_revocation_resolve_failures_total{reason}`. Reasons:
+  - `timeout`: the per-chain deadline passed while an OCSP/CRL host lookup
+    was queued, waiting for a slot or resolving.
+  - `saturated`: the 64-job queue was full, or 64 callers were already
+    waiting on one host name. Alert on it.
+  - `spawn_failed`: the `plat-dns` thread, its runtime or its resolver could
+    not start, for example when resolv.conf is missing or has no nameserver.
+  - `error` (new): NXDOMAIN, SERVFAIL, refused, no records or an unusable
+    name; with nsswitch bypassed (POAM-045), names known only to NSS appear
+    here.
+
+  Gauges `plat_revocation_resolver_inflight` (lookups running, at most 32)
+  and `plat_revocation_resolver_queued` (jobs queued, at most 64). These
+  replace `plat_revocation_resolver_threads`, which is removed. Prometheus
+  only; no audit field (schema unchanged, still 8).
 - Counter `plat_crl_state_dir_sync_failures_total`: directory fsyncs that
   failed after a successful rename (counted and warned only; not in
   `plat_crl_state_errors_total`, no audit record).

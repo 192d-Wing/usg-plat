@@ -44,6 +44,12 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
 ProtectControlGroups=yes
+# AF_INET/AF_INET6 also carry OCSP/CRL DNS: the built-in resolver
+# (`plat-dns` thread, POAM-025 (a)) sends UDP/TCP 53 straight to the
+# nameservers in /etc/resolv.conf (or [tls.revocation.resolver]) and reads
+# /etc/resolv.conf and /etc/hosts (readable under ProtectSystem=strict); no
+# NSS module is loaded (POAM-045). A systemd-resolved stub on 127.0.0.53
+# works. If host output is filtered, allow udp/tcp 53 from the plat uid.
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 RestrictNamespaces=yes
 RestrictSUIDSGID=yes
@@ -64,12 +70,16 @@ SystemCallErrorNumber=EPERM
 #   + (workers + 1) x cluster.ha.repl_ring_entries x 64 B (HA only)
 #   + held-SYN worst case (nat64.max_held_syns x 272 B + ring; ~4.5 MB default)
 #   + 128 B x (4 + min(16, 65536 / table_shards)) x table_shards + 256 MiB
+#   (+ plat-dns: 256 KiB thread stack plus about 1-2 MiB of runtime and
+#   cache heap, and one blocking-pool thread for config reloads; inside the
+#   256 MiB margin)
 # (measured on aarch64: ~780 B/session, 3.05 GB at 3.91 M sessions with a
 # 1 Mi-record queue). `platd check-config` prints it (PLAT_MEMORY_REQUIRED_BYTES
 # in env format) and warns if MemoryMax below is lower; `platd run` refuses
 # to start if it exceeds this cgroup's memory.max or 90 % of RAM (POAM-021).
 # 8G covers the default 4 M sessions; raise it with max_sessions.
 MemoryMax=8G
+# plat-dns adds one thread (it used to be up to 8 resolver helpers).
 TasksMax=1024
 # Audit logs (AU-9): writable by plat only; readable by group plat-log
 # (log shippers, verify-log operators), never through the plat group.

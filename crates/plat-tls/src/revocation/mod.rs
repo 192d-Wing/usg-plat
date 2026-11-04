@@ -29,7 +29,8 @@
 //! - NIST 800-53: AU-2, AU-12 - one [`RevocationRecord`] per checked
 //!   certificate, delivered to the caller's [`RevocationHook`]
 //! - NIST 800-53: SC-5 - shared per-chain time budget, which also bounds
-//!   name resolution (`http::Resolver`, capped helper threads)
+//!   name resolution (`dns`, one `plat-dns` thread, bounded queue and
+//!   lookups, cancelled at the deadline)
 //! - RFC 6960 (OCSP), RFC 5280 §5, §6.3 (CRL)
 // POAM: POAM-025 (narrowed) - the OCSP responder certificate's own
 // revocation is not checked (id-pkix-ocsp-nocheck assumed); indirect CRLs,
@@ -37,6 +38,7 @@
 
 pub mod chain;
 pub mod crl;
+pub mod dns;
 mod flight;
 pub mod http;
 pub mod ocsp;

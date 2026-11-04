@@ -175,6 +175,13 @@ Deployment notes:
 
 Configuration changes to note when upgrading from an earlier build:
 
+- OCSP/CRL DNS now uses the built-in resolver (see the TLS notes; nsswitch
+  is not consulted, POAM-045). Names are looked up exactly as given: no
+  search list, and single-label names are refused. The gauge
+  `plat_revocation_resolver_threads` is removed. Alert instead on
+  `plat_revocation_resolver_inflight` (max 32), `plat_revocation_resolver_queued`
+  (max 64) and `plat_revocation_resolve_failures_total{reason="saturated"|"error"}`.
+
 - `translation.allow_non_global_destinations` defaults to `false`: RFC 1918,
   100.64/10, documentation and other RFC 6890 non-global IPv4 space is
   denied as a destination (and as an inbound data source) under every
@@ -217,9 +224,14 @@ Configuration changes to note when upgrading from an earlier build:
 - Revocation checking (`tls.revocation.mode = "hard_fail"` by default)
   rejects a peer whose status cannot be determined: make OCSP responders or
   CRL distribution points reachable, or configure `crl.files`/`crl.urls`.
-  Name resolution is bounded by the revocation deadline (at most 8 resolver
-  helper threads); still prefer IP literals or a local caching resolver so
-  slow lookups cannot saturate that cap (POAM-025).
+  Responder and CDP host names are resolved by a built-in DNS resolver
+  (hickory, plain UDP/TCP 53, one `plat-dns` thread), bounded by the
+  revocation deadline. It reads `/etc/resolv.conf` (re-read on change) and
+  `/etc/hosts`, or the nameservers in `[tls.revocation.resolver]`.
+  **nsswitch is not consulted** (POAM-045): names served only by sss, mdns,
+  nss-resolve, LDAP/NIS or myhostname do not resolve. The systemd-resolved
+  stub (127.0.0.53) works. If host output is filtered, allow udp/tcp 53 from
+  the `plat` user to the configured nameservers. IP-literal URLs skip DNS.
 - The unit now sets `StateDirectory=plat/revocation` (0700) for the optional
   `tls.revocation.cache_dir = "/var/lib/plat/revocation"`, which holds
   verified CRLs and `crl-numbers` (cRLNumber rollback marks).
