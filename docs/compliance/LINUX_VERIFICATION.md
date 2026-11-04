@@ -74,7 +74,7 @@ each item.
 | L31 | XDP: fast-path-only session lifetime and idle expiry under the units | SC-10, SC-5, RFC 6146 §3.5.1 | POAM-016 | PASS (2026-11-01, WU6, kernel 6.8.0-147, systemd 255, veth, native and generic): alive after 150 s of fast-path-only traffic (`udp_secs` 120), reclaimed after 125 s idle (`plat_sessions` 0, `plat_xdp_sessions` 0, 1 retire) |
 | L32 | XDP: map-full fallback | SC-5 | POAM-016 | PASS (2026-11-03, `E2E_MAPFULL=1 e2e.sh run`, kernel 6.8.0-147, veth, native, by hand): 5000 flows against `max_sessions` 4096: 5000/5000 echoes in each of 3 rounds, 4096 fast-path sessions, 162 `map_full` + 1092 `slots` install failures, overflow on the slow path, 30000 receiver checksums verified; after expiry 100 new flows all installed and on the fast path. The 1 s back-off itself is not observable from outside |
 
-| L33 | OCSP/CRL name resolution through the built-in resolver under the unit | SC-5, IA-5(2)(b)(1), SC-7 | POAM-025 (a), POAM-045 | NOT RUN. Procedure: platd with `hard_fail` and an OCSP or CRL URL by name; (a) resolv.conf points at a local `dnsmasq` that answers: the handshake passes; (b) `nft add rule inet filter output udp dport 53 drop` (and tcp): the handshake fails within `budget_ms` and `plat_revocation_resolve_failures_total{reason="timeout"}` increments; (c) resolv.conf points at the systemd-resolved stub 127.0.0.53: the handshake passes; (d) a name only in `/etc/hosts` resolves; (e) edit resolv.conf while running: the change is picked up within 30 s, and a file without `nameserver` keeps the last good configuration; (f) the journal shows no seccomp `EPERM` / `SIGSYS` for `plat-dns` |
+| L33 | OCSP/CRL name resolution through the built-in resolver under the unit | SC-5, IA-5(2)(b)(1), SC-7 | POAM-025 (a), POAM-045 | PASS (2026-11-04, `deploy/tests/resolver/l33-resolver.sh` on `plat-linux`, kernel 6.8.0-147 aarch64, systemd 255, shipped `platd.service`, OCSP by AIA name under `hard_fail`, one run): (a) dnsmasq answers: handshake passes; (b) udp/tcp 53 dropped on the nft **input** hook: refused after 2111 ms (`budget_ms` 4000), `reason="timeout"` 0 → 1 (the procedure's **output**-hook rule fails the lookup in ~110 ms with `EPERM` from netfilter and counts `reason="error"`); (c) systemd-resolved stub 127.0.0.53: passes; (d) a name only in `/etc/hosts` resolves with DNS blackholed; (e) a resolv.conf edit is used 31 s after the edit (detected by the first lookup ≥ 30 s after the previous check, applied by the next lookup), a file without `nameserver` keeps the last good server (15/15 handshakes over 45 s, one `rejected` warning); (f) no `SIGSYS`/seccomp/`EPERM` for `plat-dns`; with `SystemCallErrorNumber=kill` lookups, timeouts and a reload pass and platd keeps running (NRestarts 0). Not run: x86_64, IPv6 nameservers, CRL by name |
 
 On macOS and in CI the real resolver runs against an in-process fake DNS
 server on 127.0.0.1 (`crates/plat-tls/tests/dns_fake_server.rs`): answers,
@@ -549,6 +549,43 @@ pool-source guard"; it now reads "has no matching pool-source guard rule"
 (`hairpin_guard.rs::missing_guard_is_reported_as_missing_not_shadowed`).
 Not covered: `plat-fwguard` live-table sync and a start under the systemd
 unit.
+
+### L33 — OCSP name resolution under the unit (POAM-025 (a))
+
+- `deploy/tests/resolver/l33-resolver.sh run PLATD REPO` (root, disposable
+  host with systemd-resolved, dnsmasq-base, openssl, curl, nft). It
+  installs the given `platd`, the repo's `platd.service` and
+  `plat-tun-setup.sh`, a standalone config with `[management.tls]` and
+  `[tls.revocation] mode = "hard_fail"` (OCSP by AIA, CRL off, no
+  `[tls.revocation.resolver]`, so `/etc/resolv.conf` and `/etc/hosts` are
+  used), and runs `openssl ocsp` (CA-signed responses) on port 8888 and two
+  dnsmasq servers (A on 127.0.0.1, B on 127.0.0.2) answering `*.l33.test`
+  with TTL 0. Every client certificate carries its own AIA host name, so
+  each handshake needs a fresh lookup (no result or OCSP cache hit). The
+  `v6-announce.conf` drop-in is moved aside for the run (it is not part of
+  the sandbox and would touch FRR). Every replaced file is backed up and
+  restored on exit, checked by SHA-256, mode and owner; nft tables,
+  resolv.conf (symlink) and the units are left as found.
+- Pass: (a)–(f) as in the table; (b) also records the output-hook rule as
+  `b0` (information only).
+
+Result (2026-11-04, `plat-linux`, Ubuntu 24.04, kernel 6.8.0-147 aarch64,
+systemd 255.4, dnsmasq 2.91, OpenSSL 3.0.13; `platd` built from
+`f23f61b`):
+
+| Case | Result | Evidence |
+|------|--------|----------|
+| (a) dnsmasq answers | PASS | handshake 200 in 148 ms; dnsmasq A logged the query for `a.l33.test` |
+| (b) DNS blackholed | PASS | input-hook drop of udp/tcp 53: handshake refused after 2111 ms (`budget_ms` 4000; resolver `timeout_ms` default 2000), `plat_revocation_resolve_failures_total{reason="timeout"}` 0 → 1. `b0`, the procedure's output-hook rule: refused after 110 ms, `reason="error"` 0 → 1, `timeout` unchanged: the local stack fails `sendto`/`connect` with `EPERM` at once (netfilter, not seccomp; see (f)). Alert on `error` as well as `timeout` |
+| (c) resolved stub | PASS | `/etc/resolv.conf` back to the stub symlink (`nameserver 127.0.0.53`), resolved forwarding `~l33.test` to dnsmasq A (temporary drop-in); first handshake through the stub 19 s after the switch (attempt 10, the reload interval), dnsmasq A logged the forwarded query |
+| (d) `/etc/hosts` only | PASS | `127.0.0.1 ocsp.l33hosts.test` in `/etc/hosts`, udp/tcp 53 dropped: handshake 200 in 40 ms, no DNS query for the name |
+| (e) edit while running | PASS (see note) | `nameserver 127.0.0.1` → `127.0.0.2`: first lookup through B 31 s after the edit (33 s in a first run), journal `plat-dns: resolver configuration reloaded`; then a file with no `nameserver`: 15/15 handshakes over 45 s still through B, journal `new resolver configuration rejected; keeping the last good one error=/etc/resolv.conf: no nameserver`. Note: the files are checked by the first lookup at least 30 s after the previous check and the new configuration is used from the next lookup, so pickup is up to 30 s plus one lookup interval (lookups every ~2 s here), not strictly 30 s |
+| (f) seccomp | PASS | shipped filter (`SystemCallErrorNumber=EPERM`): no `SIGSYS`, `type=1326` or `plat-dns` `EPERM` in the journal. Re-run under a runtime drop-in `SystemCallErrorNumber=kill` (any denied call kills platd with `SIGSYS`): lookup 200, output- and input-hook blackholes refused (42 ms, 2096 ms), `/etc/hosts` touched, reload on the blocking pool, two more lookups 200; platd active, NRestarts 0, no `SIGSYS` |
+
+Not covered: x86_64; IPv6 nameservers and AAAA-only names; CRL
+distribution points by name (same resolver path, OCSP used here); a
+saturated resolver (`reason="saturated"`) on Linux; NSS-only names
+(POAM-045, refused by design).
 
 ### L26–L32 — XDP fast path (POAM-016 Phase 1)
 

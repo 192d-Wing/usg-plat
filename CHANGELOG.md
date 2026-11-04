@@ -4,6 +4,14 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 
 ## [Unreleased]
 
+### Added
+- `deploy/tests/resolver/l33-resolver.sh`: LINUX_VERIFICATION L33, OCSP
+  name resolution through `plat-dns` under the shipped systemd unit
+  (dnsmasq, DNS blackhole, systemd-resolved stub, `/etc/hosts`, resolv.conf
+  reload, seccomp). PASS 2026-11-04 on Ubuntu 24.04 / 6.8 aarch64. An nft
+  output-hook drop of port 53 fails lookups at once with `reason="error"`
+  (netfilter `EPERM`), not `timeout`.
+
 ### Changed
 - POAM-025 (a), SC-5: OCSP/CRL host names are now resolved by a built-in
   hickory-resolver 0.26.3 (plain UDP/TCP DNS; no TLS/DoH/DNSSEC features, no

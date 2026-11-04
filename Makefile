@@ -49,7 +49,7 @@ test: xdp-env
 # Deploy scripts: POSIX syntax, shellcheck (required when CI=true) and a stubbed run
 # against the real `platd check-config --format env` output.
 DEPLOY_SH := deploy/systemd/plat-tun-setup.sh deploy/systemd/plat-fwguard.sh deploy/tests/deploy-scripts-test.sh \
-	deploy/hooks/frr-announce.sh deploy/hooks/frr-withdraw.sh deploy/systemd/plat-v6-announce.sh deploy/tests/xdp/e2e.sh scripts/verify-release.sh $(wildcard deploy/tests/cluster/*.sh)
+	deploy/hooks/frr-announce.sh deploy/hooks/frr-withdraw.sh deploy/systemd/plat-v6-announce.sh deploy/tests/xdp/e2e.sh deploy/tests/resolver/l33-resolver.sh scripts/verify-release.sh $(wildcard deploy/tests/cluster/*.sh)
 test-deploy:
 	for f in $(DEPLOY_SH); do sh -n $$f || exit 1; done
 	@if command -v shellcheck >/dev/null 2>&1; then shellcheck -x $(DEPLOY_SH); \
