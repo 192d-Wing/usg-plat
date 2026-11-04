@@ -45,8 +45,10 @@ allow-wildcard-paths = true
 # Crypto-dependency rule (T2 of the CBOM drift checks; T3 in
 # deploy/tests/supply-chain/check-cbom.py is the catch-all for crates not
 # named here). All C/FFI crypto stays behind plat-tls with the AWS-LC FIPS
-# provider (CLAUDE.md); a second provider or a pure-Rust primitive crate is
-# refused, and each allowed crypto crate may only be pulled in by the listed
+# provider (CLAUDE.md); a second provider or a pure-Rust primitive crate used
+# for protection is refused (the one exception, chacha20 as a non-crypto RNG
+# for DNS query IDs / source ports through hickory -> rand 0.10, is allowed in
+# crypto-allow.toml by user decision 2026-11-03; it is not banned here), and each allowed crypto crate may only be pulled in by the listed
 # direct parents (`wrappers`). Changing this list changes
 # docs/compliance/cbom.cdx.json in the same review.
 # COMPLIANCE MAPPING:

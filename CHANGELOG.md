@@ -4,6 +4,41 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 
 ## [Unreleased]
 
+### Changed
+- POAM-025 (a), SC-5: OCSP/CRL host names are now resolved by a built-in
+  hickory-resolver 0.26.3 (plain UDP/TCP DNS; no TLS/DoH/DNSSEC features, no
+  ring) on one `plat-dns` thread with a tokio current_thread runtime. It
+  replaces the getaddrinfo helper threads. Lookups are really cancelled at
+  the per-chain deadline. Bounds: a 64-job queue, 32 concurrent lookups, one
+  per host name, and a 256-response cache with TTLs capped at 300 s
+  (positive) and 60 s (negative). AAAA and A are both queried and IPv6 is
+  tried first.
+- New `[tls.revocation.resolver]` (`nameservers` up to 3 IP[:port],
+  `timeout_ms` 200..=5000, `use_hosts_file`). It is allowed only under
+  `[tls.revocation]`, and `check-config` prints it. Without it,
+  `/etc/resolv.conf` is used and re-read when it changes; a file that no
+  longer parses keeps the last good configuration.
+- **Behaviour change (POAM-045):** nsswitch is no longer consulted, and
+  there is no getaddrinfo fallback. Names served only by sss, mdns,
+  nss-resolve, LDAP/NIS or myhostname no longer resolve; these fetches fail
+  closed. The systemd-resolved stub (127.0.0.53) and `/etc/hosts` still
+  work.
+- Metrics: `plat_revocation_resolve_failures_total` gains `reason="error"`.
+- Supply chain: new dependencies `hickory-resolver`, `tokio` and
+  `resolv-conf`. `chacha20` (through `rand` 0.10 `std_rng`) now ships, as a
+  non-crypto RNG for DNS query IDs and source ports only, outside the FIPS
+  boundary (user decision; `crypto-allow.toml`, CBOM `lib/chacha20`,
+  CRYPTO_INVENTORY).
+
+### Removed (breaking for dashboards and alerts)
+- Gauge `plat_revocation_resolver_threads`. Alerts on it stop firing
+  silently (absent series). Replacements:
+  - `plat_revocation_resolver_inflight` (lookups holding a slot, max 32)
+  - `plat_revocation_resolver_queued` (jobs queued, max 64)
+
+  Suggested alert:
+  `plat_revocation_resolver_inflight >= 32 or plat_revocation_resolver_queued >= 48 or increase(plat_revocation_resolve_failures_total{reason="saturated"}[5m]) > 0`.
+
 ### Fixed
 - POAM-025 (a), SC-5: the OCSP/CRL fetcher no longer resolves host names
   without a timeout. IP literals skip resolution; other names resolve on a

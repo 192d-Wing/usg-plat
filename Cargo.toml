@@ -75,6 +75,24 @@ der = { version = "0.7", features = ["alloc", "oid"] }
 # RFC 6960 OCSP DER types (no builder: requests and checks use aws-lc-rs).
 x509-ocsp = { version = "0.2.1", default-features = false }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+# OCSP/CRL name resolution (plat-tls `revocation::dns`, POAM-025 (a)).
+# Plain UDP/TCP DNS only: default features off and no `tls-*`, `https-*`,
+# `quic-*`, `h3-*` or `dnssec-*` feature, so no rustls/ring/aws-lc-rs edge
+# enters through hickory (`cargo tree -i ring` stays empty; deny.toml bans
+# ring). hickory-proto/-net force `rand/std_rng` (chacha20): a ChaCha12 RNG
+# for DNS query IDs and source ports only, not SC-13 protection (user
+# decision 2026-11-03; crypto-allow.toml, CRYPTO_INVENTORY.md). Exact pin: a
+# bump is a reviewed change. `hickory-net/tokio` turns on
+# `tokio/rt-multi-thread`; it is compiled but never instantiated (one
+# current_thread runtime on the `plat-dns` thread).
+# COMPLIANCE MAPPING:
+# - NIST 800-53: SR-3, CM-8, SC-13 (no second crypto provider), SC-5
+hickory-resolver = { version = "=0.26.3", default-features = false, features = ["tokio", "system-config"] }
+# resolv.conf parser hickory itself uses (same crate and version, no new
+# graph entry); parsed directly so a changed file can be re-read on every
+# Unix target and a bad file keeps the last good config.
+resolv-conf = "0.7.6"
+tokio = { version = "1.54", default-features = false, features = ["rt", "time", "net", "sync"] }
 
 # XDP fast path (POAM-016 Phase 1). Exact pins: Aya releases churn and the
 # 0.15/0.16 crates ship without changelogs, so every upgrade is an explicit
