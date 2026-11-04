@@ -598,10 +598,9 @@ mod tests {
         assert!(s.contains("server certificate: CN=mgmt.test"), "{s}");
         assert!(s.contains("syslog 192.0.2.10:6514: tls, server_name siem.example.net"), "{s}");
         assert!(s.contains("client certificate: none"), "{s}");
-        assert!(
-            s.contains("resolver: DNS /etc/resolv.conf (re-read on change), timeout 2000 ms, /etc/hosts on"),
-            "{s}"
-        );
+        // No `{s}` message: the summary carries the certificate expiry
+        // (CodeQL cleartext-logging); the other asserts already print it.
+        assert!(s.contains("resolver: DNS /etc/resolv.conf (re-read on change), timeout 2000 ms, /etc/hosts on"));
         assert!(s.contains("revocation: hard_fail"), "{s}");
         assert!(s.contains("groups X25519MLKEM768, secp256r1, secp384r1"), "{s}");
 
