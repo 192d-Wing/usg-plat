@@ -62,17 +62,18 @@ budget_ms=4000
 # --- backup / restore ------------------------------------------------------
 # Manifest lines: <path> <saved-name> (saved-name "-" = did not exist).
 backup() {
-    n=$(printf '%s' "$1" | tr '/' '_')
-    if [ -e "$1" ] || [ -L "$1" ]; then
-        cp -a "$1" "$bk/$n"
-        if [ -L "$1" ]; then
-            echo "$1 symlink $(readlink "$1")" >>"$bk/state"
+    bpath=$1
+    n=$(printf '%s' "$bpath" | tr '/' '_')
+    if [ -e "$bpath" ] || [ -L "$bpath" ]; then
+        cp -a "$bpath" "$bk/$n"
+        if [ -L "$bpath" ]; then
+            echo "$bpath symlink $(readlink "$bpath")" >>"$bk/state"
         else
-            echo "$1 $(sha256sum <"$1" | cut -d' ' -f1) $(stat -c '%a %U %G' "$1")" >>"$bk/state"
+            echo "$bpath $(sha256sum <"$bpath" | cut -d' ' -f1) $(stat -c '%a %U %G' "$bpath")" >>"$bk/state"
         fi
-        echo "$1 $n" >>"$bk/manifest"
+        echo "$bpath $n" >>"$bk/manifest"
     else
-        echo "$1 -" >>"$bk/manifest"
+        echo "$bpath -" >>"$bk/manifest"
     fi
 }
 restore() {
