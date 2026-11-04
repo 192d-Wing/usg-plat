@@ -1023,9 +1023,24 @@ mod tests {
                 break;
             }
         }
+        // Only ids whose set has a free way are used: the table is
+        // set-associative with random keys, a set full of this source's own
+        // pending entries refuses it (by design), and a full set would evict
+        // another source's entry (freeing a buffer slot by chance).
+        let free_way = |t: &FragTable, k: &FragKey| {
+            let s = t.set_of(k);
+            t.entries[s..s + WAYS].iter().any(|e| e.st.is_none())
+        };
         // Heavy source: at most a quarter of the buffer.
-        let mut held = 0;
-        for id in 0..64u32 {
+        let (mut held, mut tried) = (0, 0);
+        for id in 0u32.. {
+            if tried == 64 {
+                break;
+            }
+            if !free_way(&t, &key_from(srcs[0], id)) {
+                continue;
+            }
+            tried += 1;
             let i = t.get_or_insert(&key_from(srcs[0], id), 0, &c).unwrap();
             if t.buffer(i, &[0; 8], &c).is_ok() {
                 held += 1;
@@ -1033,13 +1048,6 @@ mod tests {
         }
         assert_eq!(held, 4);
         // Three more sources fill the rest.
-        // The table is set-associative with random keys: use ids whose set
-        // has a free way, so no entry of another source is evicted by a
-        // full set (that would free a buffer slot by chance).
-        let free_way = |t: &FragTable, k: &FragKey| {
-            let s = t.set_of(k);
-            t.entries[s..s + WAYS].iter().any(|e| e.st.is_none())
-        };
         for &src in &srcs[1..4] {
             let mut n = 0;
             for id in 0u32.. {
