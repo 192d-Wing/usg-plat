@@ -168,6 +168,11 @@ pub(crate) trait LookupBackend {
     fn lookup(&mut self, host: &str) -> LookupFuture;
     /// Called before each job; may reload configuration.
     fn maintain(&mut self) {}
+    /// Local-only answer (static hosts, result cache). Must not start a
+    /// query or touch the network (SEC-007).
+    fn probe(&mut self, _host: &str) -> Option<Result<Vec<IpAddr>, String>> {
+        None
+    }
 }
 
 type Factory = Arc<dyn Fn() -> Result<Box<dyn LookupBackend>, String> + Send + Sync>;
@@ -343,7 +348,8 @@ pub fn stats() -> ResolverStats {
     GLOBAL.get().map(Dns::stats).unwrap_or_default()
 }
 
-/// The `plat-dns` thread: one current_thread runtime, no blocking pool use.
+/// The `plat-dns` thread: one current_thread runtime; its blocking pool
+/// (one thread at most) runs config reloads only.
 fn run(mut rx: mpsc::Receiver<Job>, factory: &Factory, shared: &Arc<Shared>) {
     let rt = tokio::runtime::Builder::new_current_thread().enable_io().enable_time().max_blocking_threads(1).build();
     let rt = match rt {
@@ -366,6 +372,9 @@ fn run(mut rx: mpsc::Receiver<Job>, factory: &Factory, shared: &Arc<Shared>) {
         Err(e) => tracing::warn!(error = %e, "plat-dns resolver could not start; OCSP/CRL fetches by name fail"),
     }
     drain(&mut rx);
+    // SEC-008: a reload stuck on the blocking pool must not keep this
+    // thread alive after the resolver is dropped.
+    rt.shutdown_timeout(Duration::from_millis(100));
 }
 
 /// Closes the queue and drops what is left (callers see `Disconnected`).
@@ -382,9 +391,10 @@ async fn serve(rx: &mut mpsc::Receiver<Job>, backend: Box<dyn LookupBackend>, sh
     // SC-5: at most MAX_INFLIGHT lookups hold a slot; `pending` (one entry
     // per name being resolved or waiting for a slot) is capped at
     // MAX_PENDING. The loop never waits for a slot (SEC-001): a job for a
-    // name already pending joins it; otherwise its task waits for a slot,
-    // after one probe poll that answers cache and hosts hits at once, so a
-    // job never blocks the jobs queued behind it.
+    // name already pending joins it; a hosts or cache hit is answered
+    // locally (no query, no slot); otherwise its task waits for a slot, so
+    // a job never blocks the jobs queued behind it. Nothing reaches the
+    // network without a slot (SEC-007).
     let sem = Arc::new(Semaphore::new(MAX_INFLIGHT));
     let pending: Pending = Rc::new(RefCell::new(Vec::new()));
     // Single-threaded; borrowed only synchronously, never across an await.
@@ -396,6 +406,12 @@ async fn serve(rx: &mut mpsc::Receiver<Job>, backend: Box<dyn LookupBackend>, sh
         }
         backend.borrow_mut().maintain();
         let key = job.host.to_ascii_lowercase();
+        if !pending.borrow().iter().any(|(k, _)| *k == key)
+            && let Some(r) = backend.borrow_mut().probe(&job.host)
+        {
+            let _ = job.reply.try_send(outcome(r));
+            continue;
+        }
         {
             let mut p = pending.borrow_mut();
             if let Some((_, w)) = p.iter_mut().find(|(k, _)| *k == key) {
@@ -426,18 +442,9 @@ async fn serve(rx: &mut mpsc::Receiver<Job>, backend: Box<dyn LookupBackend>, sh
             });
             continue;
         }
-        // All slots busy: probe once, then wait for a slot.
-        let probe = backend.borrow_mut().lookup(&job.host);
+        // All slots busy: wait for one (bounded by the deadline).
         let (sem, backend, host) = (sem.clone(), backend.clone(), job.host);
         tokio::task::spawn_local(async move {
-            let mut probe = probe;
-            let first = std::future::poll_fn(|cx| std::task::Poll::Ready(probe.as_mut().poll(cx))).await;
-            if let std::task::Poll::Ready(r) = first {
-                return done.answer(outcome(r));
-            }
-            // A probe that would need the network is dropped (cancelled)
-            // before it can hold resources without a slot.
-            drop(probe);
             let Ok(Ok(permit)) = tokio::time::timeout_at(deadline.into(), sem.acquire_owned()).await else {
                 return done.answer(Err(Fail::Timeout));
             };
@@ -536,6 +543,8 @@ struct Hickory {
     hosts: Arc<Hosts>,
     stamp: Stamp,
     next_check: Instant,
+    /// Bounded local result cache, read by `probe` without any I/O.
+    cache: Rc<ResultCache>,
     /// Result of a reload running on the blocking pool (SEC-003).
     reload: Option<smpsc::Receiver<Reload>>,
 }
@@ -551,7 +560,7 @@ impl Hickory {
         let stamp = Self::stamp(&settings);
         let (resolver, hosts) = build(&settings)?;
         let next_check = Instant::now() + settings.reload_interval;
-        Ok(Self { settings, resolver, hosts, stamp, next_check, reload: None })
+        Ok(Self { settings, resolver, hosts, stamp, next_check, cache: Rc::default(), reload: None })
     }
 
     fn stamp(s: &ResolverSettings) -> Stamp {
@@ -560,21 +569,61 @@ impl Hickory {
     }
 }
 
-impl LookupBackend for Hickory {
-    fn lookup(&mut self, host: &str) -> LookupFuture {
-        if let Ok(name) = Name::from_str(&host.to_ascii_lowercase()) {
-            let mut v = Vec::new();
-            for t in [RecordType::AAAA, RecordType::A] {
-                if let Some(l) = self.hosts.lookup_static_host(&Query::query(name.clone(), t)) {
-                    v.extend(l.answers().iter().filter_map(|r| r.data.ip_addr()));
-                }
-            }
-            if !v.is_empty() {
-                return Box::pin(std::future::ready(Ok(v)));
+impl Hickory {
+    fn hosts_lookup(&self, host: &str) -> Option<Vec<IpAddr>> {
+        let name = Name::from_str(&host.to_ascii_lowercase()).ok()?;
+        let mut v = Vec::new();
+        for t in [RecordType::AAAA, RecordType::A] {
+            if let Some(l) = self.hosts.lookup_static_host(&Query::query(name.clone(), t)) {
+                v.extend(l.answers().iter().filter_map(|r| r.data.ip_addr()));
             }
         }
-        let (r, host) = (self.resolver.clone(), host.to_owned());
-        Box::pin(async move { r.lookup_ip(host).await.map(|l| l.iter().collect()).map_err(|e| e.to_string()) })
+        (!v.is_empty()).then_some(v)
+    }
+}
+
+/// Host name, expiry, addresses.
+type ResultCache = RefCell<Vec<(String, Instant, Vec<IpAddr>)>>;
+
+/// Stores a positive answer; expired entries go first, then the one that
+/// expires soonest, so the cache never exceeds [`CACHE_SIZE`] entries.
+fn cache_put(c: &ResultCache, key: String, until: Instant, v: Vec<IpAddr>) {
+    let mut c = c.borrow_mut();
+    let now = Instant::now();
+    c.retain(|(k, t, _)| *t > now && *k != key);
+    if c.len() >= usize::try_from(CACHE_SIZE).unwrap_or(256)
+        && let Some(i) = c.iter().enumerate().min_by_key(|(_, e)| e.1).map(|(i, _)| i)
+    {
+        c.swap_remove(i);
+    }
+    c.push((key, until, v));
+}
+
+impl LookupBackend for Hickory {
+    fn probe(&mut self, host: &str) -> Option<Result<Vec<IpAddr>, String>> {
+        if let Some(v) = self.hosts_lookup(host) {
+            return Some(Ok(v));
+        }
+        let key = host.to_ascii_lowercase();
+        let now = Instant::now();
+        let c = self.cache.borrow();
+        c.iter().find(|(k, t, _)| *k == key && *t > now).map(|(_, _, v)| Ok(v.clone()))
+    }
+
+    fn lookup(&mut self, host: &str) -> LookupFuture {
+        if let Some(v) = self.hosts_lookup(host) {
+            return Box::pin(std::future::ready(Ok(v)));
+        }
+        let (r, host, cache) = (self.resolver.clone(), host.to_owned(), self.cache.clone());
+        Box::pin(async move {
+            let l = r.lookup_ip(host.as_str()).await.map_err(|e| e.to_string())?;
+            let v: Vec<IpAddr> = l.iter().collect();
+            if !v.is_empty() {
+                let until = l.valid_until().min(Instant::now() + POSITIVE_MAX_TTL);
+                cache_put(&cache, host.to_ascii_lowercase(), until, v.clone());
+            }
+            Ok(v)
+        })
     }
 
     /// Re-reads resolv.conf / hosts when their mtime changed; a bad file
@@ -592,6 +641,7 @@ impl LookupBackend for Hickory {
                         Ok((r, h)) => {
                             self.resolver = r;
                             self.hosts = h;
+                            self.cache.borrow_mut().clear();
                             tracing::info!("plat-dns: resolver configuration reloaded");
                         }
                         Err(e) => tracing::warn!(
@@ -708,6 +758,10 @@ mod tests {
     impl LookupBackend for Script {
         fn lookup(&mut self, host: &str) -> LookupFuture {
             (self.0)(host)
+        }
+
+        fn probe(&mut self, host: &str) -> Option<Result<Vec<IpAddr>, String>> {
+            (host == "cached.example").then(|| Ok(vec![ADDR]))
         }
     }
 
@@ -886,6 +940,25 @@ mod tests {
         assert!(wait_idle(&d));
     }
 
+    /// SEC-007: the local result cache stays within CACHE_SIZE, drops
+    /// expired entries first and replaces an entry for the same name.
+    #[test]
+    fn result_cache_is_bounded() {
+        let c = ResultCache::default();
+        let n = usize::try_from(CACHE_SIZE).unwrap();
+        for i in 0..n + 50 {
+            cache_put(&c, format!("h{i}.example"), secs(60 + i as u64), vec![ADDR]);
+        }
+        assert_eq!(c.borrow().len(), n);
+        cache_put(&c, "h300.example".into(), secs(1000), vec![ADDR]);
+        assert_eq!(c.borrow().iter().filter(|e| e.0 == "h300.example").count(), 1);
+        let past = Instant::now();
+        std::thread::sleep(Duration::from_millis(2));
+        c.borrow_mut()[0].1 = past;
+        cache_put(&c, "new.example".into(), secs(5), vec![ADDR]);
+        assert!(c.borrow().iter().all(|e| e.1 > past));
+    }
+
     static SLOW_CALLS: AtomicUsize = AtomicUsize::new(0);
 
     /// SEC-001: with every slot held by never-answering names, a job for a
@@ -895,7 +968,7 @@ mod tests {
     fn full_slots_do_not_block_joins_or_cache_hits() {
         let d = Arc::new(dns(|h| {
             if h == "cached.example" {
-                Box::pin(std::future::ready(Ok(vec![ADDR])))
+                unreachable!("answered by probe")
             } else {
                 SLOW_CALLS.fetch_add(1, Ordering::Relaxed);
                 Box::pin(std::future::pending())

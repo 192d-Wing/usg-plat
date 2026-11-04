@@ -410,3 +410,45 @@ fn single_label_names_are_refused() {
     }
     assert_eq!(srv.raw.lock().unwrap().len(), 0);
 }
+
+/// SEC-007: while every slot is held, waiting names send no query (nothing
+/// reaches the network without a slot), and a cached name is answered from
+/// the local cache without a query.
+#[test]
+fn no_query_without_a_slot() {
+    let srv = FakeDns::start(OK_V4);
+    let d = Arc::new(Dns::new(settings(&srv)));
+    assert!(d.resolve("ok.cached.test", 80, secs(5)).is_ok());
+    let cached_queries = srv.count("ok.cached.test");
+    let busy: Vec<_> = (0..MAX_INFLIGHT)
+        .map(|i| {
+            let d = d.clone();
+            std::thread::spawn(move || d.resolve(&format!("busy{i}.test"), 80, secs(3)))
+        })
+        .collect();
+    let end = secs(5);
+    while d.stats().in_flight < MAX_INFLIGHT && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(d.stats().in_flight, MAX_INFLIGHT);
+    let waiters: Vec<_> = (0..20)
+        .map(|i| {
+            let d = d.clone();
+            std::thread::spawn(move || {
+                d.resolve(&format!("wait{i}.test"), 80, Instant::now() + Duration::from_millis(400))
+            })
+        })
+        .collect();
+    let t0 = Instant::now();
+    assert!(d.resolve("ok.cached.test", 80, t0 + Duration::from_millis(500)).is_ok());
+    assert!(t0.elapsed() < Duration::from_millis(100), "{:?}", t0.elapsed());
+    for w in waiters {
+        assert_eq!(w.join().unwrap(), Err(HttpError::Timeout));
+    }
+    let waited = (0..20).map(|i| srv.count(&format!("wait{i}.test"))).sum::<usize>();
+    assert_eq!(waited, 0, "no query sent without a slot");
+    assert_eq!(srv.count("ok.cached.test"), cached_queries, "cache hit, no query");
+    for b in busy {
+        let _ = b.join();
+    }
+}
