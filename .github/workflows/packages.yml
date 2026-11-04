@@ -238,6 +238,8 @@ jobs:
         with:
           subject-checksums: dist/SHA256SUMS
       - name: Self-verify before publishing
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: scripts/verify-release.sh dist "$GITHUB_REF_NAME"
       - name: Publish GitHub Release
         env:

@@ -1160,7 +1160,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "plat-audit"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "criterion",
  "crossbeam-channel",
@@ -1179,7 +1179,7 @@ dependencies = [
 
 [[package]]
 name = "plat-cluster"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "plat-common",
  "proptest",
@@ -1189,7 +1189,7 @@ dependencies = [
 
 [[package]]
 name = "plat-common"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "crossbeam-utils",
  "serde",
@@ -1199,7 +1199,7 @@ dependencies = [
 
 [[package]]
 name = "plat-io"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "crossbeam-channel",
  "libc",
@@ -1208,7 +1208,7 @@ dependencies = [
 
 [[package]]
 name = "plat-nat64"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ahash",
  "criterion",
@@ -1226,14 +1226,14 @@ dependencies = [
 
 [[package]]
 name = "plat-packet"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "proptest",
 ]
 
 [[package]]
 name = "plat-tls"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "aws-lc-fips-sys",
  "aws-lc-rs",
@@ -1256,7 +1256,7 @@ dependencies = [
 
 [[package]]
 name = "plat-xdp"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "aya",
  "aya-obj",
@@ -1278,7 +1278,7 @@ dependencies = [
 
 [[package]]
 name = "plat-xdp-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "criterion",
  "crossbeam-channel",
@@ -1292,7 +1292,7 @@ dependencies = [
 
 [[package]]
 name = "plat-xdp-ebpf"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "aya-ebpf",
  "plat-xdp-core",
@@ -1300,7 +1300,7 @@ dependencies = [
 
 [[package]]
 name = "plat-xdp-loader"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "clap",
  "plat-common",
@@ -1309,7 +1309,7 @@ dependencies = [
 
 [[package]]
 name = "plat-xlat"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "criterion",
  "plat-packet",
@@ -1318,7 +1318,7 @@ dependencies = [
 
 [[package]]
 name = "platd"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "clap",
  "core_affinity",
