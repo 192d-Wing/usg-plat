@@ -217,8 +217,9 @@ Configuration changes to note when upgrading from an earlier build:
 - Revocation checking (`tls.revocation.mode = "hard_fail"` by default)
   rejects a peer whose status cannot be determined: make OCSP responders or
   CRL distribution points reachable, or configure `crl.files`/`crl.urls`.
-  Prefer IP literals or a local resolver for them (DNS has no timeout,
-  POAM-025).
+  Name resolution is bounded by the revocation deadline (at most 8 resolver
+  helper threads); still prefer IP literals or a local caching resolver so
+  slow lookups cannot saturate that cap (POAM-025).
 - The unit now sets `StateDirectory=plat/revocation` (0700) for the optional
   `tls.revocation.cache_dir = "/var/lib/plat/revocation"`, which holds
   verified CRLs and `crl-numbers` (cRLNumber rollback marks).

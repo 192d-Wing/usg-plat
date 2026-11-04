@@ -74,6 +74,10 @@ each item.
 | L31 | XDP: fast-path-only session lifetime and idle expiry under the units | SC-10, SC-5, RFC 6146 §3.5.1 | POAM-016 | PASS (2026-11-01, WU6, kernel 6.8.0-147, systemd 255, veth, native and generic): alive after 150 s of fast-path-only traffic (`udp_secs` 120), reclaimed after 125 s idle (`plat_sessions` 0, `plat_xdp_sessions` 0, 1 retire) |
 | L32 | XDP: map-full fallback | SC-5 | POAM-016 | PASS (2026-11-03, `E2E_MAPFULL=1 e2e.sh run`, kernel 6.8.0-147, veth, native, by hand): 5000 flows against `max_sessions` 4096: 5000/5000 echoes in each of 3 rounds, 4096 fast-path sessions, 162 `map_full` + 1092 `slots` install failures, overflow on the slow path, 30000 receiver checksums verified; after expiry 100 new flows all installed and on the fast path. The 1 s back-off itself is not observable from outside |
 
+Not covered: the bounded OCSP/CRL name resolution (POAM-025 (a)) is shown
+with a scripted resolver in unit tests only; real getaddrinfo/NSS behaviour
+under a slow resolver has not been exercised on Linux.
+
 ## Procedures, pass criteria and results
 
 ### L1 — unit analysis

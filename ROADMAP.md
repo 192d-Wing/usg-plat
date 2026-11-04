@@ -100,8 +100,9 @@ Ordered by value for the effort, with what each needs.
 
 ### TLS, PKI and FIPS
 
-- POAM-025: OCSP/CRL fetcher resolves names without a timeout (use IP
-  literals or a local resolver meanwhile), plus two bounded residuals.
+- POAM-025: (a) bounded name resolution closed (deadline-bounded `plat-dns`
+  helper, 8-thread cap); (b) non-Unix key checks and (c) responder status /
+  delta and indirect CRLs remain.
 - POAM-026: CMVP validation of AWS-LC-FIPS 4.x pending; re-pin to a
   validated module when a certificate covers it.
 - POAM-042: CNSA 2.0 applicability decision (AO / system owner). If it

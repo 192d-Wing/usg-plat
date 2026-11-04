@@ -1011,6 +1011,13 @@ for `nat_port_block_release` (same address and range), `service_stop`,
   first 8 bytes of the SHA-256 issuer key hash): seconds until the earliest
   nextUpdate over that issuer's verified CRLs; negative if stale. At most
   `crl.max_crls` series.
+- Counter `plat_revocation_resolve_failures_total{reason}` (`timeout`: OCSP/CRL
+  host lookup abandoned at the per-chain deadline; `saturated`: refused
+  because 8 resolver helper threads, or one for the same host name, were
+  already in flight; alert on it; `spawn_failed`: helper thread could not
+  be started) and gauge
+  `plat_revocation_resolver_threads` (helpers alive, abandoned ones
+  included). Prometheus only; no audit field (schema unchanged).
 - Counter `plat_crl_state_dir_sync_failures_total`: directory fsyncs that
   failed after a successful rename (counted and warned only; not in
   `plat_crl_state_errors_total`, no audit record).

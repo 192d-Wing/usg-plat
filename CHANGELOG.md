@@ -4,6 +4,18 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 
 ## [Unreleased]
 
+### Fixed
+- POAM-025 (a), SC-5: the OCSP/CRL fetcher no longer resolves host names
+  without a timeout. IP literals skip resolution; other names resolve on a
+  `plat-dns` helper thread waited on only until the per-chain revocation
+  deadline (`Timeout`, normal failure policy). At most 8 helper threads
+  exist process-wide, one per host name; when full, a fetch fails at once
+  (`reason="saturated"`; many distinct slow names can still fill the cap,
+  fail closed - alert on it, prefer IP literals or a local caching
+  resolver). New metrics
+  `plat_revocation_resolve_failures_total{reason}` and
+  `plat_revocation_resolver_threads`. POAM-025 (b) and (c) stay open.
+
 ## [0.2.1] - 2026-11-03
 
 First published release. Same code as 0.2.0, whose tag run signed every
