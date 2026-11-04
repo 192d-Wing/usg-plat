@@ -22,10 +22,11 @@
 
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use parking_lot::Mutex;
 use plat_common::HttpUrl;
 
 /// Header block cap (status line + headers).
@@ -41,8 +42,9 @@ pub const MAX_RESOLVER_THREADS: usize = 8;
 /// Addresses tried per host.
 const MAX_ADDRS: usize = 4;
 
-/// Helper thread stack: enough for getaddrinfo and NSS modules.
-const RESOLVER_STACK: usize = 256 * 1024;
+/// Helper thread stack: the std default (2 MiB), since getaddrinfo may
+/// load arbitrary NSS modules. Reserved virtual memory, mostly untouched.
+const RESOLVER_STACK: usize = 2 * 1024 * 1024;
 
 /// Name lookup function (`getaddrinfo` in production, scripted in tests).
 pub type LookupFn = fn(&str, u16) -> std::io::Result<Vec<SocketAddr>>;
@@ -59,8 +61,11 @@ static SYSTEM_RESOLVER: Resolver = Resolver::new(system_lookup, MAX_RESOLVER_THR
 pub struct ResolverStats {
     /// Lookups abandoned at the deadline.
     pub timeouts: u64,
-    /// Lookups refused because [`MAX_RESOLVER_THREADS`] were in flight.
+    /// Lookups refused because [`MAX_RESOLVER_THREADS`] were in flight or
+    /// a lookup for the same host name was already in flight.
     pub saturated: u64,
+    /// Helper threads that could not be started.
+    pub spawn_failed: u64,
     /// Helper threads currently alive (including abandoned lookups).
     pub in_flight: usize,
 }
@@ -74,49 +79,70 @@ pub fn resolver_stats() -> ResolverStats {
 ///
 /// COMPLIANCE MAPPING:
 /// - NIST 800-53: SC-5 - bounded wait and bounded thread count under a
-///   slow or hostile resolver (closes POAM-025 (a))
+///   slow or hostile resolver (closes POAM-025 (a)); at most one lookup
+///   per host name, so one slow name cannot take every slot
+// POAM: POAM-025 residual - many distinct slow names (or DNS interference)
+// can still fill the shared cap; fetches then fail closed and count
+// `reason="saturated"`. Mitigation: IP literals or a local caching resolver.
 #[derive(Debug)]
 pub struct Resolver {
     lookup: LookupFn,
     cap: usize,
-    in_flight: AtomicUsize,
+    /// Lowercased host names with a helper alive; `len() <= cap`. Leaf lock,
+    /// held only to test/insert/remove, never across the lookup.
+    hosts: Mutex<Vec<String>>,
     timeouts: AtomicU64,
     saturated: AtomicU64,
+    spawn_failed: AtomicU64,
 }
 
-/// Releases a helper slot when the helper thread ends (or fails to start),
-/// whether or not the caller still waits.
-struct Slot(&'static Resolver);
+/// Releases a helper slot (and its host name) when the helper thread ends
+/// (or fails to start), whether or not the caller still waits.
+struct Slot {
+    r: &'static Resolver,
+    host: String,
+}
 
 impl Drop for Slot {
     fn drop(&mut self) {
-        // Release pairs with the Acquire in `try_acquire`.
-        self.0.in_flight.fetch_sub(1, Ordering::Release);
+        let mut g = self.r.hosts.lock();
+        if let Some(i) = g.iter().position(|h| *h == self.host) {
+            g.swap_remove(i);
+        }
     }
 }
 
 impl Resolver {
     pub const fn new(lookup: LookupFn, cap: usize) -> Self {
-        Self { lookup, cap, in_flight: AtomicUsize::new(0), timeouts: AtomicU64::new(0), saturated: AtomicU64::new(0) }
+        Self {
+            lookup,
+            cap,
+            hosts: Mutex::new(Vec::new()),
+            timeouts: AtomicU64::new(0),
+            saturated: AtomicU64::new(0),
+            spawn_failed: AtomicU64::new(0),
+        }
     }
 
     pub fn stats(&self) -> ResolverStats {
         ResolverStats {
             timeouts: self.timeouts.load(Ordering::Relaxed),
             saturated: self.saturated.load(Ordering::Relaxed),
-            in_flight: self.in_flight.load(Ordering::Acquire),
+            spawn_failed: self.spawn_failed.load(Ordering::Relaxed),
+            in_flight: self.hosts.lock().len(),
         }
     }
 
-    fn try_acquire(&'static self) -> Option<Slot> {
-        let mut n = self.in_flight.load(Ordering::Acquire);
-        while n < self.cap {
-            match self.in_flight.compare_exchange_weak(n, n + 1, Ordering::Acquire, Ordering::Acquire) {
-                Ok(_) => return Some(Slot(self)),
-                Err(cur) => n = cur,
-            }
+    /// Takes a slot unless the cap is reached or `host` is already being
+    /// looked up (a second caller for the same name fails as saturated).
+    fn try_acquire(&'static self, host: &str) -> Option<Slot> {
+        let key = host.to_ascii_lowercase();
+        let mut g = self.hosts.lock();
+        if g.len() >= self.cap || g.contains(&key) {
+            return None;
         }
-        None
+        g.push(key.clone());
+        Some(Slot { r: self, host: key })
     }
 
     /// Resolves `host:port` to at most four addresses before `deadline`.
@@ -128,8 +154,8 @@ impl Resolver {
         if let Ok(ip) = lit.parse::<IpAddr>() {
             return Ok(vec![SocketAddr::new(ip, port)]);
         }
-        let wait = remaining(deadline)?;
-        let Some(slot) = self.try_acquire() else {
+        remaining(deadline)?;
+        let Some(slot) = self.try_acquire(host) else {
             self.saturated.fetch_add(1, Ordering::Relaxed);
             return Err(HttpError::Timeout);
         };
@@ -144,8 +170,11 @@ impl Resolver {
         });
         // On spawn failure the closure (and its slot) is dropped.
         if spawned.is_err() {
+            self.spawn_failed.fetch_add(1, Ordering::Relaxed);
             return Err(HttpError::Connect);
         }
+        // Spawning took time: wait only for what is left of the deadline.
+        let wait = deadline.saturating_duration_since(Instant::now());
         match rx.recv_timeout(wait) {
             Ok(Ok(mut v)) => {
                 v.truncate(MAX_ADDRS);
@@ -513,15 +542,15 @@ mod tests {
     #[test]
     fn resolver_cap_full_fails_immediately() {
         let r = leak(hang, 2);
-        for _ in 0..2 {
-            assert_eq!(r.resolve("x.example", 80, Instant::now() + Duration::from_millis(20)), Err(HttpError::Timeout));
+        for h in ["a.example", "b.example"] {
+            assert_eq!(r.resolve(h, 80, Instant::now() + Duration::from_millis(20)), Err(HttpError::Timeout));
         }
         let t0 = Instant::now();
         for _ in 0..10 {
-            assert_eq!(r.resolve("x.example", 80, Instant::now() + Duration::from_secs(5)), Err(HttpError::Timeout));
+            assert_eq!(r.resolve("c.example", 80, Instant::now() + Duration::from_secs(5)), Err(HttpError::Timeout));
         }
         assert!(t0.elapsed() < Duration::from_millis(100));
-        assert_eq!(r.stats(), ResolverStats { timeouts: 2, saturated: 10, in_flight: 2 });
+        assert_eq!(r.stats(), ResolverStats { timeouts: 2, saturated: 10, spawn_failed: 0, in_flight: 2 });
     }
 
     #[test]
@@ -542,6 +571,100 @@ mod tests {
         assert!(wait_idle(r, Duration::from_secs(5)));
         assert_eq!(r.resolve("x.example", 80, Instant::now()), Err(HttpError::Timeout));
         assert_eq!(r.stats().in_flight, 0);
+    }
+
+    fn slow(_: &str, _: u16) -> std::io::Result<Vec<SocketAddr>> {
+        std::thread::sleep(Duration::from_millis(30));
+        Ok(addr())
+    }
+
+    fn fails(_: &str, _: u16) -> std::io::Result<Vec<SocketAddr>> {
+        Err(std::io::Error::other("nxdomain"))
+    }
+
+    /// SC-5: many concurrent callers never exceed the cap, every call
+    /// resolves or is refused, and no slot leaks afterwards.
+    #[test]
+    fn resolver_concurrent_callers_respect_cap_without_leak() {
+        let r = leak(slow, MAX_RESOLVER_THREADS);
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hs: Vec<_> = (0..64)
+            .map(|_| {
+                let peak = peak.clone();
+                std::thread::spawn(move || {
+                    let res = r.resolve("c.example", 80, Instant::now() + Duration::from_secs(5));
+                    peak.fetch_max(r.stats().in_flight, Ordering::Relaxed);
+                    res
+                })
+            })
+            .collect();
+        let mut ok = 0u64;
+        for h in hs {
+            match h.join().unwrap() {
+                Ok(v) => {
+                    assert_eq!(v, addr());
+                    ok += 1;
+                }
+                Err(e) => assert_eq!(e, HttpError::Timeout),
+            }
+        }
+        let st = r.stats();
+        assert!(peak.load(Ordering::Relaxed) <= MAX_RESOLVER_THREADS);
+        assert_eq!(ok + st.saturated, 64);
+        assert!(ok >= 1);
+        assert_eq!(st.timeouts, 0);
+        assert!(wait_idle(r, Duration::from_secs(5)));
+    }
+
+    /// An already expired deadline fails before any thread or slot is used.
+    #[test]
+    fn resolver_expired_deadline_spawns_nothing() {
+        let r = leak(panics, 1);
+        let past = Instant::now().checked_sub(Duration::from_secs(1)).unwrap_or_else(Instant::now);
+        assert_eq!(r.resolve("x.example", 80, past), Err(HttpError::Timeout));
+        assert_eq!(r.stats(), ResolverStats::default());
+        // IP literal with an expired deadline still bypasses resolution.
+        assert_eq!(r.resolve("192.0.2.9", 80, past), Ok(vec![SocketAddr::from(([192, 0, 2, 9], 80))]));
+    }
+
+    /// Lookup failure maps to Connect and releases the slot.
+    #[test]
+    fn resolver_lookup_error_is_connect_and_releases_slot() {
+        let r = leak(fails, 1);
+        for _ in 0..3 {
+            assert_eq!(r.resolve("x.example", 80, Instant::now() + Duration::from_secs(5)), Err(HttpError::Connect));
+            assert!(wait_idle(r, Duration::from_secs(5)));
+        }
+        assert_eq!(r.stats(), ResolverStats::default());
+    }
+
+    /// SC-5 (SEC-001): one slow name holds one slot only; a second caller
+    /// for the same name (any case) is refused at once, other names still
+    /// resolve.
+    #[test]
+    fn resolver_one_lookup_per_host() {
+        let r = leak(hang_unless_ok, 4);
+        assert_eq!(r.resolve("slow.example", 80, Instant::now() + Duration::from_millis(20)), Err(HttpError::Timeout));
+        let t0 = Instant::now();
+        for h in ["slow.example", "SLOW.example"] {
+            assert_eq!(r.resolve(h, 80, Instant::now() + Duration::from_secs(5)), Err(HttpError::Timeout));
+        }
+        assert!(t0.elapsed() < Duration::from_millis(100));
+        assert_eq!(r.resolve("ok.example", 80, Instant::now() + Duration::from_secs(5)), Ok(addr()));
+        let st = r.stats();
+        assert_eq!((st.timeouts, st.saturated), (1, 2));
+        let end = Instant::now() + Duration::from_secs(5);
+        while r.stats().in_flight != 1 && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(r.stats().in_flight, 1);
+    }
+
+    fn hang_unless_ok(host: &str, _: u16) -> std::io::Result<Vec<SocketAddr>> {
+        if host != "ok.example" {
+            std::thread::sleep(Duration::from_secs(3600));
+        }
+        Ok(addr())
     }
 
     proptest::proptest! {

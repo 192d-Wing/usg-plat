@@ -9,7 +9,10 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
   without a timeout. IP literals skip resolution; other names resolve on a
   `plat-dns` helper thread waited on only until the per-chain revocation
   deadline (`Timeout`, normal failure policy). At most 8 helper threads
-  exist process-wide; when full, a fetch fails at once. New metrics
+  exist process-wide, one per host name; when full, a fetch fails at once
+  (`reason="saturated"`; many distinct slow names can still fill the cap,
+  fail closed - alert on it, prefer IP literals or a local caching
+  resolver). New metrics
   `plat_revocation_resolve_failures_total{reason}` and
   `plat_revocation_resolver_threads`. POAM-025 (b) and (c) stay open.
 

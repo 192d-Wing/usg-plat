@@ -159,8 +159,9 @@ impl RevocationMetrics {
             "# TYPE plat_revocation_resolve_failures_total counter\n\
              plat_revocation_resolve_failures_total{{reason=\"timeout\"}} {}\n\
              plat_revocation_resolve_failures_total{{reason=\"saturated\"}} {}\n\
+             plat_revocation_resolve_failures_total{{reason=\"spawn_failed\"}} {}\n\
              # TYPE plat_revocation_resolver_threads gauge\nplat_revocation_resolver_threads {}\n",
-            rs.timeouts, rs.saturated, rs.in_flight,
+            rs.timeouts, rs.saturated, rs.spawn_failed, rs.in_flight,
         );
         if let Some(c) = checker {
             let st = c.cache_stats();
@@ -606,5 +607,25 @@ mod tests {
         assert_eq!(date(0), "1970-01-01");
         assert_eq!(date(951_782_400), "2000-02-29");
         assert_eq!(date(1_793_196_960), "2026-10-28");
+    }
+
+    /// SI-4 / SC-5: the bounded-resolver metrics are rendered with their
+    /// TYPE lines, both `reason` labels and the thread gauge.
+    #[test]
+    fn render_resolver_metrics() {
+        let m = RevocationMetrics::default();
+        let mut o = String::new();
+        m.render(&mut o, None);
+        assert!(o.contains("# TYPE plat_revocation_resolve_failures_total counter\n"), "{o}");
+        assert!(o.contains("# TYPE plat_revocation_resolver_threads gauge\n"), "{o}");
+        for prefix in [
+            "plat_revocation_resolve_failures_total{reason=\"timeout\"} ",
+            "plat_revocation_resolve_failures_total{reason=\"saturated\"} ",
+            "plat_revocation_resolve_failures_total{reason=\"spawn_failed\"} ",
+            "plat_revocation_resolver_threads ",
+        ] {
+            let line = o.lines().find(|l| l.starts_with(prefix)).unwrap_or_else(|| panic!("missing {prefix}: {o}"));
+            assert!(line[prefix.len()..].parse::<u64>().is_ok(), "{line}");
+        }
     }
 }
