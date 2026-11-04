@@ -333,10 +333,13 @@ impl FragTable {
     ///
     /// A source already holding its share of entries is refused. A full set
     /// reuses an expired way, else evicts (`fragment_table_full`) the entry
-    /// of the heaviest source, oldest first: any pass-through, alias or
-    /// poisoned entry, or an entry holding buffered or reassembly data whose
-    /// source is heavier than `k`'s. A light source therefore cannot be
-    /// pushed out by a heavy one, and a heavy one mostly evicts itself.
+    /// of the heaviest source, oldest first, among the eligible ones: an
+    /// alias or poisoned entry, an entry of `k`'s own source, or an entry
+    /// (pass-through, buffered or reassembly) whose source holds more live
+    /// entries than `k`'s. With none eligible the insert is refused
+    /// (`fragment_table_full`). A source therefore cannot push out one that
+    /// is lighter or equal (after the insert it would be the heavier), and
+    /// a heavy one mostly evicts itself.
     ///
     /// COMPLIANCE MAPPING:
     /// - NIST 800-53: SC-5 - per-source entry cap, eviction by load
@@ -364,8 +367,12 @@ impl FragTable {
                 break;
             }
             let w = self.load_of(e.lb).live;
+            // Pass-through entries follow the same load rule as data
+            // entries; aliases (no load bucket) and poisoned entries stay
+            // always eligible.
             let ok = match st {
-                St::Pass(_) | St::Poisoned(_) => true,
+                St::Poisoned(_) => true,
+                St::Pass(_) => e.lb == NO_LB || e.lb == lb || w > mine,
                 St::Pending | St::Reasm(_) => e.lb != lb && e.lb != NO_LB && w > mine,
             };
             // SEC-007: quote aliases (no load bucket) rank below every
@@ -989,22 +996,84 @@ mod tests {
                 i
             })
             .collect();
-        // A heavy source floods: capped at max_entries / 16.
+        // A heavy source floods: capped at max_entries / 16. It may take a
+        // light entry only while the light source is strictly heavier (the
+        // loads converge); once it is as heavy, no light entry goes.
         let mut ok = 0;
         for id in 0..100_000u32 {
+            let (lw, hw) = (t.load_of(lb).live, t.load_of(t.bucket(&key_from(heavy, 0))).live);
             if let Ok(i) = t.get_or_insert(&key_from(heavy, id), 1, &c) {
                 t.set_pass(i, Fwd::To6 { dst: 9, idx: 0 });
                 ok += 1;
+            }
+            if t.load_of(lb).live < lw {
+                assert!(lw > hw, "light ({lw}) evicted by an equal or heavier source ({hw})");
             }
         }
         assert!(ok > 0);
         let heavy_live = (0..t.entries.len()).filter(|&i| t.entries[i].key.src == heavy).count();
         assert!(heavy_live <= usize::from(t.cap_live), "{heavy_live}");
-        // Eviction picks the heavier source first, so every light entry is
-        // still there.
-        for (id, i) in light.iter().enumerate() {
-            assert_eq!(t.find(&key_from(7, id as u32), 1, &c), Some(*i));
+        // The light source keeps at least half its entries (it loses one
+        // only while strictly heavier), and those left are where they were.
+        let kept =
+            light.iter().enumerate().filter(|&(id, i)| t.find(&key_from(7, id as u32), 1, &c) == Some(*i)).count();
+        assert_eq!(kept as u32, u32::from(t.load_of(lb).live));
+        assert!(kept >= 16, "{kept}");
+    }
+
+    #[test]
+    fn heavier_source_is_refused_rather_than_evicting_a_lighter_pass_entry() {
+        let c = Counters::default();
+        let mut t = FragTable::new(&cfg(0, 0));
+        // Four sources with distinct load buckets.
+        let mut srcs: Vec<u128> = Vec::new();
+        for src in 1u128.. {
+            let b = t.bucket(&key_from(src, 0));
+            if srcs.iter().all(|&o| t.bucket(&key_from(o, 0)) != b) {
+                srcs.push(src);
+            }
+            if srcs.len() == 4 {
+                break;
+            }
         }
+        let (a, heavier, equal, lighter) = (srcs[0], srcs[1], srcs[2], srcs[3]);
+        let pass = Fwd::To6 { dst: 9, idx: 0 };
+        // Source a fills one set with WAYS pass-through entries (load WAYS).
+        let s0 = t.set_of(&key_from(a, 0));
+        let in_s0 = |t: &FragTable, src: u128| (0u32..).find(|&id| t.set_of(&key_from(src, id)) == s0).unwrap();
+        let mut a_ids = Vec::new();
+        let ids: Vec<u32> = (0u32..).filter(|&id| t.set_of(&key_from(a, id)) == s0).take(WAYS).collect();
+        for id in ids {
+            let i = t.get_or_insert(&key_from(a, id), 0, &c).unwrap();
+            t.set_pass(i, pass);
+            a_ids.push(id);
+        }
+        // `heavier` holds WAYS + 1 entries elsewhere, `equal` WAYS.
+        for (src, n) in [(heavier, WAYS + 1), (equal, WAYS)] {
+            let ids: Vec<u32> = (0u32..).filter(|&id| t.set_of(&key_from(src, id)) != s0).take(n).collect();
+            for id in ids {
+                let i = t.get_or_insert(&key_from(src, id), 0, &c).unwrap();
+                t.set_pass(i, pass);
+            }
+        }
+        // Neither may push out the (lighter or equal) source a: refused.
+        for src in [heavier, equal] {
+            let id = in_s0(&t, src);
+            assert_eq!(t.get_or_insert(&key_from(src, id), 1, &c), Err(DropReason::FragmentTableFull));
+        }
+        for &id in &a_ids {
+            assert!(t.find(&key_from(a, id), 1, &c).is_some(), "a/{id} kept");
+        }
+        // A lighter source still evicts a's oldest entry, counted.
+        let before = c.drops(DropReason::FragmentTableFull);
+        let id = in_s0(&t, lighter);
+        let i = t.get_or_insert(&key_from(lighter, id), 2, &c).unwrap();
+        assert_eq!(t.state(i), Some(St::Pending));
+        assert_eq!(c.drops(DropReason::FragmentTableFull), before + 1);
+        assert_eq!(t.find(&key_from(a, a_ids[0]), 2, &c), None);
+        // Source a may always replace its own entry.
+        let own = (a_ids[WAYS - 1] + 1..).find(|&id| t.set_of(&key_from(a, id)) == s0).unwrap();
+        assert!(t.get_or_insert(&key_from(a, own), 3, &c).is_ok());
     }
 
     #[test]

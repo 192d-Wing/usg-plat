@@ -48,6 +48,12 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
   `plat_revocation_resolver_inflight >= 32 or plat_revocation_resolver_queued >= 48 or increase(plat_revocation_resolve_failures_total{reason="saturated"}[5m]) > 0`.
 
 ### Fixed
+- SC-5, RFC 6146 §3.4: a full fragment-table set no longer lets a source
+  evict another source's pass-through entry unless that source holds more
+  live entries; otherwise the insert is refused (`fragment_table_full`).
+  Previously a heavier flooding source could push out a lighter source's
+  pass-through entries. Flaky `frag` unit tests fixed (sources chosen in
+  distinct load buckets, ids in sets with a free way).
 - POAM-025 (a), SC-5: the OCSP/CRL fetcher no longer resolves host names
   without a timeout. IP literals skip resolution; other names resolve on a
   `plat-dns` helper thread waited on only until the per-chain revocation
