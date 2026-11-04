@@ -39,7 +39,7 @@ set -eu
 die() { echo "l33: $1" >&2; exit "${2:-1}"; }
 log() { echo "l33: $*"; }
 
-[ $# -eq 3 ] && [ "$1" = run ] || die "usage: l33-resolver.sh run PLATD_BINARY REPO_DIR" 2
+if ! { [ $# -eq 3 ] && [ "$1" = run ]; }; then die "usage: l33-resolver.sh run PLATD_BINARY REPO_DIR" 2; fi
 bin=$2
 repo=$3
 [ "$(id -u)" = 0 ] || die "must run as root" 2
