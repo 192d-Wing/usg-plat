@@ -153,6 +153,15 @@ impl RevocationMetrics {
             crl.load(Ordering::Relaxed),
             ocsp.load(Ordering::Relaxed),
         );
+        let rs = plat_tls::revocation::http::resolver_stats();
+        let _ = write!(
+            o,
+            "# TYPE plat_revocation_resolve_failures_total counter\n\
+             plat_revocation_resolve_failures_total{{reason=\"timeout\"}} {}\n\
+             plat_revocation_resolve_failures_total{{reason=\"saturated\"}} {}\n\
+             # TYPE plat_revocation_resolver_threads gauge\nplat_revocation_resolver_threads {}\n",
+            rs.timeouts, rs.saturated, rs.in_flight,
+        );
         if let Some(c) = checker {
             let st = c.cache_stats();
             let _ = write!(

@@ -28,12 +28,12 @@
 //!   cache of revocation data (OCSP/CRL caches, `cache_dir`)
 //! - NIST 800-53: AU-2, AU-12 - one [`RevocationRecord`] per checked
 //!   certificate, delivered to the caller's [`RevocationHook`]
-//! - NIST 800-53: SC-5 - shared per-chain time budget
+//! - NIST 800-53: SC-5 - shared per-chain time budget, which also bounds
+//!   name resolution (`http::Resolver`, capped helper threads)
 //! - RFC 6960 (OCSP), RFC 5280 §5, §6.3 (CRL)
 // POAM: POAM-025 (narrowed) - the OCSP responder certificate's own
 // revocation is not checked (id-pkix-ocsp-nocheck assumed); indirect CRLs,
-// delta CRLs and LDAP/non-HTTP distribution points are not supported;
-// `ToSocketAddrs` resolution has no timeout.
+// delta CRLs and LDAP/non-HTTP distribution points are not supported.
 
 pub mod chain;
 pub mod crl;
