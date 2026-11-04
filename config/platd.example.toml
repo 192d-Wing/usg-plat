@@ -298,6 +298,19 @@ cache_bytes = 67108864
 max_crls = 64
 refresh_margin_secs = 3600
 
+# DNS for OCSP responder and CRL distribution point names (process-wide;
+# only here, not in per-destination overrides). Built-in resolver (hickory,
+# plain UDP/TCP 53, no DNSSEC): nsswitch is NOT consulted, so names known only
+# to sss, mdns, nss-resolve, LDAP/NIS or myhostname do not resolve (POAM-045).
+# Without nameservers, /etc/resolv.conf is used and re-read when it changes
+# (a file that no longer parses keeps the last good one); a systemd-resolved
+# stub (127.0.0.53) works. IP-literal URLs skip DNS entirely. Every lookup is
+# bounded by budget_ms; AAAA and A are both queried, IPv6 tried first.
+# [tls.revocation.resolver]
+# nameservers = ["192.0.2.53", "[2001:db8::53]:53"]   # at most 3, IP[:port]
+# timeout_ms = 2000                                    # per server, 200..=5000
+# use_hosts_file = true                                # /etc/hosts before DNS
+
 # XDP fast path for established UDP sessions (POAM-016 Phase 1). Off by
 # default: without this section, or with enabled = false, the data plane is
 # TUN-only and nothing below is checked. Needs a platd built with the `xdp`

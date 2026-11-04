@@ -153,15 +153,17 @@ impl RevocationMetrics {
             crl.load(Ordering::Relaxed),
             ocsp.load(Ordering::Relaxed),
         );
-        let rs = plat_tls::revocation::http::resolver_stats();
+        let rs = plat_tls::revocation::dns::stats();
         let _ = write!(
             o,
             "# TYPE plat_revocation_resolve_failures_total counter\n\
              plat_revocation_resolve_failures_total{{reason=\"timeout\"}} {}\n\
              plat_revocation_resolve_failures_total{{reason=\"saturated\"}} {}\n\
              plat_revocation_resolve_failures_total{{reason=\"spawn_failed\"}} {}\n\
-             # TYPE plat_revocation_resolver_threads gauge\nplat_revocation_resolver_threads {}\n",
-            rs.timeouts, rs.saturated, rs.spawn_failed, rs.in_flight,
+             plat_revocation_resolve_failures_total{{reason=\"error\"}} {}\n\
+             # TYPE plat_revocation_resolver_inflight gauge\nplat_revocation_resolver_inflight {}\n\
+             # TYPE plat_revocation_resolver_queued gauge\nplat_revocation_resolver_queued {}\n",
+            rs.timeouts, rs.saturated, rs.spawn_failed, rs.errors, rs.in_flight, rs.queued,
         );
         if let Some(c) = checker {
             let st = c.cache_stats();
@@ -284,6 +286,9 @@ pub fn prepare(cfg: &Config, sink: &HookSink) -> Result<TlsRuntime, String> {
     if !cfg.uses_tls() {
         return Ok(rt);
     }
+    // SC-5: the process-wide OCSP/CRL resolver (started on first lookup).
+    let resolver = cfg.tls.revocation.resolver.clone().unwrap_or_default();
+    plat_tls::revocation::dns::configure(plat_tls::revocation::dns::ResolverSettings::from(&resolver));
     let refresh: RefreshHook = {
         let (sink, metrics) = (sink.clone(), metrics);
         Arc::new(move |r: &RefreshRecord| {
@@ -395,6 +400,25 @@ fn describe_cert(o: &mut String, warn: &mut Vec<String>, what: &str, path: &Path
         warn.push(format!("{what} {} expires in {} days", path.display(), (exp - now) / 86_400));
     }
     Ok(())
+}
+
+/// `check-config`: the OCSP/CRL resolver (POAM-045: nsswitch not used).
+fn describe_resolver(o: &mut String, r: &RevocationConfig) {
+    if r.mode == RevocationMode::Off {
+        return;
+    }
+    let c = r.resolver.clone().unwrap_or_default();
+    let servers = if c.nameservers.is_empty() {
+        "/etc/resolv.conf (re-read on change)".to_string()
+    } else {
+        c.nameserver_addrs().iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+    };
+    let _ = writeln!(
+        o,
+        "  resolver: DNS {servers}, timeout {} ms, /etc/hosts {}, nsswitch not consulted",
+        c.timeout_ms,
+        if c.use_hosts_file { "on" } else { "off" }
+    );
 }
 
 fn describe_revocation(o: &mut String, warn: &mut Vec<String>, r: &RevocationConfig, indent: &str) {
@@ -523,6 +547,7 @@ pub fn summary(cfg: &Config) -> Result<String, String> {
         }
     }
     describe_revocation(&mut o, &mut warn, &cfg.tls.revocation, "  ");
+    describe_resolver(&mut o, &cfg.tls.revocation);
     if let Some(d) = &cfg.tls.revocation.cache_dir {
         plat_tls::check_cache_dir(d).map_err(|e| format!("tls.revocation.cache_dir: {e}"))?;
     }
@@ -573,6 +598,10 @@ mod tests {
         assert!(s.contains("server certificate: CN=mgmt.test"), "{s}");
         assert!(s.contains("syslog 192.0.2.10:6514: tls, server_name siem.example.net"), "{s}");
         assert!(s.contains("client certificate: none"), "{s}");
+        assert!(
+            s.contains("resolver: DNS /etc/resolv.conf (re-read on change), timeout 2000 ms, /etc/hosts on"),
+            "{s}"
+        );
         assert!(s.contains("revocation: hard_fail"), "{s}");
         assert!(s.contains("groups X25519MLKEM768, secp256r1, secp384r1"), "{s}");
 
@@ -610,19 +639,23 @@ mod tests {
     }
 
     /// SI-4 / SC-5: the bounded-resolver metrics are rendered with their
-    /// TYPE lines, both `reason` labels and the thread gauge.
+    /// TYPE lines, every `reason` label and both gauges.
     #[test]
     fn render_resolver_metrics() {
         let m = RevocationMetrics::default();
         let mut o = String::new();
         m.render(&mut o, None);
         assert!(o.contains("# TYPE plat_revocation_resolve_failures_total counter\n"), "{o}");
-        assert!(o.contains("# TYPE plat_revocation_resolver_threads gauge\n"), "{o}");
+        assert!(o.contains("# TYPE plat_revocation_resolver_inflight gauge\n"), "{o}");
+        assert!(o.contains("# TYPE plat_revocation_resolver_queued gauge\n"), "{o}");
+        assert!(!o.contains("plat_revocation_resolver_threads"), "{o}");
         for prefix in [
             "plat_revocation_resolve_failures_total{reason=\"timeout\"} ",
             "plat_revocation_resolve_failures_total{reason=\"saturated\"} ",
             "plat_revocation_resolve_failures_total{reason=\"spawn_failed\"} ",
-            "plat_revocation_resolver_threads ",
+            "plat_revocation_resolve_failures_total{reason=\"error\"} ",
+            "plat_revocation_resolver_inflight ",
+            "plat_revocation_resolver_queued ",
         ] {
             let line = o.lines().find(|l| l.starts_with(prefix)).unwrap_or_else(|| panic!("missing {prefix}: {o}"));
             assert!(line[prefix.len()..].parse::<u64>().is_ok(), "{line}");

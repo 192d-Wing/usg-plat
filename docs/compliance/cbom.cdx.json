@@ -2025,6 +2025,20 @@
       "purl": "pkg:cargo/aws-lc-sys@0.47.0",
       "type": "library",
       "version": "0.47.0"
+    },
+    {
+      "bom-ref": "lib/chacha20",
+      "description": "RustCrypto ChaCha (ChaCha12 StdRng behind rand 0.10, forced by hickory-proto/hickory-net std_rng): DNS query IDs and source ports for OCSP/CRL name resolution only; not cryptographic protection, outside the FIPS boundary (OCSP/CRL objects are signature-checked regardless of DNS); also the proptest RNG",
+      "name": "chacha20",
+      "properties": [
+        {
+          "name": "usg-plat:status",
+          "value": "non-crypto-rng-dns-ids-only"
+        }
+      ],
+      "purl": "pkg:cargo/chacha20@0.10.2",
+      "type": "library",
+      "version": "0.10.2"
     }
   ],
   "dependencies": [
@@ -2035,7 +2049,8 @@
         "lib/rustls",
         "lib/rustls-webpki",
         "lib/rustcrypto-sha2",
-        "lib/aws-lc-nonfips"
+        "lib/aws-lc-nonfips",
+        "lib/chacha20"
       ],
       "ref": "platd"
     },

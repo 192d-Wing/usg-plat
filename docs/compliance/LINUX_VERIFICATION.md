@@ -74,9 +74,13 @@ each item.
 | L31 | XDP: fast-path-only session lifetime and idle expiry under the units | SC-10, SC-5, RFC 6146 §3.5.1 | POAM-016 | PASS (2026-11-01, WU6, kernel 6.8.0-147, systemd 255, veth, native and generic): alive after 150 s of fast-path-only traffic (`udp_secs` 120), reclaimed after 125 s idle (`plat_sessions` 0, `plat_xdp_sessions` 0, 1 retire) |
 | L32 | XDP: map-full fallback | SC-5 | POAM-016 | PASS (2026-11-03, `E2E_MAPFULL=1 e2e.sh run`, kernel 6.8.0-147, veth, native, by hand): 5000 flows against `max_sessions` 4096: 5000/5000 echoes in each of 3 rounds, 4096 fast-path sessions, 162 `map_full` + 1092 `slots` install failures, overflow on the slow path, 30000 receiver checksums verified; after expiry 100 new flows all installed and on the fast path. The 1 s back-off itself is not observable from outside |
 
-Not covered: the bounded OCSP/CRL name resolution (POAM-025 (a)) is shown
-with a scripted resolver in unit tests only; real getaddrinfo/NSS behaviour
-under a slow resolver has not been exercised on Linux.
+| L33 | OCSP/CRL name resolution through the built-in resolver under the unit | SC-5, IA-5(2)(b)(1), SC-7 | POAM-025 (a), POAM-045 | NOT RUN. Procedure: platd with `hard_fail` and an OCSP or CRL URL by name; (a) resolv.conf points at a local `dnsmasq` that answers: the handshake passes; (b) `nft add rule inet filter output udp dport 53 drop` (and tcp): the handshake fails within `budget_ms` and `plat_revocation_resolve_failures_total{reason="timeout"}` increments; (c) resolv.conf points at the systemd-resolved stub 127.0.0.53: the handshake passes; (d) a name only in `/etc/hosts` resolves; (e) edit resolv.conf while running: the change is picked up within 30 s, and a file without `nameserver` keeps the last good configuration; (f) the journal shows no seccomp `EPERM` / `SIGSYS` for `plat-dns` |
+
+On macOS and in CI the real resolver runs against an in-process fake DNS
+server on 127.0.0.1 (`crates/plat-tls/tests/dns_fake_server.rs`): answers,
+late and missing answers, NXDOMAIN, truncation, a 100-name flood, the hosts
+file, reloads and a fetch by name. These tests do not cover the systemd
+sandbox or real NSS setups.
 
 ## Procedures, pass criteria and results
 

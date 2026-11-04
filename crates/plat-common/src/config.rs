@@ -1373,6 +1373,9 @@ pub struct RevocationConfig {
     pub ocsp: OcspConfig,
     #[serde(default)]
     pub crl: CrlConfig,
+    /// OCSP/CRL name resolution (process-wide; only under `[tls.revocation]`).
+    #[serde(default)]
+    pub resolver: Option<DnsResolverConfig>,
 }
 
 impl Default for RevocationConfig {
@@ -1384,7 +1387,74 @@ impl Default for RevocationConfig {
             cache_dir: None,
             ocsp: OcspConfig::default(),
             crl: CrlConfig::default(),
+            resolver: None,
         }
+    }
+}
+
+/// Most `tls.revocation.resolver.nameservers` entries.
+pub const MAX_RESOLVER_NAMESERVERS: usize = 3;
+
+/// `[tls.revocation.resolver]`: DNS for OCSP/CRL fetches (hickory, plain
+/// UDP/TCP). Absent or without `nameservers`: `/etc/resolv.conf`, re-read
+/// when it changes. nsswitch is not consulted (POAM-045).
+///
+/// COMPLIANCE MAPPING:
+/// - NIST 800-53: CM-6, CM-7 - validated, no permissive default; SC-5 -
+///   bounded per-server timeout
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DnsResolverConfig {
+    /// IP literals, optionally with a port (`192.0.2.53`, `192.0.2.53:5353`,
+    /// `[2001:db8::53]:53`); at most 3. Empty: resolv.conf.
+    #[serde(default)]
+    pub nameservers: Vec<String>,
+    /// Per-server query timeout, 200..=5000 ms.
+    #[serde(default = "d_resolver_timeout")]
+    pub timeout_ms: u64,
+    /// Consult `/etc/hosts` before DNS.
+    #[serde(default = "d_true")]
+    pub use_hosts_file: bool,
+}
+
+impl Default for DnsResolverConfig {
+    fn default() -> Self {
+        Self { nameservers: Vec::new(), timeout_ms: d_resolver_timeout(), use_hosts_file: true }
+    }
+}
+
+fn d_resolver_timeout() -> u64 {
+    2000
+}
+
+fn parse_nameserver(s: &str) -> Option<SocketAddr> {
+    s.parse::<SocketAddr>().ok().or_else(|| s.parse::<std::net::IpAddr>().ok().map(|ip| SocketAddr::new(ip, 53)))
+}
+
+impl DnsResolverConfig {
+    /// Parsed nameservers (entries are checked by [`Self::validate`]).
+    pub fn nameserver_addrs(&self) -> Vec<SocketAddr> {
+        self.nameservers.iter().filter_map(|s| parse_nameserver(s)).collect()
+    }
+
+    pub fn validate(&self, at: &str) -> Result<(), ConfigError> {
+        if self.nameservers.len() > MAX_RESOLVER_NAMESERVERS {
+            return invalid(format!("{at}.nameservers: at most {MAX_RESOLVER_NAMESERVERS} entries"));
+        }
+        for n in &self.nameservers {
+            match parse_nameserver(n) {
+                Some(a) if a.port() != 0 && !a.ip().is_unspecified() => {}
+                _ => {
+                    return invalid(format!(
+                        "{at}.nameservers entry {n:?}: must be an IP address with an optional non-zero port"
+                    ));
+                }
+            }
+        }
+        if !(200..=5000).contains(&self.timeout_ms) {
+            return invalid(format!("{at}.timeout_ms must be 200..=5000"));
+        }
+        Ok(())
     }
 }
 
@@ -1607,6 +1677,13 @@ impl RevocationConfig {
         }
         for f in &c.files {
             check_abs(&format!("{at}.crl.files entry"), f)?;
+        }
+        if let Some(r) = &self.resolver {
+            // One process-wide resolver: overrides cannot change it.
+            if at != "tls.revocation" {
+                return invalid(format!("{at}.resolver: only [tls.revocation.resolver] is allowed (process-wide)"));
+            }
+            r.validate(&format!("{at}.resolver"))?;
         }
         Ok(())
     }
@@ -2672,6 +2749,46 @@ mod tests {
         assert!(matches!(Config::from_toml(&with("mode = \"maybe\"")), Err(ConfigError::Parse(_))));
         assert!(matches!(Config::from_toml(&with("[tls.revocation.crl]\nbogus = 1")), Err(ConfigError::Parse(_))));
         assert!(matches!(Config::from_toml(&format!("{}\n[tls]\nbogus = 1\n", base())), Err(ConfigError::Parse(_))));
+    }
+
+    /// `[tls.revocation.resolver]`: defaults, ranges, entries, unknown keys,
+    /// and refusal under per-destination overrides (process-wide).
+    #[test]
+    fn resolver_section_is_validated() {
+        let with = |body: &str| format!("{}\n[tls.revocation.resolver]\n{body}\n", base());
+        let c = Config::from_toml(&with("")).unwrap();
+        assert_eq!(c.tls.revocation.resolver, Some(DnsResolverConfig::default()));
+        assert!(Config::from_toml(&base()).unwrap().tls.revocation.resolver.is_none());
+        let c = Config::from_toml(&with(
+            "nameservers = [\"192.0.2.53\", \"192.0.2.54:5353\", \"[2001:db8::53]:53\"]\ntimeout_ms = 200\nuse_hosts_file = false",
+        ))
+        .unwrap();
+        let r = c.tls.revocation.resolver.unwrap();
+        assert_eq!(
+            r.nameserver_addrs(),
+            vec![
+                "192.0.2.53:53".parse::<SocketAddr>().unwrap(),
+                "192.0.2.54:5353".parse().unwrap(),
+                "[2001:db8::53]:53".parse().unwrap()
+            ]
+        );
+        assert!(!r.use_hosts_file);
+        Config::from_toml(&with("timeout_ms = 5000")).unwrap();
+        for (body, want) in [
+            ("timeout_ms = 199", "timeout_ms must be 200..=5000"),
+            ("timeout_ms = 5001", "timeout_ms must be 200..=5000"),
+            ("nameservers = [\"dns.example.net\"]", "nameservers entry"),
+            ("nameservers = [\"192.0.2.53:0\"]", "nameservers entry"),
+            ("nameservers = [\"0.0.0.0\"]", "nameservers entry"),
+            ("nameservers = [\"192.0.2.1\", \"192.0.2.2\", \"192.0.2.3\", \"192.0.2.4\"]", "at most 3"),
+        ] {
+            let m = invalid_msg(&with(body));
+            assert!(m.contains(want), "{body}: {m}");
+        }
+        assert!(matches!(Config::from_toml(&with("bogus = 1")), Err(ConfigError::Parse(_))));
+        let r = RevocationConfig { resolver: Some(DnsResolverConfig::default()), ..RevocationConfig::default() };
+        assert!(r.validate("tls.revocation").is_ok());
+        assert!(r.validate("cluster.ha.tls.revocation").is_err());
     }
 
     /// QA: every new numeric key at both edges (accepted) and one past

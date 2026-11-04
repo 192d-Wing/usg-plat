@@ -217,9 +217,14 @@ Configuration changes to note when upgrading from an earlier build:
 - Revocation checking (`tls.revocation.mode = "hard_fail"` by default)
   rejects a peer whose status cannot be determined: make OCSP responders or
   CRL distribution points reachable, or configure `crl.files`/`crl.urls`.
-  Name resolution is bounded by the revocation deadline (at most 8 resolver
-  helper threads); still prefer IP literals or a local caching resolver so
-  slow lookups cannot saturate that cap (POAM-025).
+  Responder and CDP host names are resolved by a built-in DNS resolver
+  (hickory, plain UDP/TCP 53, one `plat-dns` thread), bounded by the
+  revocation deadline. It reads `/etc/resolv.conf` (re-read on change) and
+  `/etc/hosts`, or the nameservers in `[tls.revocation.resolver]`.
+  **nsswitch is not consulted** (POAM-045): names served only by sss, mdns,
+  nss-resolve, LDAP/NIS or myhostname do not resolve. The systemd-resolved
+  stub (127.0.0.53) works. If host output is filtered, allow udp/tcp 53 from
+  the `plat` user to the configured nameservers. IP-literal URLs skip DNS.
 - The unit now sets `StateDirectory=plat/revocation` (0700) for the optional
   `tls.revocation.cache_dir = "/var/lib/plat/revocation"`, which holds
   verified CRLs and `crl-numbers` (cRLNumber rollback marks).

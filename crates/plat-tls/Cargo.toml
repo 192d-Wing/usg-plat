@@ -23,10 +23,13 @@ aws-lc-rs.workspace = true
 # POAM: POAM-026 AWS-LC-FIPS 4.x CMVP certificate pending; re-check and confirm OEs.
 aws-lc-fips-sys = "~0.14.4"
 der.workspace = true
+hickory-resolver.workspace = true
 parking_lot.workspace = true
+resolv-conf.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 x509-cert.workspace = true
 x509-ocsp.workspace = true
