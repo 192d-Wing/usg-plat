@@ -977,6 +977,10 @@ mod tests {
     fn one_source_cannot_fill_the_table_or_evict_others() {
         let c = Counters::default();
         let mut t = FragTable::new(&cfg(0, 0));
+        // Light and heavy sources in distinct load buckets (keyed randomly):
+        // colliding sources would share one budget and one eviction rank.
+        let lb = t.bucket(&key_from(7, 0));
+        let heavy = (8u128..).find(|&s| t.bucket(&key_from(s, 0)) != lb).unwrap();
         // A light source's pass-through entries, spread over the table.
         let light: Vec<usize> = (0..32u32)
             .map(|id| {
@@ -988,13 +992,13 @@ mod tests {
         // A heavy source floods: capped at max_entries / 16.
         let mut ok = 0;
         for id in 0..100_000u32 {
-            if let Ok(i) = t.get_or_insert(&key_from(8, id), 1, &c) {
+            if let Ok(i) = t.get_or_insert(&key_from(heavy, id), 1, &c) {
                 t.set_pass(i, Fwd::To6 { dst: 9, idx: 0 });
                 ok += 1;
             }
         }
         assert!(ok > 0);
-        let heavy_live = (0..t.entries.len()).filter(|&i| t.entries[i].key.src == 8).count();
+        let heavy_live = (0..t.entries.len()).filter(|&i| t.entries[i].key.src == heavy).count();
         assert!(heavy_live <= usize::from(t.cap_live), "{heavy_live}");
         // Eviction picks the heavier source first, so every light entry is
         // still there.
@@ -1063,17 +1067,31 @@ mod tests {
         let c = Counters::default();
         let mut t = FragTable::new(&cfg(0, 2));
         let hdr = [0x45u8; 20];
+        // Three sources with distinct load buckets: the buckets are keyed
+        // randomly, and two colliding sources would share one budget (and
+        // reclaim never takes a slot from the same bucket).
+        let mut srcs: Vec<u128> = Vec::new();
+        for src in 8u128.. {
+            let b = t.bucket(&key_from(src, 0));
+            if srcs.iter().all(|&o| t.bucket(&key_from(o, 0)) != b) {
+                srcs.push(src);
+            }
+            if srcs.len() == 3 {
+                break;
+            }
+        }
+        let (s1, s2, s3) = (srcs[0], srcs[1], srcs[2]);
         // One source: capped at half the slots.
-        let a = t.get_or_insert(&key_from(8, 1), 0, &c).unwrap();
+        let a = t.get_or_insert(&key_from(s1, 1), 0, &c).unwrap();
         t.start_reasm(a, &hdr, false, &c).unwrap();
-        let b = t.get_or_insert(&key_from(8, 2), 0, &c).unwrap();
+        let b = t.get_or_insert(&key_from(s1, 2), 0, &c).unwrap();
         assert_eq!(t.start_reasm(b, &hdr, false, &c), Err(DropReason::ReassemblyFull));
-        let d = t.get_or_insert(&key_from(9, 1), 1, &c).unwrap();
+        let d = t.get_or_insert(&key_from(s2, 1), 1, &c).unwrap();
         t.start_reasm(d, &hdr, false, &c).unwrap();
         // Both slots busy: a third source takes the oldest other one.
-        let e = t.get_or_insert(&key_from(10, 1), 2, &c).unwrap();
+        let e = t.get_or_insert(&key_from(s3, 1), 2, &c).unwrap();
         t.start_reasm(e, &hdr, false, &c).unwrap();
-        assert_eq!(t.find(&key_from(8, 1), 2, &c), None);
+        assert_eq!(t.find(&key_from(s1, 1), 2, &c), None);
         assert!(matches!(t.state(d), Some(St::Reasm(_))));
     }
 }
