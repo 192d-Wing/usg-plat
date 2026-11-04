@@ -48,11 +48,17 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
   `plat_revocation_resolver_inflight >= 32 or plat_revocation_resolver_queued >= 48 or increase(plat_revocation_resolve_failures_total{reason="saturated"}[5m]) > 0`.
 
 ### Fixed
-- SC-5, RFC 6146 §3.4: a full fragment-table set no longer lets a source
-  evict another source's pass-through entry unless that source holds more
-  live entries; otherwise the insert is refused (`fragment_table_full`).
-  Previously a heavier flooding source could push out a lighter source's
-  pass-through entries. Flaky `frag` unit tests fixed (sources chosen in
+- SC-5, RFC 6146 §3.4: a full fragment-table set no longer lets a load
+  bucket (randomly keyed source group; colliding sources share one) evict
+  another bucket's pass-through or poisoned entry unless that bucket holds
+  strictly more live entries (own-bucket entries and pass-through or
+  poisoned quote aliases excepted); otherwise the insert is refused
+  (`fragment_table_full`, which counts both evictions and refusals).
+  Quote aliases (`Sent4`/`Sent6`, not charged to any source) now only
+  replace other aliases and can no longer evict any bucketed entry.
+  Previously a heavier flooding source, or one completing many
+  datagrams, could push out a lighter source's entries. New bench
+  `nat64/frag_full_set_insert_{evict,refuse}`. Flaky `frag` unit tests fixed (sources chosen in
   distinct load buckets, ids in sets with a free way).
 - POAM-025 (a), SC-5: the OCSP/CRL fetcher no longer resolves host names
   without a timeout. IP literals skip resolution; other names resolve on a

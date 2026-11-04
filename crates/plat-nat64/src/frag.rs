@@ -331,15 +331,26 @@ impl FragTable {
 
     /// Finds or creates the entry for `k` (a new one starts `Pending`).
     ///
-    /// A source already holding its share of entries is refused. A full set
-    /// reuses an expired way, else evicts (`fragment_table_full`) the entry
-    /// of the heaviest source, oldest first, among the eligible ones: an
-    /// alias or poisoned entry, an entry of `k`'s own source, or an entry
-    /// (pass-through, buffered or reassembly) whose source holds more live
-    /// entries than `k`'s. With none eligible the insert is refused
-    /// (`fragment_table_full`). A source therefore cannot push out one that
-    /// is lighter or equal (after the insert it would be the heavier), and
-    /// a heavy one mostly evicts itself.
+    /// Sources are grouped into randomly keyed load buckets (IPv6 sources
+    /// masked to the subscriber prefix); sources whose buckets collide share
+    /// one budget and count as one "source" below. A bucket already holding
+    /// its share of entries is refused. A full set reuses an expired way,
+    /// else evicts the eligible entry of the heaviest bucket, oldest first:
+    ///
+    /// - a bucketed `k` may evict a pass-through or poisoned entry of its
+    ///   own bucket, a pass-through or poisoned quote alias, or any
+    ///   pass-through, poisoned, buffered or reassembly entry whose bucket
+    ///   holds strictly more live entries than `k`'s (buffered or
+    ///   reassembly entries of its own bucket are never evicted);
+    /// - a quote alias `k` (no bucket, not charged to any source) may only
+    ///   evict a pass-through or poisoned alias.
+    ///
+    /// Aliases rank below every bucketed entry (SEC-007), so a bucketed `k`
+    /// evicts them last. With nothing eligible the insert is refused. Both
+    /// an eviction and a refusal count `fragment_table_full`. A bucket
+    /// therefore never pushes out an entry of a bucket that is lighter or
+    /// equal (strict `>`: after the insert it would be the heavier), and
+    /// aliases cannot push out bucketed entries at all.
     ///
     /// COMPLIANCE MAPPING:
     /// - NIST 800-53: SC-5 - per-source entry cap, eviction by load
@@ -367,13 +378,12 @@ impl FragTable {
                 break;
             }
             let w = self.load_of(e.lb).live;
-            // Pass-through entries follow the same load rule as data
-            // entries; aliases (no load bucket) and poisoned entries stay
-            // always eligible.
+            // Eligibility by load (see above); an inserting alias
+            // (`lb == NO_LB`) may only replace a pass-through or poisoned
+            // alias.
             let ok = match st {
-                St::Poisoned(_) => true,
-                St::Pass(_) => e.lb == NO_LB || e.lb == lb || w > mine,
-                St::Pending | St::Reasm(_) => e.lb != lb && e.lb != NO_LB && w > mine,
+                St::Pass(_) | St::Poisoned(_) => e.lb == NO_LB || (lb != NO_LB && (e.lb == lb || w > mine)),
+                St::Pending | St::Reasm(_) => lb != NO_LB && e.lb != lb && e.lb != NO_LB && w > mine,
             };
             // SEC-007: quote aliases (no load bucket) rank below every
             // other eligible entry, so they are evicted last.
@@ -402,8 +412,9 @@ impl FragTable {
         Ok(i)
     }
 
-    /// Inserts (or refreshes) a quote alias. Best effort: a full set skips
-    /// it, and ICMP errors quoting that fragment are then unmatched.
+    /// Inserts (or refreshes) a quote alias. Best effort: a full set with no
+    /// expired way or pass-through/poisoned alias to replace skips it (not
+    /// counted), and ICMP errors quoting that fragment are then unmatched.
     pub fn alias(&mut self, k: &FragKey, fwd: Fwd, now: u64, c: &Counters) {
         if let Ok(i) = self.get_or_insert(k, now, c)
             && matches!(self.entries[i].st, Some(St::Pending | St::Pass(_)))
@@ -1170,5 +1181,145 @@ mod tests {
         t.start_reasm(e, &hdr, false, &c).unwrap();
         assert_eq!(t.find(&key_from(s1, 1), 2, &c), None);
         assert!(matches!(t.state(d), Some(St::Reasm(_))));
+    }
+
+    /// `n` sources with pairwise distinct load buckets.
+    fn distinct_sources(t: &FragTable, n: usize) -> Vec<u128> {
+        let mut srcs: Vec<u128> = Vec::new();
+        for src in 1u128.. {
+            let b = t.bucket(&key_from(src, 0));
+            if srcs.iter().all(|&o| t.bucket(&key_from(o, 0)) != b) {
+                srcs.push(src);
+            }
+            if srcs.len() == n {
+                break;
+            }
+        }
+        srcs
+    }
+
+    /// Ids of `src` whose key falls in set `s0`.
+    fn ids_in(t: &FragTable, src: u128, s0: usize, n: usize) -> Vec<u32> {
+        (0u32..).filter(|&id| t.set_of(&key_from(src, id)) == s0).take(n).collect()
+    }
+
+    fn sent4(id: u32) -> FragKey {
+        FragKey { src: 5, dst: 6, id, proto: 17, kind: Kind::Sent4 }
+    }
+
+    #[test]
+    fn alias_never_evicts_bucketed_entries() {
+        let c = Counters::default();
+        let mut t = FragTable::new(&cfg(4, 2));
+        let srcs = distinct_sources(&t, 3);
+        let pass = Fwd::To6 { dst: 9, idx: 0 };
+        let hdr = [0x45u8; 20];
+        // One set full of bucketed entries: pass-through, buffered (Pending),
+        // reassembly and poisoned.
+        let s0 = t.set_of(&key_from(srcs[0], 0));
+        let a = ids_in(&t, srcs[0], s0, 2);
+        let b = ids_in(&t, srcs[1], s0, 1);
+        let d = ids_in(&t, srcs[2], s0, 1);
+        let i = t.get_or_insert(&key_from(srcs[0], a[0]), 0, &c).unwrap();
+        t.set_pass(i, pass);
+        let i = t.get_or_insert(&key_from(srcs[0], a[1]), 0, &c).unwrap();
+        t.buffer(i, &[0; 8], &c).unwrap();
+        let i = t.get_or_insert(&key_from(srcs[1], b[0]), 0, &c).unwrap();
+        t.start_reasm(i, &hdr, false, &c).unwrap();
+        let i = t.get_or_insert(&key_from(srcs[2], d[0]), 0, &c).unwrap();
+        t.entries[i].st = Some(St::Poisoned(DropReason::FragmentOverlap));
+        let before: Vec<_> = t.entries[s0..s0 + WAYS].iter().map(|e| (e.key, e.st)).collect();
+        // Aliases into that set: none is inserted, nothing is evicted.
+        let al: Vec<u32> = (0u32..).filter(|&id| t.set_of(&sent4(id)) == s0).take(16).collect();
+        for &id in &al {
+            t.alias(&sent4(id), Fwd::Sent6 { pool: 1, idx: 0 }, 1, &c);
+            assert_eq!(t.get_or_insert(&sent4(id), 1, &c), Err(DropReason::FragmentTableFull));
+        }
+        let after: Vec<_> = t.entries[s0..s0 + WAYS].iter().map(|e| (e.key, e.st)).collect();
+        assert_eq!(before, after);
+        assert_eq!(c.drops(DropReason::FragmentTableFull), 0);
+    }
+
+    #[test]
+    fn alias_replaces_the_oldest_alias() {
+        let c = Counters::default();
+        let mut t = FragTable::new(&cfg(0, 0));
+        let fwd = Fwd::Sent6 { pool: 1, idx: 0 };
+        let s0 = t.set_of(&sent4(0));
+        let al: Vec<u32> = (0u32..).filter(|&id| t.set_of(&sent4(id)) == s0).take(WAYS + 1).collect();
+        for (n, &id) in al[..WAYS].iter().enumerate() {
+            t.alias(&sent4(id), fwd, n as u64, &c);
+        }
+        t.alias(&sent4(al[WAYS]), fwd, 10, &c);
+        assert!(t.find(&sent4(al[0]), 10, &c).is_none(), "oldest alias replaced");
+        for &id in &al[1..] {
+            assert!(t.find(&sent4(id), 10, &c).is_some(), "alias {id} kept");
+        }
+    }
+
+    #[test]
+    fn aliases_cannot_churn_another_sources_entries() {
+        let c = Counters::default();
+        let mut t = FragTable::new(&cfg(0, 0));
+        // A light source's pass-through entries, spread over the table,
+        // using only ids whose set has a free way (so it never replaces
+        // its own entry).
+        let mut light: Vec<(u32, usize)> = Vec::new();
+        for id in 0u32.. {
+            if light.len() == 32 {
+                break;
+            }
+            let s = t.set_of(&key_from(7, id));
+            if t.entries[s..s + WAYS].iter().all(|e| e.st.is_some()) {
+                continue;
+            }
+            let i = t.get_or_insert(&key_from(7, id), 0, &c).unwrap();
+            t.set_pass(i, Fwd::To6 { dst: 9, idx: 0 });
+            light.push((id, i));
+        }
+        // A source completing many datagrams (live load ~0) plants one
+        // alias per datagram.
+        for id in 0..100_000u32 {
+            t.alias(&sent4(id), Fwd::Sent6 { pool: 1, idx: 0 }, 1, &c);
+        }
+        for &(id, i) in &light {
+            assert_eq!(t.find(&key_from(7, id), 1, &c), Some(i));
+        }
+    }
+
+    #[test]
+    fn poisoned_entry_follows_the_load_rule() {
+        let c = Counters::default();
+        let mut t = FragTable::new(&cfg(0, 0));
+        let srcs = distinct_sources(&t, 4);
+        let (a, heavier, equal, lighter) = (srcs[0], srcs[1], srcs[2], srcs[3]);
+        let pass = Fwd::To6 { dst: 9, idx: 0 };
+        // Source a fills one set with poisoned entries (load WAYS).
+        let s0 = t.set_of(&key_from(a, 0));
+        let a_ids = ids_in(&t, a, s0, WAYS + 1);
+        for &id in &a_ids[..WAYS] {
+            let i = t.get_or_insert(&key_from(a, id), 0, &c).unwrap();
+            t.entries[i].st = Some(St::Poisoned(DropReason::FragmentOverlap));
+        }
+        for (src, n) in [(heavier, WAYS + 1), (equal, WAYS)] {
+            let ids: Vec<u32> = (0u32..).filter(|&id| t.set_of(&key_from(src, id)) != s0).take(n).collect();
+            for id in ids {
+                let i = t.get_or_insert(&key_from(src, id), 0, &c).unwrap();
+                t.set_pass(i, pass);
+            }
+        }
+        // Neither a heavier nor an equal source may evict them.
+        for src in [heavier, equal] {
+            let id = ids_in(&t, src, s0, 1)[0];
+            assert_eq!(t.get_or_insert(&key_from(src, id), 1, &c), Err(DropReason::FragmentTableFull));
+        }
+        for &id in &a_ids[..WAYS] {
+            assert!(t.find(&key_from(a, id), 1, &c).is_some(), "a/{id} kept");
+        }
+        // A lighter source evicts the oldest; a's own insert replaces one.
+        let id = ids_in(&t, lighter, s0, 1)[0];
+        assert!(t.get_or_insert(&key_from(lighter, id), 2, &c).is_ok());
+        assert_eq!(t.find(&key_from(a, a_ids[0]), 2, &c), None);
+        assert!(t.get_or_insert(&key_from(a, a_ids[WAYS]), 3, &c).is_ok());
     }
 }
