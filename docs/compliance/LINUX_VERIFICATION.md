@@ -454,7 +454,7 @@ path is still unexercised on Linux (covered only by
 - Remove the package: `platd` and the guard are stopped and disabled; the
   config and `/var/log/plat` remain.
 
-### L19–L23 — cluster HA on three VMs (PLANNED, not yet run)
+### L19–L23 — cluster HA on three VMs (run, PASS in round 6, 2026-10-29)
 
 Branch `feat/cluster-ha` (uncommitted). Nothing below has been executed: the
 VM definitions and scripts are authored and pass `sh -n`, shellcheck and the

@@ -1,8 +1,8 @@
 # Roadmap
 
-Status as of 2026-11-02 (`main` @ `4facf34`). Everything below is
-unreleased: the workspace is version 0.1.0 and `CHANGELOG.md` has only an
-`[Unreleased]` section. Gaps are tracked as POA&M items in
+Status as of 2026-11-03. The latest release is
+[v0.2.1](https://github.com/192d-Wing/usg-plat/releases/tag/v0.2.1)
+(signed, see `CHANGELOG.md`). Gaps are tracked as POA&M items in
 [`docs/compliance/POAM.md`](docs/compliance/POAM.md); this file groups them
 into work and does not replace that register.
 
@@ -13,7 +13,7 @@ into work and does not replace that register.
 | Stateful NAT64 / 464XLAT PLAT (RFC 6146, 7915, 6052) | Implemented: TUN data path, run-to-completion workers, fragments and reassembly (POAM-001), ICMP error generation (POAM-002), TCP simultaneous open (POAM-008), port blocks with cool-down and per-subscriber / per-aggregate limits |
 | Attribution logging (AU-*) | Implemented: schema 8, JSON/CEF, syslog UDP/TCP/TLS 1.3, SHA-256 chained files with `verify-log`; chain is unkeyed (POAM-003) |
 | FIPS / TLS (SC-8, SC-13, IA-*) | Implemented: aws-lc-rs FIPS, TLS 1.3 only, mTLS management, OCSP/CRL revocation; CMVP certificate for AWS-LC-FIPS 4.x pending (POAM-026) |
-| Cluster scale-out and HA (CP-10) | Partial (POAM-007): slices, replication, leases, witness, takeover tested in-process; the three-VM BGP/BFD runs (LINUX_VERIFICATION L19–L23) not done; leader-crash takeover ~6.2 s vs a 5 s target |
+| Cluster scale-out and HA (CP-10) | Partial (POAM-007): slices, replication, leases, witness, takeover; three-VM runs with an FRR BGP/BFD edge (LINUX_VERIFICATION L19–L23) PASS (round 6, 2026-10-29): `kill -9` takeover 3.8 s and VM loss 3.4 s with 200/200 TCP flows, leader crash max 4.5 s over 27 trials (≤ 5 s target; the simulated worst case of ~6.2 s is not excluded); sessions not replicated (POAM-028) |
 | Host hardening (AC-6, SC-7, SC-39) | Implemented: capability-free `platd`, nftables forward policy with `plat-fwguard`; verified on one Ubuntu 24.04 VM |
 | XDP fast path (POAM-016) | Phase 1 code-complete (PRs #23–#28): established UDP in eBPF, `platd` as slow path, loader and systemd units, schema 8 records, `[xdp]` off by default, kernel ≥ 6.6. CI checks are required on `main` on x86_64 and aarch64 (#29). Speed-up not measured |
 | Developer workflow | `/plat-workflow` multi-agent team for Claude Code and Codex (#30); CI: fmt/clippy (host + aarch64), Linux tests, cargo-audit/deny, XDP build/VM/proptest, SonarQube, CodeQL, docs site |
@@ -39,8 +39,9 @@ Ordered by value for the effort, with what each needs.
    is published, cosign keyless signed with build provenance, and verified
    end to end with `scripts/verify-release.sh`. Left: decide on apt/dnf
    repository signing and install-time enforcement (POAM-044).
-4. **HA verification (POAM-007).** Three-VM runs with a real BGP/BFD peer
-   (L19–L23) and the takeover-time target.
+4. **HA verification (POAM-007).** L19–L23 PASS on three VMs with FRR
+   (2026-10-29, round 6). Left: show the leader-crash worst case (~6.2 s in
+   simulation) cannot occur or tighten it, and session pickup (POAM-028).
 
 ## Backlog
 
@@ -68,6 +69,19 @@ Ordered by value for the effort, with what each needs.
   or queue steering.
 
 ### Cluster and HA
+
+- **RustyBGP as an alternative routing daemon (optional).**
+  [RustyBGP](https://github.com/osrg/rustybgp) (Rust, GoBGP gRPC API and
+  config format) supports single-hop BFD (RFC 5880/5881, since 2026-06,
+  release v0.2.0) and installs routes in the kernel without Zebra, so it
+  could replace FRR on the edge and on the translator nodes for an
+  all-Rust stack. Work: a second hook set beside
+  `deploy/hooks/frr-{announce,withdraw}.sh` and `plat-v6-announce.sh` (which
+  drive FRR through `vtysh`), probably on the `gobgp` CLI, with its own
+  `platd.service` sandbox paths and `make test-deploy` coverage; Lima
+  profiles for it; a re-run of L19 (takeover timing with RustyBGP's BFD
+  300 ms × 3) before it is offered. FRR stays the default; RustyBGP's BFD is
+  young (one release), which matters for ATO evidence.
 
 - POAM-017: leader-side batching of slice moves; handover bursts on
   membership change; legacy `contiguous` mode.
