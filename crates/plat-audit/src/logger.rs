@@ -2180,10 +2180,33 @@ mod tests {
     }
 
     fn wait(what: &str, f: impl Fn() -> bool) {
+        wait_for(what, Duration::from_secs(10), f);
+    }
+
+    fn wait_for(what: &str, limit: Duration, f: impl Fn() -> bool) {
         let t = Instant::now();
         while !f() {
-            assert!(t.elapsed() < Duration::from_secs(10), "timed out waiting for {what}");
+            assert!(t.elapsed() < limit, "timed out waiting for {what}");
             std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// Waits until `probe` holds and its value has not changed for `quiet`
+    /// (the logger is idle: no batch, rotation or prune in flight).
+    fn settle<T: PartialEq>(what: &str, quiet: Duration, ok: impl Fn(&T) -> bool, probe: impl Fn() -> T) {
+        let t = Instant::now();
+        let mut last = probe();
+        let mut since = Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_millis(10));
+            let now = probe();
+            if now != last {
+                last = now;
+                since = Instant::now();
+            } else if ok(&last) && since.elapsed() >= quiet {
+                return;
+            }
+            assert!(t.elapsed() < Duration::from_secs(60), "timed out waiting for {what} to settle");
         }
     }
 
@@ -2245,13 +2268,19 @@ mod tests {
         for i in 0..300 {
             assert!(sink.emit(ev(i)));
         }
-        wait("records", || written(&stats) >= 300 && sink.queued() == 0);
-        // The last batch may still be in flight (each checkpoint is synced);
-        // the last rotation's prune records go out with the next batch and
-        // its files are deleted after that checkpoint.
-        std::thread::sleep(Duration::from_millis(300));
-        wait("retention settled", || rotated_names(&path).len() == 2);
-        std::thread::sleep(Duration::from_millis(100));
+        // About 40 rotations, each with synced checkpoints: 3-8 s on a
+        // loaded disk, so this phase gets a load-tolerant limit.
+        wait_for("records", Duration::from_secs(60), || written(&stats) >= 300 && sink.queued() == 0);
+        // Each rotation's prune records go out with the next batch, which
+        // can fill the 4 KiB file and rotate again; wait until the logger is
+        // idle so no rotation or prune (which also returns space to the
+        // simulated volume) straddles the start of the outage.
+        settle(
+            "retention",
+            Duration::from_millis(500),
+            |(_, r): &(u64, Vec<PathBuf>)| r.len() == 2,
+            || (written(&stats), rotated_names(&path)),
+        );
         let before = rotated_names(&path);
         assert_eq!(before.len(), 2, "{before:?}");
 
@@ -2275,6 +2304,16 @@ mod tests {
             !temp_path(&path).exists() && vol.load(Ordering::SeqCst) == 400
         });
         assert_eq!(rotated_names(&path), before, "NIST-101: nothing rotated or deleted during the outage");
+
+        // Records offered during the outage are all lost before space
+        // returns: a starved logger's backlog would otherwise land in the
+        // recovered file, fill it and let retention prune `before`.
+        settle(
+            "outage backlog",
+            Duration::from_millis(200),
+            |&(q, _): &(usize, u64)| q == 0,
+            || (sink.queued(), stats.file_lost.load(Ordering::Relaxed)),
+        );
 
         // Space freed: recovers, and the failed live file is kept.
         vol.store(i64::MAX / 2, Ordering::SeqCst);

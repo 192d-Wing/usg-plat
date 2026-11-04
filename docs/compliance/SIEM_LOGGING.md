@@ -379,7 +379,9 @@ bound ports filling the held-SYN cap (SC-5); alert on it.
 SIEM guidance: a rising `fragment_overlap` or `fragment_tiny` indicates
 fragment-evasion or Teardrop-style traffic; `fragment_table_full`,
 `fragment_buffer_full` and `reassembly_full` indicate a fragment flood
-against the per-worker limits (SC-5); `fragment_unmatched` /
+against the per-worker limits (SC-5). `fragment_table_full` counts both
+entries evicted from a full set and inserts refused (per-source cap, or a
+full set with no entry the source may evict); the two are not separated; `fragment_unmatched` /
 `icmp_quote_unmatched` that do not follow a flood can indicate fragments
 steered across workers (POAM-035). Correlate with the source by packet
 capture: these counters carry no addresses.

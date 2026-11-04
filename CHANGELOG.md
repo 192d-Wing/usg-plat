@@ -4,6 +4,14 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 
 ## [Unreleased]
 
+### Added
+- `deploy/tests/resolver/l33-resolver.sh`: LINUX_VERIFICATION L33, OCSP
+  name resolution through `plat-dns` under the shipped systemd unit
+  (dnsmasq, DNS blackhole, systemd-resolved stub, `/etc/hosts`, resolv.conf
+  reload, seccomp). PASS 2026-11-04 on Ubuntu 24.04 / 6.8 aarch64. An nft
+  output-hook drop of port 53 fails lookups at once with `reason="error"`
+  (netfilter `EPERM`), not `timeout`.
+
 ### Changed
 - POAM-025 (a), SC-5: OCSP/CRL host names are now resolved by a built-in
   hickory-resolver 0.26.3 (plain UDP/TCP DNS; no TLS/DoH/DNSSEC features, no
@@ -40,6 +48,18 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
   `plat_revocation_resolver_inflight >= 32 or plat_revocation_resolver_queued >= 48 or increase(plat_revocation_resolve_failures_total{reason="saturated"}[5m]) > 0`.
 
 ### Fixed
+- SC-5, RFC 6146 §3.4: a full fragment-table set no longer lets a load
+  bucket (randomly keyed source group; colliding sources share one) evict
+  another bucket's pass-through or poisoned entry unless that bucket holds
+  strictly more live entries (own-bucket entries and pass-through or
+  poisoned quote aliases excepted); otherwise the insert is refused
+  (`fragment_table_full`, which counts both evictions and refusals).
+  Quote aliases (`Sent4`/`Sent6`, not charged to any source) now only
+  replace other aliases and can no longer evict any bucketed entry.
+  Previously a heavier flooding source, or one completing many
+  datagrams, could push out a lighter source's entries. New bench
+  `nat64/frag_full_set_insert_{evict,refuse}`. Flaky `frag` unit tests fixed (sources chosen in
+  distinct load buckets, ids in sets with a free way).
 - POAM-025 (a), SC-5: the OCSP/CRL fetcher no longer resolves host names
   without a timeout. IP literals skip resolution; other names resolve on a
   `plat-dns` helper thread waited on only until the per-chain revocation

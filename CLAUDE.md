@@ -17,7 +17,17 @@ The data plane is pure Rust. Cryptography is the one exception: TLS
 builds AWS-LC's FIPS module from C/assembly. Building therefore needs CMake,
 Go and a C compiler (plus `aarch64-linux-gnu-gcc` for `make check-linux` with
 TLS on). Keep all C/FFI crypto behind `plat-tls`; never add another crypto
-provider.
+provider. One recorded exception, not a provider: `chacha20` reaches the
+shipped binaries through `rand` 0.10 in hickory and is used only as the DNS
+query-ID and source-port RNG (non-crypto, outside the FIPS boundary;
+`deploy/tests/supply-chain/crypto-allow.toml`, `CRYPTO_INVENTORY.md`). Any
+other new cipher, hash or RNG crate in a shipped binary is a blocker
+(`make check` runs the CBOM check).
+
+The control plane uses tokio in one place only: the `plat-dns` thread in
+`plat-tls` (current_thread runtime, hickory-resolver with
+`default-features = false`; no TLS, DNSSEC, HTTPS or QUIC features). Workers,
+the sweeper and the packet path never touch it.
 
 See `ARCHITECTURE.md` for the data path, concurrency model and cluster design.
 
@@ -50,7 +60,7 @@ drift). Edit only the `.claude/` sources.
 | `crates/plat-xlat` | RFC 6052 mapping, RFC 7915 in-place header translation, ICMP error translation |
 | `crates/plat-nat64` | Sharded BIB/session/subscriber tables, port blocks, TCP FSM, sweeper, engine |
 | `crates/plat-audit` | Non-blocking SIEM logging: JSON/CEF, RFC 5424 syslog (UDP/TCP/TLS), SHA-256 chained file; `tls` feature |
-| `crates/plat-tls` | FIPS provider and start gate, TLS 1.3 policy, key/cert loading, mTLS identity allow-list, OCSP/CRL revocation |
+| `crates/plat-tls` | FIPS provider and start gate, TLS 1.3 policy, key/cert loading, mTLS identity allow-list, OCSP/CRL revocation; `revocation::dns`: bounded hickory resolver for OCSP/CRL host names (one `plat-dns` thread, `[tls.revocation.resolver]`) |
 | `crates/plat-io` | `PacketQueue` trait, Linux multiqueue TUN, in-memory queue |
 | `crates/plat-cluster` | Deterministic pool partitioning, CIDR cover, rendezvous hashing; HA (sans-IO): fixed slices with weighted rendezvous, lease-based membership/views, config digest, strict peer wire codec |
 | `crates/plat-xdp-core` | `no_std`, no `unsafe`: XDP fast-path ABI (map keys, slot/CONTROL/SLICE/CONFIG layouts), fixed-layout classifier, rewrite, RFC 1624 arithmetic and `decide` over an `Env` trait; shared by the eBPF program and the level-1 differential harness |
@@ -97,7 +107,9 @@ chain, 1 on a verification failure, an unverified tail (unless
 3. **Bounded everything (SC-5).** Every table, queue and per-subscriber resource
    has a configured limit (including `nat64.max_subscribers`); locally
    generated ICMP errors use a per-worker token bucket
-   (`translation.icmp_errors_per_sec`); hash maps use randomly keyed `ahash`.
+   (`translation.icmp_errors_per_sec`); project hash maps use randomly keyed
+   `ahash` (third-party internals such as hickory's cache are bounded by
+   configuration instead).
 4. **Attribution first (AU-12, AU-5).** A port block or binding is never used
    before its audit record is queued, unless `on_overflow = "drop_and_alert"`.
    A block returns to the pool only after its release record is queued.
@@ -138,18 +150,19 @@ chain, 1 on a verification failure, an unverified tail (unless
 
 | Family | Where |
 |--------|-------|
-| SC-5 DoS protection | limits in `Nat64Config` (incl. `max_subscribers` and the per-aggregate `max_subscribers_per_aggregate`), `State::admit_session`, `State::bib_for`, per-worker ICMP error token bucket (a quarter reserved for PTB / Frag Needed; rate 0 or ≥ 4), keyed hashing in `shard.rs`; preallocated per-worker fragment table, hold buffer and reassembly slots bounded by `[translation.fragments]` with per-source caps (`frag.rs`); held simultaneous-open SYNs (`held.rs`): per-BIB slots under the `bib4` shard lock, one per remote address, node cap `nat64.max_held_syns`, bounded expiry ring, arrays freed outside the guard when empty |
+| SC-5 DoS protection | limits in `Nat64Config` (incl. `max_subscribers` and the per-aggregate `max_subscribers_per_aggregate`), `State::admit_session`, `State::bib_for`, per-worker ICMP error token bucket (a quarter reserved for PTB / Frag Needed; rate 0 or ≥ 4), keyed hashing in `shard.rs`; preallocated per-worker fragment table, hold buffer and reassembly slots bounded by `[translation.fragments]` with per-source caps (`frag.rs`); held simultaneous-open SYNs (`held.rs`): per-BIB slots under the `bib4` shard lock, one per remote address, node cap `nat64.max_held_syns`, bounded expiry ring, arrays freed outside the guard when empty; OCSP/CRL name resolution (`revocation/dns.rs`): queue 64, 32 lookups holding a slot, one lookup per host (≤ 64 waiters), ≤ 96 names pending, cache 256 (TTL ≤ 300 s / 60 s negative), every lookup cancelled at the per-chain deadline, no query sent without a slot |
 | SC-7 boundary protection | client prefix allow-list, RFC 6052 §3.1 checks, non-global IPv4 denied by default (`allow_non_global_destinations`), pool-sourced wire IPv4 refused unless `cross_node_hairpin` with its start-gated nft guard (`services/platd/src/hairpin_guard.rs`), ICMP error validation, ADF filtering, host nftables forward policy (`deploy/systemd/plat-tun-setup.sh`) |
 | SC-10 network disconnect | idle timers (RFC 6146 minimums enforced in config) + `State::sweep` |
 | AU-2/3/8/12 | `plat-audit` events, UTC µs timestamps, sequence numbers, node identity |
 | AU-4/AU-5/AU-5(1) | bounded queue, `on_overflow` policy, degraded state on file failure or low free space (`min_free_bytes`, mandatory, default max(2 × `max_bytes`, 1 GiB)), `/healthz`, `audit_queue_overflow` / `audit_output_failure` / `audit_storage_threshold` records |
 | AU-6(3)/(4) | ECS/CEF correlation fields, RFC 5424 syslog export |
 | AU-9/AU-11 | SHA-256 chain v2 across files (unkeyed, POAM-003), `platd verify-log`, 0640 file mode, `max_files` retention with `audit_retention_prune` records |
-| SI-4 | per-worker counters, Prometheus `/metrics`, periodic counter records |
-| SI-10 | `plat-packet` validation, strict OCSP/CRL/HTTP parsing in `plat-tls`, property tests that parsers never panic |
+| SI-4 | per-worker counters, Prometheus `/metrics` (incl. `plat_revocation_resolve_failures_total{reason}`, `plat_revocation_resolver_inflight`/`_queued`), periodic counter records |
+| SI-10 | `plat-packet` validation, strict OCSP/CRL/HTTP parsing in `plat-tls`, property tests that parsers never panic; DNS responses are parsed by hickory-proto (third party, pinned `=0.26.3`), not by project parsers |
 | SC-8/SC-13/AC-17 | TLS 1.3 syslog (RFC 5425) and mTLS management via aws-lc-rs FIPS; FIPS start gate |
-| IA-3/IA-5(2)/AC-3 | mTLS client certs with typed allow-list (`cn:`/`dns:`/`uri:`/`sha256:`), full-chain OCSP then CRL revocation |
-| CP-10/SC-5(2) cluster HA | `plat-cluster` membership and slices, `plat-nat64` `repl.rs` rings/shadow and `State::adopt_slice`, `services/platd/src/cluster/`; off unless `[cluster.ha] enabled = true`; POAM-007 Partial (sessions not replicated, POAM-028 pickup; leader-crash takeover ~6.2 s vs 5 s target; L19–L23 not run), POAM-017 (a) open, (b) partial |
+| IA-3/IA-5(2)/AC-3 | mTLS client certs with typed allow-list (`cn:`/`dns:`/`uri:`/`sha256:`), full-chain OCSP then CRL revocation; responder/CDP names resolve through hickory, bypassing nsswitch (POAM-045), names looked up as given (no search list, single-label refused), resolved addresses unfiltered (POAM-046) |
+| SC-21 | not implemented in product (no DNSSEC validation); compensated by OCSP/CRL signature validation |
+| CP-10/SC-5(2) cluster HA | `plat-cluster` membership and slices, `plat-nat64` `repl.rs` rings/shadow and `State::adopt_slice`, `services/platd/src/cluster/`; off unless `[cluster.ha] enabled = true`; POAM-007 Partial (sessions not replicated, POAM-028 pickup; L19–L23 PASS on three VMs with FRR, round 6, 2026-10-29, leader crash max 4.5 s over 27 trials, simulated worst case ~6.2 s not excluded), POAM-017 (a) open, (b) partial |
 | AU-2/AU-12/AU-5 cluster | schema 7 `cluster_*` records and `nat_port_block_adopt` queued before a slice is Active (retried under `refuse_new_bindings`); `cluster_operator_command` for every takeover/restore and refusal |
 | SC-8/IA-3/AC-3 cluster | peer channel mTLS 1.3 via `plat_tls::peer_configs`, identity bound to member id, accept-side IP pinning (dialer not pinned, POAM-031), replication only from the slice owner, one trust domain (POAM-032); operator socket admits uid 0 or the daemon uid via peer credentials (`plat_io::cred`) |
 | SC-24 cluster | lease self-fence, minority never takes over, unsynced takeover holds back unseen blocks |
@@ -157,7 +170,8 @@ chain, 1 on a verification failure, an unverified tail (unless
 | AU-12/SI-4/SI-7 XDP | schema 8 `xdp_fastpath_state` and `service_start` XDP fields; `plat_xdp_*` metrics; object SHA-256 and frozen `CONFIG` digest checked at start and every 10 s; stale pins refused (`stale_maps`) |
 | AC-6/SC-39 XDP | `plat-xdp.service` oneshot loader alone holds `CAP_BPF`/`CAP_NET_ADMIN` (`Group=plat`, bound to `platd` so both restart together); `platd` stays capability-free, its drop-in adds only the `bpf` syscall and read-only `/run/plat`; bpffs at `/run/plat/bpf` via `run-plat-bpf.mount`; `plat-fwguard` detaches a swapped program (verified on one Ubuntu 24.04 / 6.8 VM, L26/L28) |
 | CM-6/CM-7 | `deny_unknown_fields`, validated ranges, management is loopback-only plaintext or mTLS (never plaintext off-host) |
-| CM-3/SA-11/SR-3 | CI (fmt, clippy host + aarch64, tests on Linux, cargo-audit/deny, and the `xdp-*` build, VM and proptest jobs on x86_64 + aarch64) is a required check on `main`; actions pinned by SHA |
+| CM-3/SA-11/SR-3 | CI (fmt, clippy host + aarch64, tests on Linux, cargo-audit/deny, and the `xdp-*` build, VM and proptest jobs on x86_64 + aarch64) is a required check on `main`; actions pinned by SHA; hickory-resolver pinned exactly, other crates through `Cargo.lock`; CBOM check with `crypto-allow.toml` |
+| SI-7/SR-4/SR-11/CM-14 | `v*` tags only: `packages.yml` `release` job signs every file and `SHA256SUMS` with cosign keyless and adds build provenance; `scripts/verify-release.sh`; `v*` tag ruleset (admins only); verified end to end on v0.2.1; install-time enforcement not met (POAM-044) |
 | AC-6/SC-39 | systemd unit grants no capabilities and sandboxes the unprivileged `plat` user (verified on one Ubuntu 24.04 Linux VM, `docs/compliance/LINUX_VERIFICATION.md` L1–L4 and L26; not on x86_64 or bare metal) |
 
 ## Compliance Documentation

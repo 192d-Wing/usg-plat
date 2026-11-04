@@ -123,6 +123,49 @@ fn bench(c: &mut Criterion) {
             })
         });
     }
+    // PERF-002: the full-set path of `FragTable::get_or_insert` (every way
+    // occupied, no expired way), which the fragment pairs above never reach.
+    // A small table is filled with one pass-through entry per source (load
+    // 1 everywhere). `evict`: each insert comes from a fresh source (load
+    // 0), so it scans the set and evicts the oldest eligible entry (steady
+    // state). `refuse`: quote-alias inserts scan the set, find only
+    // bucketed entries and are refused.
+    {
+        use plat_common::config::FragmentsConfig;
+        use plat_nat64::frag::{FragKey, FragTable, Fwd, Kind};
+        let fc = FragmentsConfig {
+            max_entries: 64,
+            max_buffered_fragments: 0,
+            reassembly_slots: 0,
+            ..FragmentsConfig::default()
+        };
+        let cnt = Counters::default();
+        let mut t = FragTable::new(&fc);
+        let key = |src: u128, kind| FragKey { src, dst: 2, id: 1, proto: 17, kind };
+        let mut src = 1u128;
+        while t.len() < 64 {
+            if let Ok(i) = t.get_or_insert(&key(src, Kind::V4In), 0, &cnt) {
+                t.set_pass(i, Fwd::To6 { dst: 9, idx: 0 });
+            }
+            src += 1;
+        }
+        g.bench_function("frag_full_set_insert_evict", |b| {
+            b.iter(|| {
+                src += 1;
+                if let Ok(i) = t.get_or_insert(&key(src, Kind::V4In), 0, &cnt) {
+                    t.set_pass(i, Fwd::To6 { dst: 9, idx: 0 });
+                }
+            })
+        });
+        let mut id = 0u32;
+        g.bench_function("frag_full_set_insert_refuse", |b| {
+            b.iter(|| {
+                id = id.wrapping_add(1);
+                let k = FragKey { src: 5, dst: 6, id, proto: 17, kind: Kind::Sent4 };
+                black_box(t.get_or_insert(&k, 0, &cnt).is_err())
+            })
+        });
+    }
     // Fragmented ICMPv6 echo: reassembly (copy into a slot) then the normal
     // path on the whole datagram.
     let echo: Vec<[Vec<u8>; 2]> = (0..1024u32)
