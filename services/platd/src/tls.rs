@@ -638,6 +638,28 @@ mod tests {
         assert_eq!(date(1_793_196_960), "2026-10-28");
     }
 
+    /// QA: `check-config` resolver line for explicit nameservers with the
+    /// hosts file off, and no line when revocation is off.
+    #[test]
+    fn qa_describe_resolver_custom_and_off() {
+        let c = plat_common::config::DnsResolverConfig {
+            nameservers: vec!["192.0.2.53".into(), "[2001:db8::53]:5353".into()],
+            timeout_ms: 500,
+            use_hosts_file: false,
+        };
+        let r = RevocationConfig { resolver: Some(c), ..RevocationConfig::default() };
+        let mut o = String::new();
+        describe_resolver(&mut o, &r);
+        assert_eq!(
+            o,
+            "  resolver: DNS 192.0.2.53:53, [2001:db8::53]:5353, timeout 500 ms, /etc/hosts off, nsswitch not consulted\n"
+        );
+        let off = RevocationConfig { mode: RevocationMode::Off, ..r };
+        let mut o = String::new();
+        describe_resolver(&mut o, &off);
+        assert!(o.is_empty(), "{o}");
+    }
+
     /// SI-4 / SC-5: the bounded-resolver metrics are rendered with their
     /// TYPE lines, every `reason` label and both gauges.
     #[test]

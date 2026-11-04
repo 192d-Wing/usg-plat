@@ -175,6 +175,13 @@ Deployment notes:
 
 Configuration changes to note when upgrading from an earlier build:
 
+- OCSP/CRL DNS now uses the built-in resolver (see the TLS notes; nsswitch
+  is not consulted, POAM-045). Names are looked up exactly as given: no
+  search list, and single-label names are refused. The gauge
+  `plat_revocation_resolver_threads` is removed. Alert instead on
+  `plat_revocation_resolver_inflight` (max 32), `plat_revocation_resolver_queued`
+  (max 64) and `plat_revocation_resolve_failures_total{reason="saturated"|"error"}`.
+
 - `translation.allow_non_global_destinations` defaults to `false`: RFC 1918,
   100.64/10, documentation and other RFC 6890 non-global IPv4 space is
   denied as a destination (and as an inbound data source) under every

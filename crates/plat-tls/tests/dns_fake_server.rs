@@ -29,6 +29,8 @@ const V6_10: std::net::Ipv6Addr = std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0
 struct FakeDns {
     addr: SocketAddr,
     queries: Arc<Mutex<HashMap<String, usize>>>,
+    /// Question names as received (case preserved).
+    raw: Arc<Mutex<Vec<String>>>,
     stop: Arc<AtomicBool>,
 }
 
@@ -46,13 +48,15 @@ impl FakeDns {
         let addr = s.local_addr().unwrap();
         let queries = Arc::new(Mutex::new(HashMap::new()));
         let stop = Arc::new(AtomicBool::new(false));
-        let (q, st) = (queries.clone(), stop.clone());
+        let raw = Arc::new(Mutex::new(Vec::new()));
+        let (q, st, rw) = (queries.clone(), stop.clone(), raw.clone());
         std::thread::spawn(move || {
             let mut buf = [0u8; 1500];
             while !st.load(Ordering::Acquire) {
                 let Ok((n, peer)) = s.recv_from(&mut buf) else { continue };
                 let Some((name, qtype, qend)) = question(&buf[..n]) else { continue };
                 *q.lock().unwrap().entry(name.clone()).or_insert(0) += 1;
+                rw.lock().unwrap().push(String::from_utf8_lossy(&buf[13..qend.saturating_sub(5)]).into_owned());
                 let first = name.split('.').next().unwrap_or("").to_string();
                 let msg = buf[..qend].to_vec();
                 let sock = s.try_clone().unwrap();
@@ -72,11 +76,21 @@ impl FakeDns {
                     }
                     "nx" => reply(header_only(&msg, 3, false)),
                     "tc" => reply(header_only(&msg, 0, true)),
+                    // Answer with every letter of the question case-flipped.
+                    "flip" => {
+                        let mut m = msg.clone();
+                        for b in &mut m[12..qend - 4] {
+                            if b.is_ascii_alphabetic() {
+                                *b ^= 0x20;
+                            }
+                        }
+                        reply(answer(&m, qtype, v4, V6_10));
+                    }
                     _ => {} // never answers (incl. "never", "flood*")
                 }
             }
         });
-        Self { addr, queries, stop }
+        Self { addr, queries, raw, stop }
     }
 
     fn count(&self, name: &str) -> usize {
@@ -259,7 +273,11 @@ fn bad_resolv_conf_keeps_last_good_config() {
     std::fs::write(&conf, "search example.net\n").unwrap(); // no nameserver
     std::fs::write(&hosts, "192.0.2.81 b.test\n").unwrap();
     std::thread::sleep(Duration::from_millis(20));
-    assert!(d.resolve("a.test", 80, secs(5)).is_ok(), "old config kept");
+    let end = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < end {
+        assert!(d.resolve("a.test", 80, secs(5)).is_ok(), "old config kept");
+        std::thread::sleep(Duration::from_millis(10));
+    }
     assert!(d.resolve("b.test", 80, Instant::now() + Duration::from_millis(500)).is_err(), "new files rejected");
 }
 
@@ -298,4 +316,97 @@ fn fetch_by_name_through_the_global_resolver() {
     assert_eq!(r.body, b"crl");
     assert!(srv.count("ocsp.test") >= 1);
     assert_eq!(dns::stats().errors, 0);
+}
+
+/// QA (Q2): the hosts file is rewritten repeatedly while lookups run;
+/// no panic, every caller returns by its deadline, and the final content
+/// is served once writes stop.
+#[test]
+fn qa_reload_races_with_lookups() {
+    let srv = FakeDns::start(OK_V4);
+    let dir = TempDir::new("dns-race");
+    let hosts = dir.write("hosts", "192.0.2.90 race.test\n", 0o644);
+    let s = ResolverSettings { hosts_file: Some(hosts.clone()), reload_interval: Duration::ZERO, ..settings(&srv) };
+    let d = Arc::new(Dns::new(s));
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let (hosts, stop) = (hosts.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut i = 0u8;
+            while !stop.load(Ordering::Acquire) {
+                // Alternate valid content and a truncated/garbled file.
+                let body =
+                    if i % 3 == 2 { "192.0.2.\n".to_string() } else { format!("192.0.2.{} race.test\n", 90 + i % 2) };
+                let tmp = hosts.with_extension("tmp");
+                std::fs::write(&tmp, body).unwrap();
+                std::fs::rename(&tmp, &hosts).unwrap();
+                i = i.wrapping_add(1);
+                std::thread::sleep(Duration::from_millis(3));
+            }
+        })
+    };
+    let hs: Vec<_> = (0..8)
+        .map(|_| {
+            let d = d.clone();
+            std::thread::spawn(move || {
+                for _ in 0..50 {
+                    let dl = Instant::now() + Duration::from_millis(500);
+                    let _ = d.resolve("race.test", 80, dl);
+                    assert!(Instant::now() < dl + Duration::from_millis(50));
+                }
+            })
+        })
+        .collect();
+    for h in hs {
+        h.join().unwrap();
+    }
+    stop.store(true, Ordering::Release);
+    writer.join().unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+    std::fs::write(&hosts, "192.0.2.99 race.test\n").unwrap();
+    // The reload runs off the lookup thread (SEC-003) and is swapped in by
+    // a later lookup, so poll for it (bounded).
+    let want = vec![SocketAddr::from(([192, 0, 2, 99], 80))];
+    let end = secs(5);
+    while d.resolve("race.test", 80, secs(1)).ok().as_ref() != Some(&want) && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(d.resolve("race.test", 80, secs(5)).unwrap(), want);
+    assert_eq!((d.stats().in_flight, d.stats().queued), (0, 0));
+}
+
+/// SEC-002: query names go out with 0x20 case randomisation, and the
+/// server's echo of the question case is accepted.
+#[test]
+fn query_case_is_randomised_and_echo_accepted() {
+    let srv = FakeDns::start(OK_V4);
+    let d = Dns::new(settings(&srv));
+    for l in ["alpha", "bravo", "charlie", "delta", "echo"] {
+        assert!(d.resolve(&format!("ok.{l}.test"), 80, secs(5)).is_ok(), "{l}");
+    }
+    let raw = srv.raw.lock().unwrap().clone();
+    assert!(raw.iter().any(|n| n.bytes().any(|b| b.is_ascii_uppercase())), "{raw:?}");
+}
+
+/// SEC-002: a reply whose question case does not match the query is not
+/// accepted; the lookup fails by its deadline.
+#[test]
+fn mismatched_question_case_is_rejected() {
+    let srv = FakeDns::start(OK_V4);
+    let d = Dns::new(settings(&srv));
+    let t0 = Instant::now();
+    assert!(d.resolve("flip.example.test", 80, t0 + Duration::from_secs(1)).is_err());
+    assert!(t0.elapsed() < Duration::from_millis(1100));
+    assert!(srv.count("flip.example.test") >= 1);
+}
+
+/// SEC-004: single-label names are refused without a query.
+#[test]
+fn single_label_names_are_refused() {
+    let srv = FakeDns::start(OK_V4);
+    let d = Dns::new(settings(&srv));
+    for h in ["ok", "ok.", "localhost"] {
+        assert_eq!(d.resolve(h, 80, secs(2)), Err(HttpError::Connect), "{h}");
+    }
+    assert_eq!(srv.raw.lock().unwrap().len(), 0);
 }

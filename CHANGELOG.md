@@ -23,14 +23,21 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
   nss-resolve, LDAP/NIS or myhostname no longer resolve; these fetches fail
   closed. The systemd-resolved stub (127.0.0.53) and `/etc/hosts` still
   work.
-- Metrics: `plat_revocation_resolver_threads` is removed and replaced by
-  `plat_revocation_resolver_inflight` and `plat_revocation_resolver_queued`.
-  `plat_revocation_resolve_failures_total` gains `reason="error"`.
+- Metrics: `plat_revocation_resolve_failures_total` gains `reason="error"`.
 - Supply chain: new dependencies `hickory-resolver`, `tokio` and
   `resolv-conf`. `chacha20` (through `rand` 0.10 `std_rng`) now ships, as a
   non-crypto RNG for DNS query IDs and source ports only, outside the FIPS
   boundary (user decision; `crypto-allow.toml`, CBOM `lib/chacha20`,
   CRYPTO_INVENTORY).
+
+### Removed (breaking for dashboards and alerts)
+- Gauge `plat_revocation_resolver_threads`. Alerts on it stop firing
+  silently (absent series). Replacements:
+  - `plat_revocation_resolver_inflight` (lookups holding a slot, max 32)
+  - `plat_revocation_resolver_queued` (jobs queued, max 64)
+
+  Suggested alert:
+  `plat_revocation_resolver_inflight >= 32 or plat_revocation_resolver_queued >= 48 or increase(plat_revocation_resolve_failures_total{reason="saturated"}[5m]) > 0`.
 
 ### Fixed
 - POAM-025 (a), SC-5: the OCSP/CRL fetcher no longer resolves host names

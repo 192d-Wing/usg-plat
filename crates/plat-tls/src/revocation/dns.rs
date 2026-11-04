@@ -8,7 +8,9 @@
 //! under `timeout_at(deadline)`, so an abandoned lookup is really cancelled:
 //! its future, sockets and slot are dropped at the deadline.
 //!
-//! IP-literal hosts skip all of this (no queue, no thread).
+//! IP-literal hosts skip all of this (no queue, no thread). Names are
+//! looked up exactly as given: no search list, `ndots` 0, and single-label
+//! names are refused. Query names use 0x20 case randomisation.
 //!
 //! Configuration comes from `[tls.revocation.resolver]` ([`ResolverSettings`]):
 //! nameservers override, else `/etc/resolv.conf`; `/etc/hosts` on or off. The
@@ -29,6 +31,9 @@
 //!   the fetch of a signed object, whose signature is always checked
 //! - RFC 1035 §4.2.1, RFC 7766 (TCP fallback), RFC 5452 (random query ID
 //!   and source port), RFC 2308 (negative caching, TTL capped at 60 s)
+//! - NIST 800-53: SC-21 - not implemented here (no DNSSEC); compensated by
+//!   OCSP/CRL signature validation, ID/port/0x20 randomisation and an
+//!   optional organisational validating resolver (`nameservers`)
 // POAM: POAM-045 - nsswitch is bypassed (no getaddrinfo fallback); names
 // resolvable only through NSS modules fail closed.
 
@@ -61,6 +66,8 @@ use super::http::HttpError;
 pub const QUEUE_CAP: usize = 64;
 /// Lookups running at once on the DNS thread.
 pub const MAX_INFLIGHT: usize = 32;
+/// Names being resolved or waiting for one of the [`MAX_INFLIGHT`] slots.
+pub const MAX_PENDING: usize = MAX_INFLIGHT + QUEUE_CAP;
 /// Callers sharing one in-flight lookup for the same host name.
 pub const MAX_DEDUPE_WAITERS: usize = 64;
 /// hickory response cache, in responses.
@@ -168,7 +175,6 @@ type Factory = Arc<dyn Fn() -> Result<Box<dyn LookupBackend>, String> + Send + S
 #[derive(Default)]
 struct Shared {
     in_flight: AtomicUsize,
-    queued: AtomicUsize,
 }
 
 struct Spawn {
@@ -220,7 +226,14 @@ impl Dns {
             spawn_failed: self.spawn_failed.load(Ordering::Relaxed),
             errors: self.errors.load(Ordering::Relaxed),
             in_flight: self.shared.in_flight.load(Ordering::Relaxed),
-            queued: self.shared.queued.load(Ordering::Relaxed),
+            // Exact: jobs sitting in the bounded channel.
+            queued: self
+                .spawn
+                .lock()
+                .tx
+                .as_ref()
+                .filter(|t| !t.is_closed())
+                .map_or(0, |t| t.max_capacity() - t.capacity()),
         }
     }
 
@@ -265,17 +278,14 @@ impl Dns {
         if deadline.saturating_duration_since(Instant::now()).is_zero() {
             return Err(HttpError::Timeout);
         }
-        if host.is_empty() || host.len() > MAX_HOST_LEN {
+        // SEC-004: single-label names are refused (no search expansion).
+        if host.is_empty() || host.len() > MAX_HOST_LEN || !host.trim_end_matches('.').contains('.') {
             self.errors.fetch_add(1, Ordering::Relaxed);
             return Err(HttpError::Connect);
         }
         let Some(tx) = self.sender() else { return Err(HttpError::Connect) };
         let (rtx, rrx) = smpsc::sync_channel(1);
-        // Counted before the send so the DNS thread's decrement never
-        // precedes it.
-        self.shared.queued.fetch_add(1, Ordering::Relaxed);
         if let Err(e) = tx.try_send(Job { host: host.to_owned(), deadline, reply: rtx }) {
-            self.shared.queued.fetch_sub(1, Ordering::Relaxed);
             return Err(match e {
                 mpsc::error::TrySendError::Full(_) => {
                     self.saturated.fetch_add(1, Ordering::Relaxed);
@@ -340,7 +350,7 @@ fn run(mut rx: mpsc::Receiver<Job>, factory: &Factory, shared: &Arc<Shared>) {
         Ok(rt) => rt,
         Err(e) => {
             tracing::warn!(error = %e, "plat-dns runtime could not start");
-            drain(&mut rx, shared);
+            drain(&mut rx);
             return;
         }
     };
@@ -355,31 +365,36 @@ fn run(mut rx: mpsc::Receiver<Job>, factory: &Factory, shared: &Arc<Shared>) {
         }
         Err(e) => tracing::warn!(error = %e, "plat-dns resolver could not start; OCSP/CRL fetches by name fail"),
     }
-    drain(&mut rx, shared);
+    drain(&mut rx);
 }
 
 /// Closes the queue and drops what is left (callers see `Disconnected`).
-fn drain(rx: &mut mpsc::Receiver<Job>, shared: &Shared) {
+fn drain(rx: &mut mpsc::Receiver<Job>) {
     rx.close();
-    while rx.try_recv().is_ok() {
-        shared.queued.fetch_sub(1, Ordering::Relaxed);
-    }
+    // `blocking_recv` also takes a send that got its permit before the
+    // close. Never called inside the runtime.
+    while rx.blocking_recv().is_some() {}
 }
 
 type Pending = Rc<RefCell<Vec<(String, Vec<smpsc::SyncSender<Reply>>)>>>;
 
-async fn serve(rx: &mut mpsc::Receiver<Job>, mut backend: Box<dyn LookupBackend>, shared: Arc<Shared>) {
-    // SC-5: at most MAX_INFLIGHT lookups; `pending` holds one entry per
-    // running lookup, so it is bounded by the semaphore too.
+async fn serve(rx: &mut mpsc::Receiver<Job>, backend: Box<dyn LookupBackend>, shared: Arc<Shared>) {
+    // SC-5: at most MAX_INFLIGHT lookups hold a slot; `pending` (one entry
+    // per name being resolved or waiting for a slot) is capped at
+    // MAX_PENDING. The loop never waits for a slot (SEC-001): a job for a
+    // name already pending joins it; otherwise its task waits for a slot,
+    // after one probe poll that answers cache and hosts hits at once, so a
+    // job never blocks the jobs queued behind it.
     let sem = Arc::new(Semaphore::new(MAX_INFLIGHT));
     let pending: Pending = Rc::new(RefCell::new(Vec::new()));
+    // Single-threaded; borrowed only synchronously, never across an await.
+    let backend = Rc::new(RefCell::new(backend));
     while let Some(job) = rx.recv().await {
-        shared.queued.fetch_sub(1, Ordering::Relaxed);
         if job.deadline <= Instant::now() {
             let _ = job.reply.try_send(Err(Fail::Timeout));
             continue;
         }
-        backend.maintain();
+        backend.borrow_mut().maintain();
         let key = job.host.to_ascii_lowercase();
         {
             let mut p = pending.borrow_mut();
@@ -391,27 +406,57 @@ async fn serve(rx: &mut mpsc::Receiver<Job>, mut backend: Box<dyn LookupBackend>
                 }
                 continue;
             }
-        }
-        let permit = match tokio::time::timeout_at(job.deadline.into(), sem.clone().acquire_owned()).await {
-            Ok(Ok(p)) => p,
-            _ => {
-                let _ = job.reply.try_send(Err(Fail::Timeout));
+            if p.len() >= MAX_PENDING {
+                let _ = job.reply.try_send(Err(Fail::Saturated));
                 continue;
             }
-        };
-        pending.borrow_mut().push((key.clone(), vec![job.reply]));
-        shared.in_flight.fetch_add(1, Ordering::Relaxed);
-        let done = Finish { key, pending: pending.clone(), shared: shared.clone(), result: None, _permit: permit };
-        let fut = backend.lookup(&job.host);
+            p.push((key.clone(), vec![job.reply]));
+        }
         let deadline = job.deadline;
+        let mut done = Finish { key, pending: pending.clone(), shared: shared.clone(), result: None, permit: None };
+        if let Ok(permit) = sem.clone().try_acquire_owned() {
+            done.hold(permit);
+            let fut = backend.borrow_mut().lookup(&job.host);
+            tokio::task::spawn_local(async move {
+                // SC-5: the lookup is dropped (cancelled) at the deadline.
+                done.answer(match tokio::time::timeout_at(deadline.into(), fut).await {
+                    Ok(r) => outcome(r),
+                    Err(_) => Err(Fail::Timeout),
+                });
+            });
+            continue;
+        }
+        // All slots busy: probe once, then wait for a slot.
+        let probe = backend.borrow_mut().lookup(&job.host);
+        let (sem, backend, host) = (sem.clone(), backend.clone(), job.host);
         tokio::task::spawn_local(async move {
-            // SC-5: the lookup is dropped (cancelled) at the deadline.
+            let mut probe = probe;
+            let first = std::future::poll_fn(|cx| std::task::Poll::Ready(probe.as_mut().poll(cx))).await;
+            if let std::task::Poll::Ready(r) = first {
+                return done.answer(outcome(r));
+            }
+            // A probe that would need the network is dropped (cancelled)
+            // before it can hold resources without a slot.
+            drop(probe);
+            let Ok(Ok(permit)) = tokio::time::timeout_at(deadline.into(), sem.acquire_owned()).await else {
+                return done.answer(Err(Fail::Timeout));
+            };
+            done.hold(permit);
+            let Some(fut) = backend.try_borrow_mut().ok().map(|mut b| b.lookup(&host)) else {
+                return done.answer(Err(Fail::Error));
+            };
             done.answer(match tokio::time::timeout_at(deadline.into(), fut).await {
-                Ok(Ok(v)) if !v.is_empty() => Ok(order(v)),
-                Ok(_) => Err(Fail::Error),
+                Ok(r) => outcome(r),
                 Err(_) => Err(Fail::Timeout),
             });
         });
+    }
+}
+
+fn outcome(r: Result<Vec<IpAddr>, String>) -> Reply {
+    match r {
+        Ok(v) if !v.is_empty() => Ok(order(v)),
+        _ => Err(Fail::Error),
     }
 }
 
@@ -422,10 +467,16 @@ struct Finish {
     pending: Pending,
     shared: Arc<Shared>,
     result: Option<Reply>,
-    _permit: tokio::sync::OwnedSemaphorePermit,
+    /// The slot, once taken (counted in `in_flight` while held).
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl Finish {
+    fn hold(&mut self, p: tokio::sync::OwnedSemaphorePermit) {
+        self.shared.in_flight.fetch_add(1, Ordering::Relaxed);
+        self.permit = Some(p);
+    }
+
     /// Records the result; waiters are answered on drop.
     fn answer(mut self, r: Reply) {
         self.result = Some(r);
@@ -434,6 +485,10 @@ impl Finish {
 
 impl Drop for Finish {
     fn drop(&mut self) {
+        // SEC-005: released first, whatever happens below.
+        if self.permit.take().is_some() {
+            self.shared.in_flight.fetch_sub(1, Ordering::Relaxed);
+        }
         let waiters = {
             let Ok(mut p) = self.pending.try_borrow_mut() else { return };
             match p.iter().position(|(k, _)| *k == self.key) {
@@ -446,10 +501,11 @@ impl Drop for Finish {
             // A caller that gave up has dropped its receiver; that is fine.
             let _ = w.try_send(r.clone());
         }
-        self.shared.in_flight.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
+// POAM: POAM-046 - resolved addresses are not filtered (loopback,
+// link-local, metadata); fetches of signed objects only, fail closed.
 /// IPv6 addresses first, then IPv4, without duplicates, at most
 /// [`MAX_ADDRS`]; when both families exist the last slot is kept for the
 /// first IPv4 address, so a host with broken IPv6 is still reachable.
@@ -480,7 +536,11 @@ struct Hickory {
     hosts: Arc<Hosts>,
     stamp: Stamp,
     next_check: Instant,
+    /// Result of a reload running on the blocking pool (SEC-003).
+    reload: Option<smpsc::Receiver<Reload>>,
 }
+
+type Reload = (Stamp, Result<(TokioResolver, Arc<Hosts>), String>);
 
 fn mtime(p: &Path) -> Option<SystemTime> {
     std::fs::metadata(p).and_then(|m| m.modified()).ok()
@@ -491,7 +551,7 @@ impl Hickory {
         let stamp = Self::stamp(&settings);
         let (resolver, hosts) = build(&settings)?;
         let next_check = Instant::now() + settings.reload_interval;
-        Ok(Self { settings, resolver, hosts, stamp, next_check })
+        Ok(Self { settings, resolver, hosts, stamp, next_check, reload: None })
     }
 
     fn stamp(s: &ResolverSettings) -> Stamp {
@@ -518,28 +578,46 @@ impl LookupBackend for Hickory {
     }
 
     /// Re-reads resolv.conf / hosts when their mtime changed; a bad file
-    /// keeps the last good resolver (warned once per change).
+    /// keeps the last good resolver (warned once per change). The stat and
+    /// the reads run on the runtime's blocking pool (one thread at most,
+    /// `max_blocking_threads(1)`), never on the thread serving lookups; the
+    /// result is swapped in by a later call.
     fn maintain(&mut self) {
+        if let Some(rx) = &self.reload {
+            match rx.try_recv() {
+                Ok((stamp, res)) => {
+                    self.reload = None;
+                    self.stamp = stamp;
+                    match res {
+                        Ok((r, h)) => {
+                            self.resolver = r;
+                            self.hosts = h;
+                            tracing::info!("plat-dns: resolver configuration reloaded");
+                        }
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            "plat-dns: new resolver configuration rejected; keeping the last good one"
+                        ),
+                    }
+                }
+                Err(smpsc::TryRecvError::Empty) => return,
+                Err(smpsc::TryRecvError::Disconnected) => self.reload = None,
+            }
+        }
         let now = Instant::now();
         if now < self.next_check {
             return;
         }
         self.next_check = now + self.settings.reload_interval;
-        let stamp = Self::stamp(&self.settings);
-        if stamp == self.stamp {
-            return;
-        }
-        self.stamp = stamp;
-        match build(&self.settings) {
-            Ok((r, h)) => {
-                self.resolver = r;
-                self.hosts = h;
-                tracing::info!("plat-dns: resolver configuration reloaded");
+        let (tx, rx) = smpsc::sync_channel(1);
+        let (settings, old) = (self.settings.clone(), self.stamp);
+        tokio::task::spawn_blocking(move || {
+            let stamp = Hickory::stamp(&settings);
+            if stamp != old {
+                let _ = tx.try_send((stamp, build(&settings)));
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "plat-dns: new resolver configuration rejected; keeping the last good one")
-            }
-        }
+        });
+        self.reload = Some(rx);
     }
 }
 
@@ -552,8 +630,9 @@ fn read_capped(p: &Path) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Nameservers, search list and `ndots` from a resolv.conf.
-fn read_resolv_conf(p: &Path) -> Result<(ResolverConfig, usize), String> {
+/// Nameservers from a resolv.conf. `search`, `domain` and `ndots` are
+/// ignored on purpose (SEC-004): CA-supplied names are never expanded.
+fn read_resolv_conf(p: &Path) -> Result<ResolverConfig, String> {
     let raw = read_capped(p).map_err(|e| format!("{}: {e}", p.display()))?;
     let c = resolv_conf::Config::parse(&raw).map_err(|e| format!("{}: {e}", p.display()))?;
     let ns: Vec<NameServerConfig> =
@@ -561,13 +640,11 @@ fn read_resolv_conf(p: &Path) -> Result<(ResolverConfig, usize), String> {
     if ns.is_empty() {
         return Err(format!("{}: no nameserver", p.display()));
     }
-    let search = c.get_last_search_or_domain().filter(|d| *d != "--").filter_map(|d| Name::from_str(d).ok()).collect();
-    let ndots = usize::try_from(c.ndots.min(15)).unwrap_or(1);
-    Ok((ResolverConfig::from_parts(None, search, ns), ndots))
+    Ok(ResolverConfig::from_parts(None, Vec::new(), ns))
 }
 
 fn build(s: &ResolverSettings) -> Result<(TokioResolver, Arc<Hosts>), String> {
-    let (config, ndots) = if s.nameservers.is_empty() {
+    let config = if s.nameservers.is_empty() {
         read_resolv_conf(&s.resolv_conf)?
     } else {
         let ns = s
@@ -582,10 +659,11 @@ fn build(s: &ResolverSettings) -> Result<(TokioResolver, Arc<Hosts>), String> {
                 n
             })
             .collect();
-        (ResolverConfig::from_parts(None, Vec::new(), ns), 1)
+        ResolverConfig::from_parts(None, Vec::new(), ns)
     };
     let mut o = ResolverOpts::default();
-    o.ndots = ndots;
+    // SEC-004: every name is tried as given (no search list, ndots 0).
+    o.ndots = 0;
     o.timeout = s.timeout;
     o.attempts = 1;
     o.edns0 = false;
@@ -599,6 +677,9 @@ fn build(s: &ResolverSettings) -> Result<(TokioResolver, Arc<Hosts>), String> {
     o.num_concurrent_reqs = 2;
     o.preserve_intermediates = false;
     o.server_ordering_strategy = ServerOrderingStrategy::QueryStatistics;
+    // SEC-002: 0x20 query-name case randomisation (UDP); a reply whose
+    // question case differs is rejected.
+    o.case_randomization = true;
     let r = TokioResolver::builder_with_config(config, TokioRuntimeProvider::default())
         .with_options(o)
         .build()
@@ -765,15 +846,23 @@ mod tests {
     }
 
     /// SC-5: 200 callers on distinct names never run more than
-    /// MAX_INFLIGHT lookups, and nothing leaks.
+    /// MAX_INFLIGHT lookups (plus the one synchronous first-poll probe of a
+    /// job refused while the slots are full), and nothing leaks.
     #[test]
     fn concurrent_callers_respect_cap_without_leak() {
         let d = Arc::new(dns(|_| {
             Box::pin(async {
+                // Decremented on drop too (a refused probe is dropped).
+                struct Live;
+                impl Drop for Live {
+                    fn drop(&mut self) {
+                        LIVE.fetch_sub(1, Ordering::Relaxed);
+                    }
+                }
                 let n = LIVE.fetch_add(1, Ordering::Relaxed) + 1;
+                let _live = Live;
                 PEAK.fetch_max(n, Ordering::Relaxed);
                 tokio::time::sleep(Duration::from_millis(20)).await;
-                LIVE.fetch_sub(1, Ordering::Relaxed);
                 Ok(vec![ADDR])
             })
         }));
@@ -791,10 +880,60 @@ mod tests {
             }
         }
         let st = d.stats();
-        assert!(PEAK.load(Ordering::Relaxed) <= MAX_INFLIGHT);
+        assert!(PEAK.load(Ordering::Relaxed) <= MAX_INFLIGHT + 1);
         assert_eq!(ok + st.saturated + st.timeouts, 200);
         assert!(ok >= MAX_INFLIGHT as u64, "{ok}");
         assert!(wait_idle(&d));
+    }
+
+    static SLOW_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    /// SEC-001: with every slot held by never-answering names, a job for a
+    /// name already in flight joins it (no new lookup) and a cache/hosts
+    /// hit queued behind a job waiting for a slot is answered at once.
+    #[test]
+    fn full_slots_do_not_block_joins_or_cache_hits() {
+        let d = Arc::new(dns(|h| {
+            if h == "cached.example" {
+                Box::pin(std::future::ready(Ok(vec![ADDR])))
+            } else {
+                SLOW_CALLS.fetch_add(1, Ordering::Relaxed);
+                Box::pin(std::future::pending())
+            }
+        }));
+        let busy: Vec<_> = (0..MAX_INFLIGHT)
+            .map(|i| {
+                let d = d.clone();
+                std::thread::spawn(move || d.resolve(&format!("busy{i}.example"), 80, secs(3)))
+            })
+            .collect();
+        let end = secs(5);
+        while d.stats().in_flight < MAX_INFLIGHT && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(d.stats().in_flight, MAX_INFLIGHT);
+        // A job waiting for a slot, far deadline.
+        let waiter = {
+            let d = d.clone();
+            std::thread::spawn(move || d.resolve("waiting.example", 80, secs(3)))
+        };
+        std::thread::sleep(Duration::from_millis(20));
+        let calls = SLOW_CALLS.load(Ordering::Relaxed);
+        // Join an in-flight name: answered at its own (short) deadline.
+        let t0 = Instant::now();
+        assert_eq!(d.resolve("busy0.example", 80, t0 + Duration::from_millis(150)), Err(HttpError::Timeout));
+        assert!(t0.elapsed() < Duration::from_millis(200), "{:?}", t0.elapsed());
+        assert_eq!(SLOW_CALLS.load(Ordering::Relaxed), calls, "joined, no new lookup");
+        // A cache hit behind the waiting job: answered well before its deadline.
+        let t1 = Instant::now();
+        assert_eq!(d.resolve("cached.example", 80, t1 + Duration::from_millis(500)), Ok(vec![sa(ADDR)]));
+        assert!(t1.elapsed() < Duration::from_millis(100), "{:?}", t1.elapsed());
+        assert_eq!(waiter.join().unwrap(), Err(HttpError::Timeout));
+        for h in busy {
+            assert_eq!(h.join().unwrap(), Err(HttpError::Timeout));
+        }
+        assert!(wait_idle(&d));
+        assert!(d.stats().in_flight <= MAX_INFLIGHT);
     }
 
     static PANICKED: AtomicBool = AtomicBool::new(false);
@@ -835,12 +974,106 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("resolv.conf");
         std::fs::write(&p, "nameserver 192.0.2.1\nnameserver 192.0.2.2\nnameserver 192.0.2.3\nnameserver 192.0.2.4\nsearch example.net\noptions ndots:2\n").unwrap();
-        let (c, ndots) = read_resolv_conf(&p).unwrap();
-        assert_eq!((c.name_servers().len(), ndots, c.search().len()), (3, 2, 1));
+        let c = read_resolv_conf(&p).unwrap();
+        // SEC-004: search/ndots ignored.
+        assert_eq!((c.name_servers().len(), c.search().len()), (3, 0));
         std::fs::write(&p, "search example.net\n").unwrap();
         assert!(read_resolv_conf(&p).is_err());
         assert!(read_resolv_conf(&dir).is_err(), "directory refused");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// QA: with the DNS thread stalled and QUEUE_CAP jobs queued, the next
+    /// caller (the 65th) is refused at once as saturated, not at its deadline.
+    #[test]
+    fn qa_caller_past_queue_cap_is_refused_at_once() {
+        let d = Arc::new(dns(|h| {
+            if h == "stall.example" {
+                std::thread::sleep(Duration::from_millis(1500));
+            }
+            after(0, Ok(vec![ADDR]))
+        }));
+        let s = {
+            let d = d.clone();
+            std::thread::spawn(move || d.resolve("stall.example", 80, secs(10)))
+        };
+        let t0 = Instant::now();
+        while d.stats().in_flight == 0 && t0.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        let hs: Vec<_> = (0..QUEUE_CAP)
+            .map(|i| {
+                let d = d.clone();
+                std::thread::spawn(move || d.resolve(&format!("q{i}.example"), 80, secs(10)))
+            })
+            .collect();
+        let t0 = Instant::now();
+        while d.stats().queued < QUEUE_CAP && t0.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(d.stats().queued, QUEUE_CAP);
+        let before = d.stats().saturated;
+        let t1 = Instant::now();
+        assert_eq!(d.resolve("overflow.example", 80, secs(10)), Err(HttpError::Timeout));
+        assert!(t1.elapsed() < Duration::from_millis(50), "{:?}", t1.elapsed());
+        assert_eq!(d.stats().saturated, before + 1);
+        // Once the stall ends every queued caller is answered.
+        assert_eq!(s.join().unwrap(), Ok(vec![sa(ADDR)]));
+        for h in hs {
+            assert_eq!(h.join().unwrap(), Ok(vec![sa(ADDR)]));
+        }
+        assert!(wait_idle(&d));
+    }
+
+    /// QA (SC-5): a flood of distinct never-answering names does not delay
+    /// any caller past its own deadline, and a fast name submitted while
+    /// the cap is filled by slow ones is either answered promptly or
+    /// refused at once, never held past its deadline.
+    #[test]
+    fn qa_flood_of_distinct_names_meets_every_deadline() {
+        let d = Arc::new(dns(|h| {
+            if h.starts_with("fast") { after(5, Ok(vec![ADDR])) } else { Box::pin(std::future::pending()) }
+        }));
+        let hs: Vec<_> = (0..300u64)
+            .map(|i| {
+                let d = d.clone();
+                std::thread::spawn(move || {
+                    let dl = Instant::now() + Duration::from_millis(100 + (i % 7) * 50);
+                    let r = d.resolve(&format!("slow{i}.example"), 80, dl);
+                    (r, Instant::now().saturating_duration_since(dl))
+                })
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(20));
+        let t0 = Instant::now();
+        let r = d.resolve("fast.example", 80, t0 + Duration::from_millis(300));
+        assert!(t0.elapsed() < Duration::from_millis(350), "{:?}", t0.elapsed());
+        assert!(matches!(r, Ok(_) | Err(HttpError::Timeout)), "{r:?}");
+        for h in hs {
+            let (r, late) = h.join().unwrap();
+            assert_eq!(r, Err(HttpError::Timeout));
+            assert!(late < Duration::from_millis(50), "overshoot {late:?}");
+        }
+        assert!(wait_idle(&d));
+        assert_eq!(d.resolve("fast2.example", 80, secs(5)), Ok(vec![sa(ADDR)]));
+    }
+
+    /// QA (Q4): ordering for single-family and mixed answers.
+    #[test]
+    fn qa_order_single_family_and_mixed() {
+        let v4 = |i: u8| IpAddr::from([192, 0, 2, i]);
+        let v6 = |i: u16| IpAddr::from([0x2001, 0xdb8, 0, 0, 0, 0, 0, i]);
+        assert_eq!(order((1..=6).map(v4).collect()), (1..=4).map(v4).collect::<Vec<_>>());
+        assert_eq!(order((1..=6).map(v6).collect()), (1..=4).map(v6).collect::<Vec<_>>());
+        // v4 first in the answer: v6 still leads, v4 fills the rest.
+        assert_eq!(order(vec![v4(1), v4(2), v6(1), v4(3), v4(4)]), vec![v6(1), v4(1), v4(2), v4(3)]);
+        // Many v6, one v4 last: the v4 keeps the 4th slot.
+        let mut a: Vec<IpAddr> = (1..=8).map(v6).collect();
+        a.push(v4(9));
+        assert_eq!(order(a), vec![v6(1), v6(2), v6(3), v4(9)]);
+        assert_eq!(order(vec![v6(1), v6(1), v4(1), v4(1)]), vec![v6(1), v4(1)]);
+        assert!(order(Vec::new()).is_empty());
     }
 
     proptest::proptest! {
