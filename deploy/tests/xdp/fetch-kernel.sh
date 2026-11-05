@@ -21,6 +21,8 @@
 # Prerequisite: the Debian archive keyring. On Debian/Ubuntu hosts install the
 # debian-archive-keyring package (the xdp-vm CI job does); elsewhere point -k /
 # XDP_DEBIAN_KEYRING at a copy. Without it this script fails closed.
+# Env: XDP_FETCH_CACHE=DIR reuses earlier snapshot.debian.org downloads
+# (verified again on every use; CI keeps DIR in actions/cache).
 # Output: stdout is the path of the unpacked vmlinuz (one line); OUTDIR/NAME-ARCH
 # holds boot/, lib/modules/KVER and kernel.env (what was fetched and verified).
 # Exit: 0 ok; 1 download or verification failure; 2 usage or missing tool.
@@ -85,8 +87,26 @@ rm -rf "$work"
 mkdir -p "$work"
 trap 'rm -rf "$work"' EXIT INT TERM
 
+# XDP_FETCH_CACHE: optional directory of earlier snapshot.debian.org
+# downloads, keyed by the sha256 of the URL. Only snapshot URLs are cached
+# (their content never changes); every cached file still goes through the
+# same gpgv, Release, Packages and kernels.conf pin checks below, so a
+# corrupted or tampered cache fails verification instead of being booted.
+cache=${XDP_FETCH_CACHE:-}
 fetch() {
     url=$1 file=$2
+    if [ -n "$cache" ] && [ "$snapshot" = yes ]; then
+        key=$(printf '%s' "$url" | sha256sum | cut -d' ' -f1)
+        if [ -f "$cache/$key" ]; then
+            log "cache hit: $url"
+            cp "$cache/$key" "$file"
+            return
+        fi
+        mkdir -p "$cache"
+        curl --proto '=https' --tlsv1.2 -fsSL --retry 5 --retry-all-errors --max-time 900 -o "$file" "$url" || die "download failed: $url"
+        cp "$file" "$cache/$key.tmp" && mv "$cache/$key.tmp" "$cache/$key"
+        return
+    fi
     curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --max-time 900 -o "$file" "$url" || die "download failed: $url"
 }
 
