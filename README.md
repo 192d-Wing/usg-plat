@@ -70,7 +70,7 @@ public Fulcio/Rekor services. When `gh` is installed the script also checks the 
 provenance attestations with `gh attestation verify <file> --repo 192d-Wing/usg-plat
 --signer-workflow 192d-Wing/usg-plat/.github/workflows/packages.yml
 --source-ref refs/tags/v0.3.0`. Nothing enforces verification at install time. The signing
-path is verified end to end on the published v0.2.1 release.
+path is verified end to end on the published v0.2.1 and v0.3.0 releases.
 
 ### Manual install
 
