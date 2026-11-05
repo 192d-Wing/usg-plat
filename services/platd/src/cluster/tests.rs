@@ -398,13 +398,20 @@ fn join_replicate_takeover_rejoin_failback() {
     let took = wait("takeover by B", Duration::from_secs(6), || b.active() == 16);
     let bound = Duration::from_millis(LEASE_MS * 11 / 10 + 200 + 5 * 100 + 1000);
     assert!(took <= bound, "takeover took {took:?}, bound {bound:?}");
-    let takeovers = b
-        .events
-        .lock()
-        .iter()
-        .skip(mark)
-        .filter(|e| matches!(e, Event::ClusterSliceAcquire { acquire, .. } if acquire.reason == AuditAcquire::Takeover))
-        .count();
+    // Acquire records reach `b.events` through the collector thread, so they
+    // can trail `active()`: wait for them before comparing.
+    let count_takeovers = || {
+        b.events
+            .lock()
+            .iter()
+            .skip(mark)
+            .filter(
+                |e| matches!(e, Event::ClusterSliceAcquire { acquire, .. } if acquire.reason == AuditAcquire::Takeover),
+            )
+            .count()
+    };
+    wait("takeover records", Duration::from_secs(5), || count_takeovers() >= a_slices);
+    let takeovers = count_takeovers();
     let rs: Vec<_> = b
         .events
         .lock()
@@ -422,9 +429,9 @@ fn join_replicate_takeover_rejoin_failback() {
         b.h().shared.takeovers("takeover") - counted >= a_slices as u64
     });
     assert_eq!(b.h().shared.takeovers("takeover") - counted, a_slices as u64);
-    assert!(
+    wait("adopt record", Duration::from_secs(5), || {
         b.has(|e| matches!(e, Event::PortBlockAdopt { adopt, .. } if adopt.v4 == v4 && adopt.prev_owner == Some(0)))
-    );
+    });
     // Same subscriber, same mapping on B (RFC 6146 §3.5.1.1).
     assert_eq!(b.send(client, 40000), Some((v4, port)));
 
@@ -432,10 +439,12 @@ fn join_replicate_takeover_rejoin_failback() {
     drop(a);
     let mut a = Node::start(cfg_a);
     wait("failback to A", Duration::from_secs(20), || a.active() > 0 && total_active(&[&a, &b]) == 16);
-    assert!(
+    wait("failback record", Duration::from_secs(5), || {
         a.has(|e| matches!(e, Event::ClusterSliceAcquire { acquire, .. } if acquire.reason == AuditAcquire::Failback))
-    );
-    assert!(b.has(|e| matches!(e, Event::PortBlockRelease { reason: Some(_), .. })));
+    });
+    wait("release record", Duration::from_secs(5), || {
+        b.has(|e| matches!(e, Event::PortBlockRelease { reason: Some(_), .. }))
+    });
     // B-3: failback only to a member whose backup copies were in sync.
     let fb: Vec<bool> = a
         .events
