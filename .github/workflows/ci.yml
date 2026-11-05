@@ -74,9 +74,14 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install AWS-LC FIPS build deps (CMake, Go, clang)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake golang-go clang
+      - name: Restore tool downloads (shellcheck, bpf-linker)
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/plat-tools
+          key: plat-tools-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('deploy/tests/install-shellcheck.sh', 'deploy/tests/xdp/install-bpf-linker.sh') }}
       - name: Install shellcheck 0.11.0 (release tarball, sha256-pinned)
         run: |
-          deploy/tests/install-shellcheck.sh "$HOME/.local/bin"
+          PLAT_TOOL_CACHE="$HOME/.cache/plat-tools" deploy/tests/install-shellcheck.sh "$HOME/.local/bin"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: PLAT_CBOM_BLESS is unset (the CBOM is never re-blessed in CI)
         run: |
@@ -137,11 +142,16 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install tools (zstd) and AWS-LC FIPS build deps
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends zstd cmake golang-go clang
+      - name: Restore tool downloads (shellcheck, bpf-linker)
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/plat-tools
+          key: plat-tools-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('deploy/tests/install-shellcheck.sh', 'deploy/tests/xdp/install-bpf-linker.sh') }}
       - name: Install shellcheck 0.11.0 (release tarball, sha256-pinned)
-        run: deploy/tests/install-shellcheck.sh "$HOME/.local/bin"
+        run: PLAT_TOOL_CACHE="$HOME/.cache/plat-tools" deploy/tests/install-shellcheck.sh "$HOME/.local/bin"
       - name: Install bpf-linker 0.12.0 (release tarball, sha256-pinned)
         run: |
-          deploy/tests/xdp/install-bpf-linker.sh "$HOME/.local/bin"
+          PLAT_TOOL_CACHE="$HOME/.cache/plat-tools" deploy/tests/xdp/install-bpf-linker.sh "$HOME/.local/bin"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: rustc and bpf-linker share one LLVM major
         run: deploy/tests/xdp/check-llvm-major.sh "$HOME/.local/bin/bpf-linker"
@@ -231,9 +241,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends virtme-ng "$QEMU_PKG" busybox-static file kmod \
             gpgv debian-archive-keyring xz-utils iproute2 iputils-ping zstd
+      - name: Restore tool downloads (shellcheck, bpf-linker)
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/plat-tools
+          key: plat-tools-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('deploy/tests/install-shellcheck.sh', 'deploy/tests/xdp/install-bpf-linker.sh') }}
       - name: Install bpf-linker 0.12.0 (release tarball, sha256-pinned)
         run: |
-          deploy/tests/xdp/install-bpf-linker.sh "$HOME/.local/bin"
+          PLAT_TOOL_CACHE="$HOME/.cache/plat-tools" deploy/tests/xdp/install-bpf-linker.sh "$HOME/.local/bin"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: rustc and bpf-linker share one LLVM major
         run: deploy/tests/xdp/check-llvm-major.sh "$HOME/.local/bin/bpf-linker"
