@@ -73,7 +73,11 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install AWS-LC FIPS build deps (CMake, Go, clang)
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake golang-go clang shellcheck
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake golang-go clang
+      - name: Install shellcheck 0.11.0 (release tarball, sha256-pinned)
+        run: |
+          deploy/tests/install-shellcheck.sh "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: PLAT_CBOM_BLESS is unset (the CBOM is never re-blessed in CI)
         run: |
           if [ -n "${PLAT_CBOM_BLESS+set}" ]; then
@@ -131,8 +135,10 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Install tools (zstd, shellcheck) and AWS-LC FIPS build deps
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends zstd shellcheck cmake golang-go clang
+      - name: Install tools (zstd) and AWS-LC FIPS build deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends zstd cmake golang-go clang
+      - name: Install shellcheck 0.11.0 (release tarball, sha256-pinned)
+        run: deploy/tests/install-shellcheck.sh "$HOME/.local/bin"
       - name: Install bpf-linker 0.12.0 (release tarball, sha256-pinned)
         run: |
           deploy/tests/xdp/install-bpf-linker.sh "$HOME/.local/bin"
