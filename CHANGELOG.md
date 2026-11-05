@@ -4,6 +4,12 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 
 ## [Unreleased]
 
+### Added
+- SEC-007, SI-4/SC-5: `plat_fragment_alias_skipped_total` counts fragment
+  quote aliases not recorded because their set had no eligible way (ICMP
+  errors quoting those fragments then go unmatched). Not a drop and not in
+  `fragment_table_full`; `/metrics` only, log schema unchanged (8).
+
 ## [0.3.0] - 2026-11-05
 
 ### Added
