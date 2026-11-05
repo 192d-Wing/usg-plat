@@ -13,6 +13,11 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
   (netfilter `EPERM`), not `timeout`.
 
 ### Changed
+- CI: the `xdp vm` job keeps snapshot.debian.org downloads (the 6.6 test
+  kernel) in `actions/cache` through `fetch-kernel.sh`'s new
+  `XDP_FETCH_CACHE`; cached files are re-verified (gpgv, Release, Packages,
+  `kernels.conf` pin) on every use. snapshot.debian.org 503/504 outages no
+  longer fail the job once the cache is warm.
 - POAM-025 (a), SC-5: OCSP/CRL host names are now resolved by a built-in
   hickory-resolver 0.26.3 (plain UDP/TCP DNS; no TLS/DoH/DNSSEC features, no
   ring) on one `plat-dns` thread with a tokio current_thread runtime. It

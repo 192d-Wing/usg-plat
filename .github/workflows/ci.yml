@@ -240,8 +240,16 @@ jobs:
           else
             echo "no /dev/kvm: TCG"
           fi
+      # snapshot.debian.org (the 6.6 source) returns 503/504 for hours at a
+      # time. Its files never change, so keep them between runs; the
+      # signature and sha256 checks in fetch-kernel.sh still run on every use.
+      - name: Restore snapshot.debian.org downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/plat-xdp-snapshot
+          key: xdp-snapshot-${{ matrix.kernel }}-${{ matrix.arch }}-${{ hashFiles('deploy/tests/xdp/kernels.conf') }}
       - name: make test-xdp (object build, fetch, verify, boot, guest checks and object gates)
-        run: make test-xdp
+        run: XDP_FETCH_CACHE="$HOME/.cache/plat-xdp-snapshot" make test-xdp
       - name: Record the kernel package and verification
         if: always()
         run: cat target/xdp-kernels/*/kernel.env >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
