@@ -40,7 +40,7 @@ url=https://github.com/koalaman/shellcheck/releases/download/v$SHELLCHECK_VERSIO
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT INT TERM
 echo "install-shellcheck: fetching $url" >&2
-curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o "$work/$asset" "$url" || die "download failed: $url"
+curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 30 --retry 6 --retry-delay 10 --retry-all-errors -o "$work/$asset" "$url" || die "download failed: $url"
 
 got=$(sha256sum "$work/$asset" | cut -d' ' -f1)
 [ "$got" = "$want" ] || die "sha256 mismatch for $asset: got $got, want $want"
