@@ -504,8 +504,14 @@ fn duplicate_id_and_digest_mismatch_are_refused() {
     let _b2 = Node::start(member_cfg(&l, 1, free_port(), &pki, &sb2.0, "", None));
     wait("duplicate refused", Duration::from_secs(10), || w.shared.net.stats.rejected(RejectReason::DuplicateId) > 0);
     assert!(w.shared.health_problem().is_some());
-    assert!(wev.lock().iter().any(|e| matches!(e, Event::ClusterPeerRejected { rejected, .. }
-        if rejected.reason == PeerRejectReason::DuplicateId && rejected.claimed_id == Some(1))));
+    // The refusal is counted before its audit record is emitted, and the
+    // collector thread moves records into `wev` asynchronously: wait for it.
+    wait("duplicate refusal record", Duration::from_secs(10), || {
+        wev.lock().iter().any(|e| {
+            matches!(e, Event::ClusterPeerRejected { rejected, .. }
+            if rejected.reason == PeerRejectReason::DuplicateId && rejected.claimed_id == Some(1))
+        })
+    });
     drop(w);
 
     // Digest mismatch: two members (manual mode), different block size.
@@ -519,8 +525,10 @@ fn duplicate_id_and_digest_mismatch_are_refused() {
             > 0
     });
     assert!(!c.h().shared.net.is_up(1));
-    assert!(c.has(|e| matches!(e, Event::ClusterPeerRejected { rejected, .. } if rejected.reason == PeerRejectReason::DigestMismatch))
-        || d.has(|e| matches!(e, Event::ClusterPeerRejected { rejected, .. } if rejected.reason == PeerRejectReason::DigestMismatch)));
+    wait("digest mismatch refusal record", Duration::from_secs(10), || {
+        c.has(|e| matches!(e, Event::ClusterPeerRejected { rejected, .. } if rejected.reason == PeerRejectReason::DigestMismatch))
+            || d.has(|e| matches!(e, Event::ClusterPeerRejected { rejected, .. } if rejected.reason == PeerRejectReason::DigestMismatch))
+    });
 }
 
 fn operator_records(n: &Node) -> Vec<(plat_audit::OperatorCommandKind, bool, Option<OperatorRefusal>, Option<u32>)> {
