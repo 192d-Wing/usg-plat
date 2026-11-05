@@ -4,6 +4,8 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-05
+
 ### Added
 - `deploy/tests/resolver/l33-resolver.sh`: LINUX_VERIFICATION L33, OCSP
   name resolution through `plat-dns` under the shipped systemd unit
