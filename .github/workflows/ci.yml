@@ -94,7 +94,7 @@ jobs:
           persist-credentials: false
       - name: Install pinned toolchain from rust-toolchain.toml
         run: rustup toolchain install && rustup show
-      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+      - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
         with:
           tool: cargo-audit@0.22.2,cargo-deny@0.20.2
       - run: make security
