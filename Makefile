@@ -46,15 +46,25 @@ codex-agents-check:
 test: xdp-env
 	cargo test --workspace
 
+# shellcheck is pinned (deploy/tests/install-shellcheck.sh installs it in CI).
+# CI=true: missing or another version fails; locally: a warning, then lint.
+SHELLCHECK_VERSION := 0.11.0
+SHELLCHECK = sh -c 'if ! command -v shellcheck >/dev/null 2>&1; then \
+	  if [ "$$CI" = true ]; then echo "ERROR: shellcheck is required in CI" >&2; exit 1; fi; \
+	  echo "WARNING: shellcheck not installed; skipped" >&2; exit 0; fi; \
+	v=$$(shellcheck --version | sed -n "s/^version: //p"); \
+	if [ "$$v" != "$(SHELLCHECK_VERSION)" ]; then \
+	  if [ "$$CI" = true ]; then echo "ERROR: shellcheck $$v, want $(SHELLCHECK_VERSION)" >&2; exit 1; fi; \
+	  echo "WARNING: shellcheck $$v, CI uses $(SHELLCHECK_VERSION)" >&2; fi; \
+	exec shellcheck -x "$$@"' shellcheck
+
 # Deploy scripts: POSIX syntax, shellcheck (required when CI=true) and a stubbed run
 # against the real `platd check-config --format env` output.
 DEPLOY_SH := deploy/systemd/plat-tun-setup.sh deploy/systemd/plat-fwguard.sh deploy/tests/deploy-scripts-test.sh \
-	deploy/hooks/frr-announce.sh deploy/hooks/frr-withdraw.sh deploy/systemd/plat-v6-announce.sh deploy/tests/xdp/e2e.sh deploy/tests/resolver/l33-resolver.sh scripts/verify-release.sh $(wildcard deploy/tests/cluster/*.sh)
+	deploy/hooks/frr-announce.sh deploy/hooks/frr-withdraw.sh deploy/systemd/plat-v6-announce.sh deploy/tests/xdp/e2e.sh deploy/tests/resolver/l33-resolver.sh scripts/verify-release.sh deploy/tests/install-shellcheck.sh $(wildcard deploy/tests/cluster/*.sh)
 test-deploy:
 	for f in $(DEPLOY_SH); do sh -n $$f || exit 1; done
-	@if command -v shellcheck >/dev/null 2>&1; then shellcheck -x $(DEPLOY_SH); \
-	elif [ "$$CI" = true ]; then echo "ERROR: shellcheck is required in CI" >&2; exit 1; \
-	else echo "WARNING: shellcheck not installed; skipped" >&2; fi
+	@$(SHELLCHECK) $(DEPLOY_SH)
 	sh deploy/tests/deploy-scripts-test.sh
 
 bench:
@@ -129,9 +139,7 @@ endif
 # evaluation, clippy for bpfel, clippy with the xdp feature.
 check-xdp: xdp-env
 	for f in $(XDP_SH); do sh -n $$f || exit 1; done
-	@if command -v shellcheck >/dev/null 2>&1; then shellcheck -x $(XDP_SH); \
-	elif [ "$$CI" = true ]; then echo "ERROR: shellcheck is required in CI" >&2; exit 1; \
-	else echo "WARNING: shellcheck not installed; skipped" >&2; fi
+	@$(SHELLCHECK) $(XDP_SH)
 	for f in $(XDP_PY); do python3 -I -c 'import ast, sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])' $$f || exit 1; done
 	python3 -I deploy/tests/xdp/check-object.py --self-test
 	python3 -I deploy/tests/xdp/obj-gate.py --self-test

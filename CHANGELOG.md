@@ -10,6 +10,12 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
   errors quoting those fragments then go unmatched). Not a drop and not in
   `fragment_table_full`; `/metrics` only, log schema unchanged (8).
 
+### Changed
+- CI installs shellcheck 0.11.0 from its sha256-pinned release tarball
+  (`deploy/tests/install-shellcheck.sh`) instead of Ubuntu's 0.9.0, and
+  `make check` checks the version: another version fails under `CI=true`
+  and warns locally.
+
 ## [0.3.0] - 2026-11-05
 
 ### Added
