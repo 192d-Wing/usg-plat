@@ -33,6 +33,10 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  # apt-get: give up on a stalled mirror after 30 s and retry, instead of
+  # hanging until the job timeout (an Ubuntu mirror stall cancelled
+  # fmt + clippy on #54 and #56 after 30 minutes).
+  APT_OPTS: -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
 
@@ -68,7 +72,7 @@ jobs:
             exit 1
           fi
       - name: Install AWS-LC FIPS build deps (CMake, Go, clang), dpkg-dev, rpm2cpio and binutils
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake golang-go clang dpkg-dev rpm2cpio cpio binutils
+        run: sudo apt-get $APT_OPTS update && sudo apt-get $APT_OPTS install -y --no-install-recommends cmake golang-go clang dpkg-dev rpm2cpio cpio binutils
       - name: Install packaging, SBOM and audit tools (version- and checksum-pinned)
         run: deploy/tests/supply-chain/install-cargo-tools.sh
       - name: Install check-jsonschema (version- and hash-pinned, wheels only)
@@ -145,7 +149,7 @@ jobs:
           key: sbom-xdp-${{ matrix.arch }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install AWS-LC FIPS build deps (CMake, Go, clang), zstd and binutils
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake golang-go clang zstd binutils
+        run: sudo apt-get $APT_OPTS update && sudo apt-get $APT_OPTS install -y --no-install-recommends cmake golang-go clang zstd binutils
       - name: Install bpf-linker 0.12.0 (release tarball, sha256-pinned)
         run: |
           deploy/tests/xdp/install-bpf-linker.sh "$HOME/.local/bin"
