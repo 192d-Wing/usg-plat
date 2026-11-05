@@ -16,6 +16,10 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  # apt-get: give up on a stalled mirror after 30 s and retry, instead of
+  # hanging until the job timeout (an Ubuntu mirror stall cancelled
+  # fmt + clippy on #54 and #56 after 30 minutes).
+  APT_OPTS: -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
 
@@ -34,7 +38,7 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install AWS-LC FIPS build deps (CMake, Go, clang, aarch64 cross gcc)
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake golang-go clang gcc-aarch64-linux-gnu libc6-dev-arm64-cross linux-libc-dev-arm64-cross
+        run: sudo apt-get $APT_OPTS update && sudo apt-get $APT_OPTS install -y --no-install-recommends cmake golang-go clang gcc-aarch64-linux-gnu libc6-dev-arm64-cross linux-libc-dev-arm64-cross
       - name: PLAT_CBOM_BLESS is unset (the CBOM is never re-blessed in CI)
         run: |
           if [ -n "${PLAT_CBOM_BLESS+set}" ]; then
@@ -73,7 +77,7 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install AWS-LC FIPS build deps (CMake, Go, clang)
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake golang-go clang
+        run: sudo apt-get $APT_OPTS update && sudo apt-get $APT_OPTS install -y --no-install-recommends cmake golang-go clang
       - name: Restore tool downloads (shellcheck, bpf-linker)
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -141,7 +145,7 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install tools (zstd) and AWS-LC FIPS build deps
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends zstd cmake golang-go clang
+        run: sudo apt-get $APT_OPTS update && sudo apt-get $APT_OPTS install -y --no-install-recommends zstd cmake golang-go clang
       - name: Restore tool downloads (shellcheck, bpf-linker)
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -185,7 +189,7 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install AWS-LC FIPS build deps (CMake, Go, clang)
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake golang-go clang
+        run: sudo apt-get $APT_OPTS update && sudo apt-get $APT_OPTS install -y --no-install-recommends cmake golang-go clang
       - name: PROPTEST_CASES=1000000 cargo test -p plat-xdp-core (release)
         env:
           PROPTEST_CASES: "1000000"
@@ -238,8 +242,8 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install virtme-ng, QEMU, gpgv and the Debian archive keyring
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends virtme-ng "$QEMU_PKG" busybox-static file kmod \
+          sudo apt-get $APT_OPTS update
+          sudo apt-get $APT_OPTS install -y --no-install-recommends virtme-ng "$QEMU_PKG" busybox-static file kmod \
             gpgv debian-archive-keyring xz-utils iproute2 iputils-ping zstd
       - name: Restore tool downloads (shellcheck, bpf-linker)
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

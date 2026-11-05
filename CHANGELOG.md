@@ -15,6 +15,8 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
   (`PLAT_TOOL_CACHE`, per job); cached copies are sha256-checked like a
   download, and one that fails is discarded and downloaded again. Release
   downloads retry for about a minute.
+- CI `apt-get` calls time out a stalled mirror after 30 s and retry (5x)
+  instead of hanging until the job timeout.
 - CI installs shellcheck 0.11.0 from its sha256-pinned release tarball
   (`deploy/tests/install-shellcheck.sh`) instead of Ubuntu's 0.9.0, and
   `make check` checks the version: another version fails under `CI=true`
