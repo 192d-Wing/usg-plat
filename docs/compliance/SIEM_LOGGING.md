@@ -380,8 +380,13 @@ SIEM guidance: a rising `fragment_overlap` or `fragment_tiny` indicates
 fragment-evasion or Teardrop-style traffic; `fragment_table_full`,
 `fragment_buffer_full` and `reassembly_full` indicate a fragment flood
 against the per-worker limits (SC-5). `fragment_table_full` counts both
-entries evicted from a full set and inserts refused (per-source cap, or a
-full set with no entry the source may evict); the two are not separated; `fragment_unmatched` /
+entries evicted from a full set and fragment inserts refused (per-source
+cap, or a full set with no entry the source may evict); the two are not
+separated. Quote-alias refusals are excluded: a skipped alias (full set, no
+expired way or alias to replace) is not a drop and is counted only on
+`/metrics` as `plat_fragment_alias_skipped_total`, never in
+`dataplane_counter` records; a rise means ICMP errors (e.g. Packet Too Big)
+quoting those fragments will count `icmp_quote_unmatched` (SEC-007); `fragment_unmatched` /
 `icmp_quote_unmatched` that do not follow a flood can indicate fragments
 steered across workers (POAM-035). Correlate with the source by packet
 capture: these counters carry no addresses.
@@ -923,7 +928,7 @@ for `nat_port_block_release` (same address and range), `service_stop`,
   `icmp_errors_generated`, `icmp_errors_rate_limited`,
   `fragmented_v4_to_v6`, `fragmented_v6_to_v4`, `fragments_in_v6`,
   `fragments_in_v4`, `fragments_forwarded`, `fragments_buffered`,
-  `datagrams_reassembled`, `icmp_time_exceeded_sent`,
+  `fragment_alias_skipped`, `datagrams_reassembled`, `icmp_time_exceeded_sent`,
   `icmp_unreachable_sent` (Destination Unreachable, including Source Route
   Failed), `icmp_param_problem_sent`, `bib_created`, `session_created`, `io_errors`,
   `tx_queue_full` (TUN `EAGAIN` back-pressure, separate from `io_errors`);

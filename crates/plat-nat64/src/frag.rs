@@ -33,7 +33,7 @@
 
 use ahash::RandomState;
 use plat_common::config::FragmentsConfig;
-use plat_common::{Counters, DropReason};
+use plat_common::{Counter, Counters, DropReason};
 use plat_packet::{parse_v4, parse_v6};
 use plat_xlat::HEADROOM;
 
@@ -346,8 +346,10 @@ impl FragTable {
     ///   evict a pass-through or poisoned alias.
     ///
     /// Aliases rank below every bucketed entry (SEC-007), so a bucketed `k`
-    /// evicts them last. With nothing eligible the insert is refused. Both
-    /// an eviction and a refusal count `fragment_table_full`. A bucket
+    /// evicts them last. With nothing eligible the insert is refused. An
+    /// eviction and a bucketed refusal count `fragment_table_full`; an
+    /// alias refusal records nothing here (`alias()` counts it as
+    /// `fragment_alias_skipped`). A bucket
     /// therefore never pushes out an entry of a bucket that is lighter or
     /// equal (strict `>`: after the insert it would be the heavier), and
     /// aliases cannot push out bucketed entries at all.
@@ -413,14 +415,22 @@ impl FragTable {
     }
 
     /// Inserts (or refreshes) a quote alias. Best effort: a full set with no
-    /// expired way or pass-through/poisoned alias to replace skips it (not
-    /// counted), and ICMP errors quoting that fragment are then unmatched.
+    /// expired way or pass-through/poisoned alias to replace skips it,
+    /// counted `fragment_alias_skipped` (never `fragment_table_full`), and
+    /// ICMP errors quoting that fragment are then unmatched. An alias has
+    /// no load bucket, so `Err` can only be that full-set case.
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: SI-4 - skipped aliases are visible on /metrics, so a
+    ///   fragment flood that starves quote aliases is observable
     pub fn alias(&mut self, k: &FragKey, fwd: Fwd, now: u64, c: &Counters) {
-        if let Ok(i) = self.get_or_insert(k, now, c)
-            && matches!(self.entries[i].st, Some(St::Pending | St::Pass(_)))
-            && self.entries[i].nbuf == 0
-        {
-            self.entries[i].st = Some(St::Pass(fwd));
+        match self.get_or_insert(k, now, c) {
+            Ok(i) => {
+                if matches!(self.entries[i].st, Some(St::Pending | St::Pass(_))) && self.entries[i].nbuf == 0 {
+                    self.entries[i].st = Some(St::Pass(fwd));
+                }
+            }
+            Err(_) => c.inc(Counter::FragmentAliasSkipped),
         }
     }
 
@@ -1238,6 +1248,48 @@ mod tests {
         let after: Vec<_> = t.entries[s0..s0 + WAYS].iter().map(|e| (e.key, e.st)).collect();
         assert_eq!(before, after);
         assert_eq!(c.drops(DropReason::FragmentTableFull), 0);
+        assert_eq!(c.get(Counter::FragmentAliasSkipped), al.len() as u64);
+    }
+
+    #[test]
+    fn alias_skip_is_counted_not_table_full() {
+        let c = Counters::default();
+        let mut t = FragTable::new(&cfg(0, 0));
+        let srcs = distinct_sources(&t, WAYS);
+        let pass = Fwd::To6 { dst: 9, idx: 0 };
+        let s0 = t.set_of(&key_from(srcs[0], 0));
+        for &src in &srcs {
+            let id = ids_in(&t, src, s0, 1)[0];
+            let i = t.get_or_insert(&key_from(src, id), 0, &c).unwrap();
+            t.set_pass(i, pass);
+        }
+        let full = c.drops(DropReason::FragmentTableFull);
+        let al: Vec<u32> = (0u32..).filter(|&id| t.set_of(&sent4(id)) == s0).take(2).collect();
+        let fwd = Fwd::Sent6 { pool: 1, idx: 0 };
+        t.alias(&sent4(al[0]), fwd, 1, &c);
+        assert_eq!(c.get(Counter::FragmentAliasSkipped), 1);
+        assert_eq!(c.drops(DropReason::FragmentTableFull), full);
+        assert!(t.find(&sent4(al[0]), 1, &c).is_none());
+        t.alias(&sent4(al[1]), fwd, 1, &c);
+        assert_eq!(c.get(Counter::FragmentAliasSkipped), 2);
+        assert_eq!(c.drops(DropReason::FragmentTableFull), full);
+    }
+
+    #[test]
+    fn alias_into_expired_set_is_not_skipped() {
+        let c = Counters::default();
+        let mut t = FragTable::new(&cfg(0, 0));
+        let srcs = distinct_sources(&t, WAYS);
+        let s0 = t.set_of(&key_from(srcs[0], 0));
+        for &src in &srcs {
+            let id = ids_in(&t, src, s0, 1)[0];
+            let i = t.get_or_insert(&key_from(src, id), 0, &c).unwrap();
+            t.set_pass(i, Fwd::To6 { dst: 9, idx: 0 });
+        }
+        let id = (0u32..).find(|&id| t.set_of(&sent4(id)) == s0).unwrap();
+        t.alias(&sent4(id), Fwd::Sent6 { pool: 1, idx: 0 }, 1_000_000, &c);
+        assert_eq!(c.get(Counter::FragmentAliasSkipped), 0);
+        assert!(t.find(&sent4(id), 1_000_000, &c).is_some());
     }
 
     #[test]
@@ -1255,6 +1307,8 @@ mod tests {
         for &id in &al[1..] {
             assert!(t.find(&sent4(id), 10, &c).is_some(), "alias {id} kept");
         }
+        assert_eq!(c.get(Counter::FragmentAliasSkipped), 0);
+        assert_eq!(c.drops(DropReason::FragmentTableFull), 1, "eviction counted once");
     }
 
     #[test]
