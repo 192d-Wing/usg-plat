@@ -114,6 +114,10 @@ define_enum!(
         // Non-first fragments translated with a first fragment's mapping.
         FragmentsForwarded => "fragments_forwarded",
         FragmentsBuffered => "fragments_buffered",
+        // Quote alias not recorded: set full, no expired way or alias to
+        // replace; ICMP errors quoting that fragment go unmatched. Not a
+        // drop (the fragment is still translated), /metrics only (SEC-007).
+        FragmentAliasSkipped => "fragment_alias_skipped",
         DatagramsReassembled => "datagrams_reassembled",
         // IPv6 packets ≤ 1280 bytes fragmented as IPv4 (RFC 7915 §5.1).
         FragmentedV6ToV4 => "fragmented_v6_to_v4",

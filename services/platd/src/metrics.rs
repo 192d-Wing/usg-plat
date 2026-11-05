@@ -49,10 +49,7 @@ pub fn render(s: &Sources) -> String {
         let v: u64 = s.workers.iter().map(|c| c.drops(*r)).sum();
         let _ = writeln!(o, "plat_drops_total{{reason=\"{}\"}} {v}", r.as_str());
     }
-    for c in Counter::ALL {
-        let v: u64 = s.workers.iter().map(|w| w.get(*c)).sum();
-        let _ = writeln!(o, "# TYPE plat_{}_total counter\nplat_{}_total {v}", c.as_str(), c.as_str());
-    }
+    render_counters(&mut o, &s.workers);
     let frag_entries: u64 = s.workers.iter().map(|w| w.fragment_entries()).sum();
     let _ = writeln!(o, "# TYPE plat_fragment_entries gauge\nplat_fragment_entries {frag_entries}");
     for (i, w) in s.workers.iter().enumerate() {
@@ -146,6 +143,15 @@ pub fn render(s: &Sources) -> String {
 /// - NIST 800-53: SI-4, SC-5 - kernel-side drops are monitored (L17)
 pub fn tun_section(ifname: String) -> Section {
     Box::new(move |o: &mut String| render_tun(o, std::path::Path::new("/sys/class/net"), &ifname))
+}
+
+/// `plat_<name>_total` for every non-drop `Counter`, summed over workers
+/// (incl. `plat_fragment_alias_skipped_total`, SEC-007).
+fn render_counters(o: &mut String, workers: &[Arc<Counters>]) {
+    for c in Counter::ALL {
+        let v: u64 = workers.iter().map(|w| w.get(*c)).sum();
+        let _ = writeln!(o, "# TYPE plat_{}_total counter\nplat_{}_total {v}", c.as_str(), c.as_str());
+    }
 }
 
 fn render_tun(o: &mut String, sysfs: &std::path::Path, ifname: &str) {
@@ -301,6 +307,20 @@ mod tests {
         render_tun(&mut o, &base, "a\"b\\c");
         assert!(o.contains("plat_tun_rx_dropped_total{interface=\"a\\\"b\\\\c\"} 7\n"), "{o}");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn fragment_alias_skipped_is_exported() {
+        let a = Arc::new(Counters::default());
+        let b = Arc::new(Counters::default());
+        a.inc(Counter::FragmentAliasSkipped);
+        b.add(Counter::FragmentAliasSkipped, 2);
+        let mut o = String::new();
+        render_counters(&mut o, &[a, b]);
+        assert!(
+            o.contains("# TYPE plat_fragment_alias_skipped_total counter\nplat_fragment_alias_skipped_total 3\n"),
+            "{o}"
+        );
     }
 
     #[test]
