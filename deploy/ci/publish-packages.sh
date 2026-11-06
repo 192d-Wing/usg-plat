@@ -183,11 +183,27 @@ publish() {
         echo "publish-packages: releases/$TAG already published with the same SHA256SUMS; re-indexing"
     fi
 
-    # 2. Copy. A package already in the tree under the same file name must be
-    # byte-identical (no-op): the canary (always 0.0.0) is re-published with
-    # every release and must never change silently; a differing one, or any
-    # other differing package, is refused before anything is copied.
+    # 2. Copy. platd / usg-plat-verify already in the tree under the same file
+    # name must be byte-identical (no-op), else refused before anything is
+    # copied. The canary is re-published with every release from a fresh
+    # build: one already in the tree with the same name, version and arch is
+    # kept as it is (whatever its bytes); any other canary version in the tree
+    # is refused.
+    for d in "$REPO"/apt/pool/main/usg-plat-pin-canary_* "$REPO"/rpm/*/usg-plat-pin-canary-*; do
+        [ -e "$d" ] || continue
+        case ${d##*/} in
+            "$CANARY_DEB")
+                id=$(dpkg-deb -f "$d" Package Version Architecture 2>/dev/null | tr '\n' ' ')
+                [ "$id" = "Package: usg-plat-pin-canary Version: 0.0.0 Architecture: all " ] ||
+                    refuse "${d#"$REPO"/}: canary in the tree is not usg-plat-pin-canary 0.0.0 all" ;;
+            "$CANARY_RPM")
+                [ "$(rpm_meta "$d")" = "usg-plat-pin-canary 0.0.0 1 noarch" ] ||
+                    refuse "${d#"$REPO"/}: canary in the tree is not usg-plat-pin-canary 0.0.0-1.noarch" ;;
+            *) refuse "${d#"$REPO"/}: a different canary version is in the tree (want $CANARY_DEB / $CANARY_RPM)" ;;
+        esac
+    done
     for b in $pkgs; do
+        case $b in "$CANARY_DEB" | "$CANARY_RPM") continue ;; *) ;; esac
         case $b in
             *.deb) dests="$REPO/apt/pool/main/$b" ;;
             *.noarch.rpm) dests=''; for a in $RPM_ARCHES; do dests="$dests $REPO/rpm/$a/$b"; done ;;
@@ -204,6 +220,10 @@ publish() {
     for a in $RPM_ARCHES; do mkdir -p "$REPO/rpm/$a"; done
     for b in $pkgs; do
         case $b in
+            "$CANARY_DEB") [ -e "$REPO/apt/pool/main/$b" ] || cp -- "$DIST/$b" "$REPO/apt/pool/main/$b" ;;
+            "$CANARY_RPM") for a in $RPM_ARCHES; do
+                [ -e "$REPO/rpm/$a/$b" ] || cp -- "$DIST/$b" "$REPO/rpm/$a/$b"
+            done ;;
             *.deb) cp -- "$DIST/$b" "$REPO/apt/pool/main/$b" ;;
             *.noarch.rpm) for a in $RPM_ARCHES; do cp -- "$DIST/$b" "$REPO/rpm/$a/$b"; done ;;
             *.rpm) a=${b%.rpm}; a=${a##*.}; cp -- "$DIST/$b" "$REPO/rpm/$a/$b" ;;
@@ -421,23 +441,47 @@ self_test() {
         ok "changed SHA256SUMS for a published tag refused"
     else bad "immutability"; fi
 
-    # The canary is re-published with every release: identical is a no-op,
-    # a different one already in the tree is refused.
+    # The canary is re-published with every release: same name/version/arch
+    # already in the tree is a no-op that keeps the tree copy (identical or
+    # not); another canary version in the tree is refused. platd stays
+    # byte-immutable.
     fx_dist "$st/d13" 0.13.0
     if run 0 "$st/can" --dist "$st/d13" --tag v0.13.0 --repo "$repo" &&
         cmp -s "$st/d13/$CANARY_DEB" "$repo/apt/pool/main/$CANARY_DEB"; then
         ok "identical canary already in the tree is a no-op"
     else bad "identical canary"; fi
-    cp -R "$st/d13" "$st/d14" && rm -f -- "$st/d14"/*0.13.0*
     fx_dist "$st/d14" 0.14.0
-    cp -- "$repo/apt/pool/main/$CANARY_DEB" "$st/can.keep"
-    printf 'x' >>"$repo/apt/pool/main/$CANARY_DEB"
-    if run 1 "$st/can2" --dist "$st/d14" --tag v0.14.0 --repo "$repo" &&
-        grep -q "$CANARY_DEB is already in the tree with different content" "$st/can2" &&
-        [ ! -d "$repo/releases/v0.14.0" ]; then
-        ok "different canary in the tree refused before copying"
-    else bad "different canary"; sed 's/^/     | /' "$st/can2"; fi
-    cp -- "$st/can.keep" "$repo/apt/pool/main/$CANARY_DEB"
+    rm -f -- "$st/d14/$CANARY_DEB" "$st/d14/$CANARY_RPM"
+    fx_deb "$st/d14" usg-plat-pin-canary 0.0.0 all
+    sleep 1 # rpm BUILDTIME differs, so the rebuilt canary has other bytes
+    fx_rpm "$st/d14" usg-plat-pin-canary 0.0.0 noarch
+    fx_sums "$st/d14"
+    cp -- "$repo/apt/pool/main/$CANARY_DEB" "$st/can.deb.keep"
+    cp -- "$repo/rpm/x86_64/$CANARY_RPM" "$st/can.rpm.keep"
+    if ! cmp -s "$st/d14/$CANARY_RPM" "$st/can.rpm.keep" &&
+        run 0 "$st/can2" --dist "$st/d14" --tag v0.14.0 --repo "$repo" &&
+        cmp -s "$st/can.deb.keep" "$repo/apt/pool/main/$CANARY_DEB" &&
+        cmp -s "$st/can.rpm.keep" "$repo/rpm/x86_64/$CANARY_RPM" &&
+        cmp -s "$st/can.rpm.keep" "$repo/rpm/aarch64/$CANARY_RPM"; then
+        ok "canary with other bytes but the same name/version/arch is a no-op (tree copy kept)"
+    else bad "canary other bytes"; sed 's/^/     | /' "$st/can2"; fi
+    fx_dist "$st/d15" 0.15.0
+    mkdir -p "$st/can-old"
+    fx_deb "$st/can-old" usg-plat-pin-canary 0.0.1 all
+    cp -- "$st/can-old/usg-plat-pin-canary_0.0.1_all.deb" "$repo/apt/pool/main/"
+    if run 1 "$st/can3" --dist "$st/d15" --tag v0.15.0 --repo "$repo" &&
+        grep -q "a different canary version is in the tree" "$st/can3" &&
+        [ ! -d "$repo/releases/v0.15.0" ]; then
+        ok "different canary version in the tree refused before copying"
+    else bad "different canary version"; sed 's/^/     | /' "$st/can3"; fi
+    rm -f -- "$repo/apt/pool/main/usg-plat-pin-canary_0.0.1_all.deb"
+    cp -- "$repo/apt/pool/main/platd_0.14.0-1_amd64.deb" "$st/pd.keep"
+    printf 'x' >>"$repo/apt/pool/main/platd_0.14.0-1_amd64.deb"
+    if run 1 "$st/pd" --dist "$st/d14" --tag v0.14.0 --repo "$repo" &&
+        grep -q "platd_0.14.0-1_amd64.deb is already in the tree with different content" "$st/pd"; then
+        ok "different platd bytes in the tree refused"
+    else bad "platd immutability"; sed 's/^/     | /' "$st/pd"; fi
+    cp -- "$st/pd.keep" "$repo/apt/pool/main/platd_0.14.0-1_amd64.deb"
 
     # Tarball holds releases/<tag>/.
     fx_dist "$st/d12" 0.12.0
