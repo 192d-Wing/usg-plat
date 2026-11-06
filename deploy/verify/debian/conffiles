@@ -1,0 +1,4 @@
+/etc/usg-plat-verify/verify.conf
+/etc/apt/apt.conf.d/50usg-plat-verify
+/etc/apt/sources.list.d/usg-plat.sources
+/etc/apt/preferences.d/usg-plat

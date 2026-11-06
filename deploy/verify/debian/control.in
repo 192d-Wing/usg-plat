@@ -1,0 +1,14 @@
+Package: usg-plat-verify
+Version: @VERSION@-1
+Architecture: all
+Maintainer: usg-plat Contributors
+Section: admin
+Priority: optional
+Depends: apt (>= 2.6), coreutils, util-linux
+Description: install-time signature gate for usg-plat packages
+ Refuses apt installs and upgrades of platd and usg-plat-verify unless the
+ package's SHA-256 is listed in the release SHA256SUMS and that file's cosign
+ keyless signature verifies offline against the pinned Sigstore trusted root
+ and the exact release workflow identity. Requires an operator-installed
+ cosign >= 3.0.3 (/usr/local/bin/cosign by default); without it every
+ usg-plat install is refused. dpkg -i bypasses the gate.
