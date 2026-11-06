@@ -29,7 +29,9 @@ set -u
 # Test hooks (the USG_PLAT_VERIFY_* overrides named in the header, and TMPDIR)
 # are honoured only when USG_PLAT_VERIFY_TEST=1, which only the test suites
 # set. Otherwise they are unset, so children inherit a clean environment, and
-# logged once to authpriv. USG_PLAT_VERIFY_SUMS_DIR is not a hook: the front
+# logged once to authpriv. When it is honoured, every invocation logs
+# "test mode enabled" at authpriv.warning and on stderr, so a production host
+# left in test mode is visible. USG_PLAT_VERIFY_SUMS_DIR is not a hook: the front
 # ends set it for local installs and verify-pkg still verifies what it names.
 #
 # COMPLIANCE MAPPING:
@@ -40,6 +42,9 @@ export PATH
 uv_test=0
 if [ "${USG_PLAT_VERIFY_TEST:-}" = 1 ]; then
     uv_test=1
+    uv_msg="test mode enabled: overrides honoured (USG_PLAT_VERIFY_TEST=1)"
+    printf 'usg-plat-verify: %s\n' "$uv_msg" >&2
+    PATH=${USG_PLAT_VERIFY_PATH:-$PATH} logger -t usg-plat-verify -p authpriv.warning -- "$uv_msg" 2>/dev/null || :
 else
     uv_ign=$(env | sed -n 's/^\(USG_PLAT_VERIFY_[A-Z_]*\)=.*/\1/p' |
         grep -v -x -e USG_PLAT_VERIFY_SUMS_DIR -e USG_PLAT_VERIFY_TEST | sort -u | tr '\n' ' ')

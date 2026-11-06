@@ -256,6 +256,52 @@ check "missing sums never call cosign" no_cosign_call
 reset
 write_conf "COSIGN=$W/stub/no-such-cosign"
 expect "cosign missing" 1 vp --name platd --version 0.3.0-1 --arch amd64 --sha256 "$H_AMD"
+# cosign itself must be root-only (SEC-010): file, target and ancestors.
+reset
+expect "test mode is announced" 0 vp --name platd --version 0.3.0-1 --arch amd64 --sha256 "$H_AMD"
+reason "test mode on stderr" 'test mode enabled: overrides honoured'
+check "test mode logged at authpriv.warning" grep -q 'authpriv.warning.*test mode enabled: overrides honoured' "$STUB_LOG"
+mkdir -p "$W/cos/gw" "$W/cos/lnk" "$W/cos/own"
+cp "$W/stub/cosign" "$W/cos/gw/cosign"
+chmod 0775 "$W/cos/gw"
+reset
+write_conf "COSIGN=$W/cos/gw/cosign"
+expect "cosign in a group-writable directory refused" 2 vp --name platd --version 0.3.0-1 --arch amd64 --sha256 "$H_AMD"
+reason "cosign refusal reason" 'cosign .* is not root-owned'
+check "untrusted cosign never ran" no_cosign_call
+reset
+ln -s "$W/stub/cosign" "$W/cos/lnk/cosign"
+write_conf "COSIGN=$W/cos/lnk/cosign"
+expect "symlink to a root-only cosign accepted" 0 vp --name platd --version 0.3.0-1 --arch amd64 --sha256 "$H_AMD"
+reset
+ln -s "$W/cos/gw/cosign" "$W/cos/lnk/cosign-gw"
+write_conf "COSIGN=$W/cos/lnk/cosign-gw"
+expect "symlink to a cosign in a group-writable directory refused" 2 vp --name platd --version 0.3.0-1 --arch amd64 --sha256 "$H_AMD"
+reset
+ln -s "$W/stub/cosign" "$W/cos/gw/cosign-ln"
+write_conf "COSIGN=$W/cos/gw/cosign-ln"
+expect "symlink in a group-writable directory refused" 2 vp --name platd --version 0.3.0-1 --arch amd64 --sha256 "$H_AMD"
+reset
+cp "$W/stub/cosign" "$W/cos/own/cosign"
+chmod 0775 "$W/cos/own/cosign"
+write_conf "COSIGN=$W/cos/own/cosign"
+expect "group-writable cosign file refused" 2 vp --name platd --version 0.3.0-1 --arch amd64 --sha256 "$H_AMD"
+chmod 0755 "$W/cos/own/cosign"
+if [ "$(id -u)" = 0 ]; then
+    chown 65534 "$W/cos/own/cosign"
+    reset
+    write_conf "COSIGN=$W/cos/own/cosign"
+    expect "cosign owned by another uid refused" 2 vp --name platd --version 0.3.0-1 --arch amd64 --sha256 "$H_AMD"
+    chown 0 "$W/cos/own/cosign"
+elif [ "${CI:-}" = true ]; then
+    bad "the non-root-owner cosign case needs root in CI"
+else
+    echo "skip cosign owned by another uid (not root)"
+fi
+reset
+write_conf "COSIGN=$W/cos/gw/cosign"
+expect "selftest --full flags an untrusted cosign" 1 "$W/libexec/selftest" --full
+reason "selftest names the cosign problem" 'cosign .* is not root-owned'
 reset
 STUB_MODE=exit127
 export STUB_MODE
@@ -472,7 +518,7 @@ EOF
 check "override logged at authpriv.warning" grep -q 'authpriv.warning.*USG_PLAT_ALLOW_DOWNGRADE=1' "$STUB_LOG"
 check "allowed downgrade logged" grep -q 'authpriv.warning.*downgrade of platd' "$STUB_LOG"
 # The common block is byte-identical in every script.
-common_of() { sed -n '/^# >>> common/,/^# <<< common/p' "$1"; }
+common_of() { sed -n '/^# >>> common:/,/^# <<< common$/p' "$1"; }
 common_same() {
     ref=$(common_of "$src/libexec/verify-pkg")
     [ -n "$ref" ] || return 1
@@ -480,6 +526,25 @@ common_same() {
         [ "$(common_of "$f")" = "$ref" ] || { echo "common block differs in $f" >&2; return 1; }
     done
 }
+# The package scripts carry the same block (the spec doubles each % for rpm).
+common_pkg() {
+    ref=$(common_of "$src/libexec/verify-pkg")
+    [ "$(common_of "$src/debian/postinst")" = "$ref" ] || { echo "common block differs in debian/postinst" >&2; return 1; }
+    [ "$(common_of "$src/rpm/usg-plat-verify.spec" | sed 's/%%/%/g')" = "$ref" ] ||
+        { echo "common block differs in rpm/usg-plat-verify.spec" >&2; return 1; }
+}
+check "common block identical in postinst and %post" common_pkg
+exec_of() { sed -n '/^# >>> common-exec/,/^# <<< common-exec/p' "$1"; }
+exec_same() {
+    ref=$(exec_of "$src/libexec/verify-pkg")
+    [ -n "$ref" ] || return 1
+    for f in "$src/libexec/selftest" "$src/debian/postinst"; do
+        [ "$(exec_of "$f")" = "$ref" ] || { echo "common-exec block differs in $f" >&2; return 1; }
+    done
+    [ "$(exec_of "$src/rpm/usg-plat-verify.spec" | sed 's/%%/%/g')" = "$ref" ] ||
+        { echo "common-exec block differs in the spec" >&2; return 1; }
+}
+check "common-exec block identical where cosign is checked" exec_same
 check "common block identical in all gate scripts" common_same
 
 # --- selftest --apt --------------------------------------------------------------

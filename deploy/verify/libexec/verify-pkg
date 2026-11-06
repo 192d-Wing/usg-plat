@@ -48,7 +48,9 @@ set -u
 # Test hooks (the USG_PLAT_VERIFY_* overrides named in the header, and TMPDIR)
 # are honoured only when USG_PLAT_VERIFY_TEST=1, which only the test suites
 # set. Otherwise they are unset, so children inherit a clean environment, and
-# logged once to authpriv. USG_PLAT_VERIFY_SUMS_DIR is not a hook: the front
+# logged once to authpriv. When it is honoured, every invocation logs
+# "test mode enabled" at authpriv.warning and on stderr, so a production host
+# left in test mode is visible. USG_PLAT_VERIFY_SUMS_DIR is not a hook: the front
 # ends set it for local installs and verify-pkg still verifies what it names.
 #
 # COMPLIANCE MAPPING:
@@ -59,6 +61,9 @@ export PATH
 uv_test=0
 if [ "${USG_PLAT_VERIFY_TEST:-}" = 1 ]; then
     uv_test=1
+    uv_msg="test mode enabled: overrides honoured (USG_PLAT_VERIFY_TEST=1)"
+    printf 'usg-plat-verify: %s\n' "$uv_msg" >&2
+    PATH=${USG_PLAT_VERIFY_PATH:-$PATH} logger -t usg-plat-verify -p authpriv.warning -- "$uv_msg" 2>/dev/null || :
 else
     uv_ign=$(env | sed -n 's/^\(USG_PLAT_VERIFY_[A-Z_]*\)=.*/\1/p' |
         grep -v -x -e USG_PLAT_VERIFY_SUMS_DIR -e USG_PLAT_VERIFY_TEST | sort -u | tr '\n' ' ')
@@ -105,6 +110,22 @@ root_only() {
     done
 }
 # <<< common
+
+# >>> common-exec (identical where cosign is checked; unit.sh checks)
+# root_only_exec PATH: an executable that may be a symlink (cosign in
+# /usr/local/bin often is). Every ancestor of PATH must pass root_only, and
+# so must the fully resolved target (readlink -f), which must be a regular
+# executable file.
+root_only_exec() {
+    case $1 in /*) ;; *) return 1 ;; esac
+    rx_d=${1%/*}
+    [ -n "$rx_d" ] || rx_d=/
+    root_only "$rx_d" || return 1
+    rx_t=$(readlink -f -- "$1" 2>/dev/null) || return 1
+    [ -n "$rx_t" ] && [ -f "$rx_t" ] && [ -x "$rx_t" ] || return 1
+    root_only "$rx_t"
+}
+# <<< common-exec
 
 PATH=${USG_PLAT_VERIFY_PATH:-/usr/sbin:/usr/bin:/sbin:/bin}
 export PATH
@@ -275,6 +296,8 @@ fi
 # --- cosign ----------------------------------------------------------------
 command -v timeout >/dev/null 2>&1 || refuse 1 "timeout(1) not found"
 [ -x "$COSIGN" ] || refuse 1 "cosign not found at $COSIGN (install it, see the install guide)"
+root_only_exec "$COSIGN" ||
+    refuse 2 "cosign $COSIGN (its target or a parent directory) is not root-owned, is group/other-writable or is not a regular file"
 
 run_cosign() {
     if [ -n "$COSIGN_GODEBUG" ]; then
