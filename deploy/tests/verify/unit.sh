@@ -380,7 +380,7 @@ good_sources() {
         "${1:-https://192d-wing.github.io/usg-plat-packages/apt}" >"$W/apt/usg-plat.sources"
 }
 good_pref() {
-    o=${1:-192d-wing.github.io}
+    o=${1-192d-wing.github.io}
     printf 'Package: *\nPin: origin "%s"\nPin-Priority: -1\n\nPackage: platd usg-plat-verify\nPin: origin "%s"\nPin-Priority: 500\n' \
         "$o" "$o" >"$W/apt/usg-plat.pref"
 }
@@ -388,9 +388,9 @@ canary() { # candidate
     printf 'usg-plat-pin-canary:\n  Installed: (none)\n  Candidate: %s\n  Version table:\n     0.0.0 -1\n        -1 https://192d-wing.github.io/usg-plat-packages/apt stable/main all Packages\n' \
         "$1" >"$W/pol/usg-plat-pin-canary"
 }
-platd_policy() { # prio
-    printf 'platd:\n  Installed: 0.2.1-1\n  Candidate: 0.3.0-1\n  Version table:\n     0.3.0-1 %s\n        -1 https://192d-wing.github.io/usg-plat-packages/apt stable/main amd64 Packages\n *** 0.2.1-1 100\n        100 /var/lib/dpkg/status\n' \
-        "$1" >"$W/pol/platd"
+platd_policy() { # prio [source-uri]
+    printf 'platd:\n  Installed: 0.2.1-1\n  Candidate: 0.3.0-1\n  Version table:\n     0.3.0-1 %s\n        -1 %s stable/main amd64 Packages\n *** 0.2.1-1 100\n        100 /var/lib/dpkg/status\n' \
+        "$1" "${2:-https://192d-wing.github.io/usg-plat-packages/apt}" >"$W/pol/platd"
 }
 st() { "$W/libexec/selftest" --apt; }
 reset
@@ -416,6 +416,34 @@ good_sources http://192d-wing.github.io/usg-plat-packages/apt
 expect "sources not https" 1 st
 good_sources https://192D-WING.github.io:443/usg-plat-packages/apt
 expect "sources host compared lowercased, port ignored" 0 st
+good_sources https://192d-wing.github.io.example.invalid/apt
+expect "sources host with REPO_HOST as a prefix fails" 1 st
+# Offline mirror on file: (apt gives it an empty origin).
+good_sources file:/srv/usg-plat/apt
+good_pref ''
+platd_policy 500 file:/srv/usg-plat/apt
+expect "file: source with origin \"\" passes" 0 st
+good_sources file:///srv/usg-plat/apt
+expect "file:/// source with origin \"\" passes" 0 st
+good_pref
+expect "file: source with origin REPO_HOST fails" 1 st
+good_pref ''
+platd_policy -1 file:/srv/usg-plat/apt
+expect "file: source with platd at -1 fails" 1 st
+platd_policy 500
+expect "file: source, platd only from https in the indexes, fails" 1 st
+platd_policy 500 file:/srv/usg-plat/apt
+good_sources file://mirror.example.invalid/apt
+expect "file: URI with a host fails" 1 st
+good_sources http://192d-wing.github.io/usg-plat-packages/apt
+expect "http: source with origin \"\" fails" 1 st
+good_sources 'https://192d-wing.github.io/usg-plat-packages/apt file:/srv/usg-plat/apt'
+expect "mixed https and file: sources fail" 1 st
+good_pref
+expect "mixed https and file: sources fail (REPO_HOST origin)" 1 st
+platd_policy 500
+good_sources https://mirror.example.invalid/usg-plat/apt
+expect "https mirror on a host other than REPO_HOST fails" 1 st
 good_sources
 canary '0.0.0'
 expect "canary with a candidate fails" 1 st

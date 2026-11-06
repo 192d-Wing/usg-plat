@@ -4,7 +4,13 @@
 # origin is the bare lowercase host (no scheme, no port): an origin that does
 # not match fails open, so `selftest --apt` (run after every apt update)
 # checks it against REPO_HOST and checks that the canary package
-# usg-plat-pin-canary has no candidate.
+# usg-plat-pin-canary has no candidate. The repository must publish the
+# canary: without it `apt-get update` fails (exit 100, Post-Invoke selftest)
+# by design, since the pin cannot be shown to match.
+#
+# Offline mirror on a file: URI: apt gives such a repository an empty origin,
+# so use `Pin: origin ""` in both stanzas (selftest requires exactly that for
+# file: sources). http: sources are never accepted.
 #
 # COMPLIANCE MAPPING:
 # - NIST 800-53: CM-7 (Least Functionality), CM-14 (Signed Components)
