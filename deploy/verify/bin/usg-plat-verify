@@ -1,0 +1,112 @@
+#!/bin/sh
+# usg-plat-verify: operator front end of the usg-plat install-time gate.
+#
+# Usage: usg-plat-verify selftest       full self-test (cosign, trust root, pin)
+#        usg-plat-verify status         configuration, cosign, trust root, last refusal
+#        usg-plat-verify verify FILE    run the gate on a .deb or .rpm by hand
+# Exit:  selftest/verify as libexec/selftest and verify-pkg (0 ok, 1 refused
+#        or failed, 2 usage/config); status 0.
+#
+# `verify FILE` reads name/version/arch from the package header, hashes the
+# file and calls verify-pkg; SHA256SUMS is taken from FILE's directory when a
+# SHA256SUMS is there, otherwise from the cache. Nothing is installed.
+#
+# Test hooks (environment): USG_PLAT_VERIFY_CONF, USG_PLAT_VERIFY_STATE,
+# USG_PLAT_VERIFY_TRUSTED_ROOT, USG_PLAT_VERIFY_LIBEXEC, USG_PLAT_VERIFY_PATH.
+#
+# COMPLIANCE MAPPING:
+# - NIST 800-53: SI-7(15) (Code Authentication), CM-14 (Signed Components),
+#   SR-11 (Component Authenticity), SI-6 (Security Function Verification)
+set -u
+
+PATH=${USG_PLAT_VERIFY_PATH:-/usr/sbin:/usr/bin:/sbin:/bin}
+export PATH
+
+CONF=${USG_PLAT_VERIFY_CONF:-/etc/usg-plat-verify/verify.conf}
+STATE=${USG_PLAT_VERIFY_STATE:-/var/lib/usg-plat-verify}
+TRUSTED_ROOT=${USG_PLAT_VERIFY_TRUSTED_ROOT:-/usr/share/usg-plat-verify/trusted_root.json}
+LIBEXEC=${USG_PLAT_VERIFY_LIBEXEC:-/usr/libexec/usg-plat-verify}
+
+usage() {
+    echo "usage: usg-plat-verify selftest | status | verify FILE" >&2
+    exit 2
+}
+
+[ $# -ge 1 ] || usage
+cmd=$1
+shift
+case $cmd in
+    selftest)
+        [ $# -eq 0 ] || usage
+        exec "$LIBEXEC/selftest" --full
+        ;;
+    status)
+        [ $# -eq 0 ] || usage
+        echo "config:       $CONF"
+        COSIGN='' NAMES='' REPO_BASE=''
+        if [ -r "$CONF" ]; then
+            # shellcheck source=deploy/verify/etc/verify.conf
+            . "$CONF"
+        fi
+        echo "names:        ${NAMES:-?}"
+        echo "repo base:    ${REPO_BASE:-?}"
+        if [ -x "${COSIGN:-}" ]; then
+            v=$("$COSIGN" version 2>/dev/null | sed -n 's/^GitVersion:[[:space:]]*//p' | head -n 1)
+            h=$(sha256sum -- "$COSIGN" 2>/dev/null)
+            echo "cosign:       $COSIGN ${v:-version unknown} sha256 ${h%% *}"
+        else
+            echo "cosign:       MISSING at ${COSIGN:-?} (every usg-plat install is refused)"
+        fi
+        if [ -f "$TRUSTED_ROOT" ]; then
+            h=$(sha256sum -- "$TRUSTED_ROOT" 2>/dev/null)
+            echo "trusted root: $TRUSTED_ROOT sha256 ${h%% *}"
+        else
+            echo "trusted root: MISSING at $TRUSTED_ROOT"
+        fi
+        rel=''
+        for d in "$STATE"/releases/v*; do
+            [ -d "$d" ] && rel="$rel ${d##*/}"
+        done
+        echo "cached sums: ${rel:- none}"
+        if [ -f "$STATE/last-refusal" ]; then
+            echo "last refusal: $(head -c 512 "$STATE/last-refusal")"
+        else
+            echo "last refusal: none"
+        fi
+        echo "refusals:     $(cat "$STATE/refusals_total" 2>/dev/null || echo 0)"
+        exit 0
+        ;;
+    verify)
+        [ $# -eq 1 ] || usage
+        f=$1
+        case $f in /*) ;; *) f="$(pwd)/$f" ;; esac
+        [ -f "$f" ] && [ ! -L "$f" ] || { echo "usg-plat-verify: $f is not a regular file" >&2; exit 2; }
+        case $f in
+            *.deb)
+                command -v dpkg-deb >/dev/null 2>&1 || { echo "usg-plat-verify: dpkg-deb not found" >&2; exit 2; }
+                fields=$(dpkg-deb -f "$f" Package Version Architecture 2>/dev/null) ||
+                    { echo "usg-plat-verify: cannot read $f" >&2; exit 1; }
+                n=$(printf '%s\n' "$fields" | sed -n 's/^Package: //p')
+                v=$(printf '%s\n' "$fields" | sed -n 's/^Version: //p')
+                a=$(printf '%s\n' "$fields" | sed -n 's/^Architecture: //p')
+                ;;
+            *.rpm)
+                command -v rpm >/dev/null 2>&1 || { echo "usg-plat-verify: rpm not found" >&2; exit 2; }
+                n=$(rpm -qp --nosignature --qf '%{NAME}' -- "$f" 2>/dev/null)
+                v=$(rpm -qp --nosignature --qf '%{VERSION}-%{RELEASE}' -- "$f" 2>/dev/null)
+                a=$(rpm -qp --nosignature --qf '%{ARCH}' -- "$f" 2>/dev/null)
+                ;;
+            *) echo "usg-plat-verify: $f is not a .deb or .rpm" >&2; exit 2 ;;
+        esac
+        h=$(sha256sum -- "$f" 2>/dev/null) || { echo "usg-plat-verify: cannot hash $f" >&2; exit 1; }
+        h=${h%% *}
+        d=${f%/*}
+        [ -n "$d" ] || d=/
+        if [ -f "$d/SHA256SUMS" ]; then
+            USG_PLAT_VERIFY_SUMS_DIR=$d exec "$LIBEXEC/verify-pkg" \
+                --name "$n" --version "$v" --arch "$a" --sha256 "$h"
+        fi
+        exec "$LIBEXEC/verify-pkg" --name "$n" --version "$v" --arch "$a" --sha256 "$h"
+        ;;
+    *) usage ;;
+esac

@@ -1,0 +1,18 @@
+// /etc/apt/apt.conf.d/50usg-plat-verify - usg-plat install-time signature gate.
+//
+// Pre-Install-Pkgs runs apt-hook before dpkg unpacks anything; a non-zero
+// exit aborts the whole transaction (fail closed). Version 3 gives the hook
+// the old/new versions, architectures and absolute .deb paths.
+//
+// After a successful `apt-get update`: fetch-sums caches SHA256SUMS and their
+// bundles (unsigned transport, verified at install, best effort: `|| true`),
+// and selftest checks the pin. selftest is not masked on purpose: a broken
+// pin fails the update loudly. A failing Post-Invoke makes `apt-get update`
+// exit 100 but cannot un-trust indexes that were already accepted.
+//
+// COMPLIANCE MAPPING:
+// - NIST 800-53: SI-7(15) (Code Authentication), CM-14 (Signed Components),
+//   SR-11 (Component Authenticity)
+DPkg::Pre-Install-Pkgs { "/usr/libexec/usg-plat-verify/apt-hook"; };
+DPkg::Tools::Options::/usr/libexec/usg-plat-verify/apt-hook::Version "3";
+APT::Update::Post-Invoke-Success { "/usr/libexec/usg-plat-verify/fetch-sums || true"; "/usr/libexec/usg-plat-verify/selftest --apt"; };

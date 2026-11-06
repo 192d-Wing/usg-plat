@@ -1,0 +1,199 @@
+#!/bin/sh
+# usg-plat-verify self-test.
+#
+# Usage: selftest --apt | --dnf | --full
+#   --apt   the apt pin (run after every `apt-get update`, by postinst, and by
+#           `usg-plat-verify selftest`):
+#           1. the URIs host of usg-plat.sources (lowercased) and the
+#              `Pin: origin` of every pin stanza both equal REPO_HOST, which
+#              must itself be a bare lowercase host (an origin with a scheme,
+#              a port or upper case does not match, and a pin that does not
+#              match fails open);
+#           2. the canary usg-plat-pin-canary has `Candidate: (none)`;
+#           3. platd from REPO_HOST is pinned at 500 (read from the
+#              version-table line: the per-source line shows -1 cosmetically).
+#   --dnf   usg-plat.repo: baseurl host is REPO_HOST, includepkgs lists only
+#           NAMES, and the dnf plugin is enabled.
+#   --full  cosign present and >= COSIGN_MIN, trust root present, then --apt
+#           and/or --dnf for the package managers found.
+# Exit: 0 pass; 1 a check failed (logged at authpriv.err); 2 usage/config.
+#
+# Test hooks (environment): USG_PLAT_VERIFY_CONF, USG_PLAT_VERIFY_PATH,
+# USG_PLAT_VERIFY_TRUSTED_ROOT, USG_PLAT_VERIFY_APT_SOURCES
+# [/etc/apt/sources.list.d/usg-plat.sources], USG_PLAT_VERIFY_APT_PREF
+# [/etc/apt/preferences.d/usg-plat], USG_PLAT_VERIFY_DNF_REPO
+# [/etc/yum.repos.d/usg-plat.repo], USG_PLAT_VERIFY_DNF_PLUGIN_CONF
+# [/etc/dnf/plugins/usg_plat_verify.conf].
+#
+# COMPLIANCE MAPPING:
+# - NIST 800-53: CM-7 (Least Functionality) - the pin admits only our names
+#   from the unsigned repository; a silently non-matching pin is detected
+# - NIST 800-53: SI-7(15), CM-14 - the gate's prerequisites are checked
+# - NIST 800-53: SI-6 (Security and Privacy Function Verification)
+# POAM: POAM-044 (c) - a file: (offline mirror) source is not supported by the
+#   origin check yet
+set -u
+
+PATH=${USG_PLAT_VERIFY_PATH:-/usr/sbin:/usr/bin:/sbin:/bin}
+export PATH
+
+CONF=${USG_PLAT_VERIFY_CONF:-/etc/usg-plat-verify/verify.conf}
+TRUSTED_ROOT=${USG_PLAT_VERIFY_TRUSTED_ROOT:-/usr/share/usg-plat-verify/trusted_root.json}
+SOURCES=${USG_PLAT_VERIFY_APT_SOURCES:-/etc/apt/sources.list.d/usg-plat.sources}
+PREF=${USG_PLAT_VERIFY_APT_PREF:-/etc/apt/preferences.d/usg-plat}
+DNF_REPO=${USG_PLAT_VERIFY_DNF_REPO:-/etc/yum.repos.d/usg-plat.repo}
+DNF_PLUGIN_CONF=${USG_PLAT_VERIFY_DNF_PLUGIN_CONF:-/etc/dnf/plugins/usg_plat_verify.conf}
+CANARY=usg-plat-pin-canary
+
+failed=0
+
+log() { # priority message
+    printf 'usg-plat-verify selftest: %s\n' "$2" >&2
+    if command -v logger >/dev/null 2>&1; then
+        logger -t usg-plat-verify -p "authpriv.$1" -- "selftest: $2" 2>/dev/null || :
+    fi
+}
+fail() { log err "FAIL: $1"; failed=1; }
+
+usage() { echo "usage: selftest --apt | --dnf | --full" >&2; exit 2; }
+[ $# -eq 1 ] || usage
+mode=$1
+case $mode in --apt | --dnf | --full) ;; *) usage ;; esac
+
+[ -f "$CONF" ] && [ -r "$CONF" ] || { log err "configuration $CONF missing"; exit 2; }
+NAMES='' REPO_HOST='' COSIGN='' COSIGN_MIN=''
+# shellcheck source=deploy/verify/etc/verify.conf
+. "$CONF" || { log err "configuration $CONF does not parse"; exit 2; }
+printf '%s\n' "$REPO_HOST" | grep -Eqx '[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+' || {
+    log err "REPO_HOST must be a bare lowercase host name (no scheme, port or path)"
+    exit 2
+}
+
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+check_apt() {
+    # 1. sources host and pin origins.
+    if [ -f "$SOURCES" ]; then
+        uris=$(sed -n 's/^URIs:[[:space:]]*//p' "$SOURCES")
+        [ -n "$uris" ] || fail "$SOURCES has no URIs"
+        for u in $uris; do
+            case $u in
+                https://*) h=${u#https://} ;;
+                *) fail "$SOURCES URI is not https://: $u"; continue ;;
+            esac
+            h=${h%%/*}
+            h=${h%%:*}
+            [ "$(lower "$h")" = "$REPO_HOST" ] || fail "$SOURCES host $h is not REPO_HOST $REPO_HOST"
+        done
+    else
+        fail "$SOURCES missing"
+    fi
+    if [ -f "$PREF" ]; then
+        pins=$(sed -n 's/^Pin:[[:space:]]*//p' "$PREF")
+        npins=0
+        while IFS= read -r p; do
+            [ -n "$p" ] || continue
+            npins=$((npins + 1))
+            [ "$p" = "origin \"$REPO_HOST\"" ] ||
+                fail "$PREF has 'Pin: $p'; expected 'Pin: origin \"$REPO_HOST\"' (bare lowercase host)"
+        done <<EOF
+$pins
+EOF
+        [ $npins -ge 2 ] || fail "$PREF must have the -1 and the 500 stanza"
+        grep -Eq '^Pin-Priority:[[:space:]]*-1[[:space:]]*$' "$PREF" || fail "$PREF has no Pin-Priority -1 stanza"
+    else
+        fail "$PREF missing"
+    fi
+
+    command -v apt-cache >/dev/null 2>&1 || { fail "apt-cache not found"; return; }
+    # 2. canary.
+    cand=$(apt-cache policy "$CANARY" 2>/dev/null | sed -n 's/^[[:space:]]*Candidate:[[:space:]]*//p' | head -n 1)
+    if [ -z "$cand" ]; then
+        fail "$CANARY is not in the package indexes (run apt-get update; the repository must publish it)"
+    elif [ "$cand" != "(none)" ]; then
+        fail "$CANARY has candidate $cand: the -1 pin does not match the repository origin"
+    fi
+    # 3. platd at 500 from REPO_HOST (version-table line before the source line).
+    prios=$(apt-cache policy platd 2>/dev/null | awk -v host="$REPO_HOST" '
+        /Version table:/ { t = 1; next }
+        !t { next }
+        $1 == "***" { prio = $3; next }
+        NF == 2 && $2 !~ /\// { prio = $2; next }
+        $2 ~ /\// {
+            u = tolower($2)
+            if (index(u, "://" host "/") || u == "https://" host) print prio
+        }')
+    if [ -z "$prios" ]; then
+        fail "platd from $REPO_HOST is not in the package indexes"
+    else
+        for p in $prios; do
+            [ "$p" = 500 ] || fail "platd from $REPO_HOST is pinned at $p, not 500"
+        done
+    fi
+}
+
+check_dnf() {
+    if [ ! -f "$DNF_REPO" ]; then
+        fail "$DNF_REPO missing"
+        return
+    fi
+    base=$(sed -n 's/^baseurl[[:space:]]*=[[:space:]]*//p' "$DNF_REPO" | head -n 1)
+    case $base in
+        https://*) h=${base#https://} h=${h%%/*} h=${h%%:*}
+            [ "$(lower "$h")" = "$REPO_HOST" ] || fail "$DNF_REPO baseurl host $h is not REPO_HOST $REPO_HOST" ;;
+        *) fail "$DNF_REPO baseurl is not https://" ;;
+    esac
+    inc=$(sed -n 's/^includepkgs[[:space:]]*=[[:space:]]*//p' "$DNF_REPO" | tr ',' ' ')
+    [ -n "$inc" ] || fail "$DNF_REPO has no includepkgs (foreign names would be installable)"
+    for p in $inc; do
+        ok=0
+        for n in $NAMES; do [ "$n" = "$p" ] && ok=1; done
+        [ $ok -eq 1 ] || fail "$DNF_REPO includepkgs lists $p, which is not in NAMES"
+    done
+    if [ -f "$DNF_PLUGIN_CONF" ]; then
+        grep -Eq '^enabled[[:space:]]*=[[:space:]]*(1|true|yes)[[:space:]]*$' "$DNF_PLUGIN_CONF" ||
+            fail "dnf plugin usg_plat_verify is not enabled in $DNF_PLUGIN_CONF"
+    else
+        fail "$DNF_PLUGIN_CONF missing"
+    fi
+}
+
+check_common() {
+    if [ -x "${COSIGN:-}" ]; then
+        v=$("$COSIGN" version 2>/dev/null | sed -n 's/^GitVersion:[[:space:]]*v\{0,1\}\([0-9][0-9.]*\).*/\1/p' | head -n 1)
+        if [ -z "$v" ]; then
+            fail "cannot read the version of $COSIGN"
+        else
+            lowest=$(printf '%s\n%s\n' "$v" "$COSIGN_MIN" | sort -t. -k1,1n -k2,2n -k3,3n | head -n 1)
+            [ "$lowest" = "$COSIGN_MIN" ] || fail "cosign $v is older than $COSIGN_MIN"
+        fi
+    else
+        fail "cosign not found at ${COSIGN:-?}: every usg-plat install will be refused"
+    fi
+    [ -f "$TRUSTED_ROOT" ] || fail "trusted root $TRUSTED_ROOT missing"
+}
+
+case $mode in
+    --apt) check_apt ;;
+    --dnf) check_dnf ;;
+    --full)
+        check_common
+        found=0
+        if [ -f "$SOURCES" ] || command -v apt-get >/dev/null 2>&1; then
+            check_apt
+            found=1
+        fi
+        if [ -f "$DNF_REPO" ] || command -v dnf >/dev/null 2>&1; then
+            check_dnf
+            found=1
+        fi
+        [ $found -eq 1 ] || fail "neither apt nor dnf found"
+        ;;
+    *) usage ;;
+esac
+
+if [ $failed -ne 0 ]; then
+    exit 1
+fi
+log info "${mode#--} checks passed"
+exit 0

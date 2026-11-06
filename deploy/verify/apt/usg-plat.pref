@@ -1,0 +1,19 @@
+# /etc/apt/preferences.d/usg-plat - usg-plat packages.
+#
+# Nothing from the usg-plat origin is installable except our names. The
+# origin is the bare lowercase host (no scheme, no port): an origin that does
+# not match fails open, so `selftest --apt` (run after every apt update)
+# checks it against REPO_HOST and checks that the canary package
+# usg-plat-pin-canary has no candidate.
+#
+# COMPLIANCE MAPPING:
+# - NIST 800-53: CM-7 (Least Functionality), CM-14 (Signed Components)
+# POAM: POAM-044 (c) - an explicit `apt-get install foo=<ver>` overrides -1
+#   for a foreign name from this origin
+Package: *
+Pin: origin "192d-wing.github.io"
+Pin-Priority: -1
+
+Package: platd usg-plat-verify
+Pin: origin "192d-wing.github.io"
+Pin-Priority: 500
