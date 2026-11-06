@@ -20,6 +20,10 @@
 # and %%pre refuses a host whose dnf uses another one (fails closed rather
 # than installing a gate dnf never loads).
 %global plugin_pys python3.9 python3.12
+# The plugin is installed for both EL9 (python3.9) and EL10 (python3.12); %%pre
+# refuses a host whose dnf uses neither. rpmbuild would otherwise add
+# Requires: python(abi) = 3.9 AND = 3.12, which no host satisfies.
+%global __requires_exclude ^python\\(abi\\)
 
 Name:           usg-plat-verify
 Version:        %{pkgversion}

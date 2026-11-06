@@ -61,7 +61,7 @@ SHELLCHECK = sh -c 'if ! command -v shellcheck >/dev/null 2>&1; then \
 # Install-time gate scripts (see verify-pkg below); defined here because
 # DEPLOY_SH includes them.
 VERIFY_SH := deploy/verify/build.sh deploy/verify/trusted-root.sh deploy/verify/debian/postinst deploy/verify/debian/prerm \
-	$(wildcard deploy/verify/libexec/*) $(wildcard deploy/verify/bin/usg-plat-verify) $(wildcard deploy/tests/verify/*.sh)
+	$(wildcard deploy/verify/libexec/*) $(wildcard deploy/verify/bin/usg-plat-verify) $(wildcard deploy/tests/verify/*.sh) $(wildcard deploy/tests/verify/install/*.sh)
 VERIFY_PY := $(wildcard deploy/tests/verify/test_dnf_plugin.py)
 
 # Deploy scripts: POSIX syntax, shellcheck (required when CI=true) and a stubbed run
