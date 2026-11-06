@@ -16,6 +16,7 @@ site_dir = "site"
 nav = [
   { "Home" = "index.md" },
   { "Getting started" = "getting-started.md" },
+  { "Install verification" = "install-verify.md" },
   { "Architecture" = "architecture.md" },
   { "Performance" = "performance.md" },
   { "Jool comparison" = "jool-comparison.md" },

@@ -68,15 +68,51 @@ or restarted by the package: edit the config, then enable a time-wait unit,
 nftables drop-in is active as soon as the package is installed, so an
 nftables start or reload turns forwarding off until `platd` has set up its
 policy. Tagged releases are signed with Sigstore cosign keyless; see
-"Verifying a release". There is no signed apt/dnf repository.
+"Verifying a release".
+
+`platd` depends on `usg-plat-verify`, so `dpkg -i` or `rpm -i` of the
+`platd` package alone fails. Install `usg-plat-verify` first (see
+"Install-time verification" below).
+
+### Install-time verification (`usg-plat-verify`)
+
+`usg-plat-verify` (`deploy/verify/`) is a noarch host package. It makes
+apt (a `DPkg::Pre-Install-Pkgs` hook) and dnf4 (a plugin) refuse `platd`
+and `usg-plat-verify` unless the package's SHA-256 is in the release's
+`SHA256SUMS` and that file's cosign keyless signature verifies offline,
+against the pinned Sigstore trust root and the exact release identity.
+It also installs the apt source and pin, or the dnf repo file, for
+<https://192d-wing.github.io/usg-plat-packages/>. That repository has
+unsigned metadata by design and is filled by the `publish` job on `v*`
+tags. No tag has published to it yet, so it starts with the first release
+after v0.3.0. Short form:
+
+1. Install upstream cosign 3.0.3 or later as `/usr/local/bin/cosign`, and
+   check it against the pinned SHA-256.
+2. Verify the release with
+   `scripts/verify-release.sh --trusted-root trusted_root.json dl vX.Y.Z`,
+   then `dpkg -i` / `rpm -i` the `usg-plat-verify` package. This is the
+   only ungated install.
+3. Run `apt-get update && apt-get install platd`, or `dnf install platd`,
+   then `usg-plat-verify selftest`.
+
+`dpkg -i` and `rpm -U` bypass the gate, and dnf5 is not supported. A
+refusal aborts the whole apt or dnf transaction, including
+unattended-upgrades and dnf-automatic runs. Offline mirrors, downgrades,
+alerting and the runbook are in `docs/install-verify.md` (site: "Install
+verification"). Residuals are in POAM-044.
 
 ### Verifying a release
 
 Download every file of a GitHub Release (for example
 `gh release download v0.3.0 -D dl`), then run
 `scripts/verify-release.sh dl v0.3.0` (or `make verify-release DIR=dl TAG=v0.3.0`).
-It needs cosign v3.0.3 or later (the script checks `cosign version`) and network access to the public Sigstore
-trust root. For one file it runs:
+It needs cosign v3.0.3 or later (the script checks `cosign version`). It
+also needs network access to the public Sigstore trust root, unless you pass
+`--trusted-root FILE`, a pinned `trusted_root.json` from
+`deploy/verify/trusted-root.sh --out FILE`, which is checked against
+`deploy/verify/trusted_root.sha256`. With that flag every `cosign
+verify-blob` uses the file and needs no network. For one file it runs:
 
 ```sh
 cosign verify-blob --bundle <file>.sigstore.json \
@@ -91,7 +127,9 @@ Every bundle is checked against the exact tag, and every file against
 public Fulcio/Rekor services. When `gh` is installed the script also checks the build
 provenance attestations with `gh attestation verify <file> --repo 192d-Wing/usg-plat
 --signer-workflow 192d-Wing/usg-plat/.github/workflows/packages.yml
---source-ref refs/tags/v0.3.0`. Nothing enforces verification at install time. The signing
+--source-ref refs/tags/v0.3.0`. Releases after v0.3.0 have 15 files. The 4 new ones are the
+`usg-plat-verify` and `usg-plat-pin-canary` `.deb` and `.rpm`. Install-time
+enforcement comes from `usg-plat-verify`, above. The signing
 path is verified end to end on the published v0.2.1 and v0.3.0 releases.
 
 ### Manual install
@@ -633,6 +671,7 @@ https://192d-wing.github.io/usg-plat/ from `main`.
 - `docs/compliance/SIEM_LOGGING.md`: log schema and SIEM correlation
 - `docs/compliance/NIST_800-53_MAPPING.md`, `RFC_COMPLIANCE.md`, `POAM.md`
 - `docs/compliance/LINUX_VERIFICATION.md`: Linux verification results
+- `docs/install-verify.md`: install-time signature gate (`usg-plat-verify`) operator guide
 - `ROADMAP.md`: current status, next steps and backlog
 - `COAs.md`: courses of action for data-plane throughput (XDP hybrid selected)
 - `docs/jool-comparison.md`: feature comparison with Jool
