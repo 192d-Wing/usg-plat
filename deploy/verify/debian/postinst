@@ -1,0 +1,31 @@
+#!/bin/sh
+# usg-plat-verify postinst.
+# COMPLIANCE MAPPING:
+# - NIST 800-53: SI-7(15) (Code Authentication), CM-14 (Signed Components) -
+#   the install-time gate is active as soon as the apt hook is unpacked; this
+#   script only prepares state and warns. It never fails the install for a
+#   missing cosign: the gate then refuses usg-plat packages (fails closed).
+# - NIST 800-53: AU-12 - the outcome is logged to authpriv.
+set -e
+
+if [ "$1" = "configure" ]; then
+    install -d -m 0755 -o root -g root /var/lib/usg-plat-verify /var/lib/usg-plat-verify/releases
+
+    COSIGN=/usr/local/bin/cosign
+    # shellcheck source=/dev/null
+    [ -r /etc/usg-plat-verify/verify.conf ] && . /etc/usg-plat-verify/verify.conf
+    if [ ! -x "$COSIGN" ]; then
+        msg="cosign not found at $COSIGN: every platd / usg-plat-verify install and upgrade will be REFUSED until cosign >= 3.0.3 is installed (see the install guide)"
+        echo "usg-plat-verify: WARNING: $msg" >&2
+        logger -t usg-plat-verify -p authpriv.warning "$msg" 2>/dev/null || true
+    fi
+
+    # The pin and canary checks need a completed `apt-get update` against the
+    # usg-plat source; before that a failure is expected, so only warn here.
+    # The same selftest runs (unmasked) after every apt update.
+    if ! /usr/libexec/usg-plat-verify/selftest --apt; then
+        echo "usg-plat-verify: WARNING: selftest --apt failed; run 'apt-get update' then 'usg-plat-verify selftest'" >&2
+    fi
+fi
+
+exit 0
