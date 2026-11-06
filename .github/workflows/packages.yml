@@ -1,7 +1,12 @@
 # NIST 800-53: CM-2 (Baseline Configuration), SI-7 (Software Integrity),
 # SR-3 (Supply Chain Controls) - .deb and .rpm built natively per
 # architecture, so the AWS-LC FIPS module is compiled by the host toolchain
-# and never cross-linked (SC-13). Every third-party action is pinned to a full
+# and never cross-linked (SC-13). The shipped builds run in a Rocky Linux 9
+# container pinned by digest (glibc 2.34, the EL9 floor; dnf-signed distro
+# packages, sha256-pinned rustup-init: deploy/build/el9-build-deps.sh), so
+# the packages install on EL9, Debian 12 and Ubuntu 22.04/24.04;
+# deploy/build/check-glibc-floor.sh fails the job on any GLIBC_ need above
+# 2.34 or a .deb libc6 floor above 2.36. Every third-party action is pinned to a full
 # commit SHA (tag in trailing comment); packaging tools are pinned versions.
 # SBOM (CycloneDX, per architecture; default and xdp builds) and CBOM are
 # attached as artifacts and installed in the packages under
@@ -52,11 +57,21 @@ jobs:
           - arch: aarch64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
+    # EL9 build floor (glibc 2.34). Keep the digest equal in `packages` and
+    # `sbom-xdp` (multi-arch index; `container:` cannot read `env`).
+    container:
+      image: rockylinux/rockylinux:9@sha256:67492e5a371d9db7c2ffb2708abae92147fb900900832a7ed3fb2ac4df9ec052
     timeout-minutes: 40
     steps:
+      - name: Install git (actions/checkout needs it inside the container)
+        run: dnf -y --setopt=install_weak_deps=False --setopt=retries=5 install git-core
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: EL9 build deps (CMake, Go, clang, perl, dpkg-dev, rpm, Python 3.12) and rustup (sha256-pinned)
+        run: |
+          deploy/build/el9-build-deps.sh
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Install pinned toolchain from rust-toolchain.toml
         run: rustup toolchain install && rustup show
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -71,8 +86,6 @@ jobs:
             echo "::error::PLAT_CBOM_BLESS is set; re-bless docs/compliance/cbom.cdx.json locally and review the diff"
             exit 1
           fi
-      - name: Install AWS-LC FIPS build deps (CMake, Go, clang), dpkg-dev, rpm2cpio and binutils
-        run: sudo apt-get $APT_OPTS update && sudo apt-get $APT_OPTS install -y --no-install-recommends cmake golang-go clang dpkg-dev rpm2cpio cpio binutils
       - name: Install packaging, SBOM and audit tools (version- and checksum-pinned)
         run: deploy/tests/supply-chain/install-cargo-tools.sh
       - name: Install check-jsonschema (version- and hash-pinned, wheels only)
@@ -81,6 +94,8 @@ jobs:
           "$RUNNER_TEMP/cj/bin/pip" install --require-hashes --only-binary :all: -r deploy/tests/supply-chain/requirements-jsonschema.txt
           echo "CHECK_JSONSCHEMA=$RUNNER_TEMP/cj/bin/check-jsonschema" >> "$GITHUB_ENV"
       - run: make packages
+      - name: glibc floor (ELF GLIBC_ <= 2.34, .deb libc6 floor <= 2.36, rpm Requires)
+        run: deploy/build/check-glibc-floor.sh --deb target/debian/*.deb --rpm target/generate-rpm/*.rpm target/dist/platd target/dist/plat-xdp-loader
       - name: Show package metadata and contents
         run: |
           for f in target/debian/*.deb; do dpkg-deb --info "$f"; dpkg-deb --contents "$f"; done
@@ -123,11 +138,21 @@ jobs:
           - arch: aarch64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
+    # EL9 build floor (glibc 2.34). Keep the digest equal in `packages` and
+    # `sbom-xdp` (multi-arch index; `container:` cannot read `env`).
+    container:
+      image: rockylinux/rockylinux:9@sha256:67492e5a371d9db7c2ffb2708abae92147fb900900832a7ed3fb2ac4df9ec052
     timeout-minutes: 60
     steps:
+      - name: Install git (actions/checkout needs it inside the container)
+        run: dnf -y --setopt=install_weak_deps=False --setopt=retries=5 install git-core
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: EL9 build deps (CMake, Go, clang, perl, dpkg-dev, rpm, Python 3.12) and rustup (sha256-pinned)
+        run: |
+          deploy/build/el9-build-deps.sh
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: The workspace build environment has no RUSTC_BOOTSTRAP
         run: |
           if [ -n "${RUSTC_BOOTSTRAP+set}" ]; then
@@ -148,8 +173,6 @@ jobs:
         with:
           key: sbom-xdp-${{ matrix.arch }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Install AWS-LC FIPS build deps (CMake, Go, clang), zstd and binutils
-        run: sudo apt-get $APT_OPTS update && sudo apt-get $APT_OPTS install -y --no-install-recommends cmake golang-go clang zstd binutils
       - name: Install bpf-linker 0.12.0 (release tarball, sha256-pinned)
         run: |
           deploy/tests/xdp/install-bpf-linker.sh "$HOME/.local/bin"
@@ -167,6 +190,8 @@ jobs:
         run: make xdp
       - name: make sbom XDP=1 (auditable dist build with xdp, T6-T8)
         run: make sbom XDP=1
+      - name: glibc floor of the xdp dist binaries (GLIBC_ <= 2.34)
+        run: deploy/build/check-glibc-floor.sh target/dist/platd target/dist/plat-xdp-loader
       - name: cargo audit bin on the xdp dist binaries (fails on an advisory)
         run: cargo audit bin target/dist/platd target/dist/plat-xdp-loader
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

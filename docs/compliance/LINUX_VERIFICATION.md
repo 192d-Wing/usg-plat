@@ -448,6 +448,16 @@ path is still unexercised on Linux (covered only by
   `root:plat` 0640; `/var/log/plat` is `plat:plat-log` 2750; `platd` and
   `plat-fwguard` are installed but neither enabled nor started;
   `lintian` and `rpmlint` report no errors.
+- glibc floor (2026-11-06, aarch64, podman throwaway containers, not
+  systemd hosts): packages built in the pinned Rocky Linux 9 container
+  (glibc 2.34, `deploy/build/el9-build-deps.sh`, `make packages`) passed
+  `deploy/build/check-glibc-floor.sh` (max `GLIBC_2.34` in both binaries,
+  `Depends: libc6 (>= 2.34), libgcc-s1, nftables, systemd`) and installed
+  with `apt-get install ./platd_*.deb` on Debian 12 (glibc 2.36), Ubuntu
+  22.04 (2.35) and 24.04 (2.39) and `dnf install ./platd-*.rpm` on Rocky
+  9.8 (2.34); on each, `platd --version` and `platd check-config -c
+  config/platd.example.toml` succeeded. x86_64 is covered by CI only;
+  the unit and user checks above were not repeated on these distributions.
 - Edit the config, enable `plat-fwguard.timer` and `platd`, then install a
   newer package: neither is restarted and an edited config is kept
   (conffile / `%config(noreplace)`).
