@@ -15,8 +15,12 @@
 # writes SHA256SUMS, signs it and every artifact with Sigstore cosign keyless
 # (GitHub Actions OIDC identity, public Rekor log; .sigstore.json bundles),
 # adds GitHub build provenance attestations and publishes a GitHub Release.
-# Pushes, PRs and dispatch runs never sign or publish. apt/dnf repository
-# metadata is out of scope (POAM-044).
+# The usg-plat-verify install-time gate and the usg-plat-pin-canary package
+# are built once (`verify-pkg`) and signed with the rest. After the release,
+# the `publish` job adds it to the apt/dnf tree in 192d-Wing/usg-plat-packages
+# (deploy/ci/publish-packages.sh; metadata unsigned by design, POAM-044 (c)).
+# Pushes, PRs and dispatch runs never sign or publish: `publish-dry-run` runs
+# the same script against a temporary tree, with no secret and no push.
 # COMPLIANCE MAPPING:
 # - NIST 800-53: CM-8 (System Component Inventory), SR-4 (Provenance), RA-5
 #   (Vulnerability Monitoring and Scanning), SI-7 (Software Integrity),
@@ -203,14 +207,95 @@ jobs:
             docs/compliance/cbom.cdx.json
           if-no-files-found: error
 
+  # usg-plat-verify (install-time gate, noarch) and the empty
+  # usg-plat-pin-canary, built once. trusted-root.sh fetches the Sigstore
+  # trusted root (cosign initialize) and fails the job unless its SHA-256 is
+  # the pin in deploy/verify/trusted_root.sha256.
+  verify-pkg:
+    name: usg-plat-verify + pin canary
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      COSIGN_VERSION: v3.1.4
+      COSIGN_SHA256: 424e2c97d0b45fd7a6b608a87f090f35633f4c23ece5f092d48bba11aaf4bbfa # cosign-linux-amd64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install rpm (rpmbuild), apt-utils and createrepo-c
+        run: sudo apt-get $APT_OPTS update && sudo apt-get $APT_OPTS install -y --no-install-recommends rpm apt-utils createrepo-c
+      - name: Restore tool downloads (shellcheck)
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/plat-tools
+          key: plat-tools-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('deploy/tests/install-shellcheck.sh') }}
+      - name: Install shellcheck 0.11.0 (release tarball, sha256-pinned)
+        run: |
+          PLAT_TOOL_CACHE="$HOME/.cache/plat-tools" deploy/tests/install-shellcheck.sh "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Install cosign (pinned version and SHA-256)
+        run: |
+          curl --proto =https --tlsv1.2 -fsSLo "$RUNNER_TEMP/cosign" "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64"
+          echo "${COSIGN_SHA256}  $RUNNER_TEMP/cosign" | sha256sum -c -
+          install -m 0755 "$RUNNER_TEMP/cosign" /usr/local/bin/cosign
+          cosign version
+      - name: make test-verify (gate unit tests, shellcheck)
+        run: make test-verify
+      - name: publish-packages.sh and pin-canary shellcheck + self-test
+        run: |
+          shellcheck -x deploy/ci/publish-packages.sh deploy/ci/pin-canary/build.sh
+          sh deploy/ci/publish-packages.sh --self-test
+      - name: make verify-pkg (trusted root must equal the pin)
+        run: make verify-pkg
+      - name: Build usg-plat-pin-canary
+        run: sh deploy/ci/pin-canary/build.sh --out target/verify
+      - name: Packaged trusted root equals the pin
+        run: |
+          set -eu
+          d=$(mktemp -d); dpkg-deb -x target/verify/usg-plat-verify_*_all.deb "$d"
+          (cd "$d/usr/share/usg-plat-verify" && sha256sum -c "$GITHUB_WORKSPACE/deploy/verify/trusted_root.sha256")
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: usg-plat-verify-packages
+          path: |
+            target/verify/*.deb
+            target/verify/*.rpm
+          if-no-files-found: error
+
+  # Non-tag runs: the publish script against a temporary tree (unsigned
+  # dist, --dry-run). No secret, no signing, no push.
+  publish-dry-run:
+    name: publish dry run
+    if: ${{ !(github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) }}
+    needs: [packages, verify-pkg]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: artifacts
+      - name: Install apt-utils, rpm and createrepo-c
+        run: sudo apt-get $APT_OPTS update && sudo apt-get $APT_OPTS install -y --no-install-recommends rpm apt-utils createrepo-c
+      - name: publish-packages.sh --dry-run into a temporary tree
+        run: |
+          set -eu
+          mkdir dist repo
+          find artifacts -type f \( -name '*.deb' -o -name '*.rpm' \) -exec cp -t dist {} +
+          ws=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
+          deploy/ci/publish-packages.sh --dry-run --dist dist --tag "v$ws" --repo repo --tar "usg-plat-repo-v$ws.tar"
+          find repo -type f | LC_ALL=C sort
+
   # POAM: POAM-044 (untested until the first tag; public Sigstore; repo
-  # metadata unsigned; signatures not enforced at install)
+  # metadata unsigned; enforced at install only by usg-plat-verify)
   # Tag-only: checksum, sign (cosign keyless) and publish. The only job with
   # id-token: write and contents: write. Verify with scripts/verify-release.sh.
   release:
     name: sign + publish release
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [packages, sbom-xdp]
+    needs: [packages, sbom-xdp, verify-pkg]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -247,9 +332,19 @@ jobs:
           for a in x86_64 aarch64; do
             cp "artifacts/platd-sbom-xdp-$a/target/xdp/plat-xdp-ebpf.sha256" "dist/plat-xdp-ebpf-$a.sha256"
           done
-          # 2 arches x (deb + rpm + SBOM + xdp SBOM + eBPF hash) + CBOM = 11
+          # 2 arches x (deb + rpm + SBOM + xdp SBOM + eBPF hash) + CBOM = 11,
+          # + usg-plat-verify (deb + rpm) + usg-plat-pin-canary (deb + rpm) = 15.
+          # All are in SHA256SUMS and get a .sigstore.json bundle below.
           n=$(find dist -maxdepth 1 -type f | wc -l)
-          if [ "$n" -ne 11 ]; then echo "::error::expected 11 release files, found $n"; ls -l dist; exit 1; fi
+          if [ "$n" -ne 15 ]; then echo "::error::expected 15 release files, found $n"; ls -l dist; exit 1; fi
+          ws=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
+          for f in "usg-plat-verify_${ws}-1_all.deb" "usg-plat-verify-${ws}-1.noarch.rpm" \
+            usg-plat-pin-canary_0.0.0_all.deb usg-plat-pin-canary-0.0.0-1.noarch.rpm; do
+            [ -f "dist/$f" ] || { echo "::error::missing release file $f"; exit 1; }
+          done
+          # The trust root inside usg-plat-verify must be the reviewed pin.
+          t=$(mktemp -d); dpkg-deb -x "dist/usg-plat-verify_${ws}-1_all.deb" "$t"
+          (cd "$t/usr/share/usg-plat-verify" && sha256sum -c "$GITHUB_WORKSPACE/deploy/verify/trusted_root.sha256")
           cd dist && sha256sum -- * | LC_ALL=C sort -k2 > SHA256SUMS && cat SHA256SUMS
       - name: Install cosign (pinned version and SHA-256)
         run: |
@@ -277,3 +372,85 @@ jobs:
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
             --title "usg-plat $GITHUB_REF_NAME" --notes "See CHANGELOG.md. Verify with scripts/verify-release.sh." \
             dist/*
+
+  # Tag-only, after the release is published: add it to the apt/dnf tree in
+  # 192d-Wing/usg-plat-packages (GitHub Pages from main) and push. The deploy
+  # key (write, that repository only) is the `release` environment secret
+  # PACKAGES_REPO_TOKEN; ssh uses a pinned github.com host key
+  # (StrictHostKeyChecking=yes, no trust on first use). One publish at a time.
+  # COMPLIANCE MAPPING:
+  # - NIST 800-53: CM-14 (Signed Components), SI-7(15) (Code Authentication) -
+  #   only files of a release that verify-release.sh accepts are published
+  # - NIST 800-53: IA-5 (Authenticator Management), AC-6 (Least Privilege) -
+  #   single-repository deploy key, environment-scoped
+  # POAM: POAM-044 (c) - repository metadata unsigned by design
+  publish:
+    name: publish to usg-plat-packages
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [release]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: release
+    concurrency:
+      group: usg-plat-packages
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    env:
+      COSIGN_VERSION: v3.1.4
+      COSIGN_SHA256: 424e2c97d0b45fd7a6b608a87f090f35633f4c23ece5f092d48bba11aaf4bbfa # cosign-linux-amd64
+      # https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints
+      GITHUB_SSH_HOST_KEY: github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install apt-utils, rpm and createrepo-c
+        run: sudo apt-get $APT_OPTS update && sudo apt-get $APT_OPTS install -y --no-install-recommends rpm apt-utils createrepo-c
+      - name: Install cosign (pinned version and SHA-256)
+        run: |
+          curl --proto =https --tlsv1.2 -fsSLo "$RUNNER_TEMP/cosign" "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64"
+          echo "${COSIGN_SHA256}  $RUNNER_TEMP/cosign" | sha256sum -c -
+          install -m 0755 "$RUNNER_TEMP/cosign" /usr/local/bin/cosign
+      - name: Download and verify the published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --dir dist
+          scripts/verify-release.sh dist "$GITHUB_REF_NAME"
+      - name: Deploy key and pinned github.com host key
+        env:
+          DEPLOY_KEY: ${{ secrets.PACKAGES_REPO_TOKEN }}
+        run: |
+          set -eu
+          [ -n "$DEPLOY_KEY" ] || { echo "::error::PACKAGES_REPO_TOKEN is not set"; exit 1; }
+          umask 077
+          mkdir -p "$RUNNER_TEMP/ssh"
+          printf '%s\n' "$DEPLOY_KEY" > "$RUNNER_TEMP/ssh/key"
+          printf '%s\n' "$GITHUB_SSH_HOST_KEY" > "$RUNNER_TEMP/ssh/known_hosts"
+          echo "GIT_SSH_COMMAND=ssh -i $RUNNER_TEMP/ssh/key -o IdentitiesOnly=yes -o IdentityAgent=none -o UserKnownHostsFile=$RUNNER_TEMP/ssh/known_hosts -o StrictHostKeyChecking=yes -o HostKeyAlgorithms=ssh-ed25519" >> "$GITHUB_ENV"
+      - name: Build the apt/dnf tree (publish-packages.sh)
+        run: |
+          set -eu
+          git clone --depth 1 git@github.com:192d-Wing/usg-plat-packages.git pkgrepo
+          deploy/ci/publish-packages.sh --dist dist --tag "$GITHUB_REF_NAME" --repo pkgrepo \
+            --tar "$RUNNER_TEMP/usg-plat-repo-$GITHUB_REF_NAME.tar"
+      - name: Commit and push
+        working-directory: pkgrepo
+        run: |
+          set -eu
+          git config user.name "usg-plat release"
+          git config user.email "usg-plat-release@users.noreply.github.com"
+          git checkout -B main
+          git add -A
+          if git diff --cached --quiet; then echo "nothing to publish"; exit 0; fi
+          git commit -q -m "publish $GITHUB_REF_NAME (usg-plat $GITHUB_SHA)"
+          git push origin main
+      - name: Remove the deploy key
+        if: always()
+        run: rm -f -- "$RUNNER_TEMP/ssh/key"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: usg-plat-repo-${{ github.ref_name }}
+          path: ${{ runner.temp }}/usg-plat-repo-${{ github.ref_name }}.tar
+          if-no-files-found: error
