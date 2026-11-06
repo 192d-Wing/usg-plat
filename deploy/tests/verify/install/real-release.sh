@@ -182,10 +182,15 @@ inside() {
     cp /assets/SHA256SUMS /assets/SHA256SUMS.sigstore.json /tmp/r-tag/
     expect R12-refuse-wrong-tag-identity 1 'does not verify' env USG_PLAT_VERIFY_SUMS_DIR=/tmp/r-tag \
         $vp --name platd --version 0.2.1-1 --arch arm64 --sha256 "$(h "/assets/platd_${REL}_arm64.deb")"
-    printf '{}\n' >/tmp/empty-root.json
+    # The USG_PLAT_VERIFY_TRUSTED_ROOT override is test-only (ignored without
+    # USG_PLAT_VERIFY_TEST=1, POAM044-SEC-003), so swap the installed,
+    # root-owned trust root itself and put it back afterwards.
+    tr=/usr/share/usg-plat-verify/trusted_root.json
+    cp -p "$tr" /root/trusted_root.json.orig
+    printf '{}\n' >"$tr"
     expect R13-refuse-wrong-trust-root 1 'does not verify' env USG_PLAT_VERIFY_SUMS_DIR=/assets \
-        USG_PLAT_VERIFY_TRUSTED_ROOT=/tmp/empty-root.json \
         $vp --name platd --version $REL --arch arm64 --sha256 "$(h "/assets/platd_${REL}_arm64.deb")"
+    cp -p /root/trusted_root.json.orig "$tr"
     mv /usr/local/bin/cosign /usr/local/bin/cosign.off
     expect R14-refuse-missing-cosign 1 'cosign not found' env USG_PLAT_VERIFY_SUMS_DIR=/assets \
         $vp --name platd --version $REL --arch arm64 --sha256 "$(h "/assets/platd_${REL}_arm64.deb")"
