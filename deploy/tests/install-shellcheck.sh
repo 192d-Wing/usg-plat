@@ -3,6 +3,7 @@
 # local `make check` lint with the same version (Ubuntu 24.04's apt package
 # is 0.9.0 and flagged SC2015 where 0.11.0 does not).
 #
+# Env: PLAT_TOOL_CACHE=DIR reuses a verified earlier download (see below).
 # Usage: install-shellcheck.sh [BINDIR]     (default: $HOME/.local/bin)
 # Exit: 0 installed; 1 download or sha256 mismatch; 2 usage or unsupported host.
 #
@@ -39,11 +40,31 @@ url=https://github.com/koalaman/shellcheck/releases/download/v$SHELLCHECK_VERSIO
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT INT TERM
-echo "install-shellcheck: fetching $url" >&2
-curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 30 --retry 6 --retry-delay 10 --retry-all-errors -o "$work/$asset" "$url" || die "download failed: $url"
-
-got=$(sha256sum "$work/$asset" | cut -d' ' -f1)
-[ "$got" = "$want" ] || die "sha256 mismatch for $asset: got $got, want $want"
+# PLAT_TOOL_CACHE=DIR: reuse an earlier verified download of this exact
+# asset (CI keeps DIR in actions/cache). A cached copy goes through the same
+# sha256 check; one that fails it is discarded and downloaded again, so a
+# corrupted or tampered cache is never installed and does not stick.
+cache=${PLAT_TOOL_CACHE:-}
+got=
+if [ -n "$cache" ] && [ -f "$cache/$asset" ]; then
+    cp "$cache/$asset" "$work/$asset"
+    got=$(sha256sum "$work/$asset" | cut -d' ' -f1)
+    if [ "$got" = "$want" ]; then
+        echo "install-shellcheck: cache hit $cache/$asset" >&2
+    else
+        echo "install-shellcheck: cached $asset fails sha256 ($got); downloading again" >&2
+        got=
+    fi
+fi
+if [ -z "$got" ]; then
+    echo "install-shellcheck: fetching $url" >&2
+    curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 30 --retry 6 --retry-delay 10 --retry-all-errors -o "$work/$asset" "$url" || die "download failed: $url"
+    got=$(sha256sum "$work/$asset" | cut -d' ' -f1)
+    [ "$got" = "$want" ] || die "sha256 mismatch for $asset: got $got, want $want"
+    if [ -n "$cache" ]; then
+        mkdir -p "$cache" && cp "$work/$asset" "$cache/$asset.tmp" && mv "$cache/$asset.tmp" "$cache/$asset"
+    fi
+fi
 echo "install-shellcheck: sha256 ok $got" >&2
 
 mkdir -p "$work/x"
