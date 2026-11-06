@@ -156,6 +156,14 @@ check_dnf() {
     else
         fail "$DNF_PLUGIN_CONF missing"
     fi
+    # dnf skips a plugin that fails to import with only a warning (fail
+    # open), so require that it is actually loaded.
+    if command -v dnf >/dev/null 2>&1; then
+        dnf -v --cacheonly repolist 2>&1 | grep -Eq '^Loaded plugins:.*usg_plat_verify' ||
+            fail "dnf did not load the usg_plat_verify plugin (dnf -v repolist)"
+    else
+        fail "dnf not found"
+    fi
 }
 
 check_common() {

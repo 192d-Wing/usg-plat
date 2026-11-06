@@ -434,6 +434,27 @@ expect "REPO_HOST with a scheme is a config error" 2 st
 reset
 expect "selftest usage" 2 "$W/libexec/selftest"
 
+# --- selftest --dnf --------------------------------------------------------------
+reset
+cat >"$W/apt/usg-plat.repo" <<'EOF'
+[usg-plat]
+baseurl=https://192d-wing.github.io/usg-plat-packages/rpm/$basearch
+includepkgs=platd usg-plat-verify
+EOF
+printf '[main]\nenabled=1\n' >"$W/apt/plugin.conf"
+cat >"$W/stub/dnf" <<'EOF'
+#!/bin/sh
+echo "Loaded plugins: builddep, ${STUB_DNF_PLUGINS:-usg_plat_verify}"
+EOF
+chmod 0755 "$W/stub/dnf"
+std() { USG_PLAT_VERIFY_DNF_REPO="$W/apt/usg-plat.repo" USG_PLAT_VERIFY_DNF_PLUGIN_CONF="$W/apt/plugin.conf" "$W/libexec/selftest" --dnf; }
+expect "selftest --dnf passes with the plugin loaded" 0 std
+STUB_DNF_PLUGINS=copr
+export STUB_DNF_PLUGINS
+expect "selftest --dnf fails when dnf did not load the plugin" 1 std
+unset STUB_DNF_PLUGINS
+rm -f "$W/stub/dnf"
+
 # --- fetch-sums ----------------------------------------------------------------
 reset
 mkdir -p "$W/fs"
