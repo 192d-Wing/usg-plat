@@ -25,9 +25,30 @@ cargo run -p platd -- check-config -c config/platd.example.toml
 
 Built natively on Linux for the host architecture (the AWS-LC FIPS module
 is never cross-compiled). CI (`.github/workflows/packages.yml`) builds both
-on x86_64 and aarch64 runners and publishes them as workflow artifacts. To
-build locally on a Linux host with the TLS build dependencies (CMake, Go,
-clang) and `dpkg-dev`:
+on x86_64 and aarch64 runners, inside a Rocky Linux 9 container pinned by
+digest, and publishes them as workflow artifacts. The release packages
+need glibc 2.34 or later and install on:
+
+| Distribution | glibc | Package |
+|--------------|-------|---------|
+| RHEL / Rocky / AlmaLinux 9 | 2.34 | `.rpm` |
+| Debian 12 (bookworm) | 2.36 | `.deb` |
+| Ubuntu 22.04 / 24.04 | 2.35 / 2.39 | `.deb` |
+
+`deploy/build/check-glibc-floor.sh` fails the CI job when a shipped binary
+needs a `GLIBC_` symbol version above 2.34 or the `.deb` asks for
+`libc6` above 2.36. To build the same way locally (podman or docker; the
+image digest is in `packages.yml`):
+
+```bash
+podman run --rm -it -v "$PWD":/src -w /src rockylinux/rockylinux:9@sha256:<digest> \
+  sh -c 'deploy/build/el9-build-deps.sh && export PATH=$HOME/.cargo/bin:$PATH && \
+         deploy/tests/supply-chain/install-cargo-tools.sh && make packages'
+```
+
+A build on any other Linux host with the TLS build dependencies (CMake,
+Go, clang) and `dpkg-dev` also works, but its packages need that host's
+glibc:
 
 ```bash
 cargo install --locked cargo-deb@3.8.0 cargo-generate-rpm@0.21.1
@@ -40,7 +61,8 @@ Output: `target/debian/platd_<ver>-1_<arch>.deb` and
 `plat-fwguard` units, the nftables drop-in, the `plat` user and `plat-log`
 group (`sysusers.d`), `/var/log/plat` (`tmpfiles.d`) and
 `/etc/plat/platd.toml` (a conffile, `root:plat` 0640). The glibc and other
-library dependencies come from the build host. No unit is enabled, started
+library dependencies come from the build host (glibc 2.34 for CI and
+release builds). No unit is enabled, started
 or restarted by the package: edit the config, then enable a time-wait unit,
 `plat-fwguard.timer` and `platd` as in the manual steps below. The
 nftables drop-in is active as soon as the package is installed, so an

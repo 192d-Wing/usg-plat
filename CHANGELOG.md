@@ -11,6 +11,17 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
   `fragment_table_full`; `/metrics` only, log schema unchanged (8).
 
 ### Changed
+- Packages install on EL9, Debian 12 and Ubuntu 22.04/24.04 (v0.3.0 needed
+  glibc 2.38/2.39 and installed only on Ubuntu 24.04). The `packages` and
+  `sbom-xdp` jobs build inside a Rocky Linux 9 container pinned by digest
+  (glibc 2.34; `deploy/build/el9-build-deps.sh` installs CMake, Go, clang,
+  dpkg-dev, rpm-build and Python 3.12 from the signed Rocky/EPEL repos and a
+  sha256-pinned rustup-init). New gate `deploy/build/check-glibc-floor.sh`:
+  no shipped ELF may need a `GLIBC_` version above 2.34, the `.deb` must
+  depend on `libc6 (>= X)` with X <= 2.36, and the `.rpm` must not require
+  `GLIBC_` above 2.34. The `.deb` now declares `Depends: libc6 (>= 2.34),
+  libgcc-s1, nftables, systemd` explicitly (`$auto` resolves nothing on
+  an EL9 build host); the gate also fails on any other `NEEDED` library.
 - CI keeps the shellcheck and bpf-linker release tarballs in `actions/cache`
   (`PLAT_TOOL_CACHE`, per job); cached copies are sha256-checked like a
   download, and one that fails is discarded and downloaded again. Release
