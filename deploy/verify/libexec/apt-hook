@@ -13,9 +13,18 @@
 # is ours but whose stdin name is not is refused (no shadowing by renaming).
 # **REMOVE** and **CONFIGURE** lines pass.
 #
+# dpkg reopens the .deb by path after this hook hashed it, so the file and
+# every ancestor directory must be owned by uid 0 and not group- or
+# other-writable (root_only); otherwise a local user could swap it between
+# check and use. apt's archives directory meets that; a local install
+# (`apt install ./x.deb`) must be staged in a root-only directory such as
+# /root/pkgs, never /tmp or a home directory.
+#
 # Test hooks (environment): USG_PLAT_VERIFY_CONF, USG_PLAT_VERIFY_STATE,
 # USG_PLAT_VERIFY_TEXTFILE_DIR, USG_PLAT_VERIFY_LIBEXEC
-# [/usr/libexec/usg-plat-verify], USG_PLAT_VERIFY_PATH (see verify-pkg).
+# [/usr/libexec/usg-plat-verify], USG_PLAT_VERIFY_PATH, USG_PLAT_VERIFY_TEST_TOP
+# (see verify-pkg); honoured only with USG_PLAT_VERIFY_TEST=1.
+# USG_PLAT_ALLOW_DOWNGRADE=1 is an operator override, always logged.
 #
 # COMPLIANCE MAPPING:
 # - NIST 800-53: SI-7(15) (Code Authentication), CM-14 (Signed Components),
@@ -26,6 +35,68 @@
 # POAM: POAM-044 (c) - `dpkg -i` does not run this hook; a refusal aborts the
 #   whole apt transaction (residual (g), alerted)
 set -u
+
+# >>> common: test hooks and root_only (identical in every script; unit.sh checks)
+# Test hooks (the USG_PLAT_VERIFY_* overrides named in the header, and TMPDIR)
+# are honoured only when USG_PLAT_VERIFY_TEST=1, which only the test suites
+# set. Otherwise they are unset, so children inherit a clean environment, and
+# logged once to authpriv. USG_PLAT_VERIFY_SUMS_DIR is not a hook: the front
+# ends set it for local installs and verify-pkg still verifies what it names.
+#
+# COMPLIANCE MAPPING:
+# - NIST 800-53: CM-6 (Configuration Settings), SI-7(15) (Code Authentication)
+#   - the decision depends only on root-owned, root-only-writable files
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+uv_test=0
+if [ "${USG_PLAT_VERIFY_TEST:-}" = 1 ]; then
+    uv_test=1
+else
+    uv_ign=$(env | sed -n 's/^\(USG_PLAT_VERIFY_[A-Z_]*\)=.*/\1/p' |
+        grep -v -x -e USG_PLAT_VERIFY_SUMS_DIR -e USG_PLAT_VERIFY_TEST | sort -u | tr '\n' ' ')
+    [ -n "${TMPDIR+x}" ] && uv_ign="${uv_ign}TMPDIR "
+    for uv_v in $uv_ign; do
+        unset "$uv_v"
+    done
+    unset USG_PLAT_VERIFY_TEST
+    if [ -n "$uv_ign" ]; then
+        uv_msg="ignoring test-only environment (USG_PLAT_VERIFY_TEST is not 1): $uv_ign"
+        printf 'usg-plat-verify: %s\n' "$uv_msg" >&2
+        logger -t usg-plat-verify -p authpriv.warning -- "$uv_msg" 2>/dev/null || :
+    fi
+fi
+
+# root_only PATH: PATH and every ancestor directory exist, are not symlinks,
+# are owned by uid 0 and are neither group- nor other-writable (POSIX ACLs
+# are not inspected). A sticky world-writable directory such as /tmp fails: its other users
+# can still rename or replace entries they own. In test mode the invoking uid
+# also counts as an owner and the walk stops at USG_PLAT_VERIFY_TEST_TOP.
+root_only() {
+    case $1 in /*) ;; *) return 1 ;; esac
+    case $1 in */./* | */../* | */. | */.. | *//*) return 1 ;; *) ;; esac
+    ro_p=$1
+    while :; do
+        if [ $uv_test -eq 1 ] && [ -n "${USG_PLAT_VERIFY_TEST_TOP:-}" ] &&
+            [ "$ro_p" = "$USG_PLAT_VERIFY_TEST_TOP" ]; then
+            return 0
+        fi
+        [ -e "$ro_p" ] && [ ! -L "$ro_p" ] || return 1
+        ro_l=$(LC_ALL=C stat -c '%A %u' -- "$ro_p" 2>/dev/null) || return 1
+        ro_m=${ro_l%% *} ro_u=${ro_l#* }
+        case $ro_m in
+            ?????w* | ????????w*) return 1 ;;
+            ??????????*) ;;
+            *) return 1 ;;
+        esac
+        if [ "$ro_u" != 0 ]; then
+            [ $uv_test -eq 1 ] && [ "$ro_u" = "$(id -u)" ] || return 1
+        fi
+        [ "$ro_p" = / ] && return 0
+        ro_p=${ro_p%/*}
+        [ -n "$ro_p" ] || ro_p=/
+    done
+}
+# <<< common
 
 PATH=${USG_PLAT_VERIFY_PATH:-/usr/sbin:/usr/bin:/sbin:/bin}
 export PATH
@@ -80,13 +151,17 @@ refuse() { # reason
 }
 
 [ -f "$CONF" ] && [ -r "$CONF" ] || refuse "configuration $CONF missing or unreadable"
+root_only "$CONF" || refuse "configuration $CONF (or a parent directory) is not root-owned or is group/other-writable"
 NAMES='' ALLOW_DOWNGRADE=0
 # shellcheck source=deploy/verify/etc/verify.conf
 . "$CONF" || refuse "configuration $CONF does not parse"
 [ -n "$NAMES" ] || refuse "NAMES is empty"
 allow_down=0
 [ "${ALLOW_DOWNGRADE:-0}" = 1 ] && allow_down=1
-[ "${USG_PLAT_ALLOW_DOWNGRADE:-0}" = 1 ] && allow_down=1
+if [ "${USG_PLAT_ALLOW_DOWNGRADE:-0}" = 1 ]; then
+    allow_down=1
+    log warning "USG_PLAT_ALLOW_DOWNGRADE=1 in the environment: downgrades of usg-plat packages are allowed for this transaction"
+fi
 
 ours() {
     for n in $NAMES; do
@@ -117,7 +192,21 @@ case $archives in /*) ;; *) archives="$cache/$archives" ;; esac
 archives=$(printf '%s\n' "$archives" | sed -e 's://*:/:g' -e 's:/$::')
 
 # --- actions -------------------------------------------------------------------
-while read -r name _ov _oa _om op nv na _nm action rest; do
+# Fields are separated by single spaces; the action (a path) is the rest of
+# the line after the eighth field, kept verbatim in $full so a path with
+# spaces cannot hide in the split.
+while IFS= read -r line || [ -n "$line" ]; do
+    [ -n "$line" ] || continue
+    name='' _ov='' _oa='' _om='' op='' nv='' na='' _nm='' action='' rest=''
+    IFS=' ' read -r name _ov _oa _om op nv na _nm action rest <<HOOKLINE
+$line
+HOOKLINE
+    full=$line
+    i=0
+    while [ $i -lt 8 ]; do
+        case $full in *' '*) full=${full#* } ;; *) full='' ;; esac
+        i=$((i + 1))
+    done
     [ -n "${name:-}" ] || continue
     name=${name%%:*}
     pname=$name pver=${nv:-}
@@ -126,16 +215,19 @@ while read -r name _ov _oa _om op nv na _nm action rest; do
         *) ;;
     esac
     if ! ours "$name"; then
-        # Not our name: the only per-file work is the shadowing check.
-        case ${action:-} in
+        # Not our name: the only per-file work is the shadowing check, on the
+        # whole remainder of the line (a path may contain spaces).
+        case $full in
             /*.deb)
-                if [ -z "${rest:-}" ] && [ -f "$action" ]; then
-                    ctl=$(dpkg-deb -f "$action" Package 2>/dev/null) ||
-                        refuse "cannot read the control file of $(clean "$action")"
+                if [ -f "$full" ]; then
+                    ctl=$(dpkg-deb -f "$full" Package 2>/dev/null) ||
+                        refuse "cannot read the control file of $(clean "$full")"
                     if ours "$ctl"; then
                         pname=$ctl
-                        refuse "$(clean "$action") contains $ctl but apt calls it $(clean "$name")"
+                        refuse "$(clean "$full") contains $ctl but apt calls it $(clean "$name")"
                     fi
+                elif [ "$full" != "$action" ]; then
+                    refuse "cannot parse the hook line for $(clean "$name") (path with spaces?)"
                 fi
                 ;;
             *) ;;
@@ -143,12 +235,18 @@ while read -r name _ov _oa _om op nv na _nm action rest; do
         continue
     fi
 
-    [ -z "${rest:-}" ] || refuse "unexpected fields in hook line"
+    [ -z "${rest:-}" ] && [ "$full" = "$action" ] ||
+        refuse "unexpected fields in hook line (path with spaces?)"
     case ${action:-} in
         /*.deb) ;;
         *) refuse "action is not an absolute .deb path: $(clean "${action:-}")" ;;
     esac
     [ -f "$action" ] && [ ! -L "$action" ] || refuse "$(clean "$action") is not a regular file"
+    # COMPLIANCE MAPPING:
+    # - NIST 800-53: SI-7(15) - no swap between this hash and dpkg's unpack:
+    #   only root can write the file or any directory above it
+    root_only "$action" ||
+        refuse "$(clean "$action"): the file or a parent directory is not root-owned or is group/other-writable (stage local packages in a root-only directory)"
 
     fields=$(dpkg-deb -f "$action" Package Version Architecture 2>/dev/null) ||
         refuse "cannot read the control file of $(clean "$action")"
@@ -159,8 +257,9 @@ while read -r name _ov _oa _om op nv na _nm action rest; do
     [ "$cver" = "$nv" ] || refuse "control Version $(clean "$cver") does not match $(clean "$nv")"
     [ "$carch" = "$na" ] || refuse "control Architecture $(clean "$carch") does not match $(clean "$na")"
 
-    if [ "$op" = '>' ] && [ "$_ov" != - ] && [ $allow_down -ne 1 ]; then
-        refuse "downgrade from $(clean "$_ov") refused (ALLOW_DOWNGRADE=0)"
+    if [ "$op" = '>' ] && [ "$_ov" != - ]; then
+        [ $allow_down -eq 1 ] || refuse "downgrade from $(clean "$_ov") refused (ALLOW_DOWNGRADE=0)"
+        log warning "downgrade of $(clean "$name") from $(clean "$_ov") to $(clean "$nv") allowed by ALLOW_DOWNGRADE"
     fi
 
     pdir=${action%/*}

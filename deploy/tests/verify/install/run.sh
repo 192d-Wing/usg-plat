@@ -300,6 +300,17 @@ apt_cases() {
     check test -z "$(apt_ver platd)"
     verdict E15-tampered-sums-refused PASS "SHA256SUMS changed after signing"
 
+    # E21: a local .deb staged in a world-writable (sticky) directory could be
+    # swapped after the hash; the gate refuses it (stage in a root-only dir).
+    start E21-world-writable-dir-refused
+    mkdir -p /tmp/usgtest-ww && chmod 1777 /tmp/usgtest-ww
+    cp /fx/local/platd_"$P4"-1_"$DA".deb /fx/local/SHA256SUMS /fx/local/SHA256SUMS.sigstore.json /tmp/usgtest-ww/
+    run E21-world-writable-dir-refused sh -c "cd /tmp/usgtest-ww && apt-get -y -o Dpkg::Use-Pty=0 install ./platd_$P4-1_$DA.deb"
+    check want E21-world-writable-dir-refused nz
+    check has E21-world-writable-dir-refused 'root-only directory'
+    check test -z "$(apt_ver platd)"
+    verdict E21-world-writable-dir-refused PASS "local .deb in a sticky world-writable directory refused"
+
     start E16-bypass-dpkg-i
     run E16-bypass-dpkg-i dpkg -i "/fx/unlisted/platd_$P3-1_$DA.deb"
     check want E16-bypass-dpkg-i 0
@@ -490,6 +501,16 @@ dnf_cases() {
     check has E15-tampered-sums-refused 'does not verify'
     check test -z "$(rpm_ver platd)"
     verdict E15-tampered-sums-refused PASS "SHA256SUMS changed after signing"
+
+    # E21: as for apt, a local .rpm in a world-writable directory is refused.
+    start E21-world-writable-dir-refused
+    mkdir -p /tmp/usgtest-ww && chmod 1777 /tmp/usgtest-ww
+    cp /fx/local/platd-"$P4"-1."$RA".rpm /fx/local/SHA256SUMS /fx/local/SHA256SUMS.sigstore.json /tmp/usgtest-ww/
+    run E21-world-writable-dir-refused sh -c "cd /tmp/usgtest-ww && dnf -y install ./platd-$P4-1.$RA.rpm"
+    check want E21-world-writable-dir-refused nz
+    check has E21-world-writable-dir-refused 'root-only directory'
+    check test -z "$(rpm_ver platd)"
+    verdict E21-world-writable-dir-refused PASS "local .rpm in a sticky world-writable directory refused"
 
     start E16-bypass-rpm-U
     run E16-bypass-rpm-U rpm -U "/fx/unlisted/platd-$P3-1.$RA.rpm"

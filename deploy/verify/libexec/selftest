@@ -25,7 +25,8 @@
 #              match, so the self-test fails closed;
 #           3. platd from the usg-plat source is pinned at 500 (read from the
 #              version-table line: the per-source line shows -1 cosmetically).
-#   --dnf   usg-plat.repo: baseurl host is REPO_HOST, includepkgs lists only
+#   --dnf   usg-plat.repo: baseurl is https:// on REPO_HOST or a local
+#           file:///path (http: and file://host fail), includepkgs lists only
 #           NAMES, and the dnf plugin is enabled.
 #   --full  cosign present and >= COSIGN_MIN, trust root present, then --apt
 #           and/or --dnf for the package managers found.
@@ -36,7 +37,8 @@
 # [/etc/apt/sources.list.d/usg-plat.sources], USG_PLAT_VERIFY_APT_PREF
 # [/etc/apt/preferences.d/usg-plat], USG_PLAT_VERIFY_DNF_REPO
 # [/etc/yum.repos.d/usg-plat.repo], USG_PLAT_VERIFY_DNF_PLUGIN_CONF
-# [/etc/dnf/plugins/usg_plat_verify.conf].
+# [/etc/dnf/plugins/usg_plat_verify.conf], USG_PLAT_VERIFY_TEST_TOP; honoured
+# only with USG_PLAT_VERIFY_TEST=1.
 #
 # COMPLIANCE MAPPING:
 # - NIST 800-53: CM-7 (Least Functionality) - the pin admits only our names
@@ -44,6 +46,68 @@
 # - NIST 800-53: SI-7(15), CM-14 - the gate's prerequisites are checked
 # - NIST 800-53: SI-6 (Security and Privacy Function Verification)
 set -u
+
+# >>> common: test hooks and root_only (identical in every script; unit.sh checks)
+# Test hooks (the USG_PLAT_VERIFY_* overrides named in the header, and TMPDIR)
+# are honoured only when USG_PLAT_VERIFY_TEST=1, which only the test suites
+# set. Otherwise they are unset, so children inherit a clean environment, and
+# logged once to authpriv. USG_PLAT_VERIFY_SUMS_DIR is not a hook: the front
+# ends set it for local installs and verify-pkg still verifies what it names.
+#
+# COMPLIANCE MAPPING:
+# - NIST 800-53: CM-6 (Configuration Settings), SI-7(15) (Code Authentication)
+#   - the decision depends only on root-owned, root-only-writable files
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+uv_test=0
+if [ "${USG_PLAT_VERIFY_TEST:-}" = 1 ]; then
+    uv_test=1
+else
+    uv_ign=$(env | sed -n 's/^\(USG_PLAT_VERIFY_[A-Z_]*\)=.*/\1/p' |
+        grep -v -x -e USG_PLAT_VERIFY_SUMS_DIR -e USG_PLAT_VERIFY_TEST | sort -u | tr '\n' ' ')
+    [ -n "${TMPDIR+x}" ] && uv_ign="${uv_ign}TMPDIR "
+    for uv_v in $uv_ign; do
+        unset "$uv_v"
+    done
+    unset USG_PLAT_VERIFY_TEST
+    if [ -n "$uv_ign" ]; then
+        uv_msg="ignoring test-only environment (USG_PLAT_VERIFY_TEST is not 1): $uv_ign"
+        printf 'usg-plat-verify: %s\n' "$uv_msg" >&2
+        logger -t usg-plat-verify -p authpriv.warning -- "$uv_msg" 2>/dev/null || :
+    fi
+fi
+
+# root_only PATH: PATH and every ancestor directory exist, are not symlinks,
+# are owned by uid 0 and are neither group- nor other-writable (POSIX ACLs
+# are not inspected). A sticky world-writable directory such as /tmp fails: its other users
+# can still rename or replace entries they own. In test mode the invoking uid
+# also counts as an owner and the walk stops at USG_PLAT_VERIFY_TEST_TOP.
+root_only() {
+    case $1 in /*) ;; *) return 1 ;; esac
+    case $1 in */./* | */../* | */. | */.. | *//*) return 1 ;; *) ;; esac
+    ro_p=$1
+    while :; do
+        if [ $uv_test -eq 1 ] && [ -n "${USG_PLAT_VERIFY_TEST_TOP:-}" ] &&
+            [ "$ro_p" = "$USG_PLAT_VERIFY_TEST_TOP" ]; then
+            return 0
+        fi
+        [ -e "$ro_p" ] && [ ! -L "$ro_p" ] || return 1
+        ro_l=$(LC_ALL=C stat -c '%A %u' -- "$ro_p" 2>/dev/null) || return 1
+        ro_m=${ro_l%% *} ro_u=${ro_l#* }
+        case $ro_m in
+            ?????w* | ????????w*) return 1 ;;
+            ??????????*) ;;
+            *) return 1 ;;
+        esac
+        if [ "$ro_u" != 0 ]; then
+            [ $uv_test -eq 1 ] && [ "$ro_u" = "$(id -u)" ] || return 1
+        fi
+        [ "$ro_p" = / ] && return 0
+        ro_p=${ro_p%/*}
+        [ -n "$ro_p" ] || ro_p=/
+    done
+}
+# <<< common
 
 PATH=${USG_PLAT_VERIFY_PATH:-/usr/sbin:/usr/bin:/sbin:/bin}
 export PATH
@@ -72,6 +136,7 @@ mode=$1
 case $mode in --apt | --dnf | --full) ;; *) usage ;; esac
 
 [ -f "$CONF" ] && [ -r "$CONF" ] || { log err "configuration $CONF missing"; exit 2; }
+root_only "$CONF" || { log err "configuration $CONF (or a parent directory) is not root-owned or is group/other-writable"; exit 2; }
 NAMES='' REPO_HOST='' COSIGN='' COSIGN_MIN=''
 # shellcheck source=deploy/verify/etc/verify.conf
 . "$CONF" || { log err "configuration $CONF does not parse"; exit 2; }
@@ -168,7 +233,9 @@ check_dnf() {
     case $base in
         https://*) h=${base#https://} h=${h%%/*} h=${h%%:*}
             [ "$(lower "$h")" = "$REPO_HOST" ] || fail "$DNF_REPO baseurl host $h is not REPO_HOST $REPO_HOST" ;;
-        *) fail "$DNF_REPO baseurl is not https://" ;;
+        # Offline mirror: a local file:///path (no host), as for apt.
+        file:///*) ;;
+        *) fail "$DNF_REPO baseurl is neither https:// on REPO_HOST nor a local file:///path" ;;
     esac
     inc=$(sed -n 's/^includepkgs[[:space:]]*=[[:space:]]*//p' "$DNF_REPO" | tr ',' ' ')
     [ -n "$inc" ] || fail "$DNF_REPO has no includepkgs (foreign names would be installable)"

@@ -27,6 +27,7 @@ for t in sha256sum timeout awk sed; do
     }
 done
 
+umask 022
 W=$(mktemp -d "${TMPDIR:-/tmp}/usg-plat-verify-unit.XXXXXX") || exit 2
 echo "unit.sh: scratch $W"
 mkdir -p "$W/stub" "$W/libexec" "$W/state/releases" "$W/arch" "$W/local" "$W/rel/v0.3.0" "$W/rel/v0.2.1" "$W/tf" "$W/apt" "$W/pol"
@@ -48,6 +49,7 @@ case ${STUB_MODE:-ok} in
     sleep) sleep 5 ;;
     fail) echo "Error: none of the expected identities matched" >&2; exit 1 ;;
     stderr-error) echo "Error: something odd" >&2; echo "Verified OK" >&2; exit 0 ;;
+    near-ok) echo "Verified OK? no" >&2; echo "not Verified OK" >&2; exit 0 ;;
     silent) exit 0 ;;
     *) ;;
 esac
@@ -107,6 +109,9 @@ write_conf() { # extra lines
 }
 write_conf
 
+# Test mode: the path overrides below are honoured, the invoking uid counts
+# as an owner for root_only() and its walk stops at $W (mktemp under /tmp).
+export USG_PLAT_VERIFY_TEST=1 USG_PLAT_VERIFY_TEST_TOP="$W"
 export USG_PLAT_VERIFY_CONF="$W/verify.conf"
 export USG_PLAT_VERIFY_STATE="$W/state"
 export USG_PLAT_VERIFY_TRUSTED_ROOT="$W/trusted_root.json"
@@ -276,7 +281,9 @@ STUB_MODE=fail
 export STUB_MODE
 expect "cosign verification failure" 1 vp --name platd --version 0.3.0-1 --arch amd64 --sha256 "$H_AMD"
 STUB_MODE=stderr-error
-expect "cosign exit 0 with an error on stderr" 1 vp --name platd --version 0.3.0-1 --arch amd64 --sha256 "$H_AMD"
+expect "cosign exit 0, exact Verified OK line, other noise accepted" 0 vp --name platd --version 0.3.0-1 --arch amd64 --sha256 "$H_AMD"
+STUB_MODE=near-ok
+expect "cosign exit 0 with only near-miss Verified OK lines refused" 1 vp --name platd --version 0.3.0-1 --arch amd64 --sha256 "$H_AMD"
 STUB_MODE=silent
 expect "cosign exit 0 without Verified OK" 1 vp --name platd --version 0.3.0-1 --arch amd64 --sha256 "$H_AMD"
 
@@ -373,6 +380,107 @@ reset
 expect "verify-pkg refusal aborts the transaction" 1 env STUB_MODE=fail "$W/libexec/apt-hook" <<EOF
 $(hook_in "libfoo - - none < 1.0 amd64 same $W/arch/libfoo_1.0_amd64.deb" "platd - - none < 0.3.0-1 amd64 none $W/arch/platd_0.3.0-1_amd64.deb")
 EOF
+
+# --- apt-hook: root-only package paths (SEC-001) ----------------------------------
+for d in ww sticky gw; do
+    mkdir -p "$W/$d"
+    cp "$W/local/platd_0.3.0-1_arm64.deb" "$W/local/SHA256SUMS" "$W/local/SHA256SUMS.sigstore.json" "$W/$d/"
+done
+chmod 0777 "$W/ww"
+chmod 1777 "$W/sticky"
+chmod g+w "$W/gw/platd_0.3.0-1_arm64.deb"
+reset
+expect "local .deb in a world-writable directory refused" 1 hook \
+    "platd - - none < 0.3.0-1 arm64 none $W/ww/platd_0.3.0-1_arm64.deb"
+reason "world-writable reason" 'root-only directory'
+expect "local .deb in a sticky world-writable directory refused" 1 hook \
+    "platd - - none < 0.3.0-1 arm64 none $W/sticky/platd_0.3.0-1_arm64.deb"
+expect "group-writable local .deb refused" 1 hook \
+    "platd - - none < 0.3.0-1 arm64 none $W/gw/platd_0.3.0-1_arm64.deb"
+mkdir -p "$W/ww/sub"
+chmod 0755 "$W/ww/sub"
+cp "$W/local/platd_0.3.0-1_arm64.deb" "$W/local/SHA256SUMS" "$W/local/SHA256SUMS.sigstore.json" "$W/ww/sub/"
+expect "local .deb below a world-writable ancestor refused" 1 hook \
+    "platd - - none < 0.3.0-1 arm64 none $W/ww/sub/platd_0.3.0-1_arm64.deb"
+expect "dot-dot path refused" 1 hook \
+    "platd - - none < 0.3.0-1 arm64 none $W/ww/../local/platd_0.3.0-1_arm64.deb"
+check "root-only refusals never call cosign" no_cosign_call
+chmod 0777 "$W/arch"
+expect "archives directory that is world-writable refused" 1 hook \
+    "platd - - none < 0.3.0-1 amd64 none $W/arch/platd_0.3.0-1_amd64.deb"
+chmod 0755 "$W/arch"
+chmod 0755 "$W/ww" "$W/sticky"
+
+# --- apt-hook: paths with spaces (SEC-005) ------------------------------------------
+mkdir -p "$W/sp ace"
+cp "$W/arch/evil_1.0_amd64.deb" "$W/sp ace/evil_1.0_amd64.deb"
+cp "$W/arch/platd_0.3.0-1_amd64.deb" "$W/sp ace/platd_0.3.0-1_amd64.deb"
+reset
+expect "foreign name, path with spaces, carrying our package refused" 1 hook \
+    "evil - - none < 1.0 amd64 none $W/sp ace/evil_1.0_amd64.deb"
+reason "shadow found through the space" 'contains platd'
+expect "foreign name, unparseable path with spaces refused" 1 hook \
+    "libfoo - - none < 1.0 amd64 none $W/no such/libfoo_1.0_amd64.deb"
+expect "our name, path with spaces refused" 1 hook \
+    "platd - - none < 0.3.0-1 amd64 none $W/sp ace/platd_0.3.0-1_amd64.deb"
+cp "$W/arch/libfoo_1.0_amd64.deb" "$W/sp ace/libfoo_1.0_amd64.deb"
+expect "foreign name, path with spaces, foreign package passes" 0 hook \
+    "libfoo - - none < 1.0 amd64 none $W/sp ace/libfoo_1.0_amd64.deb"
+no_newline_hook() { printf 'VERSION 3\n\nevil - - none < 1.0 amd64 none %s' "$W/arch/evil_1.0_amd64.deb" | "$W/libexec/apt-hook"; }
+expect "last line without a newline is still checked" 1 no_newline_hook
+
+# --- configuration and trust root ownership (SEC-008) --------------------------------
+reset
+chmod g+w "$W/verify.conf"
+expect "group-writable verify.conf: verify-pkg exit 2" 2 vp --name platd --version 0.3.0-1 --arch amd64 --sha256 "$H_AMD"
+expect "group-writable verify.conf: apt-hook refuses" 1 hook \
+    "platd - - none < 0.3.0-1 amd64 none $W/arch/platd_0.3.0-1_amd64.deb"
+expect "group-writable verify.conf: fetch-sums exit 2" 2 env USG_PLAT_VERIFY_STATE="$W/fs" "$W/libexec/fetch-sums" v0.3.0
+expect "group-writable verify.conf: selftest exit 2" 2 "$W/libexec/selftest" --apt
+check "conf refusals never call cosign" no_cosign_call
+chmod 0644 "$W/verify.conf"
+mkdir -p "$W/cdir"
+chmod 0777 "$W/cdir"
+cp "$W/verify.conf" "$W/cdir/verify.conf"
+expect "verify.conf in a world-writable directory: exit 2" 2 env USG_PLAT_VERIFY_CONF="$W/cdir/verify.conf" "$W/libexec/verify-pkg" --name platd --version 0.3.0-1 --arch amd64 --sha256 "$H_AMD"
+chmod 0755 "$W/cdir"
+chmod o+w "$W/trusted_root.json"
+expect "other-writable trusted root: exit 2" 2 vp --name platd --version 0.3.0-1 --arch amd64 --sha256 "$H_AMD"
+chmod 0644 "$W/trusted_root.json"
+if [ "$(id -u)" = 0 ]; then
+    chown 65534 "$W/verify.conf"
+    expect "verify.conf owned by another uid: exit 2" 2 vp --name platd --version 0.3.0-1 --arch amd64 --sha256 "$H_AMD"
+    chown 0 "$W/verify.conf"
+else
+    echo "skip foreign-owner verify.conf case (not root)"
+fi
+
+# --- test hooks only in test mode (SEC-003) ------------------------------------------
+reset
+expect "overrides ignored without USG_PLAT_VERIFY_TEST=1" 2 env -u USG_PLAT_VERIFY_TEST \
+    TMPDIR=/tmp USG_PLAT_VERIFY_CONF=/nonexistent/verify.conf "$W/libexec/verify-pkg" --name platd --version 0.3.0-1 --arch amd64 --sha256 "$H_AMD"
+reason "ignored overrides are named" 'ignoring test-only environment.*USG_PLAT_VERIFY_CONF'
+reason "TMPDIR is named too" 'ignoring test-only environment.*TMPDIR'
+reason "the shipped configuration path is used" '/etc/usg-plat-verify/verify.conf'
+check "overrides ignored: stand-in cosign never ran" no_cosign_call
+expect "USG_PLAT_VERIFY_TEST=0 is not test mode" 2 env USG_PLAT_VERIFY_TEST=0 "$W/libexec/verify-pkg" --name platd --version 0.3.0-1 --arch amd64 --sha256 "$H_AMD"
+reason "TEST=0 ignores overrides" 'ignoring test-only environment'
+reset
+expect "USG_PLAT_ALLOW_DOWNGRADE=1 is logged" 0 env USG_PLAT_ALLOW_DOWNGRADE=1 STUB_SIGNED_TAG=v0.2.1 "$W/libexec/apt-hook" <<EOF
+$(hook_in "platd 0.3.0-1 amd64 none > 0.2.1-1 amd64 none $W/arch/platd_0.2.1-1_amd64.deb")
+EOF
+check "override logged at authpriv.warning" grep -q 'authpriv.warning.*USG_PLAT_ALLOW_DOWNGRADE=1' "$STUB_LOG"
+check "allowed downgrade logged" grep -q 'authpriv.warning.*downgrade of platd' "$STUB_LOG"
+# The common block is byte-identical in every script.
+common_of() { sed -n '/^# >>> common/,/^# <<< common/p' "$1"; }
+common_same() {
+    ref=$(common_of "$src/libexec/verify-pkg")
+    [ -n "$ref" ] || return 1
+    for f in "$src/libexec/apt-hook" "$src/libexec/fetch-sums" "$src/libexec/selftest" "$src/bin/usg-plat-verify"; do
+        [ "$(common_of "$f")" = "$ref" ] || { echo "common block differs in $f" >&2; return 1; }
+    done
+}
+check "common block identical in all gate scripts" common_same
 
 # --- selftest --apt --------------------------------------------------------------
 good_sources() {
@@ -477,6 +585,15 @@ EOF
 chmod 0755 "$W/stub/dnf"
 std() { USG_PLAT_VERIFY_DNF_REPO="$W/apt/usg-plat.repo" USG_PLAT_VERIFY_DNF_PLUGIN_CONF="$W/apt/plugin.conf" "$W/libexec/selftest" --dnf; }
 expect "selftest --dnf passes with the plugin loaded" 0 std
+sed -i.bak "s|^baseurl=.*|baseurl=file:///srv/usg-plat/rpm/\$basearch|" "$W/apt/usg-plat.repo"
+expect "selftest --dnf accepts a file:/// mirror" 0 std
+sed -i.bak 's|^baseurl=.*|baseurl=file://mirror.example.invalid/rpm|' "$W/apt/usg-plat.repo"
+expect "selftest --dnf refuses file://host" 1 std
+sed -i.bak 's|^baseurl=.*|baseurl=http://192d-wing.github.io/usg-plat-packages/rpm|' "$W/apt/usg-plat.repo"
+expect "selftest --dnf refuses http:" 1 std
+sed -i.bak 's|^baseurl=.*|baseurl=https://example.invalid/rpm|' "$W/apt/usg-plat.repo"
+expect "selftest --dnf refuses https on another host" 1 std
+sed -i.bak "s|^baseurl=.*|baseurl=https://192d-wing.github.io/usg-plat-packages/rpm/\$basearch|" "$W/apt/usg-plat.repo"
 STUB_DNF_PLUGINS=copr
 export STUB_DNF_PLUGINS
 expect "selftest --dnf fails when dnf did not load the plugin" 1 std

@@ -32,7 +32,13 @@ check-notls:
 
 # xdp-env (defined below) refuses a pre-set RUSTC_BOOTSTRAP, so the required
 # CI jobs (which run these targets) assert it too (SEC-004 / NIST-007).
-check: xdp-env fmt clippy check-linux check-notls codex-agents-check cbom-check
+check: xdp-env fmt clippy check-linux check-notls codex-agents-check cbom-check ci-pins-check
+
+# The Rocky 9 build image is pinned twice in packages.yml (packages, sbom-xdp);
+# both digests must be equal.
+.PHONY: ci-pins-check
+ci-pins-check:
+	sh deploy/ci/check-container-pins.sh
 
 # Codex agent definitions (.codex/agents/*.toml) are generated from the Claude
 # Code ones (.claude/agents/*.md); check fails when they have drifted.
@@ -62,7 +68,7 @@ SHELLCHECK = sh -c 'if ! command -v shellcheck >/dev/null 2>&1; then \
 # DEPLOY_SH includes them.
 VERIFY_SH := deploy/verify/build.sh deploy/verify/trusted-root.sh deploy/verify/debian/postinst deploy/verify/debian/prerm \
 	$(wildcard deploy/verify/libexec/*) $(wildcard deploy/verify/bin/usg-plat-verify) $(wildcard deploy/tests/verify/*.sh) $(wildcard deploy/tests/verify/install/*.sh) \
-	deploy/ci/publish-packages.sh $(wildcard deploy/ci/pin-canary/*.sh)
+	deploy/ci/publish-packages.sh deploy/ci/check-container-pins.sh $(wildcard deploy/ci/pin-canary/*.sh)
 VERIFY_PY := $(wildcard deploy/tests/verify/test_dnf_plugin.py)
 
 # Deploy scripts: POSIX syntax, shellcheck (required when CI=true) and a stubbed run

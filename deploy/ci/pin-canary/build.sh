@@ -59,6 +59,7 @@ rpmbuild -bb --quiet \
     --define "_rpmdir $work/rpm/RPMS" \
     --define "_build_name_fmt %%{NAME}-%%{VERSION}-%%{RELEASE}.%%{ARCH}.rpm" \
     --define "use_source_date_epoch_as_buildtime 1" \
+    --define "_buildhost usg-plat-pin-canary" \
     "$here/usg-plat-pin-canary.spec" >&2
 rpm=$OUT/usg-plat-pin-canary-0.0.0-1.noarch.rpm
 cp -- "$work/rpm/RPMS/usg-plat-pin-canary-0.0.0-1.noarch.rpm" "$rpm"

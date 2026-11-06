@@ -183,7 +183,23 @@ publish() {
         echo "publish-packages: releases/$TAG already published with the same SHA256SUMS; re-indexing"
     fi
 
-    # 2. Copy.
+    # 2. Copy. A package already in the tree under the same file name must be
+    # byte-identical (no-op): the canary (always 0.0.0) is re-published with
+    # every release and must never change silently; a differing one, or any
+    # other differing package, is refused before anything is copied.
+    for b in $pkgs; do
+        case $b in
+            *.deb) dests="$REPO/apt/pool/main/$b" ;;
+            *.noarch.rpm) dests=''; for a in $RPM_ARCHES; do dests="$dests $REPO/rpm/$a/$b"; done ;;
+            *.rpm) a=${b%.rpm}; a=${a##*.}; dests="$REPO/rpm/$a/$b" ;;
+            *) dests='' ;;
+        esac
+        for d in $dests; do
+            if [ -e "$d" ] && ! cmp -s -- "$DIST/$b" "$d"; then
+                refuse "$b is already in the tree with different content (published packages are immutable)"
+            fi
+        done
+    done
     mkdir -p "$REPO/apt/pool/main" "$rel"
     for a in $RPM_ARCHES; do mkdir -p "$REPO/rpm/$a"; done
     for b in $pkgs; do
@@ -315,11 +331,16 @@ fx_dist() { # fx_dist DIR VERSION -> a full release dist
     fx_deb "$1" platd "$2-1" amd64
     fx_deb "$1" platd "$2-1" arm64
     fx_deb "$1" usg-plat-verify "$2-1" all
-    fx_deb "$1" usg-plat-pin-canary 0.0.0 all
     fx_rpm "$1" platd "$2" x86_64
     fx_rpm "$1" platd "$2" aarch64
     fx_rpm "$1" usg-plat-verify "$2" noarch
-    fx_rpm "$1" usg-plat-pin-canary 0.0.0 noarch
+    # One canary for every release, as the real (reproducible) build gives.
+    if [ ! -d "$st/canary" ]; then
+        mkdir -p "$st/canary"
+        fx_deb "$st/canary" usg-plat-pin-canary 0.0.0 all
+        fx_rpm "$st/canary" usg-plat-pin-canary 0.0.0 noarch
+    fi
+    cp -- "$st/canary/$CANARY_DEB" "$st/canary/$CANARY_RPM" "$1/"
     fx_sums "$1"
 }
 fx_sums() {
@@ -399,6 +420,24 @@ self_test() {
     if run 1 "$st/imm" --dist "$st/d11b" --tag v0.11.0 --repo "$repo" && grep -q immutable "$st/imm"; then
         ok "changed SHA256SUMS for a published tag refused"
     else bad "immutability"; fi
+
+    # The canary is re-published with every release: identical is a no-op,
+    # a different one already in the tree is refused.
+    fx_dist "$st/d13" 0.13.0
+    if run 0 "$st/can" --dist "$st/d13" --tag v0.13.0 --repo "$repo" &&
+        cmp -s "$st/d13/$CANARY_DEB" "$repo/apt/pool/main/$CANARY_DEB"; then
+        ok "identical canary already in the tree is a no-op"
+    else bad "identical canary"; fi
+    cp -R "$st/d13" "$st/d14" && rm -f -- "$st/d14"/*0.13.0*
+    fx_dist "$st/d14" 0.14.0
+    cp -- "$repo/apt/pool/main/$CANARY_DEB" "$st/can.keep"
+    printf 'x' >>"$repo/apt/pool/main/$CANARY_DEB"
+    if run 1 "$st/can2" --dist "$st/d14" --tag v0.14.0 --repo "$repo" &&
+        grep -q "$CANARY_DEB is already in the tree with different content" "$st/can2" &&
+        [ ! -d "$repo/releases/v0.14.0" ]; then
+        ok "different canary in the tree refused before copying"
+    else bad "different canary"; sed 's/^/     | /' "$st/can2"; fi
+    cp -- "$st/can.keep" "$repo/apt/pool/main/$CANARY_DEB"
 
     # Tarball holds releases/<tag>/.
     fx_dist "$st/d12" 0.12.0

@@ -82,7 +82,7 @@ jobs:
         # Tag (release) builds start clean: no cache restored from main.
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         with:
-          key: packages-${{ matrix.arch }}
+          key: el9-packages-${{ matrix.arch }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: PLAT_CBOM_BLESS is unset (the CBOM is never re-blessed in CI)
         run: |
@@ -175,7 +175,7 @@ jobs:
         # Tag (release) builds start clean: no cache restored from main.
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         with:
-          key: sbom-xdp-${{ matrix.arch }}
+          key: el9-sbom-xdp-${{ matrix.arch }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install bpf-linker 0.12.0 (release tarball, sha256-pinned)
         run: |
@@ -429,23 +429,39 @@ jobs:
           printf '%s\n' "$DEPLOY_KEY" > "$RUNNER_TEMP/ssh/key"
           printf '%s\n' "$GITHUB_SSH_HOST_KEY" > "$RUNNER_TEMP/ssh/known_hosts"
           echo "GIT_SSH_COMMAND=ssh -i $RUNNER_TEMP/ssh/key -o IdentitiesOnly=yes -o IdentityAgent=none -o UserKnownHostsFile=$RUNNER_TEMP/ssh/known_hosts -o StrictHostKeyChecking=yes -o HostKeyAlgorithms=ssh-ed25519" >> "$GITHUB_ENV"
-      - name: Build the apt/dnf tree (publish-packages.sh)
+      # A push that is not a fast-forward (someone pushed to usg-plat-packages
+      # meanwhile) is retried on a fresh clone, re-running publish-packages.sh
+      # on the new tree (no rebase of generated indexes), up to 3 attempts.
+      - name: Build the apt/dnf tree (publish-packages.sh), commit and push
         run: |
           set -eu
-          git clone --depth 1 git@github.com:192d-Wing/usg-plat-packages.git pkgrepo
-          deploy/ci/publish-packages.sh --dist dist --tag "$GITHUB_REF_NAME" --repo pkgrepo \
-            --tar "$RUNNER_TEMP/usg-plat-repo-$GITHUB_REF_NAME.tar"
-      - name: Commit and push
-        working-directory: pkgrepo
-        run: |
-          set -eu
-          git config user.name "usg-plat release"
-          git config user.email "usg-plat-release@users.noreply.github.com"
-          git checkout -B main
-          git add -A
-          if git diff --cached --quiet; then echo "nothing to publish"; exit 0; fi
-          git commit -q -m "publish $GITHUB_REF_NAME (usg-plat $GITHUB_SHA)"
-          git push origin main
+          attempt=1
+          while :; do
+            rm -rf pkgrepo
+            git clone --depth 1 git@github.com:192d-Wing/usg-plat-packages.git pkgrepo
+            deploy/ci/publish-packages.sh --dist dist --tag "$GITHUB_REF_NAME" --repo pkgrepo \
+              --tar "$RUNNER_TEMP/usg-plat-repo-$GITHUB_REF_NAME.tar"
+            git -C pkgrepo config user.name "usg-plat release"
+            git -C pkgrepo config user.email "usg-plat-release@users.noreply.github.com"
+            git -C pkgrepo checkout -B main
+            git -C pkgrepo add -A
+            if git -C pkgrepo diff --cached --quiet; then echo "nothing to publish"; exit 0; fi
+            git -C pkgrepo commit -q -m "publish $GITHUB_REF_NAME (usg-plat $GITHUB_SHA)"
+            if git -C pkgrepo push origin main 2>"$RUNNER_TEMP/push.err"; then
+              cat "$RUNNER_TEMP/push.err" >&2
+              exit 0
+            fi
+            cat "$RUNNER_TEMP/push.err" >&2
+            if ! grep -Eq 'non-fast-forward|fetch first|\[rejected\]' "$RUNNER_TEMP/push.err"; then
+              echo "::error::push to usg-plat-packages failed"; exit 1
+            fi
+            if [ "$attempt" -ge 3 ]; then
+              echo "::error::push to usg-plat-packages rejected 3 times (non-fast-forward)"; exit 1
+            fi
+            attempt=$((attempt + 1))
+            echo "push rejected (non-fast-forward); retrying on a fresh clone (attempt $attempt of 3)"
+            sleep $((attempt * 5))
+          done
       - name: Remove the deploy key
         if: always()
         run: rm -f -- "$RUNNER_TEMP/ssh/key"

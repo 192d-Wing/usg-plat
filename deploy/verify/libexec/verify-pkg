@@ -25,7 +25,11 @@
 # [/var/lib/usg-plat-verify], USG_PLAT_VERIFY_TRUSTED_ROOT
 # [/usr/share/usg-plat-verify/trusted_root.json], USG_PLAT_VERIFY_TEXTFILE_DIR
 # [/var/lib/node_exporter/textfile_collector], USG_PLAT_VERIFY_TIMEOUT [60],
-# USG_PLAT_VERIFY_PATH [/usr/sbin:/usr/bin:/sbin:/bin].
+# USG_PLAT_VERIFY_PATH [/usr/sbin:/usr/bin:/sbin:/bin], USG_PLAT_VERIFY_TEST_TOP,
+# TMPDIR [/tmp]; honoured only with USG_PLAT_VERIFY_TEST=1 (see below).
+#
+# verify.conf and the trusted root must be owned by uid 0 and not group- or
+# other-writable, with the same for every ancestor directory (exit 2).
 #
 # COMPLIANCE MAPPING:
 # - NIST 800-53: SI-7(15) (Code Authentication) - a usg-plat package is
@@ -39,6 +43,68 @@
 # POAM: POAM-044 (c) - dpkg -i / rpm -U bypass this gate; repository metadata
 #   is unsigned; root can remove the gate
 set -u
+
+# >>> common: test hooks and root_only (identical in every script; unit.sh checks)
+# Test hooks (the USG_PLAT_VERIFY_* overrides named in the header, and TMPDIR)
+# are honoured only when USG_PLAT_VERIFY_TEST=1, which only the test suites
+# set. Otherwise they are unset, so children inherit a clean environment, and
+# logged once to authpriv. USG_PLAT_VERIFY_SUMS_DIR is not a hook: the front
+# ends set it for local installs and verify-pkg still verifies what it names.
+#
+# COMPLIANCE MAPPING:
+# - NIST 800-53: CM-6 (Configuration Settings), SI-7(15) (Code Authentication)
+#   - the decision depends only on root-owned, root-only-writable files
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+uv_test=0
+if [ "${USG_PLAT_VERIFY_TEST:-}" = 1 ]; then
+    uv_test=1
+else
+    uv_ign=$(env | sed -n 's/^\(USG_PLAT_VERIFY_[A-Z_]*\)=.*/\1/p' |
+        grep -v -x -e USG_PLAT_VERIFY_SUMS_DIR -e USG_PLAT_VERIFY_TEST | sort -u | tr '\n' ' ')
+    [ -n "${TMPDIR+x}" ] && uv_ign="${uv_ign}TMPDIR "
+    for uv_v in $uv_ign; do
+        unset "$uv_v"
+    done
+    unset USG_PLAT_VERIFY_TEST
+    if [ -n "$uv_ign" ]; then
+        uv_msg="ignoring test-only environment (USG_PLAT_VERIFY_TEST is not 1): $uv_ign"
+        printf 'usg-plat-verify: %s\n' "$uv_msg" >&2
+        logger -t usg-plat-verify -p authpriv.warning -- "$uv_msg" 2>/dev/null || :
+    fi
+fi
+
+# root_only PATH: PATH and every ancestor directory exist, are not symlinks,
+# are owned by uid 0 and are neither group- nor other-writable (POSIX ACLs
+# are not inspected). A sticky world-writable directory such as /tmp fails: its other users
+# can still rename or replace entries they own. In test mode the invoking uid
+# also counts as an owner and the walk stops at USG_PLAT_VERIFY_TEST_TOP.
+root_only() {
+    case $1 in /*) ;; *) return 1 ;; esac
+    case $1 in */./* | */../* | */. | */.. | *//*) return 1 ;; *) ;; esac
+    ro_p=$1
+    while :; do
+        if [ $uv_test -eq 1 ] && [ -n "${USG_PLAT_VERIFY_TEST_TOP:-}" ] &&
+            [ "$ro_p" = "$USG_PLAT_VERIFY_TEST_TOP" ]; then
+            return 0
+        fi
+        [ -e "$ro_p" ] && [ ! -L "$ro_p" ] || return 1
+        ro_l=$(LC_ALL=C stat -c '%A %u' -- "$ro_p" 2>/dev/null) || return 1
+        ro_m=${ro_l%% *} ro_u=${ro_l#* }
+        case $ro_m in
+            ?????w* | ????????w*) return 1 ;;
+            ??????????*) ;;
+            *) return 1 ;;
+        esac
+        if [ "$ro_u" != 0 ]; then
+            [ $uv_test -eq 1 ] && [ "$ro_u" = "$(id -u)" ] || return 1
+        fi
+        [ "$ro_p" = / ] && return 0
+        ro_p=${ro_p%/*}
+        [ -n "$ro_p" ] || ro_p=/
+    done
+}
+# <<< common
 
 PATH=${USG_PLAT_VERIFY_PATH:-/usr/sbin:/usr/bin:/sbin:/bin}
 export PATH
@@ -156,6 +222,7 @@ done
 
 # --- configuration -----------------------------------------------------------
 [ -f "$CONF" ] && [ -r "$CONF" ] || refuse 2 "configuration $CONF missing or unreadable"
+root_only "$CONF" || refuse 2 "configuration $CONF (or a parent directory) is not root-owned or is group/other-writable"
 NAMES='' COSIGN='' COSIGN_MIN='' COSIGN_GODEBUG=''
 # shellcheck source=deploy/verify/etc/verify.conf
 . "$CONF" || refuse 2 "configuration $CONF does not parse"
@@ -195,6 +262,8 @@ fi
 [ -f "$sums_dir/SHA256SUMS" ] && [ -f "$sums_dir/SHA256SUMS.sigstore.json" ] ||
     refuse 1 "no SHA256SUMS and SHA256SUMS.sigstore.json for $tag in $sums_dir"
 [ -f "$TRUSTED_ROOT" ] && [ -r "$TRUSTED_ROOT" ] || refuse 2 "trusted root $TRUSTED_ROOT missing"
+root_only "$TRUSTED_ROOT" ||
+    refuse 2 "trusted root $TRUSTED_ROOT (or a parent directory) is not root-owned or is group/other-writable"
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/usg-plat-verify.XXXXXX") || refuse 1 "mktemp failed"
 mkdir "$tmp/home" || refuse 1 "mktemp failed"
@@ -231,8 +300,9 @@ run_cosign verify-blob "$tmp/SHA256SUMS" \
 rc=$?
 [ $rc -eq 124 ] && refuse 1 "cosign verify-blob timed out after ${TIMEOUT}s"
 [ $rc -eq 0 ] || refuse 1 "SHA256SUMS signature for $tag does not verify (cosign exit $rc)"
-grep -qi 'error' "$tmp/out" && refuse 1 "cosign reported an error for $tag"
-grep -q 'Verified OK' "$tmp/out" || refuse 1 "cosign did not report Verified OK for $tag"
+# Accept only exit 0 together with a line that is exactly "Verified OK";
+# other output (warnings, progress) does not decide either way.
+grep -qx 'Verified OK' "$tmp/out" || refuse 1 "cosign did not report Verified OK for $tag"
 
 # --- digest and file name ----------------------------------------------------
 # Lines are "<hex>  <name>" (or "<hex> *<name>"). Exact match on both.

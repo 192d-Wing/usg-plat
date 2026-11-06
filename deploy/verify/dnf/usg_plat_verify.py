@@ -12,6 +12,16 @@ digest to verify-pkg, which checks the keyless cosign signature over the
 release SHA256SUMS. Any refusal raises dnf.exceptions.Error, which aborts
 the whole transaction (accepted residual, POAM-044 (g)).
 
+rpm reopens the package by path after this check, so the file and every
+ancestor directory must be owned by uid 0 and not group- or other-writable
+(root_only); dnf's cache meets that. A local install (`dnf install ./x.rpm`)
+must be staged in a root-only directory such as /root/pkgs, never /tmp or a
+home directory. verify.conf is read only under the same rule.
+
+verify-pkg gets the caller's environment without USG_PLAT_VERIFY_* and
+TMPDIR (its test hooks); USG_PLAT_ALLOW_DOWNGRADE=1 is an operator override
+and is logged when it allows a downgrade.
+
 COMPLIANCE MAPPING:
 - NIST 800-53: SI-7(15) (Code Authentication) - signature checked before install
 - NIST 800-53: CM-14 (Signed Components) - unsigned or mis-signed packages refused
@@ -23,6 +33,7 @@ POAM: rpm -i/-U and dnf5 bypass this plugin; root can disable it (POAM-044 (c)).
 import datetime
 import hashlib
 import os
+import re
 import stat
 import subprocess
 import syslog
@@ -34,11 +45,15 @@ import dnf.transaction
 VERIFY_PKG = "/usr/libexec/usg-plat-verify/verify-pkg"
 FETCH_SUMS = "/usr/libexec/usg-plat-verify/fetch-sums"
 CONF_PATH = "/etc/usg-plat-verify/verify.conf"
-LAST_REFUSAL = "/var/lib/usg-plat-verify/last-refusal"
+STATE_DIR = "/var/lib/usg-plat-verify"
+TEXTFILE_DIR = "/var/lib/node_exporter/textfile_collector"
 DEFAULT_NAMES = ("platd", "usg-plat-verify")
 VERIFY_TIMEOUT = 90
 FETCH_TIMEOUT = 60
 COMMANDLINE_REPO = "@commandline"
+# Owners trusted by root_only(); the tests add their own uid and a top.
+TRUSTED_UIDS = (0,)
+TRUST_TOP = None
 
 # Incoming packages: these are the files rpm would unpack.
 INCOMING = frozenset(
@@ -77,33 +92,78 @@ class Refusal(Exception):
         self.recorded = recorded
 
 
-def _unquote(value):
-    value = value.strip()
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-        return value[1:-1]
-    return value
+class ConfError(Exception):
+    """verify.conf is unsafe or not a literal assignment file."""
+
+
+def root_only(path):
+    """True when path and every ancestor directory are owned by a trusted uid
+    (root), are not symlinks and are neither group- nor other-writable.
+
+    A sticky world-writable directory such as /tmp fails. Same rule as the
+    shell root_only() in verify-pkg and apt-hook.
+    """
+    # COMPLIANCE MAPPING:
+    # - NIST 800-53: SI-7(15) (Code Authentication) - the file rpm reopens
+    #   after this check can be written only by root
+    if not os.path.isabs(path) or path != os.path.normpath(path):
+        return False
+    p = path
+    while True:
+        if TRUST_TOP is not None and p == TRUST_TOP:
+            return True
+        try:
+            st = os.lstat(p)
+        except OSError:
+            return False
+        if stat.S_ISLNK(st.st_mode) or st.st_uid not in TRUSTED_UIDS:
+            return False
+        if st.st_mode & 0o022:
+            return False
+        if p == "/":
+            return True
+        p = os.path.dirname(p)
+
+
+# Literal assignments only, the subset on which `sh -c '. conf'` and this
+# parser agree (unit-tested): NAME=word, NAME="text" or NAME='text' with no
+# expansion, escape, tilde or command characters, optionally after `export `.
+_ASSIGN = re.compile(
+    r"""(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)=(?:"([^"$`\\]*)"|'([^']*)'|([^\s"'$`\\;&|<>(){}#~]*))[ \t]*"""
+)
 
 
 def load_conf(path=None):
     """Read the shell-style key=value verify.conf.
 
-    Only literal assignments are understood. A missing or unreadable file
-    keeps the defaults, which still gate our names (fail closed).
+    A missing file keeps the defaults, which still gate our names (fail
+    closed). A file that is not root_only() or has a line that is not a
+    literal assignment raises ConfError: the plugin then refuses our names,
+    as verify-pkg would.
     """
+    path = path or CONF_PATH
     conf = {"NAMES": " ".join(DEFAULT_NAMES), "ALLOW_DOWNGRADE": "0"}
+    if not os.path.lexists(path):
+        return conf
+    if not root_only(path):
+        raise ConfError(
+            "%s (or a parent directory) is not root-owned or is group/other-writable"
+            % path
+        )
     try:
-        with open(path or CONF_PATH, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, _, value = line.partition("=")
-                key = key.strip()
-                if key.startswith("export "):
-                    key = key[len("export ") :].strip()
-                conf[key] = _unquote(value)
-    except OSError:
-        pass
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except (OSError, UnicodeDecodeError) as e:
+        raise ConfError("cannot read %s: %s" % (path, e))
+    for n, line in enumerate(lines, 1):
+        text = line.strip()
+        if not text or text.startswith("#"):
+            continue
+        m = _ASSIGN.fullmatch(text)
+        if not m:
+            raise ConfError("%s line %d is not a literal assignment" % (path, n))
+        value = next(v for v in m.groups()[1:] if v is not None)
+        conf[m.group(1)] = value
     return conf
 
 
@@ -123,9 +183,9 @@ def open_and_measure(path):
 
     Returns (sha256 hex, (name, epoch, version, release, arch)).
     """
-    # COMPLIANCE MAPPING:
-    # - NIST 800-53: SI-7(15) - the digest and the header come from the same
-    #   descriptor, so the file cannot be swapped between check and use here
+    # The digest and the header come from the same descriptor, but rpm
+    # reopens the path later: root_only() in _check is what stops a swap
+    # between this check and rpm's unpack.
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
     except OSError as e:
@@ -181,14 +241,64 @@ def _log(priority, message):
         pass
 
 
-def _record_refusal(pkg, reason):
-    """Best effort, same file verify-pkg writes, so alerting sees plugin refusals."""
-    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+def _clean(value):
+    """Printable, bounded form, as clean() in verify-pkg."""
+    return re.sub(r"[^A-Za-z0-9._+:~-]", "?", _text(value))[:64]
+
+
+def _atomic_write(path, text, mode=None):
+    tmp = "%s.%d" % (path, os.getpid())
     try:
-        with open(LAST_REFUSAL, "w", encoding="utf-8") as f:
-            f.write("%s %s %s %s\n" % (now, pkg.name, pkg.evr, reason))
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+        if mode is not None:
+            os.chmod(tmp, mode)
+        os.replace(tmp, path)
+        return True
     except OSError:
-        pass
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
+
+
+PROM = (
+    "# HELP usg_plat_verify_refusals_total usg-plat packages refused by the install gate.\n"
+    "# TYPE usg_plat_verify_refusals_total counter\n"
+    "usg_plat_verify_refusals_total %d\n"
+    "# HELP usg_plat_verify_last_refusal_timestamp_seconds Time of the last refusal.\n"
+    "# TYPE usg_plat_verify_last_refusal_timestamp_seconds gauge\n"
+    "usg_plat_verify_last_refusal_timestamp_seconds %d\n"
+)
+
+
+def _record_refusal(pkg, reason):
+    """Same records as record_refusal() in verify-pkg (best effort): atomic
+    last-refusal, refusals_total counter and the optional node-exporter
+    textfile, so alerting sees plugin refusals too."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    n = 1
+    if os.path.isdir(STATE_DIR):
+        _atomic_write(
+            os.path.join(STATE_DIR, "last-refusal"),
+            "%s %s %s %s\n"
+            % (now.strftime("%Y-%m-%dT%H:%M:%SZ"), _clean(pkg.name), _clean(pkg.evr), reason),
+        )
+        total = os.path.join(STATE_DIR, "refusals_total")
+        try:
+            with open(total, encoding="utf-8") as f:
+                old = f.read().strip()
+        except OSError:
+            old = ""
+        n = (int(old) if old.isdigit() else 0) + 1
+        _atomic_write(total, "%d\n" % n)
+    if os.path.isdir(TEXTFILE_DIR):
+        _atomic_write(
+            os.path.join(TEXTFILE_DIR, "usg-plat-verify.prom"),
+            PROM % (n, int(now.timestamp())),
+            0o644,
+        )
 
 
 def _tag(version):
@@ -203,17 +313,21 @@ class UsgPlatVerify(dnf.Plugin):
         self.base = base
 
     def _settings(self):
-        conf = load_conf()
+        """(names, allow_downgrade, conf_error or None)."""
+        try:
+            conf = load_conf()
+        except ConfError as e:
+            return frozenset(DEFAULT_NAMES), False, str(e)
         names = frozenset(conf.get("NAMES", "").split()) or frozenset(DEFAULT_NAMES)
         allow_downgrade = (
             conf.get("ALLOW_DOWNGRADE") == "1"
             or os.environ.get("USG_PLAT_ALLOW_DOWNGRADE") == "1"
         )
-        return names, allow_downgrade
+        return names, allow_downgrade, None
 
     def resolved(self):
         """Best effort: fetch SHA256SUMS for the repo versions being installed."""
-        names, _ = self._settings()
+        names, _, _ = self._settings()
         tags = set()
         for item in self.base.transaction or ():
             pkg = item.pkg
@@ -237,7 +351,7 @@ class UsgPlatVerify(dnf.Plugin):
             pass
 
     def pre_transaction(self):
-        names, allow_downgrade = self._settings()
+        names, allow_downgrade, conf_error = self._settings()
         for item in self.base.transaction:
             pkg = item.pkg
             # Name filter first: distro packages get no per-file work.
@@ -248,6 +362,8 @@ class UsgPlatVerify(dnf.Plugin):
             try:
                 if item.action not in INCOMING:
                     raise Refusal("unknown transaction action %r" % (item.action,))
+                if conf_error:
+                    raise Refusal(conf_error)
                 self._check(item, allow_downgrade)
             except Refusal as e:
                 reason = str(e)
@@ -266,11 +382,28 @@ class UsgPlatVerify(dnf.Plugin):
             raise Refusal(
                 "downgrade refused (set ALLOW_DOWNGRADE=1 or USG_PLAT_ALLOW_DOWNGRADE=1)"
             )
+        if item.action == dnf.transaction.PKG_DOWNGRADE:
+            _log(
+                syslog.LOG_WARNING,
+                "downgrade of %s allowed by ALLOW_DOWNGRADE%s"
+                % (
+                    _nevra(pkg),
+                    " (USG_PLAT_ALLOW_DOWNGRADE=1 in the environment)"
+                    if os.environ.get("USG_PLAT_ALLOW_DOWNGRADE") == "1"
+                    else "",
+                ),
+            )
         local = pkg.localPkg()
         if not local:
             raise Refusal("no local package file")
         # @commandline paths are relative to the cwd dnf was started in.
         path = os.path.abspath(local)
+        if not root_only(path):
+            raise Refusal(
+                "%s: the file or a parent directory is not root-owned or is "
+                "group/other-writable (stage local packages in a root-only directory)"
+                % path
+            )
         digest, header = open_and_measure(path)
         expected = (pkg.name, _epoch(pkg.epoch), pkg.version, pkg.release, pkg.arch)
         if header != expected:
@@ -278,8 +411,12 @@ class UsgPlatVerify(dnf.Plugin):
                 "rpm header %s does not match transaction %s"
                 % ("-".join(header), "-".join(expected))
             )
-        env = dict(os.environ)
-        env.pop("USG_PLAT_VERIFY_SUMS_DIR", None)
+        # verify-pkg's test hooks never cross from dnf's environment.
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if not k.startswith("USG_PLAT_VERIFY_") and k != "TMPDIR"
+        }
         if pkg.reponame == COMMANDLINE_REPO:
             env["USG_PLAT_VERIFY_SUMS_DIR"] = os.path.dirname(path)
         argv = [

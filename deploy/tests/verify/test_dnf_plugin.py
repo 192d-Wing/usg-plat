@@ -15,7 +15,9 @@ COMPLIANCE MAPPING:
 import ast
 import importlib.util
 import os
+import re
 import stat
+import subprocess
 import sys
 import tempfile
 import types
@@ -24,6 +26,8 @@ from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PLUGIN = os.path.join(HERE, "..", "..", "verify", "dnf", "usg_plat_verify.py")
+VERIFY_PKG = os.path.join(HERE, "..", "..", "verify", "libexec", "verify-pkg")
+SHIPPED_CONF = os.path.join(HERE, "..", "..", "verify", "etc", "verify.conf")
 
 # The PKG_* names exported by dnf/transaction.py in dnf 4.14 (Rocky 9),
 # exactly; the plugin may use no other.  Values are deliberately unlike
@@ -97,6 +101,7 @@ class Item(object):
 STUB = """#!/bin/sh
 printf '%s\\n' "$@" > "{d}/argv"
 printf '%s\\n' "${{USG_PLAT_VERIFY_SUMS_DIR-unset}}" > "{d}/sumsdir"
+env | grep -E '^(USG_PLAT_VERIFY_|TMPDIR=)' > "{d}/env"
 exit $(cat "{d}/rc")
 """
 
@@ -104,7 +109,10 @@ exit $(cat "{d}/rc")
 class PluginTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.d = self.tmp.name
+        self.d = os.path.realpath(self.tmp.name)
+        os.chmod(self.d, 0o755)
+        old_umask = os.umask(0o022)
+        self.addCleanup(os.umask, old_umask)
         self.stub = os.path.join(self.d, "verify-pkg")
         with open(self.stub, "w") as f:
             f.write(STUB.format(d=self.d))
@@ -119,7 +127,10 @@ class PluginTest(unittest.TestCase):
         patches = [
             mock.patch.object(upv, "VERIFY_PKG", self.stub),
             mock.patch.object(upv, "CONF_PATH", self.conf),
-            mock.patch.object(upv, "LAST_REFUSAL", os.path.join(self.d, "last-refusal")),
+            mock.patch.object(upv, "STATE_DIR", self.d),
+            mock.patch.object(upv, "TEXTFILE_DIR", os.path.join(self.d, "collector")),
+            mock.patch.object(upv, "TRUSTED_UIDS", (0, os.getuid())),
+            mock.patch.object(upv, "TRUST_TOP", self.d),
             mock.patch.object(upv, "FETCH_SUMS", os.path.join(self.d, "no-fetch-sums")),
             mock.patch.object(upv, "_log", lambda *a: None),
             mock.patch.object(upv, "read_header", self.fake_header),
@@ -266,12 +277,16 @@ class PluginTest(unittest.TestCase):
             flags_seen.append(flags)
             return real_open(path, flags, *a)
 
+        # root_only() refuses the link first; open_and_measure() alone
+        # still opens with O_NOFOLLOW.
+        with self.assertRaises(DnfError):
+            self.run_plugin(Item(T.PKG_INSTALL, self.pkg(local=link)))
+        self.assertIsNone(self.argv())
         with mock.patch.object(upv.os, "open", spy):
-            with self.assertRaises(DnfError) as cm:
-                self.run_plugin(Item(T.PKG_INSTALL, self.pkg(local=link)))
+            with self.assertRaises(upv.Refusal) as cm:
+                upv.open_and_measure(link)
         self.assertTrue(flags_seen and flags_seen[0] & os.O_NOFOLLOW)
         self.assertIn("cannot open", str(cm.exception))
-        self.assertIsNone(self.argv())
 
     def test_non_regular_file_refused(self):
         with self.assertRaises(DnfError):
@@ -291,6 +306,196 @@ class PluginTest(unittest.TestCase):
         self.set_rc(1)
         with self.assertRaises(DnfError):
             self.run_plugin(Item(T.PKG_INSTALL, self.pkg()))
+
+    # --- root-only paths (SEC-001) -----------------------------------------------
+
+    def _staged(self, dirmode, sub="stage"):
+        d = os.path.join(self.d, sub)
+        os.mkdir(d)
+        os.chmod(d, dirmode)
+        p = os.path.join(d, os.path.basename(self.rpm))
+        with open(self.rpm, "rb") as src, open(p, "wb") as dst:
+            dst.write(src.read())
+        return p
+
+    def test_world_writable_directory_refused(self):
+        for mode in (0o777, 0o1777, 0o775):
+            with self.subTest(mode=oct(mode)):
+                p = self._staged(mode, "d%o" % mode)
+                with self.assertRaises(DnfError) as cm:
+                    self.run_plugin(Item(T.PKG_INSTALL, self.pkg(local=p, repo="@commandline")))
+                self.assertIn("root-only directory", str(cm.exception))
+                self.assertIsNone(self.argv())
+
+    def test_world_writable_ancestor_refused(self):
+        top = os.path.join(self.d, "ww")
+        os.mkdir(top)
+        os.chmod(top, 0o777)
+        p = self._staged(0o755, "ww/sub")
+        with self.assertRaises(DnfError):
+            self.run_plugin(Item(T.PKG_INSTALL, self.pkg(local=p)))
+
+    def test_group_writable_file_refused(self):
+        os.chmod(self.rpm, 0o664)
+        with self.assertRaises(DnfError):
+            self.run_plugin(Item(T.PKG_INSTALL, self.pkg()))
+
+    def test_root_only_dir_accepted(self):
+        p = self._staged(0o700)
+        self.run_plugin(Item(T.PKG_INSTALL, self.pkg(local=p, repo="@commandline")))
+        self.assertIsNotNone(self.argv())
+
+    def test_root_only_untrusted_owner(self):
+        with mock.patch.object(upv, "TRUSTED_UIDS", (0,)):
+            if os.getuid() != 0:
+                self.assertFalse(upv.root_only(self.rpm))
+        with mock.patch.object(upv, "TRUST_TOP", None):
+            # The walk reaches the temporary directory's sticky parent.
+            if os.stat(os.path.dirname(self.d)).st_mode & 0o002:
+                self.assertFalse(upv.root_only(self.rpm))
+
+    def test_root_only_rejects_unnormalised(self):
+        self.assertFalse(upv.root_only(self.d + "/../" + os.path.basename(self.d)))
+        self.assertFalse(upv.root_only("relative/path"))
+
+    # --- environment (SEC-003) -----------------------------------------------------
+
+    def test_test_hooks_and_tmpdir_stripped(self):
+        os.environ["USG_PLAT_VERIFY_CONF"] = "/attacker/verify.conf"
+        os.environ["USG_PLAT_VERIFY_TEST"] = "1"
+        os.environ["USG_PLAT_VERIFY_TRUSTED_ROOT"] = "/attacker/root.json"
+        os.environ["TMPDIR"] = "/attacker"
+        try:
+            self.run_plugin(Item(T.PKG_INSTALL, self.pkg()))
+        finally:
+            for k in ("USG_PLAT_VERIFY_CONF", "USG_PLAT_VERIFY_TEST",
+                      "USG_PLAT_VERIFY_TRUSTED_ROOT", "TMPDIR"):
+                os.environ.pop(k, None)
+        with open(os.path.join(self.d, "env")) as f:
+            self.assertEqual(f.read(), "")
+
+    def test_commandline_sets_only_sums_dir(self):
+        os.environ["USG_PLAT_VERIFY_STATE"] = "/attacker"
+        try:
+            self.run_plugin(Item(T.PKG_INSTALL, self.pkg(repo="@commandline")))
+        finally:
+            os.environ.pop("USG_PLAT_VERIFY_STATE", None)
+        with open(os.path.join(self.d, "env")) as f:
+            self.assertEqual(f.read().split(), ["USG_PLAT_VERIFY_SUMS_DIR=" + self.d])
+
+    def test_env_downgrade_override_logged(self):
+        logged = []
+        os.environ["USG_PLAT_ALLOW_DOWNGRADE"] = "1"
+        with mock.patch.object(upv, "_log", lambda p, m: logged.append((p, m))):
+            self.run_plugin(Item(T.PKG_DOWNGRADE, self.pkg()))
+        self.assertTrue(any("USG_PLAT_ALLOW_DOWNGRADE=1" in m for _, m in logged))
+
+    # --- verify.conf (SEC-008) ------------------------------------------------------
+
+    def test_writable_conf_refuses(self):
+        os.chmod(self.conf, 0o666)
+        with self.assertRaises(DnfError) as cm:
+            self.run_plugin(Item(T.PKG_INSTALL, self.pkg()))
+        self.assertIn("group/other-writable", str(cm.exception))
+        self.assertIsNone(self.argv())
+
+    def test_writable_conf_does_not_enable_downgrade(self):
+        with open(self.conf, "a") as f:
+            f.write("ALLOW_DOWNGRADE=1\n")
+        os.chmod(self.conf, 0o646)
+        with self.assertRaises(DnfError):
+            self.run_plugin(Item(T.PKG_DOWNGRADE, self.pkg()))
+
+    def test_non_literal_conf_refuses(self):
+        for bad in ("NAMES=$(id)\n", "NAMES=`id`\n", 'NAMES="a $b"\n', "NAMES = platd\n",
+                    "ALLOW_DOWNGRADE=1 # yes\n", "X=~/x\n", "NAMES=a;b\n", "if true\n"):
+            with self.subTest(bad=bad):
+                with open(self.conf, "w") as f:
+                    f.write(bad)
+                with self.assertRaises(upv.ConfError):
+                    upv.load_conf(self.conf)
+
+    @staticmethod
+    def _read(path):
+        with open(path) as f:
+            return f.read()
+
+    def test_conf_parser_matches_shell(self):
+        variants = [
+            self._read(SHIPPED_CONF),
+            'NAMES="platd usg-plat-verify"\nALLOW_DOWNGRADE=1\n',
+            "NAMES='platd'\nexport ALLOW_DOWNGRADE=1\n",
+            "  # comment\n\nNAMES=platd  \nCOSIGN_GODEBUG=fips140=only\nNAMES=\"x y\"\n",
+            "COSIGN=/usr/local/bin/cosign\nALLOW_DOWNGRADE=''\n",
+        ]
+        keys = ("NAMES", "ALLOW_DOWNGRADE", "COSIGN", "COSIGN_GODEBUG", "REPO_HOST")
+        for text in variants:
+            with self.subTest(text=text):
+                with open(self.conf, "w") as f:
+                    f.write(text)
+                py = upv.load_conf(self.conf)
+                out = subprocess.run(
+                    ["sh", "-c", '. "$1"; for k in %s; do eval "printf \'%%s=%%s\\n\' $k \\"\\${$k-<unset>}\\""; done'
+                     % " ".join(keys), "sh", self.conf],
+                    capture_output=True, text=True, check=True,
+                ).stdout.splitlines()
+                sh = dict(line.split("=", 1) for line in out)
+                for k in keys:
+                    want = sh[k]
+                    got = py.get(k, "<unset>")
+                    if k in ("NAMES", "ALLOW_DOWNGRADE") and want == "<unset>":
+                        continue  # plugin defaults
+                    self.assertEqual(got, want, k)
+
+    # --- refusal records (SEC-004) ----------------------------------------------------
+
+    def test_plugin_refusal_counted_and_exported(self):
+        os.mkdir(os.path.join(self.d, "collector"))
+        with open(os.path.join(self.d, "refusals_total"), "w") as f:
+            f.write("4\n")
+        with self.assertRaises(DnfError):
+            self.run_plugin(Item(T.PKG_DOWNGRADE, self.pkg()))
+        with open(os.path.join(self.d, "refusals_total")) as f:
+            self.assertEqual(f.read(), "5\n")
+        with open(os.path.join(self.d, "collector", "usg-plat-verify.prom")) as f:
+            prom = f.read()
+        self.assertIn("usg_plat_verify_refusals_total 5\n", prom)
+        mode = os.stat(os.path.join(self.d, "collector", "usg-plat-verify.prom")).st_mode
+        self.assertEqual(stat.S_IMODE(mode), 0o644)
+        leftovers = [n for n in os.listdir(self.d) + os.listdir(os.path.join(self.d, "collector"))
+                     if re.search(r"\.\d+$", n)]
+        self.assertEqual(leftovers, [])
+
+    def test_record_format_matches_verify_pkg(self):
+        """Same last-refusal line shape and .prom text as verify-pkg."""
+        sh_state = os.path.join(self.d, "sh-state")
+        sh_tf = os.path.join(self.d, "sh-tf")
+        os.mkdir(sh_state)
+        os.mkdir(sh_tf)
+        env = {"PATH": "/usr/bin:/bin", "USG_PLAT_VERIFY_TEST": "1",
+               "USG_PLAT_VERIFY_STATE": sh_state, "USG_PLAT_VERIFY_TEXTFILE_DIR": sh_tf,
+               "USG_PLAT_VERIFY_PATH": "/usr/bin:/bin"}
+        # A usage refusal is recorded before any configuration is read.
+        rc = subprocess.run(["sh", VERIFY_PKG, "--name", "platd"], env=env,
+                            capture_output=True).returncode
+        self.assertEqual(rc, 2)
+        os.mkdir(os.path.join(self.d, "collector"))
+        upv._record_refusal(self.pkg(), "downgrade refused")
+
+        def masked(path):
+            with open(path) as f:
+                return re.sub(r"\d+", "N", f.read())
+
+        self.assertEqual(masked(os.path.join(sh_tf, "usg-plat-verify.prom")),
+                         masked(os.path.join(self.d, "collector", "usg-plat-verify.prom")))
+        line_re = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z platd \S* .+\n$"
+        for p in (os.path.join(sh_state, "last-refusal"), os.path.join(self.d, "last-refusal")):
+            with open(p) as f:
+                self.assertRegex(f.read(), line_re)
+        with open(os.path.join(sh_state, "refusals_total")) as f:
+            self.assertEqual(f.read(), "1\n")
+        with open(os.path.join(self.d, "refusals_total")) as f:
+            self.assertEqual(f.read(), "1\n")
 
     # --- pass-through --------------------------------------------------------
 

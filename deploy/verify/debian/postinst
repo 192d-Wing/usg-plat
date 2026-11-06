@@ -12,8 +12,17 @@ if [ "$1" = "configure" ]; then
     install -d -m 0755 -o root -g root /var/lib/usg-plat-verify /var/lib/usg-plat-verify/releases
 
     COSIGN=/usr/local/bin/cosign
+    c=/etc/usg-plat-verify/verify.conf
+    # Sourced only when root-owned and not group/other-writable (the gate
+    # refuses every usg-plat package otherwise).
     # shellcheck source=/dev/null
-    [ -r /etc/usg-plat-verify/verify.conf ] && . /etc/usg-plat-verify/verify.conf
+    if [ -r "$c" ] && [ "$(stat -c %u "$c")" = 0 ] && [ $(($(stat -c %#a "$c") & 022)) -eq 0 ]; then
+        . "$c"
+    elif [ -e "$c" ]; then
+        msg="$c is not root-owned or is group/other-writable: every platd / usg-plat-verify install will be REFUSED until it is fixed"
+        echo "usg-plat-verify: WARNING: $msg" >&2
+        logger -t usg-plat-verify -p authpriv.warning "$msg" 2>/dev/null || true
+    fi
     if [ ! -x "$COSIGN" ]; then
         msg="cosign not found at $COSIGN: every platd / usg-plat-verify install and upgrade will be REFUSED until cosign >= 3.0.3 is installed (see the install guide)"
         echo "usg-plat-verify: WARNING: $msg" >&2
