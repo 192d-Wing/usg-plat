@@ -36,6 +36,9 @@ Requires:       python3-dnf
 Requires:       rpm
 Requires:       coreutils
 Requires:       util-linux
+# fetch-sums downloads SHA256SUMS over https (curl or curl-minimal provides curl).
+Requires:       curl
+Requires:       ca-certificates
 Requires(pre):  python3-dnf
 
 %description
