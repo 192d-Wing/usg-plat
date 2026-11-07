@@ -68,7 +68,11 @@ copyright = "usg-plat Contributors"
 extended-description = "Multithreaded 464XLAT PLAT / stateful NAT64 translator (RFC 6877, RFC 6146, RFC 7915) with SIEM attribution logging."
 section = "net"
 priority = "optional"
-depends = "$auto, nftables, systemd"
+# Explicit, not `$auto`: packages are built on EL9 (glibc 2.34), where
+# dpkg-shlibdeps has no Debian libc6 symbols data and resolves nothing. The
+# binaries need libc.so.6/libm.so.6 (GLIBC_ <= 2.34) and libgcc_s.so.1;
+# deploy/build/check-glibc-floor.sh checks both sides in CI.
+depends = "libc6 (>= 2.34), libgcc-s1, nftables, systemd"
 conf-files = ["/etc/plat/platd.toml"]
 maintainer-scripts = "../../deploy/debian/"
 systemd-units = [
