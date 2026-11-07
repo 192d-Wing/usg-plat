@@ -1,0 +1,16 @@
+#!/bin/sh
+# usg-plat-verify prerm.
+# COMPLIANCE MAPPING:
+# - NIST 800-53: AU-12 (Audit Record Generation), CM-14 - removing the gate
+#   is a security-relevant change; record it before the hook disappears.
+set -e
+
+case "$1" in
+    remove | deconfigure)
+        msg="usg-plat-verify $1: the install-time signature gate is being removed"
+        echo "usg-plat-verify: $msg" >&2
+        logger -t usg-plat-verify -p authpriv.warning "$msg" 2>/dev/null || true
+        ;;
+esac
+
+exit 0

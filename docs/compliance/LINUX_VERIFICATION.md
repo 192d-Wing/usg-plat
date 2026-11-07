@@ -75,6 +75,7 @@ each item.
 | L32 | XDP: map-full fallback | SC-5 | POAM-016 | PASS (2026-11-03, `E2E_MAPFULL=1 e2e.sh run`, kernel 6.8.0-147, veth, native, by hand): 5000 flows against `max_sessions` 4096: 5000/5000 echoes in each of 3 rounds, 4096 fast-path sessions, 162 `map_full` + 1092 `slots` install failures, overflow on the slow path, 30000 receiver checksums verified; after expiry 100 new flows all installed and on the fast path. The 1 s back-off itself is not observable from outside |
 
 | L33 | OCSP/CRL name resolution through the built-in resolver under the unit | SC-5, IA-5(2)(b)(1), SC-7 | POAM-025 (a), POAM-045 | PASS (2026-11-04, `deploy/tests/resolver/l33-resolver.sh` on `plat-linux`, kernel 6.8.0-147 aarch64, systemd 255, shipped `platd.service`, OCSP by AIA name under `hard_fail`, one run): (a) dnsmasq answers: handshake passes; (b) udp/tcp 53 dropped on the nft **input** hook: refused after 2111 ms (`budget_ms` 4000), `reason="timeout"` 0 → 1 (the procedure's **output**-hook rule fails the lookup in ~110 ms with `EPERM` from netfilter and counts `reason="error"`); (c) systemd-resolved stub 127.0.0.53: passes; (d) a name only in `/etc/hosts` resolves with DNS blackholed; (e) a resolv.conf edit is used 31 s after the edit (detected by the first lookup ≥ 30 s after the previous check, applied by the next lookup), a file without `nameserver` keeps the last good server (15/15 handshakes over 45 s, one `rejected` warning); (f) no `SIGSYS`/seccomp/`EPERM` for `plat-dns`; with `SystemCallErrorNumber=kill` lookups, timeouts and a reload pass and platd keeps running (NRestarts 0). Not run: x86_64, IPv6 nameservers, CRL by name |
+| L34 | Install-time signature gate (`usg-plat-verify`) in apt and dnf4 | SI-7(15), CM-14, SR-11, CM-7, AU-12 | POAM-044 (c), (f), (g) | PARTIAL (2026-11-06, arm64 podman containers, not systemd hosts): E-cases Debian 12 and Ubuntu 24.04 20/20, Rocky 9 and Rocky 10 20/20 (after the `python(abi)` fix, 790eb60); R-cases 16/16 on Debian 12 and Ubuntu 24.04; x86_64 CI (`verify-install`) and the first-tag release gate not run |
 
 On macOS and in CI the real resolver runs against an in-process fake DNS
 server on 127.0.0.1 (`crates/plat-tls/tests/dns_fake_server.rs`): answers,
@@ -441,8 +442,12 @@ path is still unexercised on Linux (covered only by
 
 ### L18 — package install, upgrade and removal
 
-- On Debian/Ubuntu (`apt install ./platd_*.deb`) and RHEL/Rocky
-  (`dnf install ./platd-*.rpm`), using the CI artifact for the host
+- Install cosign and `usg-plat-verify` first (`platd` depends on it;
+  `docs/install-verify.md` sections 1 and 2). Then, on Debian/Ubuntu
+  (`apt install ./platd_*.deb`) and RHEL/Rocky
+  (`dnf install ./platd-*.rpm`), with the release's `SHA256SUMS` and
+  `SHA256SUMS.sigstore.json` next to the package (the gate refuses it
+  otherwise; L34 E13), using the release files for the host
   architecture: the `plat` system user (no login shell) and `plat-log`
   group exist; `/etc/plat` is `root:plat` 0750 and `/etc/plat/platd.toml`
   `root:plat` 0640; `/var/log/plat` is `plat:plat-log` 2750; `platd` and
@@ -456,7 +461,9 @@ path is still unexercised on Linux (covered only by
   with `apt-get install ./platd_*.deb` on Debian 12 (glibc 2.36), Ubuntu
   22.04 (2.35) and 24.04 (2.39) and `dnf install ./platd-*.rpm` on Rocky
   9.8 (2.34); on each, `platd --version` and `platd check-config -c
-  config/platd.example.toml` succeeded. x86_64 is covered by CI only;
+  config/platd.example.toml` succeeded. These installs predate the
+  `usg-plat-verify` dependency and the gate, so they did not go through
+  it. x86_64 is covered by CI only;
   the unit and user checks above were not repeated on these distributions.
 - Edit the config, enable `plat-fwguard.timer` and `platd`, then install a
   newer package: neither is restarted and an edited config is kept
@@ -596,6 +603,78 @@ Not covered: x86_64; IPv6 nameservers and AAAA-only names; CRL
 distribution points by name (same resolver path, OCSP used here); a
 saturated resolver (`reason="saturated"`) on Linux; NSS-only names
 (POAM-045, refused by design).
+
+### L34 — install-time signature gate (POAM-044 (c))
+
+- `deploy/tests/verify/install/run.sh [DISTRO...]`: real apt (Debian 12,
+  Ubuntu 24.04) and dnf4 (Rocky 9, Rocky 10) in containers pinned by
+  digest, against a throwaway local HTTPS repository
+  (`fixtures.sh`) with dummy usg-plat packages and a stand-in cosign that
+  records its argv. `real-release.sh`: upstream cosign v3.1.4 (SHA-256
+  pinned) verifies the real v0.3.0 release through the installed
+  `usg-plat-verify` with `--network none`. Only the gate decision is tested
+  there; no platd package is installed.
+- GAP cases pass when the recorded residual is still present: E06, E16,
+  E17 (apt).
+
+| Case | apt | dnf4 | Checks |
+|------|-----|------|--------|
+| E00 | — | PASS | `%pre` refuses a dnf with an unexpected `PLUGINPATH` |
+| E01 | PASS | PASS | bootstrap `dpkg -i` / `rpm -i` installs the gate, warns without cosign |
+| E02 | PASS | PASS | apt: update runs fetch-sums and `selftest --apt`; dnf: plugin reported loaded; `selftest --full` passes |
+| E03 | PASS | PASS | canary uninstallable (pin -1 / `includepkgs`) |
+| E04 | PASS | PASS | foreign name from the repository has no candidate |
+| E05 | PASS | PASS | cosign missing: platd refused, not installed |
+| E06 | GAP | GAP | mixed transaction refused as a whole (POAM-044 (g)) |
+| E07 | PASS | PASS | unrelated package installs while cosign is missing |
+| E08 | PASS | PASS | platd from the HTTPS repo accepted |
+| E09 | PASS | PASS | unattended-upgrade / dnf-automatic refusal leaves an `authpriv.err` record |
+| E10 | PASS | PASS | repository upgrade |
+| E11 | PASS | PASS | downgrade refused |
+| E12 | PASS | PASS | `USG_PLAT_ALLOW_DOWNGRADE=1` accepted |
+| E13 | PASS | PASS | local `./x.deb` / `./x.rpm` with sibling `SHA256SUMS` |
+| E14 | PASS | PASS | one flipped payload byte refused |
+| E15 | PASS | PASS | `SHA256SUMS` changed after signing refused |
+| E16 | GAP | GAP | `dpkg -i` / `rpm -U` installs an unlisted platd |
+| E17 | GAP | PASS | foreign `pkg=ver` installs on apt; `includepkgs` hides it on dnf |
+| E18 | PASS | — | pin origin with a scheme fails `apt-get update` |
+| E19 | PASS | PASS | refusals logged at `authpriv.err`, `last-refusal`, `refusals_total` |
+| E20 | PASS | PASS | stand-in cosign saw the exact identity and `--trusted-root` on every call |
+| E21 | PASS | PASS | local package in a sticky world-writable directory refused (POAM044-SEC-001, added in review round 1) |
+
+R-cases (real cosign, no network): R00 no network; R01 gate installs;
+R02 cosign v3.1.4; R03 `COSIGN_GODEBUG=fips140=only` by default; R04–R07
+accept the v0.3.0 platd `.deb` amd64/arm64 and `.rpm` x86_64/aarch64;
+R08 `usg-plat-verify verify`; R09 tampered `SHA256SUMS`, R10 tampered
+package, R11 digest under another file name, R12 wrong tag identity,
+R13 wrong trust root, R14 missing cosign, all refused; R15 `last-refusal`
+written.
+
+Result (2026-11-06, aarch64 macOS host, podman): Debian 12 and Ubuntu
+24.04 E 20/20 and R 16/16. Rocky 9 and Rocky 10 E 20/20, after
+790eb60 removed the automatic `python(abi)` requires, which had made
+`usg-plat-verify` uninstallable on EL (found by E01 and R01). These counts
+come from the unit E run reports. Only the Rocky `results.txt` files were
+kept (`target/verify-install-fix/out-rocky{9,10}/`). R-cases on Rocky were
+not recorded for this run. **PARTIAL**.
+
+Re-run after security review rounds 1 and 2 (2026-11-06, commit d580501
+plus 66fb37a, aarch64 macOS host, podman; results kept in the session run
+directory, not in `target/`): `run.sh` E00–E21 21 passed, 0 failed on each
+of Debian 12, Ubuntu 24.04, Rocky 9 and Rocky 10 (apt: 18 PASS + 3 GAP;
+dnf4: 19 PASS + 2 GAP); `real-release.sh` R00–R15 16 passed, 0 failed on
+all four. R13 now replaces the installed root-owned `trusted_root.json`
+(the `USG_PLAT_VERIFY_TRUSTED_ROOT` override is test-only since
+POAM044-SEC-003). Still **PARTIAL** (see "Not covered").
+
+Not covered: x86_64 (the `ci.yml` `verify-install` job on
+`ubuntu-24.04` and `ubuntu-24.04-arm` has not run on GitHub); systemd
+hosts and real `unattended-upgrades` timers; an install from a `file:`
+mirror or the offline tarball (only the `selftest` and `fetch-sums` unit
+tests cover `file:`; apt and dnf `file:///` mirrors both pass `selftest`); a published release containing `usg-plat-verify`;
+dnf5. Release gate before any status leaves Partial: clean-VM installs
+from Pages on Debian 12 and Rocky 9, and one install from the offline
+tarball.
 
 ### L26–L32 — XDP fast path (POAM-016 Phase 1)
 
