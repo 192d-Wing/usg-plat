@@ -191,6 +191,7 @@ apt_cases() {
     # E22: fetch-sums needs an https client; a minimal image has none, so the
     # package must pull one in (found on the live v0.4.0 install).
     start E22-depends-https-client
+    # shellcheck disable=SC2016 # dpkg-query format, not a shell expansion
     run E22-depends-https-client dpkg-query -W -f '${Depends}\n' usg-plat-verify
     check has E22-depends-https-client 'curl [|] wget'
     check has E22-depends-https-client 'ca-certificates'
