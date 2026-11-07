@@ -84,8 +84,7 @@ against the pinned Sigstore trust root and the exact release identity.
 It also installs the apt source and pin, or the dnf repo file, for
 <https://192d-wing.github.io/usg-plat-packages/>. That repository has
 unsigned metadata by design and is filled by the `publish` job on `v*`
-tags. No tag has published to it yet, so it starts with the first release
-after v0.3.0. Short form:
+tags, starting with v0.4.0. Short form:
 
 1. Install upstream cosign 3.0.3 or later as `/usr/local/bin/cosign`, and
    check it against the pinned SHA-256.
@@ -105,8 +104,8 @@ verification"). Residuals are in POAM-044.
 ### Verifying a release
 
 Download every file of a GitHub Release (for example
-`gh release download v0.3.0 -D dl`), then run
-`scripts/verify-release.sh dl v0.3.0` (or `make verify-release DIR=dl TAG=v0.3.0`).
+`gh release download v0.4.0 -D dl`), then run
+`scripts/verify-release.sh dl v0.4.0` (or `make verify-release DIR=dl TAG=v0.4.0`).
 It needs cosign v3.0.3 or later (the script checks `cosign version`). It
 also needs network access to the public Sigstore trust root, unless you pass
 `--trusted-root FILE`, a pinned `trusted_root.json` from
@@ -116,7 +115,7 @@ verify-blob` uses the file and needs no network. For one file it runs:
 
 ```sh
 cosign verify-blob --bundle <file>.sigstore.json \
-  --certificate-identity https://github.com/192d-Wing/usg-plat/.github/workflows/packages.yml@refs/tags/v0.3.0 \
+  --certificate-identity https://github.com/192d-Wing/usg-plat/.github/workflows/packages.yml@refs/tags/v0.4.0 \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   <file>
 ```
@@ -127,7 +126,7 @@ Every bundle is checked against the exact tag, and every file against
 public Fulcio/Rekor services. When `gh` is installed the script also checks the build
 provenance attestations with `gh attestation verify <file> --repo 192d-Wing/usg-plat
 --signer-workflow 192d-Wing/usg-plat/.github/workflows/packages.yml
---source-ref refs/tags/v0.3.0`. Releases after v0.3.0 have 15 files. The 4 new ones are the
+--source-ref refs/tags/v0.4.0`. From v0.4.0 a release has 15 files. The 4 new ones are the
 `usg-plat-verify` and `usg-plat-pin-canary` `.deb` and `.rpm`. Install-time
 enforcement comes from `usg-plat-verify`, above. The signing
 path is verified end to end on the published v0.2.1 and v0.3.0 releases.

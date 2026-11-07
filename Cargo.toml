@@ -19,7 +19,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 authors = ["usg-plat Contributors"]
 license = "Apache-2.0"
@@ -28,18 +28,18 @@ rust-version = "1.88"
 publish = false
 
 [workspace.dependencies]
-plat-common = { path = "crates/plat-common", version = "0.3.0" }
-plat-packet = { path = "crates/plat-packet", version = "0.3.0" }
-plat-xlat = { path = "crates/plat-xlat", version = "0.3.0" }
-plat-nat64 = { path = "crates/plat-nat64", version = "0.3.0" }
+plat-common = { path = "crates/plat-common", version = "0.4.0" }
+plat-packet = { path = "crates/plat-packet", version = "0.4.0" }
+plat-xlat = { path = "crates/plat-xlat", version = "0.4.0" }
+plat-nat64 = { path = "crates/plat-nat64", version = "0.4.0" }
 # Default features off here: data-plane crates get plat-audit without TLS;
 # platd enables `plat-audit/tls` through its own `tls` feature.
-plat-audit = { path = "crates/plat-audit", version = "0.3.0", default-features = false }
-plat-io = { path = "crates/plat-io", version = "0.3.0" }
-plat-cluster = { path = "crates/plat-cluster", version = "0.3.0" }
-plat-tls = { path = "crates/plat-tls", version = "0.3.0" }
-plat-xdp-core = { path = "crates/plat-xdp-core", version = "0.3.0" }
-plat-xdp = { path = "crates/plat-xdp", version = "0.3.0" }
+plat-audit = { path = "crates/plat-audit", version = "0.4.0", default-features = false }
+plat-io = { path = "crates/plat-io", version = "0.4.0" }
+plat-cluster = { path = "crates/plat-cluster", version = "0.4.0" }
+plat-tls = { path = "crates/plat-tls", version = "0.4.0" }
+plat-xdp-core = { path = "crates/plat-xdp-core", version = "0.4.0" }
+plat-xdp = { path = "crates/plat-xdp", version = "0.4.0" }
 
 ahash = "0.8"
 clap = { version = "4", features = ["derive"] }

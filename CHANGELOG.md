@@ -4,6 +4,8 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-07
+
 ### Added
 - POAM-044 (c), SI-7(15)/CM-14/SR-11: install-time signature gate
   `usg-plat-verify` (noarch `.deb`/`.rpm`, `deploy/verify/`). Through an
