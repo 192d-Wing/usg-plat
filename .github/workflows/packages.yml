@@ -64,7 +64,11 @@ jobs:
     # EL9 build floor (glibc 2.34). Keep the digest equal in `packages` and
     # `sbom-xdp` (multi-arch index; `container:` cannot read `env`).
     container:
-      image: rockylinux/rockylinux:9@sha256:67492e5a371d9db7c2ffb2708abae92147fb900900832a7ed3fb2ac4df9ec052
+      image: rockylinux/rockylinux:9@sha256:8101994123cf3d0a8fee517bee7f39e555c7d92bd2d9eb3303cc988a0eeed00f
+      # The image config sets no PATH; without this, $GITHUB_PATH entries
+      # replace PATH entirely and later steps cannot find sh.
+      env:
+        PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     timeout-minutes: 40
     steps:
       - name: Install git (actions/checkout needs it inside the container)
@@ -145,7 +149,11 @@ jobs:
     # EL9 build floor (glibc 2.34). Keep the digest equal in `packages` and
     # `sbom-xdp` (multi-arch index; `container:` cannot read `env`).
     container:
-      image: rockylinux/rockylinux:9@sha256:67492e5a371d9db7c2ffb2708abae92147fb900900832a7ed3fb2ac4df9ec052
+      image: rockylinux/rockylinux:9@sha256:8101994123cf3d0a8fee517bee7f39e555c7d92bd2d9eb3303cc988a0eeed00f
+      # The image config sets no PATH; without this, $GITHUB_PATH entries
+      # replace PATH entirely and later steps cannot find sh.
+      env:
+        PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     timeout-minutes: 60
     steps:
       - name: Install git (actions/checkout needs it inside the container)
