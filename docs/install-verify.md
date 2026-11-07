@@ -417,10 +417,11 @@ bootstrap it again out of band (section 2). This is POAM-044 (f).
 - `usg-plat-pin-canary` must be in the first publish. Without it,
   `apt-get update` fails on every gated host (section 3).
 - Deploy key: an SSH key with write access on usg-plat-packages. Its
-  private half is the secret `PACKAGES_REPO_TOKEN`, being moved to a
-  secret of the `release` environment (POAM044-SEC-002). That environment admits
-  `v*` tags only, and admins cannot bypass it. Ruleset 26701581 on
-  usg-plat-packages blocks force-push and deletion of `main`. The job pins the github.com ed25519 host key and
+  private half is `PACKAGES_REPO_TOKEN`, a secret of the `release`
+  environment only; no repository-level copy exists (POAM044-SEC-002).
+  That environment admits `v*` tags only, and admins cannot bypass it.
+  Ruleset 26701581 on usg-plat-packages blocks force-push and deletion
+  of `main`. The job pins the github.com ed25519 host key and
   deletes the key file in an `always()` step. Rotation: create a new
   ed25519 key, add it as a write deploy key, replace the secret, delete
   the old deploy key, and record the change. Custody and rotation are
