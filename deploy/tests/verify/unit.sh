@@ -585,7 +585,7 @@ expect "origin in upper case fails" 1 st
 good_pref
 good_sources https://example.invalid/apt
 expect "sources host differs from REPO_HOST" 1 st
-good_sources http://192d-wing.github.io/usg-plat-packages/apt
+good_sources http://192d-wing.github.io/usg-plat-packages/apt  # NOSONAR S5332: negative test, clear-text URL must be refused
 expect "sources not https" 1 st
 good_sources https://192D-WING.github.io:443/usg-plat-packages/apt
 expect "sources host compared lowercased, port ignored" 0 st
@@ -608,7 +608,7 @@ expect "file: source, platd only from https in the indexes, fails" 1 st
 platd_policy 500 file:/srv/usg-plat/apt
 good_sources file://mirror.example.invalid/apt
 expect "file: URI with a host fails" 1 st
-good_sources http://192d-wing.github.io/usg-plat-packages/apt
+good_sources http://192d-wing.github.io/usg-plat-packages/apt  # NOSONAR S5332: negative test, clear-text URL must be refused
 expect "http: source with origin \"\" fails" 1 st
 good_sources 'https://192d-wing.github.io/usg-plat-packages/apt file:/srv/usg-plat/apt'
 expect "mixed https and file: sources fail" 1 st
@@ -654,7 +654,7 @@ sed -i.bak "s|^baseurl=.*|baseurl=file:///srv/usg-plat/rpm/\$basearch|" "$W/apt/
 expect "selftest --dnf accepts a file:/// mirror" 0 std
 sed -i.bak 's|^baseurl=.*|baseurl=file://mirror.example.invalid/rpm|' "$W/apt/usg-plat.repo"
 expect "selftest --dnf refuses file://host" 1 std
-sed -i.bak 's|^baseurl=.*|baseurl=http://192d-wing.github.io/usg-plat-packages/rpm|' "$W/apt/usg-plat.repo"
+sed -i.bak 's|^baseurl=.*|baseurl=http://192d-wing.github.io/usg-plat-packages/rpm|' "$W/apt/usg-plat.repo"  # NOSONAR S5332: negative test, clear-text URL must be refused
 expect "selftest --dnf refuses http:" 1 std
 sed -i.bak 's|^baseurl=.*|baseurl=https://example.invalid/rpm|' "$W/apt/usg-plat.repo"
 expect "selftest --dnf refuses https on another host" 1 std
@@ -675,7 +675,7 @@ expect "fetch-sums missing release fails" 1 env USG_PLAT_VERIFY_STATE="$W/fs" "$
 ls -a "$W/fs/releases" >"$W/ls.out"
 check "no partial directory left" absent part "$W/ls.out"
 check "no v9.9.9 directory" [ ! -e "$W/fs/releases/v9.9.9" ]
-write_conf 'REPO_BASE=http://192d-wing.github.io/usg-plat-packages'
+write_conf 'REPO_BASE=http://192d-wing.github.io/usg-plat-packages'  # NOSONAR S5332: negative test, clear-text URL must be refused
 expect "fetch-sums refuses http" 2 env USG_PLAT_VERIFY_STATE="$W/fs" "$W/libexec/fetch-sums" v0.3.0
 reset
 expect "fetch-sums with no args uses apt policy" 0 env USG_PLAT_VERIFY_STATE="$W/fs" "$W/libexec/fetch-sums"

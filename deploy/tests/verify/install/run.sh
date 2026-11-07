@@ -303,7 +303,7 @@ apt_cases() {
     # E21: a local .deb staged in a world-writable (sticky) directory could be
     # swapped after the hash; the gate refuses it (stage in a root-only dir).
     start E21-world-writable-dir-refused
-    mkdir -p /tmp/usgtest-ww && chmod 1777 /tmp/usgtest-ww
+    mkdir -p /tmp/usgtest-ww && chmod 1777 /tmp/usgtest-ww  # NOSONAR S2612: negative test, the gate must refuse this dir
     cp /fx/local/platd_"$P4"-1_"$DA".deb /fx/local/SHA256SUMS /fx/local/SHA256SUMS.sigstore.json /tmp/usgtest-ww/
     run E21-world-writable-dir-refused sh -c "cd /tmp/usgtest-ww && apt-get -y -o Dpkg::Use-Pty=0 install ./platd_$P4-1_$DA.deb"
     check want E21-world-writable-dir-refused nz
@@ -504,7 +504,7 @@ dnf_cases() {
 
     # E21: as for apt, a local .rpm in a world-writable directory is refused.
     start E21-world-writable-dir-refused
-    mkdir -p /tmp/usgtest-ww && chmod 1777 /tmp/usgtest-ww
+    mkdir -p /tmp/usgtest-ww && chmod 1777 /tmp/usgtest-ww  # NOSONAR S2612: negative test, the gate must refuse this dir
     cp /fx/local/platd-"$P4"-1."$RA".rpm /fx/local/SHA256SUMS /fx/local/SHA256SUMS.sigstore.json /tmp/usgtest-ww/
     run E21-world-writable-dir-refused sh -c "cd /tmp/usgtest-ww && dnf -y install ./platd-$P4-1.$RA.rpm"
     check want E21-world-writable-dir-refused nz
