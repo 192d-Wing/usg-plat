@@ -248,7 +248,11 @@ jobs:
           install -m 0755 "$RUNNER_TEMP/cosign" /usr/local/bin/cosign
           cosign version
       - name: make test-verify (gate unit tests, shellcheck)
-        run: make test-verify
+        # As root: the root-only ownership cases (cosign owned by another
+        # uid) must run in CI; unit.sh fails them under CI=true otherwise.
+        run: |
+          sudo --preserve-env=CI,PATH,GITHUB_ACTIONS make test-verify
+          sudo chown -R "$(id -u):$(id -g)" .
       - name: publish-packages.sh and pin-canary shellcheck + self-test
         run: |
           shellcheck -x deploy/ci/publish-packages.sh deploy/ci/pin-canary/build.sh
