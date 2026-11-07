@@ -4,7 +4,7 @@ Architecture: all
 Maintainer: usg-plat Contributors
 Section: admin
 Priority: optional
-Depends: apt (>= 2.6), coreutils, util-linux
+Depends: apt (>= 2.6), coreutils, util-linux, curl | wget, ca-certificates
 Description: install-time signature gate for usg-plat packages
  Refuses apt installs and upgrades of platd and usg-plat-verify unless the
  package's SHA-256 is listed in the release SHA256SUMS and that file's cosign
