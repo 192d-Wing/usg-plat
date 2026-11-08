@@ -4,13 +4,89 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-08
+
+### Fixed
+- `usg-plat-verify` now depends on `curl | wget` and `ca-certificates`
+  (rpm: `curl`, `ca-certificates`). On a stock Debian or Ubuntu image
+  without either client, `fetch-sums` cached no `SHA256SUMS`, and the gate
+  refused `platd` (fail closed). Found on the live v0.4.0 install
+  (LINUX_VERIFICATION L35); install case E22 checks the dependency.
+- XDP object gate (`deploy/tests/xdp/obj-gate.py`) reads the Linux 7.3
+  verifier statistics format (`stack depth max N` plus per-subprogram
+  `stack D` lines) as well as the older `stack depth A+B`; it still fails
+  closed when neither is present. The `xdp vm (latest)` jobs failed on
+  7.3.3 without this.
+
+## [0.4.0] - 2026-11-07
+
 ### Added
+- POAM-044 (c), SI-7(15)/CM-14/SR-11: install-time signature gate
+  `usg-plat-verify` (noarch `.deb`/`.rpm`, `deploy/verify/`). Through an
+  apt `DPkg::Pre-Install-Pkgs` hook and a dnf4 plugin, it refuses `platd`
+  and `usg-plat-verify` unless the package digest is in a `SHA256SUMS`
+  whose cosign keyless bundle verifies offline against the pinned Sigstore
+  trust root (`deploy/verify/trusted_root.sha256`) and the exact tag
+  identity. Downgrades are refused unless `USG_PLAT_ALLOW_DOWNGRADE=1`.
+  Refusals go to `authpriv.err`, `last-refusal` and an optional textfile
+  metric. The package installs the apt source and pin (with the
+  `usg-plat-pin-canary` check after every `apt-get update`) or the dnf repo
+  (`includepkgs`) for https://192d-wing.github.io/usg-plat-packages/
+  (metadata unsigned by design). Cosign 3.0.3 or later is installed by the
+  operator and never bundled. `dpkg -i`, `rpm -U` and dnf5 are not
+  gated. Operator guide: `docs/install-verify.md`. Tests: `make
+  test-verify`; container install cases E00–E20 and real-cosign cases
+  R00–R15 (`deploy/tests/verify/install/`, LINUX_VERIFICATION L34,
+  arm64 only so far). Platd log schema unchanged (8).
+- `usg-plat-verify` review round 1: every package path (apt archives, dnf
+  cache, local) and its ancestors must be root-owned and not group/other
+  writable, no symlinks, sticky `/tmp` refused (POSIX ACLs not inspected;
+  stage local packages in e.g. `/root/pkgs`; install case E21);
+  `USG_PLAT_VERIFY_*`/`TMPDIR` honoured only with `USG_PLAT_VERIFY_TEST=1`,
+  otherwise unset and logged at `authpriv.warning`;
+  `USG_PLAT_ALLOW_DOWNGRADE` logged at `authpriv.warning`; dnf plugin
+  refusals counted (`refusals_total`, `.prom`); cosign accepted only on an
+  exact `Verified OK` line; `verify.conf` and the trusted root must be
+  root-only (exit 2); `selftest --dnf` accepts a `file:///` baseurl
+  (POAM044-SEC-001/003/007/008).
+- Publish: `platd` and `usg-plat-verify` byte-immutable in the tree;
+  `usg-plat-pin-canary` matched by name/version/arch (other canary
+  versions refused); push retried up to 3 times on non-fast-forward;
+  `make ci-pins-check` (in `make check`) keeps container images
+  digest-pinned with one digest per image (both Rocky 9 pins identical).
+- `scripts/verify-release.sh --trusted-root FILE`: verify against a pinned
+  `trusted_root.json` with no network.
+- CI: `usg-plat-verify` + pin canary build job; `publish` (tag only,
+  `release` environment, deploy key `PACKAGES_REPO_TOKEN`; re-verifies
+  the release, then pushes the apt/dnf tree to `usg-plat-packages`;
+  offline tarball `usg-plat-repo-<tag>.tar` as a workflow artifact, not
+  in `SHA256SUMS`) and `publish-dry-run` (non-tag); `verify-install`
+  (`ci.yml`, x86_64 and aarch64). The publish jobs have not run on GitHub yet.
 - SEC-007, SI-4/SC-5: `plat_fragment_alias_skipped_total` counts fragment
   quote aliases not recorded because their set had no eligible way (ICMP
   errors quoting those fragments then go unmatched). Not a drop and not in
   `fragment_table_full`; `/metrics` only, log schema unchanged (8).
 
 ### Changed
+- **Breaking (packaging):** `platd` now depends on `usg-plat-verify`
+  (`.deb` `Depends: libc6 (>= 2.34), libgcc-s1, nftables, systemd,
+  usg-plat-verify`; `.rpm` `Requires: usg-plat-verify`). Installing the
+  `platd` package alone with `dpkg -i` / `rpm -i` fails: install
+  `usg-plat-verify` first (`docs/install-verify.md`).
+- Release assets grow from 11 to 15 files: the `usg-plat-verify` and
+  `usg-plat-pin-canary` `.deb` and `.rpm`, all in `SHA256SUMS` and
+  each with a cosign bundle.
+- Packages install on EL9, Debian 12 and Ubuntu 22.04/24.04 (v0.3.0 needed
+  glibc 2.38/2.39 and installed only on Ubuntu 24.04). The `packages` and
+  `sbom-xdp` jobs build inside a Rocky Linux 9 container pinned by digest
+  (glibc 2.34; `deploy/build/el9-build-deps.sh` installs CMake, Go, clang,
+  dpkg-dev, rpm-build and Python 3.12 from the signed Rocky/EPEL repos and a
+  sha256-pinned rustup-init). New gate `deploy/build/check-glibc-floor.sh`:
+  no shipped ELF may need a `GLIBC_` version above 2.34, the `.deb` must
+  depend on `libc6 (>= X)` with X <= 2.36, and the `.rpm` must not require
+  `GLIBC_` above 2.34. The `.deb` now declares `Depends: libc6 (>= 2.34),
+  libgcc-s1, nftables, systemd, usg-plat-verify` explicitly (`$auto` resolves nothing on
+  an EL9 build host); the gate also fails on any other `NEEDED` library.
 - CI keeps the shellcheck and bpf-linker release tarballs in `actions/cache`
   (`PLAT_TOOL_CACHE`, per job); cached copies are sha256-checked like a
   download, and one that fails is discarded and downloaded again. Release

@@ -1,0 +1,324 @@
+#!/bin/sh
+# usg-plat-verify self-test.
+#
+# Usage: selftest --apt | --dnf | --full
+#   --apt   the apt pin (run after every `apt-get update`, by postinst, and by
+#           `usg-plat-verify selftest`):
+#           1. usg-plat.sources is either
+#              - https: every URIs host (lowercased, port ignored) equals
+#                REPO_HOST, and every `Pin: origin` equals REPO_HOST, which
+#                must itself be a bare lowercase host (an origin with a
+#                scheme, a port or upper case does not match, and a pin that
+#                does not match fails open); or
+#              - file: (offline mirror, `file:/path` or `file:///path`): every
+#                `Pin: origin` is "" (apt gives a file: repository an empty
+#                origin; checked with apt 2.6.2 on Debian 12: the -1/500
+#                pair then behaves as for https, the canary has no candidate,
+#                and /var/lib/dpkg/status and `apt install ./x.deb` stay
+#                at 100).
+#              http: is never accepted, nor are https and file: mixed. Every
+#              usg-plat .deb from either source still goes through apt-hook;
+#           2. the canary usg-plat-pin-canary has `Candidate: (none)`. A
+#              repository that does not publish the canary makes this check,
+#              and so `apt-get update` (Post-Invoke, exit 100), fail. That is
+#              by design: without the canary the pin cannot be shown to
+#              match, so the self-test fails closed;
+#           3. platd from the usg-plat source is pinned at 500 (read from the
+#              version-table line: the per-source line shows -1 cosmetically).
+#   --dnf   usg-plat.repo: baseurl is https:// on REPO_HOST or a local
+#           file:///path (http: and file://host fail), includepkgs lists only
+#           NAMES, and the dnf plugin is enabled.
+#   --full  cosign present and >= COSIGN_MIN, trust root present, then --apt
+#           and/or --dnf for the package managers found.
+# Exit: 0 pass; 1 a check failed (logged at authpriv.err); 2 usage/config.
+#
+# Test hooks (environment): USG_PLAT_VERIFY_CONF, USG_PLAT_VERIFY_PATH,
+# USG_PLAT_VERIFY_TRUSTED_ROOT, USG_PLAT_VERIFY_APT_SOURCES
+# [/etc/apt/sources.list.d/usg-plat.sources], USG_PLAT_VERIFY_APT_PREF
+# [/etc/apt/preferences.d/usg-plat], USG_PLAT_VERIFY_DNF_REPO
+# [/etc/yum.repos.d/usg-plat.repo], USG_PLAT_VERIFY_DNF_PLUGIN_CONF
+# [/etc/dnf/plugins/usg_plat_verify.conf], USG_PLAT_VERIFY_TEST_TOP; honoured
+# only with USG_PLAT_VERIFY_TEST=1.
+#
+# COMPLIANCE MAPPING:
+# - NIST 800-53: CM-7 (Least Functionality) - the pin admits only our names
+#   from the unsigned repository; a silently non-matching pin is detected
+# - NIST 800-53: SI-7(15), CM-14 - the gate's prerequisites are checked
+# - NIST 800-53: SI-6 (Security and Privacy Function Verification)
+set -u
+
+# >>> common: test hooks and root_only (identical in every script; unit.sh checks)
+# Test hooks (the USG_PLAT_VERIFY_* overrides named in the header, and TMPDIR)
+# are honoured only when USG_PLAT_VERIFY_TEST=1, which only the test suites
+# set. Otherwise they are unset, so children inherit a clean environment, and
+# logged once to authpriv. When it is honoured, every invocation logs
+# "test mode enabled" at authpriv.warning and on stderr, so a production host
+# left in test mode is visible. USG_PLAT_VERIFY_SUMS_DIR is not a hook: the front
+# ends set it for local installs and verify-pkg still verifies what it names.
+#
+# COMPLIANCE MAPPING:
+# - NIST 800-53: CM-6 (Configuration Settings), SI-7(15) (Code Authentication)
+#   - the decision depends only on root-owned, root-only-writable files
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+uv_test=0
+if [ "${USG_PLAT_VERIFY_TEST:-}" = 1 ]; then
+    uv_test=1
+    uv_msg="test mode enabled: overrides honoured (USG_PLAT_VERIFY_TEST=1)"
+    printf 'usg-plat-verify: %s\n' "$uv_msg" >&2
+    PATH=${USG_PLAT_VERIFY_PATH:-$PATH} logger -t usg-plat-verify -p authpriv.warning -- "$uv_msg" 2>/dev/null || :
+else
+    uv_ign=$(env | sed -n 's/^\(USG_PLAT_VERIFY_[A-Z_]*\)=.*/\1/p' |
+        grep -v -x -e USG_PLAT_VERIFY_SUMS_DIR -e USG_PLAT_VERIFY_TEST | sort -u | tr '\n' ' ')
+    [ -n "${TMPDIR+x}" ] && uv_ign="${uv_ign}TMPDIR "
+    for uv_v in $uv_ign; do
+        unset "$uv_v"
+    done
+    unset USG_PLAT_VERIFY_TEST
+    if [ -n "$uv_ign" ]; then
+        uv_msg="ignoring test-only environment (USG_PLAT_VERIFY_TEST is not 1): $uv_ign"
+        printf 'usg-plat-verify: %s\n' "$uv_msg" >&2
+        logger -t usg-plat-verify -p authpriv.warning -- "$uv_msg" 2>/dev/null || :
+    fi
+fi
+
+# root_only PATH: PATH and every ancestor directory exist, are not symlinks,
+# are owned by uid 0 and are neither group- nor other-writable (POSIX ACLs
+# are not inspected). A sticky world-writable directory such as /tmp fails: its other users
+# can still rename or replace entries they own. In test mode the invoking uid
+# also counts as an owner and the walk stops at USG_PLAT_VERIFY_TEST_TOP.
+root_only() {
+    case $1 in /*) ;; *) return 1 ;; esac
+    case $1 in */./* | */../* | */. | */.. | *//*) return 1 ;; *) ;; esac
+    ro_p=$1
+    while :; do
+        if [ $uv_test -eq 1 ] && [ -n "${USG_PLAT_VERIFY_TEST_TOP:-}" ] &&
+            [ "$ro_p" = "$USG_PLAT_VERIFY_TEST_TOP" ]; then
+            return 0
+        fi
+        [ -e "$ro_p" ] && [ ! -L "$ro_p" ] || return 1
+        ro_l=$(LC_ALL=C stat -c '%A %u' -- "$ro_p" 2>/dev/null) || return 1
+        ro_m=${ro_l%% *} ro_u=${ro_l#* }
+        case $ro_m in
+            ?????w* | ????????w*) return 1 ;;
+            ??????????*) ;;
+            *) return 1 ;;
+        esac
+        if [ "$ro_u" != 0 ]; then
+            [ $uv_test -eq 1 ] && [ "$ro_u" = "$(id -u)" ] || return 1
+        fi
+        [ "$ro_p" = / ] && return 0
+        ro_p=${ro_p%/*}
+        [ -n "$ro_p" ] || ro_p=/
+    done
+}
+# <<< common
+
+# >>> common-exec (identical where cosign is checked; unit.sh checks)
+# root_only_exec PATH: an executable that may be a symlink (cosign in
+# /usr/local/bin often is). Every ancestor of PATH must pass root_only, and
+# so must the fully resolved target (readlink -f), which must be a regular
+# executable file.
+root_only_exec() {
+    case $1 in /*) ;; *) return 1 ;; esac
+    rx_d=${1%/*}
+    [ -n "$rx_d" ] || rx_d=/
+    root_only "$rx_d" || return 1
+    rx_t=$(readlink -f -- "$1" 2>/dev/null) || return 1
+    [ -n "$rx_t" ] && [ -f "$rx_t" ] && [ -x "$rx_t" ] || return 1
+    root_only "$rx_t"
+}
+# <<< common-exec
+
+PATH=${USG_PLAT_VERIFY_PATH:-/usr/sbin:/usr/bin:/sbin:/bin}
+export PATH
+
+CONF=${USG_PLAT_VERIFY_CONF:-/etc/usg-plat-verify/verify.conf}
+TRUSTED_ROOT=${USG_PLAT_VERIFY_TRUSTED_ROOT:-/usr/share/usg-plat-verify/trusted_root.json}
+SOURCES=${USG_PLAT_VERIFY_APT_SOURCES:-/etc/apt/sources.list.d/usg-plat.sources}
+PREF=${USG_PLAT_VERIFY_APT_PREF:-/etc/apt/preferences.d/usg-plat}
+DNF_REPO=${USG_PLAT_VERIFY_DNF_REPO:-/etc/yum.repos.d/usg-plat.repo}
+DNF_PLUGIN_CONF=${USG_PLAT_VERIFY_DNF_PLUGIN_CONF:-/etc/dnf/plugins/usg_plat_verify.conf}
+CANARY=usg-plat-pin-canary
+
+failed=0
+
+log() { # priority message
+    printf 'usg-plat-verify selftest: %s\n' "$2" >&2
+    if command -v logger >/dev/null 2>&1; then
+        logger -t usg-plat-verify -p "authpriv.$1" -- "selftest: $2" 2>/dev/null || :
+    fi
+}
+fail() { log err "FAIL: $1"; failed=1; }
+
+usage() { echo "usage: selftest --apt | --dnf | --full" >&2; exit 2; }
+[ $# -eq 1 ] || usage
+mode=$1
+case $mode in --apt | --dnf | --full) ;; *) usage ;; esac
+
+[ -f "$CONF" ] && [ -r "$CONF" ] || { log err "configuration $CONF missing"; exit 2; }
+root_only "$CONF" || { log err "configuration $CONF (or a parent directory) is not root-owned or is group/other-writable"; exit 2; }
+NAMES='' REPO_HOST='' COSIGN='' COSIGN_MIN=''
+# shellcheck source=deploy/verify/etc/verify.conf
+. "$CONF" || { log err "configuration $CONF does not parse"; exit 2; }
+printf '%s\n' "$REPO_HOST" | grep -Eqx '[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+' || {
+    log err "REPO_HOST must be a bare lowercase host name (no scheme, port or path)"
+    exit 2
+}
+
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+check_apt() {
+    # 1. sources kind (https on REPO_HOST, or file:) and pin origins.
+    kind=''
+    if [ -f "$SOURCES" ]; then
+        uris=$(sed -n 's/^URIs:[[:space:]]*//p' "$SOURCES")
+        [ -n "$uris" ] || fail "$SOURCES has no URIs"
+        for u in $uris; do
+            case $u in
+                https://*)
+                    k='https'
+                    h=${u#https://}
+                    h=${h%%/*}
+                    h=${h%%:*}
+                    [ "$(lower "$h")" = "$REPO_HOST" ] || fail "$SOURCES host $h is not REPO_HOST $REPO_HOST"
+                    ;;
+                file:///* | file:/[!/]*) k='file' ;;
+                *) fail "$SOURCES URI is neither https:// nor a local file: path: $u"; continue ;;
+            esac
+            if [ -z "$kind" ]; then
+                kind=$k
+            elif [ "$kind" != "$k" ]; then
+                fail "$SOURCES mixes https:// and file: URIs (one pin origin cannot cover both)"
+            fi
+        done
+    else
+        fail "$SOURCES missing"
+    fi
+    case $kind in
+        file) origin='' ;;
+        *) origin=$REPO_HOST ;;
+    esac
+    if [ -f "$PREF" ]; then
+        pins=$(sed -n 's/^Pin:[[:space:]]*//p' "$PREF")
+        npins=0
+        while IFS= read -r p; do
+            [ -n "$p" ] || continue
+            npins=$((npins + 1))
+            [ "$p" = "origin \"$origin\"" ] ||
+                fail "$PREF has 'Pin: $p'; expected 'Pin: origin \"$origin\"' (bare lowercase host for https, empty for file:)"
+        done <<EOF
+$pins
+EOF
+        [ $npins -ge 2 ] || fail "$PREF must have the -1 and the 500 stanza"
+        grep -Eq '^Pin-Priority:[[:space:]]*-1[[:space:]]*$' "$PREF" || fail "$PREF has no Pin-Priority -1 stanza"
+    else
+        fail "$PREF missing"
+    fi
+
+    command -v apt-cache >/dev/null 2>&1 || { fail "apt-cache not found"; return; }
+    # 2. canary.
+    cand=$(apt-cache policy "$CANARY" 2>/dev/null | sed -n 's/^[[:space:]]*Candidate:[[:space:]]*//p' | head -n 1)
+    if [ -z "$cand" ]; then
+        fail "$CANARY is not in the package indexes (run apt-get update; the repository must publish it)"
+    elif [ "$cand" != "(none)" ]; then
+        fail "$CANARY has candidate $cand: the -1 pin does not match the repository origin"
+    fi
+    # 3. platd at 500 from the usg-plat source (version-table line before the
+    # source line; a file: source is listed as file:/path).
+    prios=$(apt-cache policy platd 2>/dev/null | awk -v host="$REPO_HOST" -v kind="$kind" '
+        /Version table:/ { t = 1; next }
+        !t { next }
+        $1 == "***" { prio = $3; next }
+        NF == 2 && $2 !~ /\// { prio = $2; next }
+        $2 ~ /\// {
+            u = tolower($2)
+            if (kind == "file") { if (u ~ /^file:/) print prio }
+            else if (index(u, "https://" host "/") == 1 || index(u, "https://" host ":") == 1 || u == "https://" host) print prio
+        }')
+    if [ -z "$prios" ]; then
+        fail "platd from the usg-plat source is not in the package indexes"
+    else
+        for p in $prios; do
+            [ "$p" = 500 ] || fail "platd from the usg-plat source is pinned at $p, not 500"
+        done
+    fi
+}
+
+check_dnf() {
+    if [ ! -f "$DNF_REPO" ]; then
+        fail "$DNF_REPO missing"
+        return
+    fi
+    base=$(sed -n 's/^baseurl[[:space:]]*=[[:space:]]*//p' "$DNF_REPO" | head -n 1)
+    case $base in
+        https://*) h=${base#https://} h=${h%%/*} h=${h%%:*}
+            [ "$(lower "$h")" = "$REPO_HOST" ] || fail "$DNF_REPO baseurl host $h is not REPO_HOST $REPO_HOST" ;;
+        # Offline mirror: a local file:///path (no host), as for apt.
+        file:///*) ;;
+        *) fail "$DNF_REPO baseurl is neither https:// on REPO_HOST nor a local file:///path" ;;
+    esac
+    inc=$(sed -n 's/^includepkgs[[:space:]]*=[[:space:]]*//p' "$DNF_REPO" | tr ',' ' ')
+    [ -n "$inc" ] || fail "$DNF_REPO has no includepkgs (foreign names would be installable)"
+    for p in $inc; do
+        ok=0
+        for n in $NAMES; do [ "$n" = "$p" ] && ok=1; done
+        [ $ok -eq 1 ] || fail "$DNF_REPO includepkgs lists $p, which is not in NAMES"
+    done
+    if [ -f "$DNF_PLUGIN_CONF" ]; then
+        grep -Eq '^enabled[[:space:]]*=[[:space:]]*(1|true|yes)[[:space:]]*$' "$DNF_PLUGIN_CONF" ||
+            fail "dnf plugin usg_plat_verify is not enabled in $DNF_PLUGIN_CONF"
+    else
+        fail "$DNF_PLUGIN_CONF missing"
+    fi
+    # dnf skips a plugin that fails to import with only a warning (fail
+    # open), so require that it is actually loaded.
+    if command -v dnf >/dev/null 2>&1; then
+        dnf -v --cacheonly repolist 2>&1 | grep -Eq '^Loaded plugins:.*usg_plat_verify' ||
+            fail "dnf did not load the usg_plat_verify plugin (dnf -v repolist)"
+    else
+        fail "dnf not found"
+    fi
+}
+
+check_common() {
+    if [ -x "${COSIGN:-}" ] && ! root_only_exec "$COSIGN"; then
+        fail "cosign $COSIGN (its target or a parent directory) is not root-owned, is group/other-writable or is not a regular file: every usg-plat install will be refused"
+    elif [ -x "${COSIGN:-}" ]; then
+        v=$("$COSIGN" version 2>/dev/null | sed -n 's/^GitVersion:[[:space:]]*v\{0,1\}\([0-9][0-9.]*\).*/\1/p' | head -n 1)
+        if [ -z "$v" ]; then
+            fail "cannot read the version of $COSIGN"
+        else
+            lowest=$(printf '%s\n%s\n' "$v" "$COSIGN_MIN" | sort -t. -k1,1n -k2,2n -k3,3n | head -n 1)
+            [ "$lowest" = "$COSIGN_MIN" ] || fail "cosign $v is older than $COSIGN_MIN"
+        fi
+    else
+        fail "cosign not found at ${COSIGN:-?}: every usg-plat install will be refused"
+    fi
+    [ -f "$TRUSTED_ROOT" ] || fail "trusted root $TRUSTED_ROOT missing"
+}
+
+case $mode in
+    --apt) check_apt ;;
+    --dnf) check_dnf ;;
+    --full)
+        check_common
+        found=0
+        if [ -f "$SOURCES" ] || command -v apt-get >/dev/null 2>&1; then
+            check_apt
+            found=1
+        fi
+        if [ -f "$DNF_REPO" ] || command -v dnf >/dev/null 2>&1; then
+            check_dnf
+            found=1
+        fi
+        [ $found -eq 1 ] || fail "neither apt nor dnf found"
+        ;;
+    *) usage ;;
+esac
+
+if [ $failed -ne 0 ]; then
+    exit 1
+fi
+log info "${mode#--} checks passed"
+exit 0

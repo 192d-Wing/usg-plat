@@ -1,0 +1,20 @@
+# /etc/apt/sources.list.d/usg-plat.sources - usg-plat packages.
+#
+# Repository metadata is unsigned by design (keyless signing only), hence
+# `Trusted: yes`. Integrity comes from the install gate (apt-hook: every
+# platd / usg-plat-verify .deb must be listed in a cosign-verified SHA256SUMS)
+# and the pin in /etc/apt/preferences.d/usg-plat (nothing else from this
+# origin is installable). The URIs host must equal REPO_HOST in
+# /etc/usg-plat-verify/verify.conf; `usg-plat-verify selftest` checks it.
+# An offline mirror may use a local `file:/path` URI instead (with
+# `Pin: origin ""` in the preferences file); http: is refused.
+#
+# COMPLIANCE MAPPING:
+# - NIST 800-53: CM-14 (Signed Components), SR-11 (Component Authenticity)
+# POAM: POAM-044 (c) - unsigned metadata: a frozen or rolled-back index can
+#   hide updates
+Types: deb
+URIs: https://192d-wing.github.io/usg-plat-packages/apt
+Suites: stable
+Components: main
+Trusted: yes

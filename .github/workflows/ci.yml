@@ -297,3 +297,48 @@ jobs:
             target/xdp/plat-xdp-ebpf.sha256
           if-no-files-found: ignore
           retention-days: 14
+
+  # POAM-044 (c) install-time gate: real apt / dnf4 in containers (images
+  # pinned by index digest in the scripts) against a local HTTPS repository
+  # with a stand-in cosign (run.sh), then upstream cosign v3.1.4 with the
+  # pinned trust root against the real v0.3.0 release, --network none
+  # (real-release.sh).
+  verify-install:
+    name: verify-install (${{ matrix.distro }}, ${{ matrix.runner }})
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        distro: [debian12, ubuntu2404, rocky9, rocky10]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install rpm (rpmbuild for make verify-pkg)
+        run: sudo apt-get $APT_OPTS update && sudo apt-get $APT_OPTS install -y --no-install-recommends rpm
+      - name: Restore tool downloads (cosign)
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/plat-tools
+          key: plat-tools-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('deploy/tests/verify/install/real-release.sh') }}
+      - name: Install cosign v3.1.4 (release binary, sha256-pinned)
+        run: |
+          c=$(PLAT_TOOL_CACHE="$HOME/.cache/plat-tools" sh deploy/tests/verify/install/real-release.sh --fetch-cosign "$RUNNER_TEMP/cosign")
+          echo "COSIGN=$c" >> "$GITHUB_ENV"
+      - name: make verify-pkg (trusted root checked against the pin)
+        run: make verify-pkg
+      - name: Install-time gate tests (stub cosign, local HTTPS repository)
+        run: sh deploy/tests/verify/install/run.sh --engine docker --work target/verify-install ${{ matrix.distro }}
+      - name: Real release, real cosign, no network
+        run: sh deploy/tests/verify/install/real-release.sh --engine docker --work target/verify-real ${{ matrix.distro }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: verify-install-${{ matrix.distro }}-${{ runner.arch }}
+          path: |
+            target/verify-install/out-*/
+            target/verify-real/out-*/
+          if-no-files-found: ignore
+          retention-days: 14

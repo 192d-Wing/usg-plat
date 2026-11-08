@@ -1049,6 +1049,43 @@ for `nat_port_block_release` (same address and range), `service_stop`,
 `audit file not writable`, `audit volume below min_free_bytes`,
 `audit queue full`, `audit queue above 90%`.
 
+## Host install-gate records (not `platd` records)
+
+`usg-plat-verify` is a host package (`docs/install-verify.md`). Its shell
+scripts write plain syslog lines through `logger -t usg-plat-verify`. They
+are not `platd` audit records: they have no JSON/CEF schema and no
+sequence number, and they are not hash-chained. `LOG_SCHEMA_VERSION` stays
+8. Forward them with the host's normal syslog pipeline.
+
+| Priority | Message | When |
+|----------|---------|------|
+| `authpriv.err` | `refusing <name> <version> <arch>: <reason>` | a `platd` / `usg-plat-verify` package is refused |
+| `authpriv.info` | `accepted <file> (<tag>, sha256 <hex>)` | a package is accepted |
+| `authpriv.err` | `selftest: FAIL: <check>` | a self-test check fails (after `apt-get update`, or `usg-plat-verify selftest`) |
+| `authpriv.info` | `selftest: <mode> checks passed` | a self-test passes |
+| `authpriv.warning` | `cosign not found at <path>: ...` | `postinst` on a host without cosign |
+
+Name, version and arch are sanitised to `[A-Za-z0-9._+:~-]` and cut to 64
+characters before they are logged. Example:
+
+```text
+<84>1 2026-11-06T12:00:00Z node1 usg-plat-verify - - - usg-plat-verify: refusing platd 0.3.1-1 amd64: digest is not in the verified SHA256SUMS for v0.3.1
+```
+
+The same refusal updates `/var/lib/usg-plat-verify/last-refusal`
+(`<UTC> <name> <version> <reason>`) and `refusals_total`. When
+`/var/lib/node_exporter/textfile_collector` exists it also updates
+`usg_plat_verify_refusals_total` and
+`usg_plat_verify_last_refusal_timestamp_seconds`. For correlation, match
+`host.name` and the time with the node's `service_start` record that
+follows the next successful upgrade. Alert on any `authpriv.err` from
+`usg-plat-verify`: a refusal also holds back distro updates in the same
+transaction (POAM-044 (g)). Evidence: E09, E19; `unit.sh`
+`refusal logged at authpriv.err with tag`,
+`accept logged at authpriv.info`,
+`selftest failure logged at authpriv.err`,
+`textfile written when the directory exists`.
+
 ## Injection safety
 
 Data-plane and audit-health records contain no attacker-controlled text:

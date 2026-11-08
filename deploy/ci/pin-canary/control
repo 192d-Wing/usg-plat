@@ -1,0 +1,12 @@
+Package: usg-plat-pin-canary
+Version: 0.0.0
+Architecture: all
+Maintainer: usg-plat Contributors
+Section: admin
+Priority: optional
+Description: apt pin canary for the usg-plat repository (never installable)
+ Empty package. The usg-plat repository publishes it so that
+ `usg-plat-verify selftest --apt` can show that the -1 pin for names other
+ than platd and usg-plat-verify matches the repository origin: apt must
+ report `Candidate: (none)` for it. If apt ever offers to install it, the
+ pin does not match and the host fails open; selftest then fails.

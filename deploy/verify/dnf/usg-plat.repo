@@ -1,0 +1,18 @@
+# /etc/yum.repos.d/usg-plat.repo
+#
+# Repository metadata and rpms are not OpenPGP-signed, by design: the trust
+# anchor is the keyless cosign signature over each release's SHA256SUMS,
+# checked by the usg_plat_verify dnf plugin before rpm runs. includepkgs
+# keeps this repository from supplying any other package name.
+#
+# COMPLIANCE MAPPING:
+# - NIST 800-53: SI-7(15), CM-14, SR-11
+# POAM: unsigned metadata, a frozen or rolled-back repo hides updates (POAM-044 (c)).
+[usg-plat]
+name=usg-plat
+baseurl=https://192d-wing.github.io/usg-plat-packages/rpm/$basearch
+enabled=1
+gpgcheck=0
+repo_gpgcheck=0
+includepkgs=platd usg-plat-verify
+metadata_expire=6h

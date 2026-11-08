@@ -32,7 +32,13 @@ check-notls:
 
 # xdp-env (defined below) refuses a pre-set RUSTC_BOOTSTRAP, so the required
 # CI jobs (which run these targets) assert it too (SEC-004 / NIST-007).
-check: xdp-env fmt clippy check-linux check-notls codex-agents-check cbom-check
+check: xdp-env fmt clippy check-linux check-notls codex-agents-check cbom-check ci-pins-check
+
+# The Rocky 9 build image is pinned twice in packages.yml (packages, sbom-xdp);
+# both digests must be equal.
+.PHONY: ci-pins-check
+ci-pins-check:
+	sh deploy/ci/check-container-pins.sh
 
 # Codex agent definitions (.codex/agents/*.toml) are generated from the Claude
 # Code ones (.claude/agents/*.md); check fails when they have drifted.
@@ -58,14 +64,51 @@ SHELLCHECK = sh -c 'if ! command -v shellcheck >/dev/null 2>&1; then \
 	  echo "WARNING: shellcheck $$v, CI uses $(SHELLCHECK_VERSION)" >&2; fi; \
 	exec shellcheck -x "$$@"' shellcheck
 
+# Install-time gate scripts (see verify-pkg below); defined here because
+# DEPLOY_SH includes them.
+VERIFY_SH := deploy/verify/build.sh deploy/verify/trusted-root.sh deploy/verify/debian/postinst deploy/verify/debian/prerm \
+	$(wildcard deploy/verify/libexec/*) $(wildcard deploy/verify/bin/usg-plat-verify) $(wildcard deploy/tests/verify/*.sh) $(wildcard deploy/tests/verify/install/*.sh) \
+	deploy/ci/publish-packages.sh deploy/ci/check-container-pins.sh $(wildcard deploy/ci/pin-canary/*.sh)
+VERIFY_PY := $(wildcard deploy/tests/verify/test_dnf_plugin.py)
+
 # Deploy scripts: POSIX syntax, shellcheck (required when CI=true) and a stubbed run
 # against the real `platd check-config --format env` output.
 DEPLOY_SH := deploy/systemd/plat-tun-setup.sh deploy/systemd/plat-fwguard.sh deploy/tests/deploy-scripts-test.sh \
-	deploy/hooks/frr-announce.sh deploy/hooks/frr-withdraw.sh deploy/systemd/plat-v6-announce.sh deploy/tests/xdp/e2e.sh deploy/tests/resolver/l33-resolver.sh scripts/verify-release.sh deploy/tests/install-shellcheck.sh $(wildcard deploy/tests/cluster/*.sh)
+	deploy/hooks/frr-announce.sh deploy/hooks/frr-withdraw.sh deploy/systemd/plat-v6-announce.sh deploy/tests/xdp/e2e.sh deploy/tests/resolver/l33-resolver.sh scripts/verify-release.sh deploy/tests/install-shellcheck.sh $(wildcard deploy/build/*.sh) $(wildcard deploy/tests/cluster/*.sh) \
+	$(VERIFY_SH)
 test-deploy:
 	for f in $(DEPLOY_SH); do sh -n $$f || exit 1; done
 	@$(SHELLCHECK) $(DEPLOY_SH)
 	sh deploy/tests/deploy-scripts-test.sh
+
+# Install-time signature gate (POAM-044 (c)): the usg-plat-verify .deb/.rpm.
+# The package is shell, python and data only (no binary, no crypto): it stays
+# out of the cargo graph, the SBOM's Rust components and the CBOM. The bundled
+# Sigstore trusted root is fetched with cosign and refused unless it matches
+# deploy/verify/trusted_root.sha256; a new root lands only through a reviewed
+# PR (make trusted-root-update). The sources of units not yet in the tree are
+# picked up by wildcard; build.sh refuses to build without them.
+# COMPLIANCE MAPPING:
+# - NIST 800-53: SI-7(15) (Code Authentication), CM-14 (Signed Components),
+#   SR-11 (Component Authenticity), CM-3 (Configuration Change Control)
+
+.PHONY: verify-pkg trusted-root-update test-verify
+verify-pkg:
+	sh deploy/verify/trusted-root.sh --out target/verify/trusted_root.json
+	sh deploy/verify/build.sh --trusted-root target/verify/trusted_root.json
+
+trusted-root-update:
+	sh deploy/verify/trusted-root.sh --update --out target/verify/trusted_root.json
+
+test-verify:
+	for f in $(VERIFY_SH); do sh -n $$f || exit 1; done
+	@$(SHELLCHECK) $(VERIFY_SH)
+	@if grep -rn -e '--certificate-identity-regexp' deploy/verify; then \
+	  echo "ERROR: the verifier must pass an exact --certificate-identity" >&2; exit 1; fi
+	sh deploy/verify/trusted-root.sh --self-test
+	sh deploy/verify/build.sh --self-test
+	$(if $(wildcard deploy/tests/verify/unit.sh),sh deploy/tests/verify/unit.sh,@if [ "$$CI" = true ]; then echo "ERROR: deploy/tests/verify/unit.sh is required in CI" >&2; exit 1; fi; echo "WARNING: deploy/tests/verify/unit.sh not in the tree; skipped" >&2)
+	$(if $(VERIFY_PY),python3 -I -m unittest discover -s deploy/tests/verify -p 'test_dnf_plugin.py',@if [ "$$CI" = true ]; then echo "ERROR: deploy/tests/verify/test_dnf_plugin.py is required in CI" >&2; exit 1; fi; echo "WARNING: deploy/tests/verify/test_dnf_plugin.py not in the tree; skipped" >&2)
 
 bench:
 	cargo bench -p plat-xlat -p plat-nat64 -p plat-audit -p plat-xdp-core -p plat-tls --bench xlat --bench nat64 --bench audit --bench decide --bench handshake
@@ -298,7 +341,7 @@ rpm: sbom
 
 packages: deb rpm
 
-# Verify a downloaded GitHub Release: make verify-release DIR=./dl TAG=v0.3.0
+# Verify a downloaded GitHub Release: make verify-release DIR=./dl TAG=v0.4.1
 # (cosign keyless bundles, identity = packages.yml at refs/tags/v*; SI-7, SR-11).
 verify-release:
 	@test -n "$(DIR)" && test -n "$(TAG)" || { echo "usage: make verify-release DIR=<dir> TAG=v<x.y.z>" >&2; exit 2; }

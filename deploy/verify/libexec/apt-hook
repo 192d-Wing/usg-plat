@@ -1,0 +1,284 @@
+#!/bin/sh
+# usg-plat-verify apt front end: DPkg::Pre-Install-Pkgs hook, protocol v3.
+#
+# stdin: "VERSION 3", the apt config dump, a blank line, then one line per
+# action: name old-ver old-arch old-ma op new-ver new-arch new-ma action.
+# Exit non-zero aborts the transaction before dpkg unpacks anything.
+#
+# Per line, the name filter runs before any per-file work. For our names
+# (NAMES in verify.conf) the action must be an absolute path to a regular
+# .deb; its control Package/Version/Architecture must equal the stdin fields;
+# a downgrade is refused unless ALLOW_DOWNGRADE=1 or USG_PLAT_ALLOW_DOWNGRADE=1;
+# then the file is hashed and verify-pkg decides. A .deb whose control Package
+# is ours but whose stdin name is not is refused (no shadowing by renaming).
+# **REMOVE** and **CONFIGURE** lines pass.
+#
+# dpkg reopens the .deb by path after this hook hashed it, so the file and
+# every ancestor directory must be owned by uid 0 and not group- or
+# other-writable (root_only); otherwise a local user could swap it between
+# check and use. apt's archives directory meets that; a local install
+# (`apt install ./x.deb`) must be staged in a root-only directory such as
+# /root/pkgs, never /tmp or a home directory.
+#
+# Test hooks (environment): USG_PLAT_VERIFY_CONF, USG_PLAT_VERIFY_STATE,
+# USG_PLAT_VERIFY_TEXTFILE_DIR, USG_PLAT_VERIFY_LIBEXEC
+# [/usr/libexec/usg-plat-verify], USG_PLAT_VERIFY_PATH, USG_PLAT_VERIFY_TEST_TOP
+# (see verify-pkg); honoured only with USG_PLAT_VERIFY_TEST=1.
+# USG_PLAT_ALLOW_DOWNGRADE=1 is an operator override, always logged.
+#
+# COMPLIANCE MAPPING:
+# - NIST 800-53: SI-7(15) (Code Authentication), CM-14 (Signed Components),
+#   SR-11 (Component Authenticity) - prevent-install for apt and
+#   unattended-upgrades
+# - NIST 800-53: CM-14 - downgrade refused by default (rollback to a signed but
+#   older release)
+# POAM: POAM-044 (c) - `dpkg -i` does not run this hook; a refusal aborts the
+#   whole apt transaction (residual (g), alerted)
+set -u
+
+# >>> common: test hooks and root_only (identical in every script; unit.sh checks)
+# Test hooks (the USG_PLAT_VERIFY_* overrides named in the header, and TMPDIR)
+# are honoured only when USG_PLAT_VERIFY_TEST=1, which only the test suites
+# set. Otherwise they are unset, so children inherit a clean environment, and
+# logged once to authpriv. When it is honoured, every invocation logs
+# "test mode enabled" at authpriv.warning and on stderr, so a production host
+# left in test mode is visible. USG_PLAT_VERIFY_SUMS_DIR is not a hook: the front
+# ends set it for local installs and verify-pkg still verifies what it names.
+#
+# COMPLIANCE MAPPING:
+# - NIST 800-53: CM-6 (Configuration Settings), SI-7(15) (Code Authentication)
+#   - the decision depends only on root-owned, root-only-writable files
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+uv_test=0
+if [ "${USG_PLAT_VERIFY_TEST:-}" = 1 ]; then
+    uv_test=1
+    uv_msg="test mode enabled: overrides honoured (USG_PLAT_VERIFY_TEST=1)"
+    printf 'usg-plat-verify: %s\n' "$uv_msg" >&2
+    PATH=${USG_PLAT_VERIFY_PATH:-$PATH} logger -t usg-plat-verify -p authpriv.warning -- "$uv_msg" 2>/dev/null || :
+else
+    uv_ign=$(env | sed -n 's/^\(USG_PLAT_VERIFY_[A-Z_]*\)=.*/\1/p' |
+        grep -v -x -e USG_PLAT_VERIFY_SUMS_DIR -e USG_PLAT_VERIFY_TEST | sort -u | tr '\n' ' ')
+    [ -n "${TMPDIR+x}" ] && uv_ign="${uv_ign}TMPDIR "
+    for uv_v in $uv_ign; do
+        unset "$uv_v"
+    done
+    unset USG_PLAT_VERIFY_TEST
+    if [ -n "$uv_ign" ]; then
+        uv_msg="ignoring test-only environment (USG_PLAT_VERIFY_TEST is not 1): $uv_ign"
+        printf 'usg-plat-verify: %s\n' "$uv_msg" >&2
+        logger -t usg-plat-verify -p authpriv.warning -- "$uv_msg" 2>/dev/null || :
+    fi
+fi
+
+# root_only PATH: PATH and every ancestor directory exist, are not symlinks,
+# are owned by uid 0 and are neither group- nor other-writable (POSIX ACLs
+# are not inspected). A sticky world-writable directory such as /tmp fails: its other users
+# can still rename or replace entries they own. In test mode the invoking uid
+# also counts as an owner and the walk stops at USG_PLAT_VERIFY_TEST_TOP.
+root_only() {
+    case $1 in /*) ;; *) return 1 ;; esac
+    case $1 in */./* | */../* | */. | */.. | *//*) return 1 ;; *) ;; esac
+    ro_p=$1
+    while :; do
+        if [ $uv_test -eq 1 ] && [ -n "${USG_PLAT_VERIFY_TEST_TOP:-}" ] &&
+            [ "$ro_p" = "$USG_PLAT_VERIFY_TEST_TOP" ]; then
+            return 0
+        fi
+        [ -e "$ro_p" ] && [ ! -L "$ro_p" ] || return 1
+        ro_l=$(LC_ALL=C stat -c '%A %u' -- "$ro_p" 2>/dev/null) || return 1
+        ro_m=${ro_l%% *} ro_u=${ro_l#* }
+        case $ro_m in
+            ?????w* | ????????w*) return 1 ;;
+            ??????????*) ;;
+            *) return 1 ;;
+        esac
+        if [ "$ro_u" != 0 ]; then
+            [ $uv_test -eq 1 ] && [ "$ro_u" = "$(id -u)" ] || return 1
+        fi
+        [ "$ro_p" = / ] && return 0
+        ro_p=${ro_p%/*}
+        [ -n "$ro_p" ] || ro_p=/
+    done
+}
+# <<< common
+
+PATH=${USG_PLAT_VERIFY_PATH:-/usr/sbin:/usr/bin:/sbin:/bin}
+export PATH
+
+CONF=${USG_PLAT_VERIFY_CONF:-/etc/usg-plat-verify/verify.conf}
+STATE=${USG_PLAT_VERIFY_STATE:-/var/lib/usg-plat-verify}
+TEXTFILE_DIR=${USG_PLAT_VERIFY_TEXTFILE_DIR:-/var/lib/node_exporter/textfile_collector}
+LIBEXEC=${USG_PLAT_VERIFY_LIBEXEC:-/usr/libexec/usg-plat-verify}
+
+pname='' pver=''
+
+clean() {
+    printf '%s' "$1" | tr -c 'A-Za-z0-9._+:~/-' '?' | cut -c1-128
+}
+
+log() { # priority message
+    printf 'usg-plat-verify: %s\n' "$2" >&2
+    if command -v logger >/dev/null 2>&1; then
+        logger -t usg-plat-verify -p "authpriv.$1" -- "$2" 2>/dev/null || :
+    fi
+}
+
+# Same record as verify-pkg (last-refusal, counter, optional textfile).
+refuse() { # reason
+    log err "apt-hook refusing $(clean "$pname") $(clean "$pver"): $1"
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    epoch=$(date -u +%s)
+    n=1
+    if [ -d "$STATE" ]; then
+        printf '%s %s %s %s\n' "$now" "$(clean "$pname")" "$(clean "$pver")" "$1" \
+            >"$STATE/last-refusal.$$" 2>/dev/null &&
+            mv -f -- "$STATE/last-refusal.$$" "$STATE/last-refusal" 2>/dev/null
+        n=$(cat "$STATE/refusals_total" 2>/dev/null)
+        case $n in '' | *[!0-9]*) n=0 ;; *) ;; esac
+        n=$((n + 1))
+        printf '%s\n' "$n" >"$STATE/refusals_total.$$" 2>/dev/null &&
+            mv -f -- "$STATE/refusals_total.$$" "$STATE/refusals_total" 2>/dev/null
+    fi
+    if [ -d "$TEXTFILE_DIR" ]; then
+        {
+            echo '# HELP usg_plat_verify_refusals_total usg-plat packages refused by the install gate.'
+            echo '# TYPE usg_plat_verify_refusals_total counter'
+            echo "usg_plat_verify_refusals_total $n"
+            echo '# HELP usg_plat_verify_last_refusal_timestamp_seconds Time of the last refusal.'
+            echo '# TYPE usg_plat_verify_last_refusal_timestamp_seconds gauge'
+            echo "usg_plat_verify_last_refusal_timestamp_seconds $epoch"
+        } >"$TEXTFILE_DIR/usg-plat-verify.prom.$$" 2>/dev/null &&
+            chmod 0644 "$TEXTFILE_DIR/usg-plat-verify.prom.$$" 2>/dev/null &&
+            mv -f -- "$TEXTFILE_DIR/usg-plat-verify.prom.$$" "$TEXTFILE_DIR/usg-plat-verify.prom" 2>/dev/null
+    fi
+    exit 1
+}
+
+[ -f "$CONF" ] && [ -r "$CONF" ] || refuse "configuration $CONF missing or unreadable"
+root_only "$CONF" || refuse "configuration $CONF (or a parent directory) is not root-owned or is group/other-writable"
+NAMES='' ALLOW_DOWNGRADE=0
+# shellcheck source=deploy/verify/etc/verify.conf
+. "$CONF" || refuse "configuration $CONF does not parse"
+[ -n "$NAMES" ] || refuse "NAMES is empty"
+allow_down=0
+[ "${ALLOW_DOWNGRADE:-0}" = 1 ] && allow_down=1
+if [ "${USG_PLAT_ALLOW_DOWNGRADE:-0}" = 1 ]; then
+    allow_down=1
+    log warning "USG_PLAT_ALLOW_DOWNGRADE=1 in the environment: downgrades of usg-plat packages are allowed for this transaction"
+fi
+
+ours() {
+    for n in $NAMES; do
+        [ "$n" = "$1" ] && return 0
+    done
+    return 1
+}
+
+# --- header and config dump ----------------------------------------------------
+IFS= read -r first || refuse "empty hook input"
+[ "$first" = "VERSION 3" ] || refuse "hook protocol is not VERSION 3 (check 50usg-plat-verify)"
+dir=/ cache=var/cache/apt/ archives=archives/
+while IFS= read -r line; do
+    [ -z "$line" ] && break
+    case $line in
+        Dir=*) dir=${line#Dir=} ;;
+        Dir::Cache=*) cache=${line#Dir::Cache=} ;;
+        Dir::Cache::archives=*) archives=${line#Dir::Cache::archives=} ;;
+        *) ;;
+    esac
+done
+dir=${dir#\"} dir=${dir%\"}
+cache=${cache#\"} cache=${cache%\"}
+archives=${archives#\"} archives=${archives%\"}
+case $cache in /*) ;; *) cache="$dir/$cache" ;; esac
+case $archives in /*) ;; *) archives="$cache/$archives" ;; esac
+# Collapse "//" and drop the trailing "/".
+archives=$(printf '%s\n' "$archives" | sed -e 's://*:/:g' -e 's:/$::')
+
+# --- actions -------------------------------------------------------------------
+# Fields are separated by single spaces; the action (a path) is the rest of
+# the line after the eighth field, kept verbatim in $full so a path with
+# spaces cannot hide in the split.
+while IFS= read -r line || [ -n "$line" ]; do
+    [ -n "$line" ] || continue
+    name='' _ov='' _oa='' _om='' op='' nv='' na='' _nm='' action='' rest=''
+    IFS=' ' read -r name _ov _oa _om op nv na _nm action rest <<HOOKLINE
+$line
+HOOKLINE
+    full=$line
+    i=0
+    while [ $i -lt 8 ]; do
+        case $full in *' '*) full=${full#* } ;; *) full='' ;; esac
+        i=$((i + 1))
+    done
+    [ -n "${name:-}" ] || continue
+    name=${name%%:*}
+    pname=$name pver=${nv:-}
+    case ${action:-} in
+        '**REMOVE**' | '**CONFIGURE**') continue ;;
+        *) ;;
+    esac
+    if ! ours "$name"; then
+        # Not our name: the only per-file work is the shadowing check, on the
+        # whole remainder of the line (a path may contain spaces).
+        case $full in
+            /*.deb)
+                if [ -f "$full" ]; then
+                    ctl=$(dpkg-deb -f "$full" Package 2>/dev/null) ||
+                        refuse "cannot read the control file of $(clean "$full")"
+                    if ours "$ctl"; then
+                        pname=$ctl
+                        refuse "$(clean "$full") contains $ctl but apt calls it $(clean "$name")"
+                    fi
+                elif [ "$full" != "$action" ]; then
+                    refuse "cannot parse the hook line for $(clean "$name") (path with spaces?)"
+                fi
+                ;;
+            *) ;;
+        esac
+        continue
+    fi
+
+    [ -z "${rest:-}" ] && [ "$full" = "$action" ] ||
+        refuse "unexpected fields in hook line (path with spaces?)"
+    case ${action:-} in
+        /*.deb) ;;
+        *) refuse "action is not an absolute .deb path: $(clean "${action:-}")" ;;
+    esac
+    [ -f "$action" ] && [ ! -L "$action" ] || refuse "$(clean "$action") is not a regular file"
+    # COMPLIANCE MAPPING:
+    # - NIST 800-53: SI-7(15) - no swap between this hash and dpkg's unpack:
+    #   only root can write the file or any directory above it
+    root_only "$action" ||
+        refuse "$(clean "$action"): the file or a parent directory is not root-owned or is group/other-writable (stage local packages in a root-only directory)"
+
+    fields=$(dpkg-deb -f "$action" Package Version Architecture 2>/dev/null) ||
+        refuse "cannot read the control file of $(clean "$action")"
+    cpkg=$(printf '%s\n' "$fields" | sed -n 's/^Package: //p')
+    cver=$(printf '%s\n' "$fields" | sed -n 's/^Version: //p')
+    carch=$(printf '%s\n' "$fields" | sed -n 's/^Architecture: //p')
+    [ "$cpkg" = "$name" ] || refuse "control Package $(clean "$cpkg") does not match $(clean "$name")"
+    [ "$cver" = "$nv" ] || refuse "control Version $(clean "$cver") does not match $(clean "$nv")"
+    [ "$carch" = "$na" ] || refuse "control Architecture $(clean "$carch") does not match $(clean "$na")"
+
+    if [ "$op" = '>' ] && [ "$_ov" != - ]; then
+        [ $allow_down -eq 1 ] || refuse "downgrade from $(clean "$_ov") refused (ALLOW_DOWNGRADE=0)"
+        log warning "downgrade of $(clean "$name") from $(clean "$_ov") to $(clean "$nv") allowed by ALLOW_DOWNGRADE"
+    fi
+
+    pdir=${action%/*}
+    [ -n "$pdir" ] || pdir=/
+    h=$(sha256sum -- "$action" 2>/dev/null) || refuse "cannot hash $(clean "$action")"
+    h=${h%% *}
+    if [ "$pdir" = "$archives" ]; then
+        "$LIBEXEC/verify-pkg" --name "$name" --version "$nv" --arch "$na" --sha256 "$h" </dev/null
+    else
+        USG_PLAT_VERIFY_SUMS_DIR=$pdir \
+            "$LIBEXEC/verify-pkg" --name "$name" --version "$nv" --arch "$na" --sha256 "$h" </dev/null
+    fi
+    rc=$?
+    # verify-pkg already logged and recorded the refusal.
+    [ $rc -eq 0 ] || exit 1
+done
+exit 0

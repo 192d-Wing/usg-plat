@@ -1,0 +1,344 @@
+#!/bin/sh
+# usg-plat-verify: decide whether one usg-plat package may be installed.
+#
+# Usage: verify-pkg --name N --version V --arch A --sha256 H
+# Exit:  0 accept; 1 refuse; 2 configuration or usage error (the front ends
+#        treat 2 as a refusal too).
+#
+# The caller (apt-hook, the dnf plugin, `usg-plat-verify verify`) hashes the
+# package file; this script never opens it. It verifies the release's
+# SHA256SUMS with cosign against the pinned Sigstore trust root and the exact
+# signer identity of tag v<upstream version>, then requires a SHA256SUMS line
+# with digest H whose file name is the expected .deb/.rpm name for N, V, A.
+#
+# SHA256SUMS and its bundle are read from $USG_PLAT_VERIFY_SUMS_DIR (set by a
+# front end to the package's own directory for local installs), otherwise from
+# /var/lib/usg-plat-verify/releases/<tag>/. Both are copied to a private
+# temporary directory first, so the file that is verified is the file that is
+# read.
+#
+# Never used: the deprecated offline flag (`--trusted-root` alone keeps cosign off
+# the network) and the regexp identity form (it matches any signer).
+#
+# Test hooks (environment, default in brackets): USG_PLAT_VERIFY_CONF
+# [/etc/usg-plat-verify/verify.conf], USG_PLAT_VERIFY_STATE
+# [/var/lib/usg-plat-verify], USG_PLAT_VERIFY_TRUSTED_ROOT
+# [/usr/share/usg-plat-verify/trusted_root.json], USG_PLAT_VERIFY_TEXTFILE_DIR
+# [/var/lib/node_exporter/textfile_collector], USG_PLAT_VERIFY_TIMEOUT [60],
+# USG_PLAT_VERIFY_PATH [/usr/sbin:/usr/bin:/sbin:/bin], USG_PLAT_VERIFY_TEST_TOP,
+# TMPDIR [/tmp]; honoured only with USG_PLAT_VERIFY_TEST=1 (see below).
+#
+# verify.conf and the trusted root must be owned by uid 0 and not group- or
+# other-writable, with the same for every ancestor directory (exit 2).
+#
+# COMPLIANCE MAPPING:
+# - NIST 800-53: SI-7(15) (Code Authentication) - a usg-plat package is
+#   installed only if its digest is listed in a cosign-verified SHA256SUMS
+# - NIST 800-53: CM-14 (Signed Components) - installation is prevented unless
+#   the signature verifies against the exact release identity
+# - NIST 800-53: SR-11 (Component Authenticity) - pinned trust root, exact
+#   Fulcio identity and OIDC issuer, fail closed on any error
+# - NIST 800-53: AU-2/AU-12 - every decision is logged (authpriv) and the last
+#   refusal is recorded for alerting
+# POAM: POAM-044 (c) - dpkg -i / rpm -U bypass this gate; repository metadata
+#   is unsigned; root can remove the gate
+set -u
+
+# >>> common: test hooks and root_only (identical in every script; unit.sh checks)
+# Test hooks (the USG_PLAT_VERIFY_* overrides named in the header, and TMPDIR)
+# are honoured only when USG_PLAT_VERIFY_TEST=1, which only the test suites
+# set. Otherwise they are unset, so children inherit a clean environment, and
+# logged once to authpriv. When it is honoured, every invocation logs
+# "test mode enabled" at authpriv.warning and on stderr, so a production host
+# left in test mode is visible. USG_PLAT_VERIFY_SUMS_DIR is not a hook: the front
+# ends set it for local installs and verify-pkg still verifies what it names.
+#
+# COMPLIANCE MAPPING:
+# - NIST 800-53: CM-6 (Configuration Settings), SI-7(15) (Code Authentication)
+#   - the decision depends only on root-owned, root-only-writable files
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+uv_test=0
+if [ "${USG_PLAT_VERIFY_TEST:-}" = 1 ]; then
+    uv_test=1
+    uv_msg="test mode enabled: overrides honoured (USG_PLAT_VERIFY_TEST=1)"
+    printf 'usg-plat-verify: %s\n' "$uv_msg" >&2
+    PATH=${USG_PLAT_VERIFY_PATH:-$PATH} logger -t usg-plat-verify -p authpriv.warning -- "$uv_msg" 2>/dev/null || :
+else
+    uv_ign=$(env | sed -n 's/^\(USG_PLAT_VERIFY_[A-Z_]*\)=.*/\1/p' |
+        grep -v -x -e USG_PLAT_VERIFY_SUMS_DIR -e USG_PLAT_VERIFY_TEST | sort -u | tr '\n' ' ')
+    [ -n "${TMPDIR+x}" ] && uv_ign="${uv_ign}TMPDIR "
+    for uv_v in $uv_ign; do
+        unset "$uv_v"
+    done
+    unset USG_PLAT_VERIFY_TEST
+    if [ -n "$uv_ign" ]; then
+        uv_msg="ignoring test-only environment (USG_PLAT_VERIFY_TEST is not 1): $uv_ign"
+        printf 'usg-plat-verify: %s\n' "$uv_msg" >&2
+        logger -t usg-plat-verify -p authpriv.warning -- "$uv_msg" 2>/dev/null || :
+    fi
+fi
+
+# root_only PATH: PATH and every ancestor directory exist, are not symlinks,
+# are owned by uid 0 and are neither group- nor other-writable (POSIX ACLs
+# are not inspected). A sticky world-writable directory such as /tmp fails: its other users
+# can still rename or replace entries they own. In test mode the invoking uid
+# also counts as an owner and the walk stops at USG_PLAT_VERIFY_TEST_TOP.
+root_only() {
+    case $1 in /*) ;; *) return 1 ;; esac
+    case $1 in */./* | */../* | */. | */.. | *//*) return 1 ;; *) ;; esac
+    ro_p=$1
+    while :; do
+        if [ $uv_test -eq 1 ] && [ -n "${USG_PLAT_VERIFY_TEST_TOP:-}" ] &&
+            [ "$ro_p" = "$USG_PLAT_VERIFY_TEST_TOP" ]; then
+            return 0
+        fi
+        [ -e "$ro_p" ] && [ ! -L "$ro_p" ] || return 1
+        ro_l=$(LC_ALL=C stat -c '%A %u' -- "$ro_p" 2>/dev/null) || return 1
+        ro_m=${ro_l%% *} ro_u=${ro_l#* }
+        case $ro_m in
+            ?????w* | ????????w*) return 1 ;;
+            ??????????*) ;;
+            *) return 1 ;;
+        esac
+        if [ "$ro_u" != 0 ]; then
+            [ $uv_test -eq 1 ] && [ "$ro_u" = "$(id -u)" ] || return 1
+        fi
+        [ "$ro_p" = / ] && return 0
+        ro_p=${ro_p%/*}
+        [ -n "$ro_p" ] || ro_p=/
+    done
+}
+# <<< common
+
+# >>> common-exec (identical where cosign is checked; unit.sh checks)
+# root_only_exec PATH: an executable that may be a symlink (cosign in
+# /usr/local/bin often is). Every ancestor of PATH must pass root_only, and
+# so must the fully resolved target (readlink -f), which must be a regular
+# executable file.
+root_only_exec() {
+    case $1 in /*) ;; *) return 1 ;; esac
+    rx_d=${1%/*}
+    [ -n "$rx_d" ] || rx_d=/
+    root_only "$rx_d" || return 1
+    rx_t=$(readlink -f -- "$1" 2>/dev/null) || return 1
+    [ -n "$rx_t" ] && [ -f "$rx_t" ] && [ -x "$rx_t" ] || return 1
+    root_only "$rx_t"
+}
+# <<< common-exec
+
+PATH=${USG_PLAT_VERIFY_PATH:-/usr/sbin:/usr/bin:/sbin:/bin}
+export PATH
+umask 077
+
+# Constants, deliberately not configuration.
+IDENTITY_PREFIX=https://github.com/192d-Wing/usg-plat/.github/workflows/packages.yml@refs/tags/
+ISSUER=https://token.actions.githubusercontent.com
+
+CONF=${USG_PLAT_VERIFY_CONF:-/etc/usg-plat-verify/verify.conf}
+STATE=${USG_PLAT_VERIFY_STATE:-/var/lib/usg-plat-verify}
+TRUSTED_ROOT=${USG_PLAT_VERIFY_TRUSTED_ROOT:-/usr/share/usg-plat-verify/trusted_root.json}
+TEXTFILE_DIR=${USG_PLAT_VERIFY_TEXTFILE_DIR:-/var/lib/node_exporter/textfile_collector}
+TIMEOUT=${USG_PLAT_VERIFY_TIMEOUT:-60}
+
+NL='
+'
+name='' version='' arch='' sha=''
+tmp=''
+
+cleanup() {
+    if [ -n "$tmp" ] && [ -d "$tmp" ]; then
+        rm -f -- "$tmp/SHA256SUMS" "$tmp/SHA256SUMS.sigstore.json" "$tmp/out"
+        rmdir -- "$tmp/home" 2>/dev/null
+        rmdir -- "$tmp" 2>/dev/null
+    fi
+}
+trap 'cleanup' EXIT
+trap 'cleanup; exit 1' HUP INT TERM
+
+# Printable, bounded form of a possibly hostile string for logs.
+clean() {
+    printf '%s' "$1" | tr -c 'A-Za-z0-9._+:~-' '?' | cut -c1-64
+}
+
+log() { # priority message
+    printf 'usg-plat-verify: %s\n' "$2" >&2
+    if command -v logger >/dev/null 2>&1; then
+        logger -t usg-plat-verify -p "authpriv.$1" -- "$2" 2>/dev/null || :
+    fi
+}
+
+record_refusal() { # reason
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    epoch=$(date -u +%s)
+    if [ -d "$STATE" ]; then
+        printf '%s %s %s %s\n' "$now" "$(clean "$name")" "$(clean "$version")" "$1" \
+            >"$STATE/last-refusal.$$" 2>/dev/null &&
+            mv -f -- "$STATE/last-refusal.$$" "$STATE/last-refusal" 2>/dev/null
+        n=$(cat "$STATE/refusals_total" 2>/dev/null)
+        case $n in '' | *[!0-9]*) n=0 ;; *) ;; esac
+        n=$((n + 1))
+        printf '%s\n' "$n" >"$STATE/refusals_total.$$" 2>/dev/null &&
+            mv -f -- "$STATE/refusals_total.$$" "$STATE/refusals_total" 2>/dev/null
+    else
+        n=1
+    fi
+    # Optional node-exporter textfile, only when the collector directory exists.
+    if [ -d "$TEXTFILE_DIR" ]; then
+        {
+            echo '# HELP usg_plat_verify_refusals_total usg-plat packages refused by the install gate.'
+            echo '# TYPE usg_plat_verify_refusals_total counter'
+            echo "usg_plat_verify_refusals_total $n"
+            echo '# HELP usg_plat_verify_last_refusal_timestamp_seconds Time of the last refusal.'
+            echo '# TYPE usg_plat_verify_last_refusal_timestamp_seconds gauge'
+            echo "usg_plat_verify_last_refusal_timestamp_seconds $epoch"
+        } >"$TEXTFILE_DIR/usg-plat-verify.prom.$$" 2>/dev/null &&
+            chmod 0644 "$TEXTFILE_DIR/usg-plat-verify.prom.$$" 2>/dev/null &&
+            mv -f -- "$TEXTFILE_DIR/usg-plat-verify.prom.$$" "$TEXTFILE_DIR/usg-plat-verify.prom" 2>/dev/null
+    fi
+}
+
+refuse() { # code reason
+    log err "refusing $(clean "$name") $(clean "$version") $(clean "$arch"): $2"
+    record_refusal "$2"
+    cleanup
+    exit "$1"
+}
+
+# ver_ge A B: true when x.y.z A >= B (numeric, missing parts are 0).
+ver_ge() {
+    a=$1 b=$2
+    i=0
+    while [ $i -lt 3 ]; do
+        x=${a%%.*} y=${b%%.*}
+        x=${x%%[!0-9]*} y=${y%%[!0-9]*}
+        x=${x:-0} y=${y:-0}
+        [ "$x" -gt "$y" ] && return 0
+        [ "$x" -lt "$y" ] && return 1
+        case $a in *.*) a=${a#*.} ;; *) a=0 ;; esac
+        case $b in *.*) b=${b#*.} ;; *) b=0 ;; esac
+        i=$((i + 1))
+    done
+    return 0
+}
+
+usage() { refuse 2 "usage: verify-pkg --name N --version V --arch A --sha256 H"; }
+
+# --- arguments -------------------------------------------------------------
+while [ $# -gt 0 ]; do
+    [ $# -ge 2 ] || usage
+    case $1 in
+        --name) name=$2 ;;
+        --version) version=$2 ;;
+        --arch) arch=$2 ;;
+        --sha256) sha=$2 ;;
+        *) usage ;;
+    esac
+    shift 2
+done
+for v in "$name" "$version" "$arch" "$sha"; do
+    [ -n "$v" ] || usage
+    case $v in *"$NL"*) usage ;; *) ;; esac
+done
+
+# --- configuration -----------------------------------------------------------
+[ -f "$CONF" ] && [ -r "$CONF" ] || refuse 2 "configuration $CONF missing or unreadable"
+root_only "$CONF" || refuse 2 "configuration $CONF (or a parent directory) is not root-owned or is group/other-writable"
+NAMES='' COSIGN='' COSIGN_MIN='' COSIGN_GODEBUG=''
+# shellcheck source=deploy/verify/etc/verify.conf
+. "$CONF" || refuse 2 "configuration $CONF does not parse"
+case $COSIGN in /*) ;; *) refuse 2 "COSIGN must be an absolute path" ;; esac
+printf '%s\n' "$COSIGN_MIN" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+' ||
+    refuse 2 "COSIGN_MIN must be x.y.z"
+ver_ge "$COSIGN_MIN" 3.0.3 || refuse 2 "COSIGN_MIN below the 3.0.3 floor"
+case $COSIGN_GODEBUG in *[!A-Za-z0-9=,._-]*) refuse 2 "COSIGN_GODEBUG has unexpected characters" ;; *) ;; esac
+case $TIMEOUT in '' | *[!0-9]*) refuse 2 "bad timeout" ;; *) ;; esac
+[ -n "$NAMES" ] || refuse 2 "NAMES is empty"
+
+# --- inputs ----------------------------------------------------------------
+known=0
+for n in $NAMES; do
+    [ "$n" = "$name" ] && known=1
+done
+[ $known -eq 1 ] || refuse 2 "name is not a usg-plat package"
+printf '%s\n' "$version" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?' ||
+    refuse 2 "version is not x.y.z[-r]"
+case $arch in
+    amd64 | arm64 | all) file="${name}_${version}_${arch}.deb" ;;
+    x86_64 | aarch64 | noarch) file="${name}-${version}.${arch}.rpm" ;;
+    *) refuse 2 "unsupported architecture" ;;
+esac
+printf '%s\n' "$sha" | grep -Eqx '[0-9a-f]{64}' || refuse 2 "sha256 is not 64 lowercase hex digits"
+
+tag="v${version%%-*}"
+identity="$IDENTITY_PREFIX$tag"
+
+# --- sums ------------------------------------------------------------------
+if [ -n "${USG_PLAT_VERIFY_SUMS_DIR:-}" ]; then
+    sums_dir=$USG_PLAT_VERIFY_SUMS_DIR
+    case $sums_dir in /*) ;; *) refuse 2 "USG_PLAT_VERIFY_SUMS_DIR must be absolute" ;; esac
+else
+    sums_dir="$STATE/releases/$tag"
+fi
+[ -f "$sums_dir/SHA256SUMS" ] && [ -f "$sums_dir/SHA256SUMS.sigstore.json" ] ||
+    refuse 1 "no SHA256SUMS and SHA256SUMS.sigstore.json for $tag in $sums_dir"
+[ -f "$TRUSTED_ROOT" ] && [ -r "$TRUSTED_ROOT" ] || refuse 2 "trusted root $TRUSTED_ROOT missing"
+root_only "$TRUSTED_ROOT" ||
+    refuse 2 "trusted root $TRUSTED_ROOT (or a parent directory) is not root-owned or is group/other-writable"
+
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/usg-plat-verify.XXXXXX") || refuse 1 "mktemp failed"
+mkdir "$tmp/home" || refuse 1 "mktemp failed"
+if ! cp -- "$sums_dir/SHA256SUMS" "$tmp/SHA256SUMS" ||
+    ! cp -- "$sums_dir/SHA256SUMS.sigstore.json" "$tmp/SHA256SUMS.sigstore.json"; then
+    refuse 1 "cannot copy SHA256SUMS from $sums_dir"
+fi
+
+# --- cosign ----------------------------------------------------------------
+command -v timeout >/dev/null 2>&1 || refuse 1 "timeout(1) not found"
+[ -x "$COSIGN" ] || refuse 1 "cosign not found at $COSIGN (install it, see the install guide)"
+root_only_exec "$COSIGN" ||
+    refuse 2 "cosign $COSIGN (its target or a parent directory) is not root-owned, is group/other-writable or is not a regular file"
+
+run_cosign() {
+    if [ -n "$COSIGN_GODEBUG" ]; then
+        timeout "$TIMEOUT" env HOME="$tmp/home" GODEBUG="$COSIGN_GODEBUG" "$COSIGN" "$@"
+    else
+        timeout "$TIMEOUT" env HOME="$tmp/home" "$COSIGN" "$@"
+    fi
+}
+
+run_cosign version >"$tmp/out" 2>&1
+rc=$?
+[ $rc -eq 124 ] && refuse 1 "cosign version timed out"
+[ $rc -eq 0 ] || refuse 1 "cosign version failed (exit $rc)"
+cver=$(sed -n 's/^GitVersion:[[:space:]]*v\{0,1\}\([0-9][0-9.]*\).*/\1/p' "$tmp/out" | head -n 1)
+[ -n "$cver" ] || refuse 1 "cannot read the cosign version"
+ver_ge "$cver" "$COSIGN_MIN" || refuse 1 "cosign $(clean "$cver") is older than $COSIGN_MIN"
+
+run_cosign verify-blob "$tmp/SHA256SUMS" \
+    --bundle "$tmp/SHA256SUMS.sigstore.json" \
+    --certificate-identity "$identity" \
+    --certificate-oidc-issuer "$ISSUER" \
+    --trusted-root "$TRUSTED_ROOT" >"$tmp/out" 2>&1
+rc=$?
+[ $rc -eq 124 ] && refuse 1 "cosign verify-blob timed out after ${TIMEOUT}s"
+[ $rc -eq 0 ] || refuse 1 "SHA256SUMS signature for $tag does not verify (cosign exit $rc)"
+# Accept only exit 0 together with a line that is exactly "Verified OK";
+# other output (warnings, progress) does not decide either way.
+grep -qx 'Verified OK' "$tmp/out" || refuse 1 "cosign did not report Verified OK for $tag"
+
+# --- digest and file name ----------------------------------------------------
+# Lines are "<hex>  <name>" (or "<hex> *<name>"). Exact match on both.
+match=$(awk -v h="$sha" -v f="$file" '
+    NF == 2 && $1 == h { n = $2; sub(/^\*/, "", n); if (n == f) ok = 1; else other = 1 }
+    END { if (ok) print "ok"; else if (other) print "other"; else print "none" }
+' "$tmp/SHA256SUMS")
+case $match in
+    ok) ;;
+    other) refuse 1 "digest is listed in SHA256SUMS for $tag under another file name (expected $file)" ;;
+    *) refuse 1 "digest is not in the verified SHA256SUMS for $tag" ;;
+esac
+
+log info "accepted $file ($tag, sha256 $sha)"
+cleanup
+exit 0
