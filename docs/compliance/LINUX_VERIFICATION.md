@@ -77,6 +77,7 @@ each item.
 | L33 | OCSP/CRL name resolution through the built-in resolver under the unit | SC-5, IA-5(2)(b)(1), SC-7 | POAM-025 (a), POAM-045 | PASS (2026-11-04, `deploy/tests/resolver/l33-resolver.sh` on `plat-linux`, kernel 6.8.0-147 aarch64, systemd 255, shipped `platd.service`, OCSP by AIA name under `hard_fail`, one run): (a) dnsmasq answers: handshake passes; (b) udp/tcp 53 dropped on the nft **input** hook: refused after 2111 ms (`budget_ms` 4000), `reason="timeout"` 0 → 1 (the procedure's **output**-hook rule fails the lookup in ~110 ms with `EPERM` from netfilter and counts `reason="error"`); (c) systemd-resolved stub 127.0.0.53: passes; (d) a name only in `/etc/hosts` resolves with DNS blackholed; (e) a resolv.conf edit is used 31 s after the edit (detected by the first lookup ≥ 30 s after the previous check, applied by the next lookup), a file without `nameserver` keeps the last good server (15/15 handshakes over 45 s, one `rejected` warning); (f) no `SIGSYS`/seccomp/`EPERM` for `plat-dns`; with `SystemCallErrorNumber=kill` lookups, timeouts and a reload pass and platd keeps running (NRestarts 0). Not run: x86_64, IPv6 nameservers, CRL by name |
 | L34 | Install-time signature gate (`usg-plat-verify`) in apt and dnf4 | SI-7(15), CM-14, SR-11, CM-7, AU-12 | POAM-044 (c), (f), (g) | PARTIAL (2026-11-06, arm64 podman containers, not systemd hosts): E-cases Debian 12 and Ubuntu 24.04 20/20, Rocky 9 and Rocky 10 20/20 (after the `python(abi)` fix, 790eb60); R-cases 16/16 on Debian 12 and Ubuntu 24.04; x86_64 CI (`verify-install`) and the first-tag release gate not run |
 | L35 | Live v0.4.0 install from the published repository through the gate | SI-7(15), CM-14, SR-11, CM-7 | POAM-044 (c) | PASS with a fix (2026-11-07, arm64 podman, live https://192d-wing.github.io/usg-plat-packages, upstream cosign v3.1.4): Rocky 9 and Rocky 10 6/6; Debian 12 and Ubuntu 24.04 refused `platd` on a stock image because `usg-plat-verify` 0.4.0 does not depend on curl/wget, so `fetch-sums` cached nothing (fail closed); with curl installed 8/8. Fix: Depends/Requires (E22), ships in the next release |
+| L36 | Live v0.4.1 install on stock images without curl/wget (L35 fix) | SI-7(15), CM-14, SR-11, CM-7 | POAM-044 (c) | PASS (2026-11-08, arm64 podman, live https://192d-wing.github.io/usg-plat-packages, upstream cosign v3.1.4): Debian 12 and Ubuntu 24.04 bootstrap pulls in curl and ca-certificates, `apt-get update` caches the v0.4.1 `SHA256SUMS`, `platd` 0.4.1-1 accepted by the gate; Rocky 9 and 10 `platd` 0.4.1-1 accepted. Not run: x86_64, systemd hosts, tamper cases (L07/L08 not repeated) |
 
 On macOS and in CI the real resolver runs against an in-process fake DNS
 server on 127.0.0.1 (`crates/plat-tls/tests/dns_fake_server.rs`): answers,
@@ -703,7 +704,28 @@ refused `platd` ("no SHA256SUMS ... for v0.4.0"). That is fail closed, but
 the documented install did not work there. The E-case harness preinstalls
 curl, which hid it. Fixed: `usg-plat-verify` now depends on `curl | wget`
 and `ca-certificates` (rpm: `curl`, `ca-certificates`), checked by E22; it
-ships in the release after v0.4.0. Not run: x86_64, systemd hosts.
+ships in v0.4.1 (L36). Not run: x86_64, systemd hosts.
+
+### L36 — live v0.4.1 install on stock images (POAM-044 (c))
+
+Re-run of L35 on v0.4.1 (tag `v0.4.1` at `7ff4c38`, 2026-11-08), which
+ships the E22 dependency. `verify-release.sh` passed on all 15 files
+(cosign v3.1.4, provenance verified). In arm64 podman containers with
+network, against the live repository, upstream cosign v3.1.4 at
+`/usr/local/bin/cosign`, and the verified `usg-plat-verify` 0.4.1 package
+installed with `apt-get install ./…` / `dnf install ./…`:
+
+| Case | Debian 12 / Ubuntu 24.04 | Rocky 9 / Rocky 10 | Checks |
+|------|--------------------------|--------------------|--------|
+| L36-1 | PASS | — | stock image has neither curl nor wget |
+| L36-2 | PASS | PASS | bootstrap install resolves the dependency: curl and ca-certificates installed (Rocky 9 satisfies `curl` with `curl-minimal`) |
+| L36-3 | PASS | — | `apt-get update` runs fetch-sums, which caches `releases/v0.4.1/SHA256SUMS` |
+| L36-4 | PASS | PASS | `apt-get install platd` / `dnf install platd` accepted by the gate; `platd` 0.4.1-1 installed |
+
+`dpkg -i` and `rpm -i` do not install dependencies, so the bootstrap step
+in `docs/install-verify.md` now uses `apt-get install ./…` and
+`dnf install ./…`. Not run: x86_64, systemd hosts; the L35 tamper and
+reinstall cases (L05–L08) were not repeated on v0.4.1.
 
 ### L26–L32 — XDP fast path (POAM-016 Phase 1)
 
