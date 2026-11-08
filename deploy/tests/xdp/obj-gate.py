@@ -343,11 +343,20 @@ def deepest_chain(subprogs, calls, depths):
 def evaluate(log, subprogs, calls, tail_calls, max_stack, max_insns):
     """(summary line, problems) for a verifier statistics log."""
     m_insns = re.search(r"processed (\d+) insns", log)
+    # Kernels before 7.3 print "stack depth A+B+..."; 7.3 prints
+    # "stack depth max N" plus one "subprog I (...) ... stack D" line each.
     m_stack = re.search(r"stack depth ([0-9+]+)", log)
-    if not m_insns or not m_stack:
+    sub = re.findall(r"^subprog (\d+) .*\bstack (\d+)\s*$", log, re.M)
+    if m_stack:
+        stack_text = m_stack.group(1)
+    elif sub and [int(i) for i, _ in sub] == list(range(len(sub))):
+        stack_text = "+".join(d for _, d in sub)
+    else:
+        stack_text = None
+    if not m_insns or stack_text is None:
         return None, ["verifier statistics missing (no 'processed N insns' / 'stack depth' line); failing closed"]
     insns = int(m_insns.group(1))
-    depths = [int(x) for x in m_stack.group(1).split("+")]
+    depths = [int(x) for x in stack_text.split("+")]
     if len(depths) != len(subprogs):
         return None, [f"verifier reports {len(depths)} stack depths for {len(subprogs)} subprograms"]
     chain = deepest_chain(subprogs, calls, depths)
@@ -356,7 +365,7 @@ def evaluate(log, subprogs, calls, tail_calls, max_stack, max_insns):
     if tail_calls and len(subprogs) > 1:
         budget = min(budget, STACK_BUDGET_TAILCALL)
     summary = (
-        f"insns_processed={insns} insn_budget={max_insns} stack_depths={m_stack.group(1)} "
+        f"insns_processed={insns} insn_budget={max_insns} stack_depths={stack_text} "
         f"deepest_chain={chain} (rounded {rounded}) stack_budget={budget} subprograms={len(subprogs)} "
         f"tail_calls={'yes' if tail_calls else 'no'}"
     )
@@ -400,6 +409,14 @@ def self_test():
     # main (0) calls 10, which calls 20; main also calls 30.
     sub, calls = [0, 10, 20, 30], [(2, 10), (12, 20), (4, 30)]
     multi = "stack depth 8+100+200+250\nprocessed 500 insns (limit 1000000)"
+    v73 = (
+        "verification time 14964 usec\nstack depth max 336\n"
+        "subprog 0 (<unknown>) main insns_self 4160 insns_total 4160 stack 336\n"
+        "processed 4160 insns (limit 1000000) max_states_per_insn 1 total_states 157"
+    )
+    v73m = "stack depth max 250\n" + "".join(
+        f"subprog {i} (f{i}) insns_self 1 insns_total 1 stack {d}\n" for i, d in enumerate([8, 100, 200, 250])
+    ) + "processed 500 insns (limit 1000000)"
     cases = [
         ("one frame within budget", evaluate(one, [0], [], False, 384, 8000), True),
         ("stack over budget", evaluate(one, [0], [], False, 320, 8000), False),
@@ -411,6 +428,12 @@ def self_test():
         ("deepest chain 308 > 307", evaluate(multi, sub, calls, False, 307, 8000), False),
         ("tail calls with subprograms: 256 B budget", evaluate(multi, sub, calls, True, 384, 8000), False),
         ("tail calls without subprograms keep the budget", evaluate(one, [0], [], True, 384, 8000), True),
+        # Linux 7.3 format: "stack depth max N" and per-subprogram lines.
+        ("7.3 format within budget", evaluate(v73, [0], [], False, 384, 8000), True),
+        ("7.3 format over budget", evaluate(v73, [0], [], False, 320, 8000), False),
+        ("7.3 multi-subprogram chain 308", evaluate(v73m, sub, calls, False, 308, 8000), True),
+        ("7.3 multi-subprogram chain 308 > 307", evaluate(v73m, sub, calls, False, 307, 8000), False),
+        ("7.3 'max' alone fails closed", evaluate("stack depth max 336\nprocessed 10 insns", [0], [], False, 384, 8000), False),
         # 15 chained 1-byte frames: raw 15 B passes, rounded 15 x 32 = 480 B fails.
         (
             "raw chain passes, rounded chain fails",
