@@ -30,8 +30,22 @@ const LEASE_MS: u64 = 1000;
 const PREFIX: u128 = 0x0064_ff9b_0001_0000_0000_0000_0000_0000;
 const SERVER: u32 = 0xcb00_7105; // 203.0.113.5
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+/// A free port that is none of the layout's member or witness ports.
+fn free_port_besides(l: &Layout) -> u16 {
+    loop {
+        let p = free_ports(1)[0];
+        if !l.ports.contains(&p) && l.witness != Some(p) {
+            return p;
+        }
+    }
+}
+
+/// `n` distinct free ports. Every listener stays open until all are picked:
+/// the kernel may hand out a just-closed ephemeral port again, and a witness
+/// port equal to a member's peer port fails config validation.
+fn free_ports(n: usize) -> Vec<u16> {
+    let held: Vec<TcpListener> = (0..n).map(|_| TcpListener::bind("127.0.0.1:0").unwrap()).collect();
+    held.iter().map(|l| l.local_addr().unwrap().port()).collect()
 }
 
 /// A short private directory (the operator socket path must stay under
@@ -91,7 +105,9 @@ struct Layout {
 
 impl Layout {
     fn new(members: usize, witness: bool) -> Self {
-        Self { ports: (0..members).map(|_| free_port()).collect(), witness: witness.then(free_port), auto: None }
+        let mut ports = free_ports(members + usize::from(witness));
+        let witness = witness.then(|| ports.pop().unwrap());
+        Self { ports, witness, auto: None }
     }
 }
 
@@ -510,7 +526,7 @@ fn duplicate_id_and_digest_mismatch_are_refused() {
     let _b = Node::start(member_cfg(&l, 1, l.ports[1], &pki, &sb.0, "", None));
     wait("B up at the witness", Duration::from_secs(10), || w.shared.net.is_up(1));
     // A clone of member 1 on another port dials the witness too.
-    let _b2 = Node::start(member_cfg(&l, 1, free_port(), &pki, &sb2.0, "", None));
+    let _b2 = Node::start(member_cfg(&l, 1, free_port_besides(&l), &pki, &sb2.0, "", None));
     wait("duplicate refused", Duration::from_secs(10), || w.shared.net.stats.rejected(RejectReason::DuplicateId) > 0);
     assert!(w.shared.health_problem().is_some());
     // The refusal is counted before its audit record is emitted, and the
@@ -947,7 +963,7 @@ fn impostor_of_a_live_member_is_a_duplicate_id() {
     wait("A up at the witness", Duration::from_secs(10), || w.shared.net.is_up(0));
     assert!(w.shared.health_problem().is_none());
     // Id 0 again, but with member 1's certificate.
-    let mut cfg = member_cfg(&l, 0, free_port(), &pki, &sx.0, "", None);
+    let mut cfg = member_cfg(&l, 0, free_port_besides(&l), &pki, &sx.0, "", None);
     let (cert, key) = pki.leaf(&ident(1));
     let ha = cfg.cluster.ha.as_mut().unwrap();
     ha.tls.cert_file = cert;
