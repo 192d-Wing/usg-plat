@@ -4,12 +4,19 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-08
+
 ### Fixed
 - `usg-plat-verify` now depends on `curl | wget` and `ca-certificates`
   (rpm: `curl`, `ca-certificates`). On a stock Debian or Ubuntu image
   without either client, `fetch-sums` cached no `SHA256SUMS`, and the gate
   refused `platd` (fail closed). Found on the live v0.4.0 install
   (LINUX_VERIFICATION L35); install case E22 checks the dependency.
+- XDP object gate (`deploy/tests/xdp/obj-gate.py`) reads the Linux 7.3
+  verifier statistics format (`stack depth max N` plus per-subprogram
+  `stack D` lines) as well as the older `stack depth A+B`; it still fails
+  closed when neither is present. The `xdp vm (latest)` jobs failed on
+  7.3.3 without this.
 
 ## [0.4.0] - 2026-11-07
 

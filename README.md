@@ -104,8 +104,8 @@ verification"). Residuals are in POAM-044.
 ### Verifying a release
 
 Download every file of a GitHub Release (for example
-`gh release download v0.4.0 -D dl`), then run
-`scripts/verify-release.sh dl v0.4.0` (or `make verify-release DIR=dl TAG=v0.4.0`).
+`gh release download v0.4.1 -D dl`), then run
+`scripts/verify-release.sh dl v0.4.1` (or `make verify-release DIR=dl TAG=v0.4.1`).
 It needs cosign v3.0.3 or later (the script checks `cosign version`). It
 also needs network access to the public Sigstore trust root, unless you pass
 `--trusted-root FILE`, a pinned `trusted_root.json` from
@@ -115,7 +115,7 @@ verify-blob` uses the file and needs no network. For one file it runs:
 
 ```sh
 cosign verify-blob --bundle <file>.sigstore.json \
-  --certificate-identity https://github.com/192d-Wing/usg-plat/.github/workflows/packages.yml@refs/tags/v0.4.0 \
+  --certificate-identity https://github.com/192d-Wing/usg-plat/.github/workflows/packages.yml@refs/tags/v0.4.1 \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   <file>
 ```
