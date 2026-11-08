@@ -63,7 +63,8 @@ and R04–R08 verify under it.
 ## 2. Bootstrap `usg-plat-verify` (one ungated install)
 
 The first `usg-plat-verify` install cannot be gated by itself. Verify it
-by hand on a workstation, then install it with `dpkg -i` or `rpm -i`:
+by hand on a workstation, then install it with `apt-get install ./…` or
+`dnf install ./…`:
 
 ```sh
 gh release download vX.Y.Z -R 192d-Wing/usg-plat -D dl
@@ -78,9 +79,14 @@ against the exact tag. Without `--trusted-root` it fetches the public
 Sigstore root over the network (TUF). Copy the verified package to the host:
 
 ```sh
-sudo dpkg -i usg-plat-verify_X.Y.Z-1_all.deb            # Debian / Ubuntu
-sudo rpm -i usg-plat-verify-X.Y.Z-1.noarch.rpm          # EL9 / EL10
+sudo apt-get install ./usg-plat-verify_X.Y.Z-1_all.deb  # Debian / Ubuntu
+sudo dnf install ./usg-plat-verify-X.Y.Z-1.noarch.rpm   # EL9 / EL10
 ```
+
+Use `apt-get install ./…` and `dnf install ./…`, not `dpkg -i` or
+`rpm -i`: from v0.4.1 the package depends on `curl | wget` and
+`ca-certificates`, which `dpkg -i` and `rpm -i` do not install. Stock
+Debian 12 and Ubuntu 24.04 images have neither curl nor wget (L35, L36).
 
 The install prints a warning when cosign is missing (E01) and still
 installs. On EL, `%pre` refuses a host whose dnf `PLUGINPATH` is neither
