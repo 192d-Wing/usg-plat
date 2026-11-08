@@ -4,6 +4,8 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-08
+
 ### Fixed
 - `usg-plat-verify` now depends on `curl | wget` and `ca-certificates`
   (rpm: `curl`, `ca-certificates`). On a stock Debian or Ubuntu image
