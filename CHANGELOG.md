@@ -4,6 +4,13 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 
 ## [Unreleased]
 
+### Fixed
+- `usg-plat-verify` now depends on `curl | wget` and `ca-certificates`
+  (rpm: `curl`, `ca-certificates`). On a stock Debian or Ubuntu image
+  without either client, `fetch-sums` cached no `SHA256SUMS`, and the gate
+  refused `platd` (fail closed). Found on the live v0.4.0 install
+  (LINUX_VERIFICATION L35); install case E22 checks the dependency.
+
 ## [0.4.0] - 2026-11-07
 
 ### Added

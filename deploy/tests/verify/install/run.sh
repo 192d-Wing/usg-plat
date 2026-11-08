@@ -2,7 +2,7 @@
 # Install-time gate tests (POAM-044 (c)): real apt / dnf in containers against
 # a throwaway local HTTPS repository (fixtures.sh) with dummy usg-plat
 # packages and the stand-in cosign. One function per case; case ids are
-# stable (E00-E21) and cited by docs/compliance/LINUX_VERIFICATION.md.
+# stable (E00-E22) and cited by docs/compliance/LINUX_VERIFICATION.md.
 #
 #   run.sh [--engine podman|docker] [--work DIR] [DISTRO...]
 #   run.sh --inside        (in the test container; used by the above)
@@ -188,6 +188,14 @@ apt_cases() {
     check want E01-bootstrap-dpkg-i 0
     check has E01-bootstrap-dpkg-i 'WARNING: cosign not found'
     verdict E01-bootstrap-dpkg-i PASS "gate installed, warns without cosign"
+    # E22: fetch-sums needs an https client; a minimal image has none, so the
+    # package must pull one in (found on the live v0.4.0 install).
+    start E22-depends-https-client
+    # shellcheck disable=SC2016 # dpkg-query format, not a shell expansion
+    run E22-depends-https-client dpkg-query -W -f '${Depends}\n' usg-plat-verify
+    check has E22-depends-https-client 'curl [|] wget'
+    check has E22-depends-https-client 'ca-certificates'
+    verdict E22-depends-https-client PASS "Depends names curl | wget and ca-certificates"
     point_conf
     sed -i "s|^URIs:.*|URIs: $BASE/apt|" /etc/apt/sources.list.d/usg-plat.sources
     sed -i "s|^Pin: origin .*|Pin: origin \"$HOST\"|" /etc/apt/preferences.d/usg-plat
@@ -380,6 +388,11 @@ dnf_cases() {
     check want E01-bootstrap-rpm-i 0
     check has E01-bootstrap-rpm-i 'WARNING: cosign not found'
     verdict E01-bootstrap-rpm-i PASS "gate installed, warns without cosign"
+    start E22-depends-https-client
+    run E22-depends-https-client rpm -q --requires usg-plat-verify
+    check has E22-depends-https-client 'curl'
+    check has E22-depends-https-client 'ca-certificates'
+    verdict E22-depends-https-client PASS "Requires names curl and ca-certificates"
     if [ -z "$(rpm_ver usg-plat-verify)" ]; then
         # E01 stays FAILED; continue without the dependency check so the
         # remaining cases still run.

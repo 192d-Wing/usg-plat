@@ -264,11 +264,28 @@ for d in $distros; do
     img=$(image_of "$d")
     mkdir -p "$work/out-$d"
     echo "real-release: === $d ($img)"
+    # usg-plat-verify depends on an https client (curl | wget) and
+    # ca-certificates, which the apt base images lack: add them with network
+    # in a prep container, then run the cases from that image without network.
+    prep=usg-plat-real-prep-$d-$$
+    # shellcheck disable=SC2016 # expanded by sh -c inside the container
+    case $d in
+        debian*|ubuntu*) pcmd='apt-get ${APT_OPTS:-} update && apt-get ${APT_OPTS:-} install -y --no-install-recommends curl ca-certificates' ;;
+        *) pcmd='command -v curl >/dev/null' ;;
+    esac
+    if ! "$engine" run --name "$prep" -e APT_OPTS="${APT_OPTS:-}" -e DEBIAN_FRONTEND=noninteractive \
+        "$img" sh -c "$pcmd" >"$work/out-$d/prep.log" 2>&1 ||
+        ! "$engine" commit "$prep" "localhost/$prep:latest" >>"$work/out-$d/prep.log" 2>&1; then
+        "$engine" rm -f "$prep" >/dev/null 2>&1
+        die "prerequisites for $d failed (see $work/out-$d/prep.log)"
+    fi
+    "$engine" rm -f "$prep" >/dev/null 2>&1
     "$engine" run --rm --network none \
         -v "$repo:/src:ro" -v "$vdir:/verify:ro" -v "$assets:/assets:ro" \
         -v "$work/cosign:/cosign:ro" -v "$work/out-$d:/out" \
-        "$img" sh /src/deploy/tests/verify/install/real-release.sh --inside
+        "localhost/$prep:latest" sh /src/deploy/tests/verify/install/real-release.sh --inside
     rc=$?
+    "$engine" rmi -f "localhost/$prep:latest" >/dev/null 2>&1
     [ $rc -eq 0 ] || status=1
     summary="$summary
 $d: $(tail -n 1 "$work/out-$d/results.txt" 2>/dev/null || echo 'no results') (exit $rc)"
