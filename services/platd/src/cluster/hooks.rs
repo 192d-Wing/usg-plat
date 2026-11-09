@@ -338,9 +338,10 @@ mod tests {
             Some(later.clone()),
             state.path().to_path_buf(),
             me(&d),
-            // Long enough for a loaded CI runner to write the pidfile
-            // before the kill; the script itself waits 30 s.
-            Duration::from_secs(2),
+            // Long enough for a loaded CI runner to start the shell and
+            // write the pidfile before the kill (2 s was not, on GitHub's
+            // ubuntu runner); the script itself waits 30 s.
+            Duration::from_secs(5),
             16,
             sink,
         )
@@ -361,7 +362,11 @@ mod tests {
         assert!(!ran.exists(), "a hook failing the re-check is not run");
         assert_eq!(h.stats.failures[0].load(Ordering::Relaxed), 1);
         // The background child of the killed hook is gone too.
-        let pid: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap_or_else(|e| panic!("hook was killed before it wrote {}: {e}", pidfile.display()))
+            .trim()
+            .parse()
+            .unwrap();
         let pid = rustix::process::Pid::from_raw(pid).unwrap();
         let t = Instant::now();
         while rustix::process::test_kill_process(pid).is_ok() {
@@ -383,7 +388,11 @@ mod tests {
         h.submit(job());
         h.join();
         assert_eq!(h.stats.failures[0].load(Ordering::Relaxed), 0);
-        let pid: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap_or_else(|e| panic!("hook was killed before it wrote {}: {e}", pidfile.display()))
+            .trim()
+            .parse()
+            .unwrap();
         let pid = rustix::process::Pid::from_raw(pid).unwrap();
         let t = Instant::now();
         while rustix::process::test_kill_process(pid).is_ok() {
