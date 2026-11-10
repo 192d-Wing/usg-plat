@@ -1,7 +1,7 @@
 # Roadmap
 
-Status as of 2026-11-05. The latest release is
-[v0.3.0](https://github.com/192d-Wing/usg-plat/releases/tag/v0.3.0)
+Status as of 2026-11-10. The latest release is
+[v0.4.2](https://github.com/192d-Wing/usg-plat/releases/tag/v0.4.2)
 (signed, see `CHANGELOG.md`). Gaps are tracked as POA&M items in
 [`docs/compliance/POAM.md`](docs/compliance/POAM.md); this file groups them
 into work and does not replace that register.
@@ -16,6 +16,7 @@ into work and does not replace that register.
 | Cluster scale-out and HA (CP-10) | Partial (POAM-007): slices, replication, leases, witness, takeover; three-VM runs with an FRR BGP/BFD edge (LINUX_VERIFICATION L19–L23) PASS (round 6, 2026-10-29): `kill -9` takeover 3.8 s and VM loss 3.4 s with 200/200 TCP flows, leader crash max 4.5 s over 27 trials (≤ 5 s target; the simulated worst case of ~6.2 s is not excluded); sessions not replicated (POAM-028) |
 | Host hardening (AC-6, SC-7, SC-39) | Implemented: capability-free `platd`, nftables forward policy with `plat-fwguard`; verified on one Ubuntu 24.04 VM |
 | XDP fast path (POAM-016) | Phase 1 code-complete (PRs #23–#28): established UDP in eBPF, `platd` as slow path, loader and systemd units, schema 8 records, `[xdp]` off by default, kernel ≥ 6.6. CI checks are required on `main` on x86_64 and aarch64 (#29). Speed-up not measured |
+| Releases and install-time verification (SI-7, SR-4, SR-11, CM-14) | Implemented, Partial (POAM-044): `v*` tags signed with cosign keyless and build provenance (v0.2.1 onwards, `scripts/verify-release.sh`); apt/dnf repository at https://192d-wing.github.io/usg-plat-packages/ and an offline tarball per tag; install-time gate `usg-plat-verify` (v0.4.0 onwards; apt hook + dnf4 plugin, `platd` depends on it). Packages install on EL9, Debian 12 and Ubuntu 22.04/24.04 (glibc floor 2.34). Live installs through the gate: L35 (v0.4.0, fixed in v0.4.1), L36 (v0.4.1) PASS; L37 offline mirror PARTIAL (apt fixed in v0.4.2, live re-run open). arm64 containers only |
 | Developer workflow | `/plat-workflow` multi-agent team for Claude Code and Codex (#30); CI: fmt/clippy (host + aarch64), Linux tests, cargo-audit/deny, XDP build/VM/proptest, SonarQube, CodeQL, docs site |
 
 See also [`COAs.md`](COAs.md) (data-plane throughput options; XDP hybrid
@@ -25,23 +26,32 @@ selected) and [`docs/jool-comparison.md`](docs/jool-comparison.md).
 
 Ordered by value for the effort, with what each needs.
 
-1. **XDP verification the VM can do (no new hardware).** Done
-   2026-11-03 (`test/xdp-linux-verification`): L30, L32 and L29 PASS, the two e2e cases written and passing. The L29
-   audit finding (a `kill -STOP` of `platd` ran the deadline out with no
-   `xdp_fastpath_state` record) is fixed and re-run. Left: the
-   intermittent `frag_needed_revalidate` failure.
+1. **Close out L37 (no new hardware).** Re-run the live apt offline-mirror
+   install (`file:` mirror, `--network none`) against v0.4.2, which carries
+   the apt-hook fix (E23). Then x86_64 runs of L34–L37 and an install on a
+   systemd host rather than a container.
 2. **XDP Phase 0: bare-metal measurement (needs hardware).** x86 host with
    a real NIC (zero-copy XDP driver) and an external traffic generator.
    Measures the actual speed-up over TUN, the `bib4` maximum hold ≤ 20 µs
    criterion, and L27 on a real NIC. This is the evidence POAM-016 exists
    for.
-3. **First release (v0.2.1).** Done 2026-11-03: [v0.2.1](https://github.com/192d-Wing/usg-plat/releases/tag/v0.2.1)
-   is published, cosign keyless signed with build provenance, and verified
-   end to end with `scripts/verify-release.sh`. Left: decide on apt/dnf
-   repository signing and install-time enforcement (POAM-044).
-4. **HA verification (POAM-007).** L19–L23 PASS on three VMs with FRR
+3. **HA verification (POAM-007).** L19–L23 PASS on three VMs with FRR
    (2026-10-29, round 6). Left: show the leader-crash worst case (~6.2 s in
    simulation) cannot occur or tighten it, and session pickup (POAM-028).
+
+Done since the last update:
+
+- **XDP verification the VM can do** (2026-11-03): L29, L30 and L32 PASS;
+  the TUN-only capture comparison and `frag_needed_revalidate` e2e cases
+  pass. The intermittent `frag_needed_revalidate` failure was a tcpdump
+  capture race in the test, fixed with `--immediate-mode` and a wait for
+  the Packet Too Big (20 of 20 runs pass, native and generic).
+- **Signed releases** v0.2.1 (2026-11-03) through v0.4.2 (2026-11-10),
+  verified end to end with `scripts/verify-release.sh`.
+- **Install-time enforcement (POAM-044 (c))** in v0.4.0 (2026-11-07):
+  `usg-plat-verify`, the apt/dnf repository and the offline tarball; fixes
+  from the live installs in v0.4.1 (curl/ca-certificates dependency) and
+  v0.4.2 (`file:` mirror in the apt hook).
 
 ## Backlog
 
@@ -61,6 +71,21 @@ Ordered by value for the effort, with what each needs.
 - Smaller items: preallocated pool for the per-BIB slot arrays (rule 2);
   sharded publisher threads above ~1 M flow lifecycles/s per node; the three
   test-string constants SonarQube flags in `deploy-scripts-test.sh`.
+- Level-4 e2e (`deploy/tests/xdp/e2e.sh`) runs by hand only, not in CI;
+  `capture_compare` does not run under `E2E_UNITS=1`.
+
+### Release and install-time verification (POAM-044 residuals)
+
+- (c) partial: `dpkg -i` / `rpm -U` and dnf5 bypass the gate.
+- (f): after a Sigstore key rotation, a stale pinned `trusted_root.json`
+  makes hosts refuse new releases (fail closed); needs a trust-root update
+  path.
+- (g), accepted: a refusal aborts the whole apt/dnf transaction, holding
+  back distro security updates in that run (unattended-upgrades,
+  dnf-automatic).
+- (h): downgrade refusal is in-transaction only (POAM044-SEC-006).
+- Repository metadata is unsigned by design; the gate verifies package
+  digests against the signed `SHA256SUMS` instead.
 
 ### Performance
 
@@ -97,6 +122,8 @@ Ordered by value for the effort, with what each needs.
   decision.
 - POAM-027: `verify-log` cannot tell a power cut from deliberate truncation
   of the newest file (tied to POAM-003).
+- POAM-043 (a): keyed chain v3 with an explicit algorithm field (with
+  POAM-003).
 
 ### TLS, PKI and FIPS
 
@@ -108,10 +135,16 @@ Ordered by value for the effort, with what each needs.
 - POAM-042: CNSA 2.0 applicability decision (AO / system owner). If it
   applies: a `tls` profile option (AES-256 only, SHA-384, ML-KEM-1024 or a
   P-384 + ML-KEM-1024 hybrid once FIPS-approved, ML-DSA-87 per POAM-041) and
-  a matching CBOM variant, on the AO's transition dates.
+  a matching CBOM variant, on the AO's transition dates. POAM-043 (b)–(e)
+  follow this decision.
 - POAM-041: ML-DSA (and Ed25519 / P-521) certificates are refused today; add
   them only with `sig.rs` OCSP/CRL rows, confirmed FIPS approval and an
   operator PKI.
+- POAM-045: OCSP/CRL host names resolve through hickory and bypass
+  nsswitch, with no fallback: names known only to NSS modules (`sss`,
+  `mdns4_minimal`, `myhostname`, LDAP/NIS) do not resolve.
+- POAM-046: addresses resolved for responder/CDP names are not filtered
+  (loopback, link-local, RFC 1918 and metadata addresses are reachable).
 
 ### Boundary and protocol
 
