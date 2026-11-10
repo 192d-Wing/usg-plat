@@ -290,6 +290,18 @@ mod tests {
     use super::*;
     use crate::test_pki::TempDir;
 
+    /// Held by every test that runs a hook. `Command::spawn` forks, and a
+    /// fork made while another test still has a script open for writing
+    /// inherits that descriptor until its own exec; the script's exec then
+    /// fails with ETXTBSY ("Text file busy") and the hook reports "not
+    /// started" (seen on GitHub's ubuntu runner). One test at a time means
+    /// no fork can overlap a script write.
+    static EXEC: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn exec_lock() -> std::sync::MutexGuard<'static, ()> {
+        EXEC.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
         let p = dir.join(name);
         std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
@@ -326,6 +338,7 @@ mod tests {
     /// times out is killed with everything it started (process group).
     #[test]
     fn timeout_kills_the_process_group_and_recheck_refuses() {
+        let _exec = exec_lock();
         let d = TempDir::new("hookrun");
         let pidfile = d.path().join("child.pid");
         let ran = d.path().join("ran");
@@ -378,6 +391,7 @@ mod tests {
     /// SEC-R1-2: a hook that exits normally leaves no background child.
     #[test]
     fn normal_exit_kills_the_process_group() {
+        let _exec = exec_lock();
         let d = TempDir::new("hookexit");
         let pidfile = d.path().join("child.pid");
         let bg = script(d.path(), "bg", &format!("sleep 30 &\necho $! > {}\nexit 0", pidfile.display()));
