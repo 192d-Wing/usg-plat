@@ -475,6 +475,75 @@ expect "foreign name, path with spaces, foreign package passes" 0 hook \
 no_newline_hook() { printf 'VERSION 3\n\nevil - - none < 1.0 amd64 none %s' "$W/arch/evil_1.0_amd64.deb" | "$W/libexec/apt-hook"; }
 expect "last line without a newline is still checked" 1 no_newline_hook
 
+# --- apt-hook: file: offline mirror ----------------------------------------------
+# apt passes a file: source's .deb in place. Below a mirror root from the
+# sources file or a file: REPO_BASE it must be checked against the cache, never
+# against sums beside it. $W/mpool/*/local.deb has sibling sums that list it
+# but is not in the cache, so it passes only when treated as local.
+for d in mirror/apt/pool/main mirror-evil/apt/pool/main base/apt/pool/main; do
+    mkdir -p "$W/$d"
+    cp "$W/arch/platd_0.3.0-1_amd64.deb" "$W/$d/"
+    cp "$W/local/platd_0.3.0-1_arm64.deb" "$W/local/SHA256SUMS" "$W/local/SHA256SUMS.sigstore.json" "$W/$d/"
+done
+mirror_sources() { printf 'Types: deb\nURIs: %s\nSuites: stable\nComponents: main\nTrusted: yes\n' "$1" >"$W/apt/usg-plat.sources"; }
+reset
+mirror_sources "file://$W//mirror/apt/"
+expect "mirror .deb in the cached sums passes (sibling sums do not list it)" 0 hook \
+    "platd - - none < 0.3.0-1 amd64 none $W/mirror/apt/pool/main/platd_0.3.0-1_amd64.deb"
+reset
+mirror_sources "file://$W/mirror/apt"
+expect "mirror .deb with only sibling sums refused (no SUMS_DIR override)" 1 hook \
+    "platd - - none < 0.3.0-1 arm64 none $W/mirror/apt/pool/main/platd_0.3.0-1_arm64.deb"
+reset
+mirror_sources "file:$W/mirror/apt"
+expect "file:/path URI form is a mirror root" 1 hook \
+    "platd - - none < 0.3.0-1 arm64 none $W/mirror/apt/pool/main/platd_0.3.0-1_arm64.deb"
+reset
+printf 'Types: deb\n  URIs: file://%s/mirror/apt\nSuites: stable\n' "$W" >"$W/apt/usg-plat.sources"
+expect "indented URIs: field is a mirror root" 0 hook \
+    "platd - - none < 0.3.0-1 amd64 none $W/mirror/apt/pool/main/platd_0.3.0-1_amd64.deb"
+reset
+printf 'Types: deb\nURIs: https://example.invalid/apt\n file://%s/mirror/apt\nSuites: stable\n' "$W" >"$W/apt/usg-plat.sources"
+expect "continuation-line URI is not a mirror root (local, refused without sibling sums)" 1 hook \
+    "platd - - none < 0.3.0-1 amd64 none $W/mirror/apt/pool/main/platd_0.3.0-1_amd64.deb"
+reset
+mirror_sources "file://$W/mirror"
+expect "sibling-prefix directory is local (sibling sums)" 0 hook \
+    "platd - - none < 0.3.0-1 arm64 none $W/mirror-evil/apt/pool/main/platd_0.3.0-1_arm64.deb"
+reset
+expect "dot-dot path into the mirror refused" 1 hook \
+    "platd - - none < 0.3.0-1 arm64 none $W/mirror/../mirror/apt/pool/main/platd_0.3.0-1_arm64.deb"
+reset
+mirror_sources "file://$W/mirror/../local"
+expect "dot-dot mirror URI ignored (local stays local)" 0 hook \
+    "platd - - none < 0.3.0-1 arm64 none $W/local/platd_0.3.0-1_arm64.deb"
+reason "dot-dot mirror URI logged" 'not a root-only local directory'
+reset
+mirror_sources "file://$W/mirror/apt"
+expect "local ./x.deb outside the mirror unchanged" 0 hook \
+    "platd - - none < 0.3.0-1 arm64 none $W/local/platd_0.3.0-1_arm64.deb"
+reset
+mirror_sources "file://$W/mirror/apt"
+chmod g+w "$W/apt/usg-plat.sources"
+expect "group-writable sources: its file: URIs are not mirror roots" 0 hook \
+    "platd - - none < 0.3.0-1 arm64 none $W/mirror/apt/pool/main/platd_0.3.0-1_arm64.deb"
+reason "group-writable sources logged" 'not used as mirror roots'
+chmod g-w "$W/apt/usg-plat.sources"
+reset
+ln -s "$W/mirror" "$W/mlink"
+mirror_sources "file://$W/mlink/apt"
+expect "symlinked mirror root ignored" 0 hook \
+    "platd - - none < 0.3.0-1 arm64 none $W/mirror/apt/pool/main/platd_0.3.0-1_arm64.deb"
+rm -f "$W/mlink" "$W/apt/usg-plat.sources"
+reset
+write_conf "REPO_BASE=file://$W/base"
+expect "file: REPO_BASE is a mirror root" 1 hook \
+    "platd - - none < 0.3.0-1 arm64 none $W/base/apt/pool/main/platd_0.3.0-1_arm64.deb"
+write_conf "REPO_BASE=file://$W/base"
+expect "file: REPO_BASE mirror .deb in the cached sums passes" 0 hook \
+    "platd - - none < 0.3.0-1 amd64 none $W/base/apt/pool/main/platd_0.3.0-1_amd64.deb"
+reset
+
 # --- configuration and trust root ownership (SEC-008) --------------------------------
 reset
 chmod g+w "$W/verify.conf"

@@ -20,8 +20,16 @@
 # (`apt install ./x.deb`) must be staged in a root-only directory such as
 # /root/pkgs, never /tmp or a home directory.
 #
+# A .deb in Dir::Cache::archives, or below a configured usg-plat file: mirror
+# root, is verified against the cached SHA256SUMS for its tag (verify-pkg
+# default). apt hands a file: source's .deb over in place, so without the
+# mirror rule every offline-mirror install was treated as local. Mirror roots
+# come only from root-owned configuration (the file: URIs in usg-plat.sources
+# and a file: REPO_BASE in verify.conf), never from the hook input; see
+# mirror_roots. Any other path is a local install: sums from its directory.
+#
 # Test hooks (environment): USG_PLAT_VERIFY_CONF, USG_PLAT_VERIFY_STATE,
-# USG_PLAT_VERIFY_TEXTFILE_DIR, USG_PLAT_VERIFY_LIBEXEC
+# USG_PLAT_VERIFY_TEXTFILE_DIR, USG_PLAT_VERIFY_APT_SOURCES, USG_PLAT_VERIFY_LIBEXEC
 # [/usr/libexec/usg-plat-verify], USG_PLAT_VERIFY_PATH, USG_PLAT_VERIFY_TEST_TOP
 # (see verify-pkg); honoured only with USG_PLAT_VERIFY_TEST=1.
 # USG_PLAT_ALLOW_DOWNGRADE=1 is an operator override, always logged.
@@ -110,6 +118,7 @@ CONF=${USG_PLAT_VERIFY_CONF:-/etc/usg-plat-verify/verify.conf}
 STATE=${USG_PLAT_VERIFY_STATE:-/var/lib/usg-plat-verify}
 TEXTFILE_DIR=${USG_PLAT_VERIFY_TEXTFILE_DIR:-/var/lib/node_exporter/textfile_collector}
 LIBEXEC=${USG_PLAT_VERIFY_LIBEXEC:-/usr/libexec/usg-plat-verify}
+SOURCES=${USG_PLAT_VERIFY_APT_SOURCES:-/etc/apt/sources.list.d/usg-plat.sources}
 
 pname='' pver=''
 
@@ -157,7 +166,7 @@ refuse() { # reason
 
 [ -f "$CONF" ] && [ -r "$CONF" ] || refuse "configuration $CONF missing or unreadable"
 root_only "$CONF" || refuse "configuration $CONF (or a parent directory) is not root-owned or is group/other-writable"
-NAMES='' ALLOW_DOWNGRADE=0
+NAMES='' ALLOW_DOWNGRADE=0 REPO_BASE=''
 # shellcheck source=deploy/verify/etc/verify.conf
 . "$CONF" || refuse "configuration $CONF does not parse"
 [ -n "$NAMES" ] || refuse "NAMES is empty"
@@ -167,6 +176,67 @@ if [ "${USG_PLAT_ALLOW_DOWNGRADE:-0}" = 1 ]; then
     allow_down=1
     log warning "USG_PLAT_ALLOW_DOWNGRADE=1 in the environment: downgrades of usg-plat packages are allowed for this transaction"
 fi
+
+# mirror_root URI: print the normalised local directory of a file: URI
+# (file:///p or file:/p; file://host is not local), or fail. "//" collapses,
+# a trailing "/" goes; ".", ".." and empty results, and characters outside a
+# plain path set (percent-escapes, spaces, glob characters), are refused.
+# The root must pass root_only (no symlink in it or above it), so a root
+# that a local user could redirect is never a mirror.
+mirror_root() {
+    case $1 in
+        file:///*) mr_p=${1#file://} ;;
+        file:/[!/]*) mr_p=${1#file:} ;;
+        *) return 1 ;;
+    esac
+    mr_p=$(printf '%s\n' "$mr_p" | sed -e 's://*:/:g' -e 's:/$::')
+    case $mr_p in
+        '' | *[!A-Za-z0-9._+~/-]*) return 1 ;;
+        */./* | */../* | */. | */..) return 1 ;;
+        *) ;;
+    esac
+    root_only "$mr_p" || return 1
+    printf '%s\n' "$mr_p"
+}
+
+# mirror_roots: one root per line from the file: URIs of $SOURCES (only when
+# it is root_only) and a file: REPO_BASE. Unusable entries are skipped and
+# logged; they never widen the set. Only single-line `URIs:` fields are read
+# (leading blanks allowed); a URI on a continuation line is not a root, so its
+# .debs fall back to the local path (sibling sums), which is stricter.
+#
+# COMPLIANCE MAPPING:
+# - NIST 800-53: CM-6 (Configuration Settings) - roots come only from the
+#   root-only sources file and verify.conf, never from hook input
+mirror_roots() {
+    mrs_u=''
+    if [ -f "$SOURCES" ]; then
+        if root_only "$SOURCES"; then
+            mrs_u=$(sed -n 's/^[[:space:]]*URIs:[[:space:]]*//p' "$SOURCES")
+        else
+            log warning "$SOURCES (or a parent directory) is not root-owned or is group/other-writable: its file: URIs are not used as mirror roots"
+        fi
+    fi
+    case ${REPO_BASE:-} in file:*) mrs_u="$mrs_u $REPO_BASE" ;; *) ;; esac
+    # No pathname expansion: a glob in a URI must be refused by mirror_root,
+    # not expanded against the filesystem first.
+    set -f
+    for mrs_x in $mrs_u; do
+        case $mrs_x in file:*) ;; *) continue ;; esac
+        mirror_root "$mrs_x" ||
+            log warning "mirror URI $(clean "$mrs_x") is not a root-only local directory: ignored"
+    done
+    set +f
+}
+
+# in_mirror PATH: PATH lies strictly below one of $MIRRORS (directory
+# boundary: /srv/usg-plat-evil is not below /srv/usg-plat).
+in_mirror() {
+    for im_r in $MIRRORS; do
+        case $1 in "$im_r"/*) return 0 ;; *) ;; esac
+    done
+    return 1
+}
 
 ours() {
     for n in $NAMES; do
@@ -195,6 +265,8 @@ case $cache in /*) ;; *) cache="$dir/$cache" ;; esac
 case $archives in /*) ;; *) archives="$cache/$archives" ;; esac
 # Collapse "//" and drop the trailing "/".
 archives=$(printf '%s\n' "$archives" | sed -e 's://*:/:g' -e 's:/$::')
+# Roots contain no whitespace (mirror_root), so newline/space splitting is safe.
+MIRRORS=$(mirror_roots)
 
 # --- actions -------------------------------------------------------------------
 # Fields are separated by single spaces; the action (a path) is the rest of
@@ -271,7 +343,12 @@ HOOKLINE
     [ -n "$pdir" ] || pdir=/
     h=$(sha256sum -- "$action" 2>/dev/null) || refuse "cannot hash $(clean "$action")"
     h=${h%% *}
-    if [ "$pdir" = "$archives" ]; then
+    # COMPLIANCE MAPPING:
+    # - NIST 800-53: SI-7(15) (Code Authentication), CM-14 (Signed Components),
+    #   SR-11 (Component Authenticity) - an apt cache or offline-mirror .deb is
+    #   checked against the cached, cosign-verified SHA256SUMS only (no
+    #   sibling-sums override); CM-6 - mirror roots from root-only config only
+    if [ "$pdir" = "$archives" ] || in_mirror "$action"; then
         "$LIBEXEC/verify-pkg" --name "$name" --version "$nv" --arch "$na" --sha256 "$h" </dev/null
     else
         USG_PLAT_VERIFY_SUMS_DIR=$pdir \

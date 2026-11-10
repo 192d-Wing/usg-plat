@@ -2,7 +2,7 @@
 # Install-time gate tests (POAM-044 (c)): real apt / dnf in containers against
 # a throwaway local HTTPS repository (fixtures.sh) with dummy usg-plat
 # packages and the stand-in cosign. One function per case; case ids are
-# stable (E00-E22) and cited by docs/compliance/LINUX_VERIFICATION.md.
+# stable (E00-E23) and cited by docs/compliance/LINUX_VERIFICATION.md.
 #
 #   run.sh [--engine podman|docker] [--work DIR] [DISTRO...]
 #   run.sh --inside        (in the test container; used by the above)
@@ -146,6 +146,15 @@ PY
         sleep 0.25
     done
     die "test services did not start (see $OUT/https.log)"
+}
+
+# mirror_unpack TREE: replace /srv/usg-plat with a root-owned copy of TREE
+# (an operator unpacking the offline tarball, docs/install-verify.md §4).
+mirror_unpack() {
+    mu_tree=$1
+    rm -rf /srv/usg-plat
+    mkdir -p /srv
+    cp -R "$mu_tree" /srv/usg-plat && chown -R 0:0 /srv/usg-plat && chmod -R go-w /srv/usg-plat
 }
 
 # Point the shipped configuration at the test repository (an operator of a
@@ -340,6 +349,47 @@ apt_cases() {
     run E18-selftest-bad-origin AG update
     check want E18-selftest-bad-origin 0
     verdict E18-selftest-bad-origin PASS "origin with a scheme fails apt-get update (exit $rc after restore)"
+
+    # E23: offline file: mirror (docs/install-verify.md §4). apt hands a file:
+    # source's .deb over in place (not via Dir::Cache::archives); the gate must
+    # still check it against the cached, verified SHA256SUMS for its tag, not
+    # sums beside it. Then the mirror is replaced by one with a substitute
+    # platd <P2> (same Package/Version/Arch, regenerated Packages/Release with
+    # the same Origin/Label/Codename): refused, platd unchanged.
+    dpkg -r platd >/dev/null 2>&1
+    cp -p /etc/apt/sources.list.d/usg-plat.sources /root/usg-plat.sources.https
+    cp -p /etc/apt/preferences.d/usg-plat /root/usg-plat.pref.https
+    cp -p /etc/usg-plat-verify/verify.conf /root/verify.conf.https
+    start E23-file-mirror
+    mirror_unpack /fx/www/usg-plat-packages
+    sed -i "s|^URIs:.*|URIs: file:/srv/usg-plat/apt|" /etc/apt/sources.list.d/usg-plat.sources
+    sed -i 's|^Pin: origin .*|Pin: origin ""|' /etc/apt/preferences.d/usg-plat
+    sed -i "s|^REPO_BASE=.*|REPO_BASE=file:///srv/usg-plat|" /etc/usg-plat-verify/verify.conf
+    rm -rf "$STATE/releases"
+    run E23-file-mirror AG update
+    check want E23-file-mirror 0
+    check test -f "$STATE/releases/v$P1/SHA256SUMS"
+    run E23-file-mirror apt-cache policy platd
+    check has E23-file-mirror 'file:/srv/usg-plat/apt stable/main'
+    run E23-file-mirror AG install "platd=$P1-1"
+    check want E23-file-mirror 0
+    check has E23-file-mirror "accepted platd_$P1-1_$DA.deb"
+    check test "$(apt_ver platd)" = "$P1-1"
+    check test ! -e "/var/cache/apt/archives/platd_$P1-1_$DA.deb"
+    run E23-file-mirror AG install --reinstall usg-plat-verify
+    check want E23-file-mirror 0
+    check has E23-file-mirror "accepted usg-plat-verify_${VV}-1_all.deb"
+    mirror_unpack /fx/submirror/usg-plat-packages
+    run E23-file-mirror AG update
+    check want E23-file-mirror 0
+    run E23-file-mirror AG install "platd=$P2-1"
+    check want E23-file-mirror nz
+    check has E23-file-mirror "refusing platd $P2-1 $DA: .*not in the verified SHA256SUMS"
+    check test "$(apt_ver platd)" = "$P1-1"
+    verdict E23-file-mirror PASS "platd $P1-1 and a usg-plat-verify reinstall from a file: mirror accepted; substitute $P2-1 refused, stays $P1-1"
+    cp -p /root/usg-plat.sources.https /etc/apt/sources.list.d/usg-plat.sources
+    cp -p /root/usg-plat.pref.https /etc/apt/preferences.d/usg-plat
+    cp -p /root/verify.conf.https /etc/usg-plat-verify/verify.conf
 }
 
 # ---------------------------------------------------------------------------------
@@ -536,6 +586,34 @@ dnf_cases() {
     check want E17-foreign-pkg-eq-ver nz
     check test -z "$(rpm_ver usg-test-foreign)"
     verdict E17-foreign-pkg-eq-ver PASS "includepkgs also hides an explicit foreign name-version"
+
+    # E23: offline file:/// mirror, as for apt: platd <P1> from the mirror is
+    # accepted against the cached sums; a substitute platd <P2> (same NEVRA,
+    # repodata regenerated) is refused and platd stays <P1>.
+    rpm -e platd >/dev/null 2>&1
+    cp -p /etc/yum.repos.d/usg-plat.repo /root/usg-plat.repo.https
+    cp -p /etc/usg-plat-verify/verify.conf /root/verify.conf.https
+    start E23-file-mirror
+    mirror_unpack /fx/www/usg-plat-packages
+    # shellcheck disable=SC2016 # $basearch is a dnf variable
+    sed -i 's|^baseurl=.*|baseurl=file:///srv/usg-plat/rpm/$basearch|' /etc/yum.repos.d/usg-plat.repo
+    sed -i "s|^REPO_BASE=.*|REPO_BASE=file:///srv/usg-plat|" /etc/usg-plat-verify/verify.conf
+    rm -rf "$STATE/releases"
+    run E23-file-mirror DNF clean all
+    run E23-file-mirror DNF install "platd-$P1-1"
+    check want E23-file-mirror 0
+    check has E23-file-mirror "accepted platd-$P1-1.$RA.rpm"
+    check test "$(rpm_ver platd)" = "$P1-1"
+    mirror_unpack /fx/submirror/usg-plat-packages
+    run E23-file-mirror DNF clean all
+    run E23-file-mirror DNF upgrade platd
+    check want E23-file-mirror nz
+    check has E23-file-mirror 'usg-plat-verify: refusing platd'
+    check has E23-file-mirror 'not in the verified SHA256SUMS'
+    check test "$(rpm_ver platd)" = "$P1-1"
+    verdict E23-file-mirror PASS "platd $P1-1 from a file:/// mirror accepted; substitute $P2-1 refused, stays $P1-1"
+    cp -p /root/usg-plat.repo.https /etc/yum.repos.d/usg-plat.repo
+    cp -p /root/verify.conf.https /etc/usg-plat-verify/verify.conf
 }
 
 # Common to both: the refusals above were logged and recorded.

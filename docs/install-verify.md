@@ -226,9 +226,34 @@ accepts a `file:` source only with `Pin: origin ""`, and it refuses
 `file: source with origin "" passes`, `file: source with origin REPO_HOST fails`,
 `mixed https and file: sources fail`, `http: source with origin "" fails`,
 `fetch-sums from a file:// base`). Both apt and dnf offline mirrors
-pass `selftest`. No install case (E-series) covers an
-install from a `file:` mirror yet. The release gate requires one install
-from the offline tarball (`LINUX_VERIFICATION.md` L34, not run).
+pass `selftest`.
+
+The apt hook verifies a `.deb` read in place from a `file:` mirror
+against the cached, cosign-verified `SHA256SUMS` for the tag, the same
+as a downloaded package (no sibling `SHA256SUMS` override). Mirror roots
+come only from the `file:` `URIs:` of the root-only
+`/etc/apt/sources.list.d/usg-plat.sources` and a `file:` `REPO_BASE` in
+`verify.conf`, never from the package path. Install case E23 (apt and
+dnf, arm64 containers) installs `platd` from a `file:` mirror and refuses
+a substitute package with regenerated repository metadata.
+
+Operator requirements for the mirror root:
+
+- The mirror tree (for example `/srv/usg-plat`) and every ancestor must be
+  owned by uid 0, not group- or other-writable, and not a symlink.
+  Otherwise the root is ignored (logged at `authpriv`) and installs from
+  it are refused.
+- The mirror root must be a dedicated directory that holds only the
+  unpacked tarball. Do not use a broad root such as `file:/srv` or
+  `file:/root`: every package under a mirror root is checked against the
+  cached `SHA256SUMS` only, so a local install staged elsewhere under it
+  (for example `/root/pkgs/x.deb` with its sibling `SHA256SUMS`) is
+  refused (fail closed).
+
+Live offline tarball run (`LINUX_VERIFICATION.md` L37, v0.4.1): dnf
+passed on Rocky 9 and 10. apt on v0.4.1 refused the mirror install (fail
+closed); this change fixes that (E23), and the live apt re-run with the
+fix is still open.
 
 dnf: point `baseurl=file:///srv/usg-plat/rpm/$basearch` at the unpacked
 tree and set `REPO_BASE=file:///srv/usg-plat` as above. `selftest --dnf`
