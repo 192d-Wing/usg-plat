@@ -681,10 +681,11 @@ with the previous `apt-hook`, Debian 12 gave 22/1, E23 failing with
 branch of E23 also reinstalls `usg-plat-verify` from the mirror through
 the gate (the second command refused in L37).
 
-Not covered: x86_64 (the `ci.yml` `verify-install` job on
-`ubuntu-24.04` and `ubuntu-24.04-arm` has not run on GitHub); systemd
-hosts and real `unattended-upgrades` timers; dnf5 (the live offline tarball install, L37, passed on dnf with v0.4.1
-and on apt with v0.4.2, arm64 containers only). Release gate before any status
+Not covered: x86_64 outside CI (the `ci.yml` `verify-install` job
+passed on `ubuntu-24.04` and `ubuntu-24.04-arm` for all four distros on
+PR #64); systemd hosts and real `unattended-upgrades` timers; dnf5. The
+live offline tarball install (L37) passed on dnf with v0.4.1 and on apt
+with v0.4.2, on arm64 containers only. Release gate before any status
 leaves Partial: clean-VM installs from Pages on Debian 12 and Rocky 9,
 and one install from the offline tarball (L37: met in arm64 containers,
 dnf on v0.4.1 and apt on v0.4.2; not on a VM).
