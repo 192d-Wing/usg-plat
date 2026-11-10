@@ -79,6 +79,7 @@ each item.
 | L35 | Live v0.4.0 install from the published repository through the gate | SI-7(15), CM-14, SR-11, CM-7 | POAM-044 (c) | PASS with a fix (2026-11-07, arm64 podman, live https://192d-wing.github.io/usg-plat-packages, upstream cosign v3.1.4): Rocky 9 and Rocky 10 6/6; Debian 12 and Ubuntu 24.04 refused `platd` on a stock image because `usg-plat-verify` 0.4.0 does not depend on curl/wget, so `fetch-sums` cached nothing (fail closed); with curl installed 8/8. Fix: Depends/Requires (E22), ships in the next release |
 | L36 | Live v0.4.1 install on stock images without curl/wget (L35 fix) | SI-7(15), CM-14, SR-11, CM-7 | POAM-044 (c) | PASS (2026-11-08, arm64 podman, live https://192d-wing.github.io/usg-plat-packages, upstream cosign v3.1.4): Debian 12 and Ubuntu 24.04 bootstrap pulls in curl and ca-certificates, `apt-get update` caches the v0.4.1 `SHA256SUMS`, `platd` 0.4.1-1 accepted by the gate; Rocky 9 and 10 `platd` 0.4.1-1 accepted. Not run: x86_64, systemd hosts, tamper cases (L07/L08 not repeated) |
 | L37 | Live v0.4.1 and v0.4.2 installs from the offline tarball (`file:` mirror, no network) | SI-7(15), CM-14, SR-11, CM-7 | POAM-044 (c) | PASS on arm64 containers (podman, `--network none`, tarball from the publish run, upstream cosign v3.1.4). dnf, v0.4.1 (2026-11-09): Rocky 9 and Rocky 10 12/12, substitute rpm with regenerated metadata refused. apt, v0.4.1: `apt-get install platd` and reinstall of `usg-plat-verify` refused (fail closed; apt passes `file:` debs in place), fixed in v0.4.2. apt, v0.4.2 (2026-11-10): Debian 12 14/14; Ubuntu 24.04 13/14, the one failure a harness check (`dpkg --verify` reports doc files the image's `path-exclude` never installed; output identical before and after the refusal); substitute `.deb` with regenerated metadata refused on both. dnf not repeated on v0.4.2. Not run: x86_64, systemd hosts |
+| L38 | Live v0.4.2 installs on clean VMs under systemd: published repository and offline tarball | SI-7(15), CM-14, SR-11, CM-7 | POAM-044 (c) | PASS (2026-11-10, two fresh Lima VMs, aarch64, systemd 252 as PID 1, upstream cosign v3.1.4): Debian 12 (kernel 6.1) repository 14/14, offline tarball 13/13; Rocky 9.8 (kernel 5.14) repository 13/13 valid checks, offline tarball 11/11 on the second run (the first lost `nftables` to the harness); substitute `platd` with regenerated metadata refused on both; post-install: `plat` user, `platd.service` loads and passes `systemd-analyze verify`, `check-config` exit 0. Not run: x86_64, service start, `unattended-upgrades` run; offline by removing the default route only |
 
 On macOS and in CI the real resolver runs against an in-process fake DNS
 server on 127.0.0.1 (`crates/plat-tls/tests/dns_fake_server.rs`): answers,
@@ -683,12 +684,14 @@ the gate (the second command refused in L37).
 
 Not covered: x86_64 outside CI (the `ci.yml` `verify-install` job
 passed on `ubuntu-24.04` and `ubuntu-24.04-arm` for all four distros on
-PR #64); systemd hosts and real `unattended-upgrades` timers; dnf5. The
-live offline tarball install (L37) passed on dnf with v0.4.1 and on apt
-with v0.4.2, on arm64 containers only. Release gate before any status
+PR #64); a real `unattended-upgrades` run and starting `platd` after a
+gated install; dnf5. The live offline tarball install passed in arm64
+containers (L37: dnf on v0.4.1, apt on v0.4.2) and on arm64 VMs under
+systemd (L38, v0.4.2, apt and dnf). Release gate before any status
 leaves Partial: clean-VM installs from Pages on Debian 12 and Rocky 9,
-and one install from the offline tarball (L37: met in arm64 containers,
-dnf on v0.4.1 and apt on v0.4.2; not on a VM).
+and one install from the offline tarball. L38 meets it on aarch64 VMs;
+the status stays Partial for the gaps listed in POAM-044 (c), (f), (g)
+and (h).
 
 ### L35 — live v0.4.0 install from the published repository (POAM-044 (c))
 
@@ -792,6 +795,55 @@ output.
 
 Status: **PASS** on arm64 containers (dnf on v0.4.1, apt on v0.4.2). The
 dnf cases were not repeated on v0.4.2. Not run: x86_64, systemd hosts.
+
+### L38 — live v0.4.2 installs on clean VMs under systemd (POAM-044 (c))
+
+v0.4.2 installed on two VMs created for this run (2026-11-10, Lima 2.3.0,
+`vz`, aarch64, 2 vCPU, 2 GiB, stock `debian-12` and `rocky-9` templates):
+Debian 12 (kernel 6.1.0-54-cloud-arm64) and Rocky Linux 9.8 (kernel
+5.14.0-687.10.1.el9_8), both with systemd 252 as PID 1. cosign is
+upstream v3.1.4, installed by hand. The bootstrap `usg-plat-verify`
+package is the release file that `scripts/verify-release.sh` accepted.
+
+Published repository (network on):
+
+| Case | Debian 12 | Rocky 9 | Checks |
+| ---- | --------- | ------- | ------ |
+| L38-1 | PASS | PASS | bootstrap with `apt-get install ./…` / `dnf install ./…`; `SHA256SUMS` for v0.4.2 cached |
+| L38-2 | PASS | PASS | `platd` 0.4.2-1 installed from the Pages repository; the gate logs "accepted" with the package SHA-256 |
+| L38-3 | PASS | PASS | `usg-plat-verify selftest`; reinstall of `usg-plat-verify` through the gate |
+| L38-4 | PASS | PASS | maintainer scripts under systemd: `plat` user and group exist; `platd.service` is loaded and passes `systemd-analyze verify`; no failed units; unit installed disabled and inactive |
+| L38-5 | PASS | PASS | `platd --version` reports 0.4.2; `platd check-config -c /etc/plat/platd.toml` exits 0 |
+| L38-6 | PASS (other reason) | PASS | a rebuilt `platd` 0.4.2-1 offered as a local file is refused and `last-refusal` is written; installed files unchanged. dnf: "no SHA256SUMS and SHA256SUMS.sigstore.json for v0.4.2" beside the file. apt: refused as "downgrade from 0.4.2-1 refused (ALLOW_DOWNGRADE=0)", because apt treats a same-version local file as a downgrade, so the digest check was not reached in this case |
+
+Debian 12: 14/14. Rocky 9: 13 of 14; the failing check was a harness
+error (`usg-plat-verify selftest --dnf` is not a command of the wrapper;
+plain `selftest` passed).
+
+Offline tarball (`usg-plat-repo-v0.4.2.tar` from publish run
+42817378871, unpacked to a root-owned `/srv/usg-plat`,
+`REPO_BASE=file:///srv/usg-plat`), on the same VMs after removing both
+packages and the cached `SHA256SUMS`. The default route was removed
+first: `curl` to the Pages host could not connect, but the interface
+stayed up and Lima's on-link resolver still answered DNS.
+
+| Case | Debian 12 | Rocky 9 | Checks |
+| ---- | --------- | ------- | ------ |
+| L38-7 | PASS | PASS | bootstrap package in the tarball byte-identical to the verified release file; bootstrap install; `SHA256SUMS` fetched from `file:`; `selftest` |
+| L38-8 | PASS | PASS | `platd` 0.4.2-1 installed from the `file:` mirror; reinstall of `usg-plat-verify` through the gate |
+| L38-9 | PASS | PASS | substitute `platd` 0.4.2-1 with regenerated metadata (`apt-ftparchive` / `createrepo_c`) refused: "digest is not in the verified SHA256SUMS for v0.4.2"; `last-refusal` written |
+| L38-10 | PASS | PASS | after the refusal `dpkg --verify` / `rpm -V --noconfig` is clean and the `platd` binary is unchanged |
+
+Debian 12: 13/13. Rocky 9: 11/11 on the second run. The first run
+failed at the `platd` install: removing `platd` beforehand had also
+removed `nftables` as an unused dependency, so the offline install had
+no provider for it. `nftables` was reinstalled with the route restored,
+and the run repeated from a fresh copy of the mirror.
+
+Status: **PASS** on aarch64 VMs. Not run: x86_64 VMs or bare metal;
+starting `platd.service`; an `unattended-upgrades` run (the apt timers
+are present on the Debian VM, nothing was pending); Ubuntu 24.04 and
+Rocky 10 VMs; dnf5.
 
 ### L26–L32 — XDP fast path (POAM-016 Phase 1)
 
