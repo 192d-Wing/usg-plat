@@ -23,6 +23,8 @@
 #   tamper/    the same names, one payload byte changed (.rpm rebuilt, see below)
 #   badsums/   good packages, SHA256SUMS with one extra line (signature no longer matches)
 #   unlisted/  platd <P3>, in no SHA256SUMS (dpkg -i / rpm -U bypass)
+#   submirror/usg-plat-packages/  www copy with substitute platd <P2> packages and
+#              regenerated indexes (file: mirror substitution, E23)
 #
 # The usg-plat repository also carries usg-plat-pin-canary 0.0.0 and, to
 # simulate a compromised Pages site, usg-test-foreign 99.0 (a foreign name
@@ -252,6 +254,49 @@ for a in x86_64 aarch64; do createrepo_c -q "$www/rpm/$a"; done
     mv -- "$work/Release" Release
 )
 createrepo_c -q "$out/distro/rpm"
+
+# --- submirror/: a substituted offline mirror (E23) ----------------------------------
+# A copy of www/usg-plat-packages in which every platd <P2> package is rebuilt
+# (same Package/Version/Arch and NEVRA, different payload) and the indexes are
+# regenerated with the same Origin/Label/Codename, as an attacker who can write
+# the mirror tree would. releases/ is unchanged, so the substitutes are in no
+# SHA256SUMS.
+sub=$out/submirror/usg-plat-packages
+mkdir -p "$out/submirror"
+cp -R -- "$www" "$sub"
+MARKER=USGPLAT-FIXTURE-PAYLOAD-C
+for a in amd64 arm64; do mkdeb platd "$P2-1" "$a" "$sub/apt/pool/main" usg-plat-verify; done
+# mkdeb / mkrpm reuse their <P2> build trees: control, spec and payload are rewritten.
+for a in x86_64 aarch64; do
+    mkrpm platd "$P2" "$a" "$sub/rpm/$a" usg-plat-verify
+    rm -rf -- "$sub/rpm/$a/repodata"
+    createrepo_c -q "$sub/rpm/$a"
+done
+for f in "$sub"/apt/pool/main/platd_"$P2"-1_*.deb "$sub"/rpm/*/platd-"$P2"-1.*.rpm; do
+    rel=${f#"$sub"/}
+    if cmp -s "$f" "$www/$rel"; then
+        echo "fixtures: substitute $rel equals the original" >&2
+        exit 1
+    fi
+done
+(
+    cd "$sub/apt"
+    rm -rf dists
+    for a in amd64 arm64; do
+        mkdir -p "dists/stable/main/binary-$a"
+        apt-ftparchive --arch "$a" packages pool/main >"dists/stable/main/binary-$a/Packages"
+        gzip -9nk "dists/stable/main/binary-$a/Packages"
+    done
+    apt-ftparchive \
+        -o APT::FTPArchive::Release::Origin=usg-plat \
+        -o APT::FTPArchive::Release::Label=usg-plat \
+        -o APT::FTPArchive::Release::Suite=stable \
+        -o APT::FTPArchive::Release::Codename=stable \
+        -o "APT::FTPArchive::Release::Architectures=amd64 arm64" \
+        -o APT::FTPArchive::Release::Components=main \
+        release dists/stable >"$work/Release.sub"
+    mv -- "$work/Release.sub" dists/stable/Release
+)
 
 # --- TLS for https://usg-plat.test ----------------------------------------------------
 (

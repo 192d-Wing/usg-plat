@@ -4,6 +4,18 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 
 ## [Unreleased]
 
+### Fixed
+- `usg-plat-verify` apt hook: a `.deb` that apt takes in place from a
+  `file:` offline mirror (`docs/install-verify.md` §4) is now verified
+  against the cached, cosign-verified `SHA256SUMS` for its tag, like one
+  from the https repository. It was treated as a local `apt install ./x.deb`
+  and looked for sums beside the package, so every mirror install of
+  `platd` and `usg-plat-verify` was refused (found on the live v0.4.1
+  offline install). Mirror roots come only from the `file:` URIs in
+  `usg-plat.sources` and a `file:` `REPO_BASE` in `verify.conf`; each is
+  normalised, refused on `.`/`..`, and must be root-only. Matching is on a
+  directory boundary. Other local installs are unchanged.
+
 ## [0.4.1] - 2026-11-08
 
 ### Fixed

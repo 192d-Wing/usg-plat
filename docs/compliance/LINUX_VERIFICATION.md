@@ -78,6 +78,7 @@ each item.
 | L34 | Install-time signature gate (`usg-plat-verify`) in apt and dnf4 | SI-7(15), CM-14, SR-11, CM-7, AU-12 | POAM-044 (c), (f), (g) | PARTIAL (2026-11-06, arm64 podman containers, not systemd hosts): E-cases Debian 12 and Ubuntu 24.04 20/20, Rocky 9 and Rocky 10 20/20 (after the `python(abi)` fix, 790eb60); R-cases 16/16 on Debian 12 and Ubuntu 24.04; x86_64 CI (`verify-install`) and the first-tag release gate not run |
 | L35 | Live v0.4.0 install from the published repository through the gate | SI-7(15), CM-14, SR-11, CM-7 | POAM-044 (c) | PASS with a fix (2026-11-07, arm64 podman, live https://192d-wing.github.io/usg-plat-packages, upstream cosign v3.1.4): Rocky 9 and Rocky 10 6/6; Debian 12 and Ubuntu 24.04 refused `platd` on a stock image because `usg-plat-verify` 0.4.0 does not depend on curl/wget, so `fetch-sums` cached nothing (fail closed); with curl installed 8/8. Fix: Depends/Requires (E22), ships in the next release |
 | L36 | Live v0.4.1 install on stock images without curl/wget (L35 fix) | SI-7(15), CM-14, SR-11, CM-7 | POAM-044 (c) | PASS (2026-11-08, arm64 podman, live https://192d-wing.github.io/usg-plat-packages, upstream cosign v3.1.4): Debian 12 and Ubuntu 24.04 bootstrap pulls in curl and ca-certificates, `apt-get update` caches the v0.4.1 `SHA256SUMS`, `platd` 0.4.1-1 accepted by the gate; Rocky 9 and 10 `platd` 0.4.1-1 accepted. Not run: x86_64, systemd hosts, tamper cases (L07/L08 not repeated) |
+| L37 | Live v0.4.1 install from the offline tarball (`file:` mirror, no network) | SI-7(15), CM-14, SR-11, CM-7 | POAM-044 (c) | PARTIAL (2026-11-09, arm64 podman, `--network none`, `usg-plat-repo-v0.4.1.tar` from the publish run, upstream cosign v3.1.4): Rocky 9 and Rocky 10 12/12, substitute rpm with regenerated metadata refused; Debian 12 and Ubuntu 24.04 `apt-get update` PASS but `apt-get install platd` and reinstall of `usg-plat-verify` refused with v0.4.1 (fail closed; apt passes `file:` debs in place); fixed in this change (E23), live apt re-run with the fix open. Not run: x86_64, systemd hosts |
 
 On macOS and in CI the real resolver runs against an in-process fake DNS
 server on 127.0.0.1 (`crates/plat-tls/tests/dns_fake_server.rs`): answers,
@@ -644,6 +645,7 @@ saturated resolver (`reason="saturated"`) on Linux; NSS-only names
 | E20 | PASS | PASS | stand-in cosign saw the exact identity and `--trusted-root` on every call |
 | E21 | PASS | PASS | local package in a sticky world-writable directory refused (POAM044-SEC-001, added in review round 1) |
 | E22 | PASS | PASS | package declares an https client for fetch-sums (`curl \| wget`, `ca-certificates`; added after L35) |
+| E23 | PASS | PASS | install from a `file:` offline mirror (`/srv/usg-plat`, `REPO_BASE=file:///srv/usg-plat`): `platd` accepted against the cached `SHA256SUMS` (apt: `.deb` read in place, not from archives); a substitute with regenerated metadata refused, `platd` unchanged (added after L37) |
 
 R-cases (real cosign, no network): R00 no network; R01 gate installs;
 R02 cosign v3.1.4; R03 `COSIGN_GODEBUG=fips140=only` by default; R04–R07
@@ -670,14 +672,24 @@ all four. R13 now replaces the installed root-owned `trusted_root.json`
 (the `USG_PLAT_VERIFY_TRUSTED_ROOT` override is test-only since
 POAM044-SEC-003). Still **PARTIAL** (see "Not covered").
 
+Re-run with E22 and E23 (2026-11-09, aarch64 macOS host, podman, branch
+`fix/verify-apt-file-mirror`): `run.sh` E00–E23 23 passed, 0 failed on
+each of Debian 12, Ubuntu 24.04, Rocky 9 and Rocky 10. Negative control:
+with the previous `apt-hook`, Debian 12 gave 22/1, E23 failing with
+"no SHA256SUMS and SHA256SUMS.sigstore.json for v0.4.1 in
+/srv/usg-plat/apt/pool/main", the same refusal as live L37. The apt
+branch of E23 also reinstalls `usg-plat-verify` from the mirror through
+the gate (the second command refused in L37).
+
 Not covered: x86_64 (the `ci.yml` `verify-install` job on
 `ubuntu-24.04` and `ubuntu-24.04-arm` has not run on GitHub); systemd
-hosts and real `unattended-upgrades` timers; an install from a `file:`
-mirror or the offline tarball (only the `selftest` and `fetch-sums` unit
-tests cover `file:`; apt and dnf `file:///` mirrors both pass `selftest`); a published release containing `usg-plat-verify`;
-dnf5. Release gate before any status leaves Partial: clean-VM installs
-from Pages on Debian 12 and Rocky 9, and one install from the offline
-tarball.
+hosts and real `unattended-upgrades` timers; a live apt install from
+the offline tarball with the E23 fix (`file:` mirror installs are covered
+by E23 in containers; the live v0.4.1 tarball run, L37, passed on dnf and
+was refused on apt before the fix); dnf5. Release gate before any status
+leaves Partial: clean-VM installs from Pages on Debian 12 and Rocky 9,
+and one install from the offline tarball (L37: met for dnf; apt open
+until a release with the fix passes live).
 
 ### L35 — live v0.4.0 install from the published repository (POAM-044 (c))
 
@@ -726,6 +738,38 @@ installed with `apt-get install ./…` / `dnf install ./…`:
 in `docs/install-verify.md` now uses `apt-get install ./…` and
 `dnf install ./…`. Not run: x86_64, systemd hosts; the L35 tamper and
 reinstall cases (L05–L08) were not repeated on v0.4.1.
+
+### L37 — live v0.4.1 install from the offline tarball (POAM-044 (c))
+
+Offline install of v0.4.1 from `usg-plat-repo-v0.4.1.tar`, the tarball
+from the publish run (2026-11-09, arm64 podman). Prerequisites (curl,
+ca-certificates, systemd, nftables; on Rocky also createrepo_c,
+rpm-build, diffutils) were installed in a networked prep step and
+committed to the image. Every case below ran with `--network none`,
+upstream cosign v3.1.4, and the tarball unpacked to a root-owned
+`/srv/usg-plat` with `REPO_BASE=file:///srv/usg-plat`.
+
+| Case | Debian 12 / Ubuntu 24.04 | Rocky 9 / Rocky 10 | Checks |
+| ---- | ------------------------ | ------------------ | ------ |
+| L37-1 | PASS | PASS | bootstrap package in the tarball byte-identical to the verified release file; bootstrap install |
+| L37-2 | PASS | PASS | apt: `apt-get update` runs fetch-sums from `file:` and `selftest --apt`, `SHA256SUMS` cached; dnf: `selftest` accepts the `file:///` mirror |
+| L37-3 | REFUSED | PASS | `apt-get install platd` / `dnf install platd`: dnf installs `platd` 0.4.1-1; apt refused with "no SHA256SUMS ... in /srv/usg-plat/apt/pool/main" |
+| L37-4 | REFUSED | PASS | reinstall of `usg-plat-verify` through the gate (apt refused the same way) |
+| L37-5 | — | PASS | substitute `platd-0.4.1-1.aarch64` built with `rpmbuild` and indexed with `createrepo_c` refused: "digest is not in the verified SHA256SUMS for v0.4.1"; `last-refusal` written |
+| L37-6 | — | PASS | after the refusal `rpm -V --noconfig` is clean and the `platd` binary is unchanged |
+
+Rocky 9 and Rocky 10: 12/12. A substitute rpm with one appended byte is
+rejected by rpm's own payload digest before the gate runs, so that case
+is not counted.
+
+Debian 12 and Ubuntu 24.04 (v0.4.1, before the fix): the update steps
+passed, but the gate refused both installs (fail closed). apt hands a
+`.deb` from a `file:` source to the hook in place, not through
+`/var/cache/apt/archives`, so v0.4.1 took the local-package path and
+looked for a sibling `SHA256SUMS`. Fixed in `fix/verify-apt-file-mirror`:
+mirror `.deb`s are checked against the cached `SHA256SUMS` (E23,
+containers). The live apt re-run with a release containing the fix is
+**open**. Status: **PARTIAL**. Not run: x86_64, systemd hosts.
 
 ### L26–L32 — XDP fast path (POAM-016 Phase 1)
 
