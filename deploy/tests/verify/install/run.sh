@@ -151,9 +151,10 @@ PY
 # mirror_unpack TREE: replace /srv/usg-plat with a root-owned copy of TREE
 # (an operator unpacking the offline tarball, docs/install-verify.md §4).
 mirror_unpack() {
+    mu_tree=$1
     rm -rf /srv/usg-plat
     mkdir -p /srv
-    cp -R "$1" /srv/usg-plat && chown -R 0:0 /srv/usg-plat && chmod -R go-w /srv/usg-plat
+    cp -R "$mu_tree" /srv/usg-plat && chown -R 0:0 /srv/usg-plat && chmod -R go-w /srv/usg-plat
 }
 
 # Point the shipped configuration at the test repository (an operator of a
