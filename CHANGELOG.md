@@ -4,6 +4,8 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-11-10
+
 ### Fixed
 - `usg-plat-verify` apt hook: a `.deb` that apt takes in place from a
   `file:` offline mirror (`docs/install-verify.md` §4) is now verified
