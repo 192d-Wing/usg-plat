@@ -250,10 +250,11 @@ Operator requirements for the mirror root:
   (for example `/root/pkgs/x.deb` with its sibling `SHA256SUMS`) is
   refused (fail closed).
 
-Live offline tarball run (`LINUX_VERIFICATION.md` L37, v0.4.1): dnf
-passed on Rocky 9 and 10. apt on v0.4.1 refused the mirror install (fail
-closed); this change fixes that (E23), and the live apt re-run with the
-fix is still open.
+Live offline tarball runs (`LINUX_VERIFICATION.md` L37, arm64
+containers): dnf passed on Rocky 9 and 10 with v0.4.1. apt on v0.4.1
+refused the mirror install (fail closed); v0.4.2 fixes that, and the apt
+run passed on Debian 12 and Ubuntu 24.04 with v0.4.2. Use v0.4.2 or
+later for an apt offline mirror.
 
 dnf: point `baseurl=file:///srv/usg-plat/rpm/$basearch` at the unpacked
 tree and set `REPO_BASE=file:///srv/usg-plat` as above. `selftest --dnf`
