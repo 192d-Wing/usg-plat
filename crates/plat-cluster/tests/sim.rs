@@ -884,6 +884,97 @@ const PERSIST_DELAYS: [u64; 3] = [0, 20, 50];
 
 const TOPOLOGIES: [(u16, bool); 5] = [(2, true), (3, false), (3, true), (4, false), (5, false)];
 
+/// Worst trial `(time, seed, bound)` and the violations of one cell.
+type Cell = ((u64, u64, u64), Vec<String>);
+
+/// Every cell of the bound test: topology x clock rates x delay x write time.
+fn bound_cells() -> Vec<CellKey> {
+    let mut cells = Vec::new();
+    for (members, witness) in TOPOLOGIES {
+        for mode in ALL_RATES {
+            for delay in [2u64, 30] {
+                for f in PERSIST_DELAYS {
+                    cells.push((members, witness, mode, delay, f));
+                }
+            }
+        }
+    }
+    cells
+}
+
+/// Seeds for one cell: `seeds` without write time, a third with it.
+fn cell_seeds(seeds: u64, f: u64) -> u64 {
+    if f == 0 { seeds } else { seeds.div_ceil(3) }
+}
+
+/// Runs the leader-crash trials of one cell against the bound.
+fn run_bound_cell(&(members, witness, mode, delay, f): &CellKey, seeds: u64) -> Cell {
+    let mut worst = (0, 0, 0);
+    let mut bad = Vec::new();
+    for seed in 0..cell_seeds(seeds, f) {
+        let mut t = Trial::new(seed, members, witness, mode, delay);
+        t.persist_delay = f;
+        t.deliver_after_crash = seed % 2 == 1;
+        let bound = t.bound();
+        match leader_crash(&t) {
+            Ok(o) => {
+                if o.took > worst.0 {
+                    worst = (o.took, seed, bound);
+                }
+                if o.took > bound {
+                    bad.push(format!("{t:?} ({mode:?}): took {} ms, bound {bound} ms", o.took));
+                }
+            }
+            Err(e) => bad.push(e),
+        }
+    }
+    (worst, bad)
+}
+
+/// Runs every cell, spread over the cores (the cells are independent
+/// simulations), and returns the results in cell order.
+fn run_bound_cells(cells: &[CellKey], seeds: u64) -> Vec<Cell> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let workers = std::thread::available_parallelism().map_or(1, usize::from).min(cells.len());
+    let mut results: Vec<(usize, Cell)> = std::thread::scope(|sc| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                sc.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(cell) = cells.get(i) else { break done };
+                        done.push((i, run_bound_cell(cell, seeds)));
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| match h.join() {
+                Ok(v) => v,
+                // An invariant of `Sim::check` failed inside a trial.
+                Err(e) => std::panic::resume_unwind(e),
+            })
+            .collect()
+    });
+    results.sort_by_key(|r| r.0);
+    results.into_iter().map(|(_, c)| c).collect()
+}
+
+/// Prints the worst trial over the cells that `keep` selects.
+fn report_worst(label: &str, cells: &[CellKey], results: &[Cell], keep: &dyn Fn(&CellKey) -> bool) {
+    let mut worst = (0, 0, 0);
+    let mut at = None;
+    for (cell, (w, _)) in cells.iter().zip(results) {
+        if keep(cell) && w.0 > worst.0 {
+            worst = *w;
+            at = Some(*cell);
+        }
+    }
+    println!("leader crash, {label}: worst {} ms (bound {} ms, seed {}, {at:?})", worst.0, worst.2, worst.1);
+}
+
 /// The takeover bound over topologies, clock rates, delays and crash
 /// phases. What is asserted: with no fault other than the crash, no loss,
 /// one-way delay at most `d` and clocks within the drift margin, every
@@ -908,92 +999,19 @@ const TOPOLOGIES: [(u16, bool); 5] = [(2, true), (3, false), (3, true), (4, fals
 #[test]
 fn leader_crash_bound_holds_across_topologies() {
     let seeds: u64 = std::env::var("PLAT_SIM_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(0).max(50);
-    let mut cells = Vec::new();
-    for (members, witness) in TOPOLOGIES {
-        for mode in ALL_RATES {
-            for delay in [2u64, 30] {
-                for f in PERSIST_DELAYS {
-                    cells.push((members, witness, mode, delay, f));
-                }
-            }
-        }
-    }
-    // (worst time, its seed, its bound) and the violations of one cell.
-    type Cell = ((u64, u64, u64), Vec<String>);
-    let run_cell = |&(members, witness, mode, delay, f): &CellKey| -> Cell {
-        let mut worst = (0, 0, 0);
-        let mut bad = Vec::new();
-        let n = if f == 0 { seeds } else { seeds.div_ceil(3) };
-        for seed in 0..n {
-            let mut t = Trial::new(seed, members, witness, mode, delay);
-            t.persist_delay = f;
-            t.deliver_after_crash = seed % 2 == 1;
-            let bound = t.bound();
-            match leader_crash(&t) {
-                Ok(o) => {
-                    if o.took > worst.0 {
-                        worst = (o.took, seed, bound);
-                    }
-                    if o.took > bound {
-                        bad.push(format!("{t:?} ({mode:?}): took {} ms, bound {bound} ms", o.took));
-                    }
-                }
-                Err(e) => bad.push(e),
-            }
-        }
-        (worst, bad)
-    };
-    // The cells are independent simulations: spread them over the cores.
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let workers = std::thread::available_parallelism().map_or(1, usize::from).min(cells.len());
-    let mut results: Vec<(usize, Cell)> = std::thread::scope(|sc| {
-        let handles: Vec<_> = (0..workers)
-            .map(|_| {
-                sc.spawn(|| {
-                    let mut done = Vec::new();
-                    loop {
-                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let Some(cell) = cells.get(i) else { break done };
-                        done.push((i, run_cell(cell)));
-                    }
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .flat_map(|h| match h.join() {
-                Ok(v) => v,
-                // An invariant of `Sim::check` failed inside a trial.
-                Err(e) => std::panic::resume_unwind(e),
-            })
-            .collect()
-    });
-    results.sort_by_key(|r| r.0);
-    let mut bad = Vec::new();
-    for (_, (_, b)) in &results {
-        bad.extend(b.iter().cloned());
-    }
+    let cells = bound_cells();
+    let results = run_bound_cells(&cells, seeds);
+    let bad: Vec<String> = results.iter().flat_map(|(_, b)| b.iter().cloned()).collect();
     // Worst case per topology and state-write time; then per drift mode.
-    let report = |label: &str, keep: &dyn Fn(&CellKey) -> bool| {
-        let mut worst = (0, 0, 0);
-        let mut at = None;
-        for (i, (w, _)) in &results {
-            if keep(&cells[*i]) && w.0 > worst.0 {
-                worst = *w;
-                at = Some(cells[*i]);
-            }
-        }
-        println!("leader crash, {label}: worst {} ms (bound {} ms, seed {}, {at:?})", worst.0, worst.2, worst.1);
-    };
     for (members, witness) in TOPOLOGIES {
+        let w = if witness { " + witness" } else { "" };
         for f in PERSIST_DELAYS {
-            let n = if f == 0 { seeds } else { seeds.div_ceil(3) };
-            let w = if witness { " + witness" } else { "" };
-            report(&format!("{members} members{w}, F {f} ms, {n} seeds per cell"), &|c| {
+            let n = cell_seeds(seeds, f);
+            report_worst(&format!("{members} members{w}, F {f} ms, {n} seeds per cell"), &cells, &results, &|c| {
                 (c.0, c.1, c.4) == (members, witness, f)
             });
             for mode in [Rates::Margin, Rates::AllSlow] {
-                report(&format!("{members} members{w}, F {f} ms, {mode:?}"), &|c| {
+                report_worst(&format!("{members} members{w}, F {f} ms, {mode:?}"), &cells, &results, &|c| {
                     (c.0, c.1, c.2, c.4) == (members, witness, mode, f)
                 });
             }
