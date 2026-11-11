@@ -4,6 +4,28 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 
 ## [Unreleased]
 
+### Changed
+- Cluster HA (CP-10, SC-24): faster election after a leader crash. A
+  candidate retries on a short timer and yields to a lower member id at
+  most once per term; a pre-candidate keeps re-soliciting pre-votes (empty
+  grant set each round) until it wins or hears a leader; a new leader
+  grants the first lease right away instead of waiting a heartbeat period;
+  a member the new leader has not heard from is not re-added to the view;
+  election jitter is now H/2. No wire, config, persisted-state or log-schema
+  change (`LOG_SCHEMA_VERSION` stays 8). Mixed-version clusters
+  interoperate; the faster bound holds only once every voter is upgraded.
+  POAM-007 (2) stays open (VM takeover trials not re-run).
+
+### Added
+- Metrics `plat_cluster_election_rounds_total{result="won|timeout|yield"}`
+  and `plat_cluster_heartbeats_expedited_total` (SI-4).
+- `adopt_slice` criterion bench in `plat-nat64`, run by `make bench`.
+- Simulator leader-crash bound tests (`leader_crash_bound_holds_across_topologies`
+  and related) with `persist_delay` and `deliver_after_crash` knobs, off by
+  default.
+- POAM-047: slice adoption can stall the control loop on large slices
+  (new, open).
+
 ## [0.4.2] - 2026-11-10
 
 ### Fixed

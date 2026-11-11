@@ -37,10 +37,34 @@
 //! gaining from a member the leader dropped (silent for `safe`) does not
 //! wait.
 //!
+//! # Election timing
+//!
+//! Only *when* a node asks for votes is tuned for a short takeover; whether
+//! a vote, a lease or a slice is granted is decided by the rules above and
+//! by nothing in this section:
+//! - a follower campaigns `safe + j` after its last leader contact, with
+//!   `j < heartbeat / 2`;
+//! - a pre-candidate does not time out: it asks again every `heartbeat / 5`
+//!   (with an empty grant set) until a majority grants, a leader shows up or
+//!   it grants a real vote. A voter that still keeps a lease promise simply
+//!   refuses until the promise has run out;
+//! - a candidate round lasts `heartbeat / 2`. A round without a majority
+//!   (split vote, slow voter) ends in a new campaign at the next tick; the
+//!   round length doubles per consecutive timed-out round, capped at `safe`,
+//!   so voters that persist slowly cannot keep every round too short;
+//! - a candidate that sees a real vote request for its own term from a
+//!   lower-id data member yields to it and stays quiet for four rounds;
+//! - the new leader sends the next heartbeat at once when a voter's first
+//!   ack of the term arrives and when a view commits, so a follower's lease
+//!   follows the election by round trips, not by heartbeat periods.
+//!
 //! COMPLIANCE MAPPING:
 //! - NIST 800-53: SC-24 (Fail in Known State) - a minority or lease-less
 //!   node fences its slices; CP-10 (System Recovery and Reconstitution) -
-//!   takeover of a lost member's slices by their backups; AU-12 - every
+//!   takeover of a lost member's slices by their backups; the time from a
+//!   leader crash to full service is asserted for simulated schedules only
+//!   (`tests/sim.rs`, `leader_crash_bound_holds_across_topologies`); SI-4 - election round
+//!   and expedited-heartbeat counters ([`ElectionStats`]); AU-12 - every
 //!   acquire and release is an action the driver audits; SC-5 - all state is
 //!   bounded by the voter count (at most 64) and the slice count (at most
 //!   4096)
@@ -195,6 +219,25 @@ pub enum Action {
     },
 }
 
+/// Election counters since this [`Membership`] was built.
+///
+/// COMPLIANCE MAPPING:
+/// - NIST 800-53: SI-4 (System Monitoring) - exported by platd as
+///   `plat_cluster_election_rounds_total{result}` and
+///   `plat_cluster_heartbeats_expedited_total`
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ElectionStats {
+    /// Candidate rounds that ended with this node elected.
+    pub won: u64,
+    /// Candidate rounds that ended without a majority in time.
+    pub timeout: u64,
+    /// Candidate rounds given up for a lower-id candidate of the same term.
+    pub yielded: u64,
+    /// Heartbeat rounds sent ahead of the period (first ack of the term from
+    /// a voter, or a view commit).
+    pub heartbeats_expedited: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SliceState {
     Idle,
@@ -219,6 +262,9 @@ struct PeerState {
     /// `first_sent` of the newest acked heartbeat (leadership anchor).
     anchor: Option<u64>,
     last_ack_recv: u64,
+    /// An ack (heartbeat or view) arrived in this term. `last_ack_recv`
+    /// starts at the election time, which says nothing about the member.
+    heard: bool,
     acked_epoch: u64,
     /// Since when the member is in `standby` (failback timer).
     standby_since: u64,
@@ -256,6 +302,14 @@ pub struct Membership {
     // Candidate.
     grants: u64,
     best_view: Option<View>,
+    /// Pre-candidate: when to ask for pre-votes again.
+    next_solicit_at: u64,
+    /// Consecutive candidate rounds that timed out (round length doubling).
+    round_timeouts: u32,
+    /// Term of the last yield (C6; at most one per term).
+    yielded_term: u32,
+    /// Yields since this node last heard or became a leader.
+    yields_in_row: u32,
     // Leader.
     peers: Vec<PeerState>,
     next_hb_at: u64,
@@ -267,6 +321,9 @@ pub struct Membership {
     /// Automatic failback also waits until the standby member reports its
     /// backup copies in sync ([`Membership::set_failback_needs_sync`]).
     failback_needs_sync: bool,
+    /// Leader: send the next heartbeat round now instead of at `next_hb_at`.
+    expedite: bool,
+    stats: ElectionStats,
 }
 
 fn majority(n: usize) -> usize {
@@ -348,12 +405,18 @@ impl Membership {
             attempt: 0,
             grants: 0,
             best_view: None,
+            next_solicit_at: 0,
+            round_timeouts: 0,
+            yielded_term: 0,
+            yields_in_row: 0,
             peers: vec![PeerState::default(); n],
             next_hb_at: now,
             elected_at: now,
             proposal_base: 0,
             manual_hold_until: 0,
             failback_needs_sync: false,
+            expedite: false,
+            stats: ElectionStats::default(),
         };
         m.election_deadline = now + m.election_timeout();
         let mut out = Vec::new();
@@ -431,6 +494,11 @@ impl Membership {
         self.slices.iter().enumerate().filter(|(_, s)| **s == SliceState::Active).map(|(i, _)| i as SliceId)
     }
 
+    /// Election counters since this instance was built (SI-4).
+    pub fn election_stats(&self) -> ElectionStats {
+        self.stats
+    }
+
     /// How often the driver should call [`Membership::on_tick`].
     pub fn tick_interval_ms(&self) -> u64 {
         (self.cfg.heartbeat_ms / 10).max(5)
@@ -448,7 +516,24 @@ impl Membership {
 
     fn election_timeout(&self) -> u64 {
         let j = mix(self.cfg.seed ^ mix((u64::from(self.p.term) << 16) | u64::from(self.cfg.self_id)) ^ self.attempt);
-        self.safe_ms + j % (2 * self.cfg.heartbeat_ms)
+        self.safe_ms + j % (self.cfg.heartbeat_ms / 2).max(1)
+    }
+
+    /// Length of the current candidate round: `heartbeat / 2`, doubled per
+    /// consecutive timed-out round, at most `safe`.
+    fn round_ms(&self) -> u64 {
+        let base = (self.cfg.heartbeat_ms / 2).max(1);
+        (base << self.round_timeouts.min(16)).min(self.safe_ms)
+    }
+
+    /// How often a pre-candidate asks again.
+    fn solicit_ms(&self) -> u64 {
+        (self.cfg.heartbeat_ms / 5).max(1)
+    }
+
+    /// How long a candidate that yielded stays quiet: four base rounds.
+    fn yield_quiet_ms(&self) -> u64 {
+        4 * (self.cfg.heartbeat_ms / 2).max(1)
     }
 
     fn bit(&self, m: MemberId) -> u64 {
@@ -592,7 +677,14 @@ impl Membership {
                 // committed view would have reached us first, or broken the
                 // chain and reset the wait in `adopt`).
                 SliceState::Pending { ready_at: None, prev_owner, reason } if leased => {
-                    self.slices[s] = SliceState::Pending { ready_at: Some(now), prev_owner, reason };
+                    if committed {
+                        // Same condition as the arm below with `ready_at =
+                        // now`; no reason to wait for another pass.
+                        self.slices[s] = SliceState::Active;
+                        out.push(Action::Acquire { slice, epoch, prev_owner, reason });
+                    } else {
+                        self.slices[s] = SliceState::Pending { ready_at: Some(now), prev_owner, reason };
+                    }
                 }
                 SliceState::Pending { ready_at: Some(r), prev_owner, reason } if leased && committed && now >= r => {
                     self.slices[s] = SliceState::Active;
@@ -616,16 +708,35 @@ impl Membership {
                     self.start_pre_vote(now, &mut out);
                 }
             }
-            Role::PreCandidate | Role::Candidate => {
+            Role::PreCandidate => {
+                // No timeout: a voter that refused was keeping a lease
+                // promise, which runs out; ask again until a majority
+                // grants. `follow` and a granted real vote end this state.
+                //
+                // COMPLIANCE MAPPING:
+                // - NIST 800-53: SC-24 - asking more often changes no
+                //   answer: every voter still checks `may_vote` (its
+                //   promise of `safe` after the last ack) on each request
+                if now >= self.next_solicit_at {
+                    self.start_pre_vote(now, &mut out);
+                }
+            }
+            Role::Candidate => {
                 if now >= self.election_deadline {
-                    // No majority in time: back off and retry.
+                    // No majority within the round (split vote or slow
+                    // voters): campaign again at the next tick, through
+                    // `Follower` so that `sticky_until` is checked again,
+                    // with a longer round.
+                    self.stats.timeout += 1;
+                    self.round_timeouts = self.round_timeouts.saturating_add(1);
                     self.set_role(Role::Follower, &mut out);
                     self.attempt += 1;
-                    self.election_deadline = now + self.election_timeout();
+                    self.election_deadline = now;
                 }
             }
             Role::Leader => self.leader_tick(now, &mut out),
         }
+        self.expedite_round(now, &mut out);
         self.advance_slices(now, &mut out);
         out
     }
@@ -648,6 +759,7 @@ impl Membership {
                 {
                     self.peers[i].acked_epoch = self.peers[i].acked_epoch.max(*epoch);
                     self.peers[i].last_ack_recv = now;
+                    self.peers[i].heard = true;
                     self.update_commit(&mut out);
                 }
             }
@@ -666,6 +778,7 @@ impl Membership {
             }
             _ => {}
         }
+        self.expedite_round(now, &mut out);
         self.advance_slices(now, &mut out);
         out
     }
@@ -681,9 +794,11 @@ impl Membership {
             return;
         }
         self.set_role(Role::PreCandidate, out);
+        // Every round starts from an empty grant set: grants do not add up
+        // over many rounds.
         self.grants = self.bit(self.cfg.self_id);
         self.best_view = self.view.clone();
-        self.election_deadline = now + self.election_timeout();
+        self.next_solicit_at = now + self.solicit_ms();
         let epoch = make_epoch(self.p.term + 1, 0);
         self.broadcast(Msg::Vote { epoch, pre: true }, out);
         self.check_votes(now, out);
@@ -696,7 +811,7 @@ impl Membership {
         self.set_role(Role::Candidate, out);
         self.grants = self.bit(self.cfg.self_id);
         self.best_view = self.view.clone();
-        self.election_deadline = now + self.election_timeout();
+        self.election_deadline = now + self.round_ms();
         self.broadcast(Msg::Vote { epoch: make_epoch(self.p.term, 0), pre: false }, out);
         self.check_votes(now, out);
     }
@@ -717,6 +832,35 @@ impl Membership {
         } else {
             if t > self.p.term && self.may_vote(now) {
                 self.observe_term(now, t, out);
+            }
+            // Split vote: two candidates of one term. The higher id yields
+            // and stays quiet, so the lower id retries alone. At most once
+            // per term, and at most `data members - 1` times in a row
+            // without hearing a leader (SEC-001): a lower-id peer that
+            // answers every candidacy with a same-term request cannot hold
+            // this node off for good. The cap is what the split-round
+            // count `k <= S - 1` needs (a node yields at most once per
+            // split round); past it, a split ends by the round timeout.
+            //
+            // COMPLIANCE MAPPING:
+            // - NIST 800-53: SC-24 - giving up a candidacy grants nothing:
+            //   this node keeps its own vote of the term (`voted_for`) and
+            //   the request is refused below, so there is still one vote
+            //   per voter and term; CP-10 - a split costs one round
+            //   instead of two election timeouts
+            if self.role == Role::Candidate
+                && candidate_ok
+                && t == self.p.term
+                && from < self.cfg.self_id
+                && self.yielded_term != t
+                && (self.yields_in_row as usize) < self.cfg.members.len().saturating_sub(1)
+            {
+                self.yielded_term = t;
+                self.yields_in_row += 1;
+                self.stats.yielded += 1;
+                self.set_role(Role::Follower, out);
+                self.attempt += 1;
+                self.election_deadline = now + self.yield_quiet_ms();
             }
             let ok =
                 candidate_ok && t == self.p.term && self.may_vote(now) && self.p.voted_for.is_none_or(|v| v == from);
@@ -780,6 +924,9 @@ impl Membership {
 
     fn become_leader(&mut self, now: u64, out: &mut Vec<Action>) {
         self.set_role(Role::Leader, out);
+        self.stats.won += 1;
+        self.round_timeouts = 0;
+        self.yields_in_row = 0;
         self.leader = Some(self.cfg.self_id);
         self.elected_at = now;
         let base_seq = u64::from(self.p.term) << 32;
@@ -789,6 +936,7 @@ impl Membership {
             acked: false,
             anchor: None,
             last_ack_recv: now,
+            heard: false,
             acked_epoch: 0,
             standby_since: now,
             sync_epoch: None,
@@ -859,7 +1007,32 @@ impl Membership {
         if n >= majority(self.voters.len()) {
             self.committed = cur;
             out.push(Action::Committed(cur));
+            // Members gain slices only under a committed view: tell them
+            // now.
+            self.expedite = true;
         }
+    }
+
+    /// Runs a heartbeat round ahead of the period when one was asked for
+    /// (first ack of the term from a voter, view commit). Only the spacing
+    /// of heartbeats changes: `leader_tick` still advances a voter's
+    /// sequence number only after its ack and only while this node holds
+    /// the leadership lease, and the voter's lease still runs from the time
+    /// it sent that ack.
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: CP-10 - a surviving follower is leased again one round
+    ///   trip after the new leader has its ack, not one heartbeat period
+    ///   later; SC-24 - no grant without the leadership lease
+    fn expedite_round(&mut self, now: u64, out: &mut Vec<Action>) {
+        if !std::mem::take(&mut self.expedite) || self.role != Role::Leader {
+            return;
+        }
+        self.stats.heartbeats_expedited += 1;
+        self.next_hb_at = now;
+        self.leader_tick(now, out);
+        // A commit found by that tick went out with its heartbeats.
+        self.expedite = false;
     }
 
     fn leader_tick(&mut self, now: u64, out: &mut Vec<Action>) {
@@ -885,6 +1058,8 @@ impl Membership {
             return;
         }
         self.next_hb_at = now + self.cfg.heartbeat_ms;
+        // This round carries the commit index and every grant that is due.
+        self.expedite = false;
         let Some(view) = self.view.clone() else { return };
         let granting = now < lease;
         for i in 0..self.voters.len() {
@@ -928,8 +1103,15 @@ impl Membership {
         };
         next.live.retain(|m| !silent(self, *m));
         next.standby.retain(|m| !silent(self, *m));
+        // `heard`: `last_ack_recv` starts at the election time for every
+        // voter (so that `silent` gives each one `safe` to answer), which
+        // must not make a member that never answered in this term look
+        // reachable; the crashed leader would come straight back as standby.
         let reachable = |s: &Self, m: MemberId| {
-            m == me || s.idx(m).is_some_and(|i| now.saturating_sub(s.peers[i].last_ack_recv) < 2 * s.cfg.heartbeat_ms)
+            m == me
+                || s.idx(m).is_some_and(|i| {
+                    s.peers[i].heard && now.saturating_sub(s.peers[i].last_ack_recv) < 2 * s.cfg.heartbeat_ms
+                })
         };
         for (id, _) in self.cfg.members.clone() {
             if !next.is_live(id) && !next.is_standby(id) && reachable(self, id) {
@@ -1023,13 +1205,19 @@ impl Membership {
             return;
         }
         p.last_ack_recv = now;
+        p.heard = true;
+        let mut first = false;
         if !p.acked {
             p.acked = true;
+            first = p.anchor.is_none();
             p.anchor = Some(p.first_sent);
         }
         // The member's adopted view as of this ack; lower after a restart,
         // which makes us resend the proposal.
         p.acked_epoch = epoch;
+        // First ack of the term from this voter: send its next heartbeat
+        // now (it carries the lease once we hold the leadership lease).
+        self.expedite |= first;
         self.update_commit(out);
     }
 
@@ -1052,6 +1240,8 @@ impl Membership {
             self.leader = Some(from);
         }
         self.last_leader_contact = now;
+        self.round_timeouts = 0;
+        self.yields_in_row = 0;
         self.election_deadline = now + self.election_timeout();
         true
     }
@@ -1194,6 +1384,282 @@ mod tests {
             seed: 1,
         };
         Membership::new(cfg, Persisted::default(), 0).unwrap().0
+    }
+
+    /// `members` data members (ids from 0) plus an optional witness with
+    /// the next id; `safe` 1300, round 50, re-solicit 20, yield quiet 200.
+    fn node(me: MemberId, members: u16, witness: bool) -> Membership {
+        let cfg = MembershipConfig {
+            self_id: me,
+            members: (0..members).map(|m| (m, 1)).collect(),
+            witness: witness.then_some(members),
+            slice_count: 8,
+            lease_ms: 1000,
+            heartbeat_ms: 100,
+            drift_margin_pct: 10,
+            failback_delay_ms: 0,
+            auto_failover: true,
+            seed: 7,
+        };
+        Membership::new(cfg, Persisted::default(), 0).unwrap().0
+    }
+
+    fn pre_grant(term: u32) -> Msg {
+        Msg::VoteAck { epoch: make_epoch(term, 0), pre: true, granted: true, last_view: None }
+    }
+
+    fn grant(term: u32) -> Msg {
+        Msg::VoteAck { epoch: make_epoch(term, 0), pre: false, granted: true, last_view: None }
+    }
+
+    fn sent(out: &[Action], to: MemberId) -> impl Iterator<Item = &Msg> {
+        out.iter().filter_map(move |a| match a {
+            Action::Send { to: t, msg } if *t == to => Some(msg),
+            _ => None,
+        })
+    }
+
+    /// Past the boot quiet time and the first election deadline.
+    const T0: u64 = 1400;
+
+    /// `m` campaigns at `T0` and `voter` grants the pre-vote; with three
+    /// voters that makes it a candidate of term 1.
+    fn candidate(m: &mut Membership, voter: MemberId) {
+        let out = m.on_tick(T0);
+        assert_eq!(m.role(), Role::PreCandidate, "{out:?}");
+        let _ = m.on_msg(T0, voter, &pre_grant(1));
+        assert_eq!((m.role(), m.term()), (Role::Candidate, 1));
+    }
+
+    /// C6: a candidate gives way only to a real vote request for its own
+    /// term from a lower-id data member, grants nothing by doing so and
+    /// stays quiet for four rounds.
+    #[test]
+    fn candidate_yields_only_to_a_lower_id_in_its_own_term() {
+        let mut m = node(1, 3, false);
+        candidate(&mut m, 2);
+        let vote = |term| Msg::Vote { epoch: make_epoch(term, 0), pre: false };
+        // Higher id, same term.
+        let _ = m.on_msg(T0 + 1, 2, &vote(1));
+        assert_eq!(m.role(), Role::Candidate);
+        // Lower id, older term.
+        let _ = m.on_msg(T0 + 1, 0, &vote(0));
+        assert_eq!(m.role(), Role::Candidate);
+        // Lower id, pre-vote for the next term.
+        let _ = m.on_msg(T0 + 1, 0, &Msg::Vote { epoch: make_epoch(2, 0), pre: true });
+        assert_eq!(m.role(), Role::Candidate);
+        assert_eq!(m.election_stats().yielded, 0);
+        // Lower id, same term: yield, and refuse (this node voted for itself).
+        let out = m.on_msg(T0 + 2, 0, &vote(1));
+        assert_eq!(m.role(), Role::Follower);
+        assert_eq!(m.election_stats(), ElectionStats { yielded: 1, ..ElectionStats::default() });
+        assert!(sent(&out, 0).any(|x| matches!(x, Msg::VoteAck { pre: false, granted: false, .. })), "{out:?}");
+        assert_eq!(m.persisted().voted_for, Some(1));
+        // A late grant does not elect a node that yielded.
+        let _ = m.on_msg(T0 + 3, 2, &grant(1));
+        assert_eq!(m.role(), Role::Follower);
+        // Quiet for four rounds, then it campaigns again.
+        let _ = m.on_tick(T0 + 2 + 199);
+        assert_eq!(m.role(), Role::Follower);
+        let _ = m.on_tick(T0 + 2 + 200);
+        assert_eq!(m.role(), Role::PreCandidate);
+
+        // A vote request from the witness (never a candidate) does not
+        // count, even with the lowest id.
+        let cfg = MembershipConfig {
+            self_id: 2,
+            members: vec![(1, 1), (2, 1)],
+            witness: Some(0),
+            slice_count: 8,
+            lease_ms: 1000,
+            heartbeat_ms: 100,
+            drift_margin_pct: 10,
+            failback_delay_ms: 0,
+            auto_failover: true,
+            seed: 7,
+        };
+        let mut c = Membership::new(cfg, Persisted::default(), 0).unwrap().0;
+        candidate(&mut c, 1);
+        let _ = c.on_msg(T0 + 1, 0, &vote(1));
+        assert_eq!(c.role(), Role::Candidate, "the witness cannot make a candidate yield");
+        assert_eq!(c.election_stats().yielded, 0);
+    }
+
+    /// SEC-001: a lower-id peer that answers every candidacy with a
+    /// same-term vote request makes this node yield at most once per term
+    /// and at most `data members - 1` (here 2) times without a leader; the
+    /// vote stays its own either way.
+    #[test]
+    fn yield_is_capped_per_term_and_without_a_leader() {
+        let mut m = node(1, 3, false);
+        let vote = |term| Msg::Vote { epoch: make_epoch(term, 0), pre: false };
+        let mut now = T0;
+        let mut yields = Vec::new();
+        for term in 1..=4u32 {
+            let _ = m.on_tick(now);
+            assert_eq!(m.role(), Role::PreCandidate, "term {term}");
+            let _ = m.on_msg(now, 2, &pre_grant(term));
+            assert_eq!((m.role(), m.term()), (Role::Candidate, term));
+            let _ = m.on_msg(now + 1, 0, &vote(term));
+            yields.push(m.role() == Role::Follower);
+            assert_eq!(m.persisted().voted_for, Some(1), "term {term}: own vote kept");
+            if m.role() == Role::Candidate {
+                // Not yielded: the round times out instead.
+                now += m.round_ms();
+                let _ = m.on_tick(now);
+            } else {
+                // Yielded once: a second request of the same term changes nothing.
+                assert_eq!(m.election_stats().yielded as usize, yields.iter().filter(|y| **y).count());
+                now += m.yield_quiet_ms();
+            }
+            now += 1;
+        }
+        assert_eq!(yields, [true, true, false, false]);
+        assert_eq!(m.election_stats().yielded, 2);
+        // Hearing a leader resets the run.
+        let hb = Msg::Heartbeat { epoch: make_epoch(5, 0), lease_ms: 1000, seq: 1, commit: 0 };
+        let _ = m.on_msg(now, 0, &hb);
+        assert_eq!(m.yields_in_row, 0);
+
+        // Same term twice: the second request finds a follower (nothing to
+        // yield), and a re-campaign in that term is not possible (the term
+        // moves on), so once per term holds by construction too.
+        let mut c = node(2, 3, false);
+        candidate(&mut c, 1);
+        let _ = c.on_msg(T0 + 1, 0, &vote(1));
+        let _ = c.on_msg(T0 + 2, 1, &vote(1));
+        assert_eq!(c.election_stats().yielded, 1);
+    }
+
+    /// C4: a pre-candidate does not time out; it asks again every
+    /// `heartbeat / 5` and every round starts from an empty grant set.
+    #[test]
+    fn pre_candidate_resolicits_with_an_empty_grant_set() {
+        let mut m = node(0, 5, false);
+        let out = m.on_tick(T0);
+        assert_eq!(m.role(), Role::PreCandidate);
+        assert_eq!(
+            out.iter().filter(|a| matches!(a, Action::Send { msg: Msg::Vote { pre: true, .. }, .. })).count(),
+            4
+        );
+        // One grant of the three needed.
+        let _ = m.on_msg(T0 + 1, 1, &pre_grant(1));
+        assert_eq!(m.role(), Role::PreCandidate);
+        // Not before the round is over.
+        let out = m.on_tick(T0 + 19);
+        assert!(out.is_empty(), "{out:?}");
+        let out = m.on_tick(T0 + 20);
+        assert_eq!(
+            out.iter().filter(|a| matches!(a, Action::Send { msg: Msg::Vote { pre: true, .. }, .. })).count(),
+            4
+        );
+        // The grant of the first round no longer counts.
+        let _ = m.on_msg(T0 + 21, 2, &pre_grant(1));
+        assert_eq!(m.role(), Role::PreCandidate);
+        // No timeout, no term change, however long nobody answers.
+        let mut now = T0 + 21;
+        while now < T0 + 10 * m.safe_ms() {
+            now += m.tick_interval_ms();
+            let _ = m.on_tick(now);
+            assert_eq!((m.role(), m.term()), (Role::PreCandidate, 0));
+        }
+        assert_eq!(m.election_stats(), ElectionStats::default());
+        // Two grants within one round make the majority.
+        let _ = m.on_msg(now, 3, &pre_grant(1));
+        let _ = m.on_msg(now, 4, &pre_grant(1));
+        assert_eq!((m.role(), m.term()), (Role::Candidate, 1));
+    }
+
+    /// C5: a candidate round lasts `heartbeat / 2`, then doubles per
+    /// consecutive timeout up to `safe`; hearing a leader resets it.
+    #[test]
+    fn candidate_round_doubles_up_to_safe() {
+        let mut m = node(1, 3, false);
+        let mut now = T0;
+        let mut rounds = Vec::new();
+        for term in 1..=7u32 {
+            let _ = m.on_tick(now);
+            assert_eq!(m.role(), Role::PreCandidate);
+            let _ = m.on_msg(now, 0, &pre_grant(term));
+            assert_eq!((m.role(), m.term()), (Role::Candidate, term));
+            let round = m.round_ms();
+            rounds.push(round);
+            let _ = m.on_tick(now + round - 1);
+            assert_eq!(m.role(), Role::Candidate);
+            now += round;
+            let _ = m.on_tick(now);
+            assert_eq!(m.role(), Role::Follower, "back through follower: sticky_until is checked again");
+            assert_eq!(m.election_stats().timeout, u64::from(term));
+            now += 1;
+        }
+        assert_eq!(rounds, [50, 100, 200, 400, 800, 1300, 1300]);
+        let hb = Msg::Heartbeat { epoch: make_epoch(8, 0), lease_ms: 1000, seq: 1, commit: 0 };
+        let _ = m.on_msg(now, 0, &hb);
+        assert_eq!(m.round_ms(), 50);
+    }
+
+    /// C2: the heartbeat round sent ahead of the period on a voter's first
+    /// ack does not advance any sequence number (grants no lease) until
+    /// this node holds the leadership lease.
+    #[test]
+    fn no_expedited_grant_without_the_leadership_lease() {
+        let mut m = node(0, 5, false);
+        let _ = m.on_tick(T0);
+        let _ = m.on_msg(T0, 1, &pre_grant(1));
+        let _ = m.on_msg(T0, 2, &pre_grant(1));
+        assert_eq!(m.role(), Role::Candidate);
+        let _ = m.on_msg(T0 + 1, 1, &grant(1));
+        let out = m.on_msg(T0 + 1, 2, &grant(1));
+        assert_eq!(m.role(), Role::Leader);
+        assert_eq!(m.election_stats().won, 1);
+        let n0 = 1u64 << 32;
+        let seqs = |out: &[Action], to| -> Vec<u64> {
+            sent(out, to).filter_map(|x| if let Msg::Heartbeat { seq, .. } = x { Some(*seq) } else { None }).collect()
+        };
+        assert_eq!(seqs(&out, 1), [n0]);
+        let ack = Msg::HeartbeatAck { epoch: make_epoch(1, 0), seq: n0 };
+        // First ack of the term: a round at once, but two of five voters
+        // are not a majority, so the same number is sent again.
+        let out = m.on_msg(T0 + 2, 1, &ack);
+        assert_eq!(m.election_stats().heartbeats_expedited, 1);
+        assert_eq!(m.lease_remaining(T0 + 2), 0);
+        for to in 1..5 {
+            assert_eq!(seqs(&out, to), [n0], "voter {to}: {out:?}");
+        }
+        // A repeated ack is not a first ack.
+        let out = m.on_msg(T0 + 3, 1, &ack);
+        assert!(seqs(&out, 1).is_empty(), "{out:?}");
+        assert_eq!(m.election_stats().heartbeats_expedited, 1);
+        // Third voter of five: leadership lease, and the two voters that
+        // acked get the next number; the others do not.
+        let out = m.on_msg(T0 + 4, 2, &ack);
+        assert!(m.lease_remaining(T0 + 4) > 0);
+        assert_eq!(seqs(&out, 1), [n0 + 1]);
+        assert_eq!(seqs(&out, 2), [n0 + 1]);
+        assert_eq!(seqs(&out, 3), [n0]);
+        assert_eq!(seqs(&out, 4), [n0]);
+    }
+
+    /// C1: the member that never answered in this term is not put back.
+    #[test]
+    fn member_not_heard_in_this_term_is_not_reachable() {
+        let mut m = node(0, 3, false);
+        let old = View { epoch: make_epoch(0, 1), live: vec![0, 1, 2], standby: vec![], leader: 2 };
+        let mut out = Vec::new();
+        m.adopt(10, old.clone(), None, &mut out);
+        candidate(&mut m, 1);
+        let _ = m.on_msg(T0 + 1, 1, &grant(1));
+        assert_eq!(m.role(), Role::Leader);
+        let first = m.view().cloned().unwrap();
+        assert_eq!((first.live.as_slice(), first.standby.as_slice()), ([0, 1].as_slice(), [].as_slice()));
+        // Member 1 acks the view and the heartbeat: committed.
+        let _ = m.on_msg(T0 + 2, 1, &Msg::ViewAck { epoch: first.epoch });
+        let _ = m.on_msg(T0 + 2, 1, &Msg::HeartbeatAck { epoch: first.epoch, seq: 1u64 << 32 });
+        assert_eq!(m.committed(), first.epoch);
+        for now in (T0 + 3..T0 + 150).step_by(10) {
+            let _ = m.on_tick(now);
+            assert_eq!(m.view(), Some(&first), "t={now}");
+        }
     }
 
     /// A slice whose primary is `prev` in `from` and `me` in `to`.

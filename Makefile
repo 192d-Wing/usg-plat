@@ -111,7 +111,7 @@ test-verify:
 	$(if $(VERIFY_PY),python3 -I -m unittest discover -s deploy/tests/verify -p 'test_dnf_plugin.py',@if [ "$$CI" = true ]; then echo "ERROR: deploy/tests/verify/test_dnf_plugin.py is required in CI" >&2; exit 1; fi; echo "WARNING: deploy/tests/verify/test_dnf_plugin.py not in the tree; skipped" >&2)
 
 bench:
-	cargo bench -p plat-xlat -p plat-nat64 -p plat-audit -p plat-xdp-core -p plat-tls --bench xlat --bench nat64 --bench audit --bench decide --bench handshake
+	cargo bench -p plat-xlat -p plat-nat64 -p plat-audit -p plat-xdp-core -p plat-tls --bench xlat --bench nat64 --bench adopt_slice --bench audit --bench decide --bench handshake
 
 # XDP fast path (POAM-016 Phase 1, plan §15). Not part of check/test: those need
 # no bpf-linker and no Linux VM. The crates arrive in later work units, so each
