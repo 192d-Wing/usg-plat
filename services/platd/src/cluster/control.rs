@@ -45,6 +45,7 @@ use plat_audit::{
     MemberState, OperatorCommand, OperatorCommandKind, OperatorRefusal, SliceAcquire, SliceReleaseReason, TryEmit,
     ViewReason,
 };
+use plat_cluster::membership::ElectionStats;
 use plat_cluster::{
     AcquireReason, Action, MemberId, Membership, MembershipConfig, Msg, Persisted, ReleaseReason, Role, SliceId,
     SliceMap, View,
@@ -205,6 +206,8 @@ struct Snap {
     leader: Option<MemberId>,
     lease_remaining: u64,
     weights: Vec<u32>,
+    /// Election counters of this process's `Membership`.
+    election: ElectionStats,
 }
 
 /// State shared by the cluster threads, `/metrics` and `/cluster`.
@@ -251,6 +254,33 @@ fn takeover_ix(r: AuditAcquire) -> usize {
         AuditAcquire::Failback => 3,
         AuditAcquire::Manual => 4,
     }
+}
+
+/// Election counters of this process's `Membership` (zero on a witness and
+/// in manual mode, which never campaign). `result`: `won` (elected),
+/// `timeout` (no majority within the candidate round: split vote or slow
+/// voters), `yield` (gave way to a lower-id candidate of the same term).
+/// Rounds that end because another leader or a newer term shows up are not
+/// counted.
+///
+/// COMPLIANCE MAPPING:
+/// - NIST 800-53: SI-4 (System Monitoring) - repeated `timeout` or `yield`
+///   rounds show an election that is not converging; CP-10 - shows how many
+///   split or timed-out rounds a takeover took (the `k` term of the bound in
+///   `plat-cluster/tests/sim.rs`). The counters record round outcomes, not
+///   time; they do not measure how long a takeover took
+fn render_election(o: &mut String, e: &ElectionStats) {
+    use std::fmt::Write as _;
+    let _ = write!(
+        o,
+        "# TYPE plat_cluster_election_rounds_total counter\n\
+         plat_cluster_election_rounds_total{{result=\"won\"}} {}\n\
+         plat_cluster_election_rounds_total{{result=\"timeout\"}} {}\n\
+         plat_cluster_election_rounds_total{{result=\"yield\"}} {}\n\
+         # TYPE plat_cluster_heartbeats_expedited_total counter\n\
+         plat_cluster_heartbeats_expedited_total {}\n",
+        e.won, e.timeout, e.yielded, e.heartbeats_expedited
+    );
 }
 
 fn role_str(r: Option<Role>) -> &'static str {
@@ -372,11 +402,12 @@ impl Shared {
         let _ = write!(
             o,
             "# TYPE plat_cluster_handovers_total counter\nplat_cluster_handovers_total {}\n\
-             # TYPE plat_cluster_state_persist_failures_total counter\nplat_cluster_state_persist_failures_total {}\n\
-             # TYPE plat_cluster_peer_rejected_total counter\n",
+             # TYPE plat_cluster_state_persist_failures_total counter\nplat_cluster_state_persist_failures_total {}\n",
             self.handovers.load(Ordering::Relaxed),
             self.persist_failures.load(Ordering::Relaxed)
         );
+        render_election(o, &s.election);
+        o.push_str("# TYPE plat_cluster_peer_rejected_total counter\n");
         for r in super::peer::REJECT_REASONS {
             let _ = writeln!(
                 o,
@@ -824,6 +855,7 @@ impl Ctl {
         s.committed = self.m.committed();
         s.leader = self.m.leader();
         s.lease_remaining = self.m.lease_remaining(now).min(3_600_000);
+        s.election = self.m.election_stats();
         #[cfg(all(feature = "xdp", target_os = "linux"))]
         self.sh
             .lease_fence_ns
@@ -1478,4 +1510,25 @@ pub fn cli_request(state_dir: &Path, line: &str) -> Result<String, String> {
     let mut out = String::new();
     s.take(1 << 20).read_to_string(&mut out).map_err(|e| e.to_string())?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod metric_tests {
+    use super::{ElectionStats, render_election};
+
+    /// SI-4: the election counters render under their documented names.
+    #[test]
+    fn election_metrics_render() {
+        let mut o = String::new();
+        render_election(&mut o, &ElectionStats { won: 3, timeout: 2, yielded: 1, heartbeats_expedited: 7 });
+        assert_eq!(
+            o,
+            "# TYPE plat_cluster_election_rounds_total counter\n\
+             plat_cluster_election_rounds_total{result=\"won\"} 3\n\
+             plat_cluster_election_rounds_total{result=\"timeout\"} 2\n\
+             plat_cluster_election_rounds_total{result=\"yield\"} 1\n\
+             # TYPE plat_cluster_heartbeats_expedited_total counter\n\
+             plat_cluster_heartbeats_expedited_total 7\n"
+        );
+    }
 }

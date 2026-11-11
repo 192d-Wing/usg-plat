@@ -970,7 +970,9 @@ for `nat_port_block_release` (same address and range), `service_stop`,
   `plat_cluster_resync_total`, `plat_cluster_takeovers_total{reason}`,
   `plat_cluster_handovers_total`, `plat_cluster_peer_rejected_total{reason}`,
   `plat_cluster_hook_failures_total{hook}`,
-  `plat_cluster_state_persist_failures_total`, and the per-worker
+  `plat_cluster_state_persist_failures_total`,
+  `plat_cluster_election_rounds_total{result}` (`won`, `timeout`, `yield`),
+  `plat_cluster_heartbeats_expedited_total`, and the per-worker
   `plat_cluster_steer_missteered_total`, `plat_cluster_reserve_starved_total`,
   and `plat_pool_paired_exhausted_total` (strict paired pooling refused: the
   subscriber's address is full while other addresses have free blocks).

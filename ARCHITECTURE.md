@@ -531,8 +531,13 @@ flowchart LR
   `plat-peer-<id>`, `plat-cluster-ctl` (ticks at heartbeat/10),
   `plat-repl`, `plat-cluster-hook`, `plat-cluster-cli`. None is on the
   packet path.
-- **Failover time** (simulation): member crash ≤ about 4.7 s, leader crash
-  up to about 6.2 s, against a 5 s target; pending three-VM data (POAM-007).
+- **Failover time** (simulation, 5 s target): member crash ≤ about 4.7 s.
+  Leader crash: simulated bound `B(D, F, k, r)` excluding slice-adoption
+  time A (`leader_crash_bound_holds_across_topologies`); ≤ 5 s for 3 data
+  members at 10 % drift only for peer delay ≤ 24 ms with A = 50 ms, 4 members
+  only at ≤ 1 % drift, 5+ not. A runs inline on `plat-cluster-ctl` and is
+  not bounded at scale (POAM-047). No VM trials of the new election yet
+  (POAM-007 (2) open).
 
 ## Trust boundaries
 

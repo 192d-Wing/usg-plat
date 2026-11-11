@@ -13,8 +13,8 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
-use plat_cluster::membership::{Action, Membership, MembershipConfig, Persisted, Role};
-use plat_cluster::{Msg, SliceId};
+use plat_cluster::membership::{Action, ElectionStats, Membership, MembershipConfig, Persisted, Role};
+use plat_cluster::{Msg, SliceId, View};
 
 const SLICES: usize = 48;
 const LEASE: u64 = 3000;
@@ -51,6 +51,9 @@ struct Node {
     /// Clock rate in parts per million relative to real time.
     rate_ppm: i64,
     offset: u64,
+    /// Real time until which the node is blocked in a state write
+    /// (`Sim::persist_delay`); ticks and deliveries wait for it.
+    busy_until: u64,
 }
 
 impl Node {
@@ -74,6 +77,17 @@ struct Sim {
     /// Real time of the last time a slice had no server (liveness).
     unserved_since: Option<u64>,
     acquires: usize,
+    /// Real time one `Action::Persist` takes (the driver's fsync). The node
+    /// handles nothing meanwhile and the later sends of the batch leave
+    /// when it is done. 0 by default.
+    persist_delay: u64,
+    /// Deliver messages a node sent before it crashed (already in the
+    /// socket). Off by default: a crash drops them.
+    deliver_after_crash: bool,
+    /// Every view adopted: (real time, node, view).
+    adopted: Vec<(u64, usize, View)>,
+    /// Refused pre-votes delivered to their candidate.
+    prevote_refusals: u64,
 }
 
 fn cfg(id: u16, members: u16, witness: bool, failback_ms: u64, seed: u64) -> MembershipConfig {
@@ -105,6 +119,7 @@ impl Sim {
                 persisted: Persisted::default(),
                 rate_ppm: rates.get(id).copied().unwrap_or(0),
                 offset,
+                busy_until: 0,
             });
         }
         let mut s = Sim {
@@ -120,6 +135,10 @@ impl Sim {
             loss_pct,
             unserved_since: Some(0),
             acquires: 0,
+            persist_delay: 0,
+            deliver_after_crash: false,
+            adopted: Vec::new(),
+            prevote_refusals: 0,
         };
         for i in 0..n {
             s.start(i);
@@ -147,6 +166,7 @@ impl Sim {
 
     fn crash(&mut self, i: usize) {
         self.nodes[i].m = None;
+        self.nodes[i].busy_until = 0;
         self.check();
     }
 
@@ -199,10 +219,17 @@ impl Sim {
     }
 
     fn apply(&mut self, from: usize, acts: Vec<Action>) {
+        // When the batch's sends leave: after every state write before them.
+        let mut at = self.now;
         for a in acts {
             match a {
-                Action::Persist(p) => self.nodes[from].persisted = p,
-                Action::Send { to, msg } => self.send(from, usize::from(to), msg),
+                Action::Persist(p) => {
+                    self.nodes[from].persisted = p;
+                    at += self.persist_delay;
+                    self.nodes[from].busy_until = at;
+                }
+                Action::Send { to, msg } => self.send_at(at, from, usize::from(to), msg),
+                Action::ViewAdopted(v) => self.adopted.push((self.now, from, v)),
                 Action::Release {
                     slice,
                     epoch,
@@ -210,7 +237,7 @@ impl Sim {
                     reason: plat_cluster::ReleaseReason::Handover,
                 } => {
                     // What the driver does after flushing replication.
-                    self.send(from, usize::from(to), Msg::HandoverFence { slice, epoch, final_seq: 0 });
+                    self.send_at(at, from, usize::from(to), Msg::HandoverFence { slice, epoch, final_seq: 0 });
                 }
                 Action::Acquire { .. } => self.acquires += 1,
                 _ => {}
@@ -219,11 +246,17 @@ impl Sim {
     }
 
     fn send(&mut self, from: usize, to: usize, msg: Msg) {
+        self.send_at(self.now, from, to, msg);
+    }
+
+    /// Send at real time `sent` (now, or when the sender's state write is
+    /// done).
+    fn send_at(&mut self, sent: u64, from: usize, to: usize, msg: Msg) {
         if to >= self.nodes.len() || !self.up[from][to] || self.rng.below(100) < self.loss_pct {
             return;
         }
         // FIFO per link, like the TLS stream.
-        let at = (self.now + 1 + self.rng.below(self.max_delay)).max(self.last_delivery[from][to]);
+        let at = (sent + 1 + self.rng.below(self.max_delay)).max(self.last_delivery[from][to]);
         self.last_delivery[from][to] = at;
         self.msgs.push(Some(msg));
         let id = (self.msgs.len() - 1) as u64;
@@ -235,6 +268,12 @@ impl Sim {
         self.now = at;
         match ev {
             Ev::Tick(i) => {
+                let busy = self.nodes[i].busy_until;
+                if busy > at {
+                    // Blocked in a state write: the tick runs when it is done.
+                    self.push(busy, Ev::Tick(i));
+                    return;
+                }
                 self.push(at + TICK, Ev::Tick(i));
                 let local = self.nodes[i].local(at);
                 if let Some(m) = self.nodes[i].m.as_mut() {
@@ -243,13 +282,23 @@ impl Sim {
                 }
             }
             Ev::Deliver(from, to, id) => {
+                let busy = self.nodes[to].busy_until;
+                if busy > at {
+                    // Deferred events keep their order (same time, rising
+                    // sequence numbers).
+                    self.push(busy, Ev::Deliver(from, to, id));
+                    return;
+                }
                 let msg = self.msgs[id as usize].take();
                 // A link cut while the message was in flight drops it (the
                 // connection resets).
                 if let Some(msg) = msg
                     && self.up[from][to]
-                    && self.alive(from)
+                    && (self.alive(from) || self.deliver_after_crash)
                 {
+                    if matches!(msg, Msg::VoteAck { pre: true, granted: false, .. }) {
+                        self.prevote_refusals += 1;
+                    }
                     let local = self.nodes[to].local(at);
                     if let Some(m) = self.nodes[to].m.as_mut() {
                         let acts = m.on_msg(local, from as u16, &msg);
@@ -272,11 +321,20 @@ impl Sim {
     }
 
     fn check(&mut self) {
+        // Servers per slice, counted without allocating (this runs after
+        // every event); the list is only built to report a violation.
+        let mut count = [0u8; SLICES];
+        for n in &self.nodes {
+            let Some(m) = &n.m else { continue };
+            let local = n.local(self.now);
+            for (s, c) in count.iter_mut().enumerate() {
+                *c += u8::from(m.is_serving(s as SliceId, local));
+            }
+        }
         let mut all = true;
-        for s in 0..SLICES as SliceId {
-            let srv = self.servers(s);
-            assert!(srv.len() <= 1, "t={} slice {s} served by {srv:?}", self.now);
-            all &= srv.len() == 1;
+        for (s, c) in count.iter().enumerate() {
+            assert!(*c <= 1, "t={} slice {s} served by {:?}", self.now, self.servers(s as SliceId));
+            all &= *c == 1;
         }
         let mut leaders: Vec<u32> = self
             .nodes
@@ -324,6 +382,18 @@ impl Sim {
     fn served_by(&self, i: usize) -> usize {
         (0..SLICES as SliceId).filter(|s| self.servers(*s) == vec![i]).count()
     }
+
+    /// Election counters summed over the running nodes.
+    fn election_stats(&self) -> ElectionStats {
+        let mut sum = ElectionStats::default();
+        for st in self.nodes.iter().filter_map(|n| n.m.as_ref().map(Membership::election_stats)) {
+            sum.won += st.won;
+            sum.timeout += st.timeout;
+            sum.yielded += st.yielded;
+            sum.heartbeats_expedited += st.heartbeats_expedited;
+        }
+        sum
+    }
 }
 
 // Derived bounds (see membership docs): safe = 3300 + 200.
@@ -360,16 +430,20 @@ fn member_crash_is_taken_over_within_bound() {
 
 #[test]
 fn leader_crash_is_taken_over_within_bound() {
-    let mut s = Sim::new(3, 4, false, &[90_000, -90_000, 0, 30_000], 30, 0);
+    let rates = [90_000, -90_000, 0, 30_000];
+    let delay = 30;
+    let mut s = Sim::new(3, 4, false, &rates, delay, 0);
     s.until_all_served(4 * SAFE).unwrap();
     s.run_for(5_000);
     let leader = s.leader().unwrap();
+    let t0 = s.now;
     s.crash(leader);
-    s.run_for(1);
-    let t = s.until_all_served(4 * SAFE).expect("takeover");
-    // Election timeout (safe + < 2 hb jitter) + pre-vote/vote + one lease
-    // round trip + commit.
-    assert!(t <= SAFE + 5 * HB + 200, "leader takeover took {t} ms");
+    s.until_all_served(4 * SAFE).expect("takeover");
+    let t = s.now - t0;
+    // Three surviving data members (at most two split rounds), slowest
+    // clock 9 % slow: see `takeover_bound`.
+    let bound = takeover_bound(2, 90_000, delay, 0);
+    assert!(t <= bound, "leader takeover took {t} ms, bound {bound} ms");
     assert_ne!(s.leader(), Some(leader));
 }
 
@@ -626,4 +700,435 @@ fn failback_promotes_within_delay_once_in_sync() {
     let took = b - a;
     assert!(took >= 8_000, "promoted before failback_delay: {took} ms");
     assert!(took <= 8_000 + SYNC_PERIOD + HB, "promotion {took} ms after standby, more than delay + one sync period");
+}
+
+// ------------------------------------------------- leader-crash takeover
+
+/// Clock rates of a leader-crash trial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rates {
+    Zero,
+    /// Each node within +-100 ppm.
+    Ppm100,
+    /// Each node anywhere within the drift margin.
+    Margin,
+    /// Every node the full margin slow.
+    AllSlow,
+    /// Every node the full margin fast.
+    AllFast,
+}
+
+const ALL_RATES: [Rates; 5] = [Rates::Zero, Rates::Ppm100, Rates::Margin, Rates::AllSlow, Rates::AllFast];
+const MARGIN_PPM: u64 = MARGIN * 10_000;
+
+/// One leader-crash trial: its parameters, all derived from the seed.
+#[derive(Debug, Clone)]
+struct Trial {
+    seed: u64,
+    members: u16,
+    witness: bool,
+    rates: Vec<i64>,
+    delay: u64,
+    /// Crash time after 5 s of stable service (phase within two heartbeats).
+    phase: u64,
+    persist_delay: u64,
+    deliver_after_crash: bool,
+}
+
+impl Trial {
+    fn new(seed: u64, members: u16, witness: bool, mode: Rates, delay: u64) -> Trial {
+        let mut r = Rng(seed.wrapping_mul(0x9e37_79b9) ^ 0x51ed);
+        let n = usize::from(members) + usize::from(witness);
+        let rates = (0..n)
+            .map(|_| match mode {
+                Rates::Zero => 0,
+                Rates::Ppm100 => r.below(201) as i64 - 100,
+                Rates::Margin => r.below(2 * MARGIN_PPM + 1) as i64 - MARGIN_PPM as i64,
+                Rates::AllSlow => -(MARGIN_PPM as i64),
+                Rates::AllFast => MARGIN_PPM as i64,
+            })
+            .collect();
+        let phase = r.below(2 * HB);
+        Trial { seed, members, witness, rates, delay, phase, persist_delay: 0, deliver_after_crash: false }
+    }
+
+    /// `r` of the bound, in ppm: how slow the slowest clock of the trial is.
+    fn slow_ppm(&self) -> u64 {
+        self.rates.iter().map(|r| (-*r).max(0) as u64).max().unwrap_or(0)
+    }
+
+    /// `k` of the bound: surviving data members minus one.
+    fn split_rounds(&self) -> u64 {
+        u64::from(self.members).saturating_sub(2)
+    }
+
+    fn bound(&self) -> u64 {
+        takeover_bound(self.split_rounds(), self.slow_ppm(), self.delay, self.persist_delay)
+    }
+}
+
+/// What a leader-crash trial measured.
+struct Outcome {
+    /// Crash until every slice is served again (real ms).
+    took: u64,
+    /// New leader's election until every slice is served again.
+    after_election: u64,
+    old_leader: usize,
+    new_leader: usize,
+    /// Election counters of the survivors: after the crash minus before.
+    timeouts: u64,
+    yields: u64,
+    prevote_refusals: u64,
+    sim: Sim,
+}
+
+/// The bound on "leader crash until every slice is served again" in real
+/// ms: plan A.5 `B_new` with the driver's adoption time `A = 0` (the
+/// simulation counts a slice as served when `Membership` says so) and the
+/// state-write coefficients counted from the code (fix round 0):
+///
+/// ```text
+///   D + (safe + H/2)/(1-r) + tick      last follower fired, every promise ran out
+/// + 4D + 3F                            pre-vote, vote
+/// + k * (R/(1-r) + tick + 4D + 3F)     k split rounds, R = H/2
+/// + 3D + 3F + tick                     view and n0 acked, expedited n0+1 with the commit
+/// ```
+///
+/// `k`: split rounds, `r`: slowest clock in ppm, `d`: maximum one-way
+/// delay, `f`: time of one state write. The sim, like `Ctl::exec`, writes
+/// once per `Action::Persist` and sends the rest of the batch afterwards.
+///
+/// State writes on the critical path (`membership.rs`):
+/// - pre-vote: none (`start_pre_vote` and a pre-vote grant persist nothing);
+/// - vote, 3F: candidate `start_election` (term and own vote) 1, then the
+///   voter that completes the majority, in one batch, `observe_term` (new
+///   term) 1 and `on_vote` (`voted_for`) 1;
+/// - each split round, 3F: the same three writes again (a new
+///   `start_election`, and a voter that sees the new term);
+/// - view commit and first lease, 3F: new leader `propose` (view epoch) 1
+///   before `ViewPropose` and the first heartbeat leave; then a follower
+///   in `on_propose` writes once (`adopt`) if it voted in this term, twice
+///   (`observe_term` in `follow`, then `adopt`) if it did not, before its
+///   `ViewAck`/`HeartbeatAck`. The last follower to be leased can be a
+///   non-voter, so 2. The commit needs a majority of those acks, which
+///   carry the same writes, and the expedited `n0+1` is sent without one
+///   (`leader_tick` and the follower's `on_heartbeat` persist nothing).
+///
+/// The plan's version charged `2F` for the vote and `F` for the lease step;
+/// seed 26 (2 + witness, zero drift, 2 ms, `F = 20`) exceeded it by 13 ms.
+///
+/// COMPLIANCE MAPPING:
+/// - NIST 800-53: CP-10 (System Recovery and Reconstitution), SC-5(2)
+///   (capacity and redundancy) - the membership part of the recovery time
+///   after a leader crash, simulated. It excludes the slice-adoption time
+///   `A` (`State::adopt_slice` in the driver), which is not bounded at scale:
+///   the `adopt_slice` bench measured more than 50 ms above about 130k BIBs
+///   (PERF-001, tracked separately). Not a statement about the driver, the
+///   network or routing
+fn takeover_bound(k: u64, r_ppm: u64, d: u64, f: u64) -> u64 {
+    // A local interval on a clock `r` slow, in real ms (rounded up).
+    let real = |local: u64| (local * 1_000_000).div_ceil(1_000_000 - r_ppm);
+    let fire = d + real(SAFE + HB / 2) + TICK;
+    let vote = 4 * d + 3 * f;
+    let split = real(HB / 2) + TICK + 4 * d + 3 * f;
+    let lease = 3 * d + 3 * f + TICK;
+    fire + vote + k * split + lease
+}
+
+/// Cold start, 5 s plus the phase of stable service, crash the leader,
+/// run until every slice is served again (at most `12 * safe`).
+fn leader_crash(t: &Trial) -> Result<Outcome, String> {
+    let mut s = Sim::new(t.seed, t.members, t.witness, &t.rates, t.delay, 0);
+    s.persist_delay = t.persist_delay;
+    s.deliver_after_crash = t.deliver_after_crash;
+    s.until_all_served(8 * SAFE).ok_or_else(|| format!("{t:?}: no service after cold start\n{}", s.dump()))?;
+    s.run_for(5_000 + t.phase);
+    if s.unserved_since.is_some() {
+        return Err(format!("{t:?}: not stable before the crash\n{}", s.dump()));
+    }
+    let old_leader = s.leader().ok_or_else(|| format!("{t:?}: no leader before the crash"))?;
+    let before = s.election_stats();
+    let own = s.nodes[old_leader].m.as_ref().map_or(ElectionStats::default(), Membership::election_stats);
+    let refusals = s.prevote_refusals;
+    let t0 = s.now;
+    s.crash(old_leader);
+    let mut elected = None;
+    while s.unserved_since.is_some() {
+        if s.now > t0 + 12 * SAFE || s.q.is_empty() {
+            return Err(format!("{t:?}: not every slice served {} ms after the crash\n{}", s.now - t0, s.dump()));
+        }
+        s.step();
+        if elected.is_none() && s.leader().is_some() {
+            elected = Some(s.now);
+        }
+    }
+    let after = s.election_stats();
+    let new_leader = s.leader().ok_or_else(|| format!("{t:?}: served without a leader\n{}", s.dump()))?;
+    Ok(Outcome {
+        took: s.now - t0,
+        after_election: s.now - elected.unwrap_or(t0),
+        old_leader,
+        new_leader,
+        timeouts: after.timeout - (before.timeout - own.timeout),
+        yields: after.yielded - (before.yielded - own.yielded),
+        prevote_refusals: s.prevote_refusals - refusals,
+        sim: s,
+    })
+}
+
+/// (members, witness, rates, delay, state-write time) of a bound-test cell.
+type CellKey = (u16, bool, Rates, u64, u64);
+
+/// State-write times (ms) of the bound test.
+const PERSIST_DELAYS: [u64; 3] = [0, 20, 50];
+
+const TOPOLOGIES: [(u16, bool); 5] = [(2, true), (3, false), (3, true), (4, false), (5, false)];
+
+/// Worst trial `(time, seed, bound)` and the violations of one cell.
+type Cell = ((u64, u64, u64), Vec<String>);
+
+/// Every cell of the bound test: topology x clock rates x delay x write time.
+fn bound_cells() -> Vec<CellKey> {
+    let mut cells = Vec::new();
+    for (members, witness) in TOPOLOGIES {
+        for mode in ALL_RATES {
+            for delay in [2u64, 30] {
+                for f in PERSIST_DELAYS {
+                    cells.push((members, witness, mode, delay, f));
+                }
+            }
+        }
+    }
+    cells
+}
+
+/// Seeds for one cell: `seeds` without write time, a third with it.
+fn cell_seeds(seeds: u64, f: u64) -> u64 {
+    if f == 0 { seeds } else { seeds.div_ceil(3) }
+}
+
+/// Runs the leader-crash trials of one cell against the bound.
+fn run_bound_cell(&(members, witness, mode, delay, f): &CellKey, seeds: u64) -> Cell {
+    let mut worst = (0, 0, 0);
+    let mut bad = Vec::new();
+    for seed in 0..cell_seeds(seeds, f) {
+        let mut t = Trial::new(seed, members, witness, mode, delay);
+        t.persist_delay = f;
+        t.deliver_after_crash = seed % 2 == 1;
+        let bound = t.bound();
+        match leader_crash(&t) {
+            Ok(o) => {
+                if o.took > worst.0 {
+                    worst = (o.took, seed, bound);
+                }
+                if o.took > bound {
+                    bad.push(format!("{t:?} ({mode:?}): took {} ms, bound {bound} ms", o.took));
+                }
+            }
+            Err(e) => bad.push(e),
+        }
+    }
+    (worst, bad)
+}
+
+/// Runs every cell, spread over the cores (the cells are independent
+/// simulations), and returns the results in cell order.
+fn run_bound_cells(cells: &[CellKey], seeds: u64) -> Vec<Cell> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let workers = std::thread::available_parallelism().map_or(1, usize::from).min(cells.len());
+    let mut results: Vec<(usize, Cell)> = std::thread::scope(|sc| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                sc.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(cell) = cells.get(i) else { break done };
+                        done.push((i, run_bound_cell(cell, seeds)));
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| match h.join() {
+                Ok(v) => v,
+                // An invariant of `Sim::check` failed inside a trial.
+                Err(e) => std::panic::resume_unwind(e),
+            })
+            .collect()
+    });
+    results.sort_by_key(|r| r.0);
+    results.into_iter().map(|(_, c)| c).collect()
+}
+
+/// Prints the worst trial over the cells that `keep` selects.
+fn report_worst(label: &str, cells: &[CellKey], results: &[Cell], keep: &dyn Fn(&CellKey) -> bool) {
+    let mut worst = (0, 0, 0);
+    let mut at = None;
+    for (cell, (w, _)) in cells.iter().zip(results) {
+        if keep(cell) && w.0 > worst.0 {
+            worst = *w;
+            at = Some(*cell);
+        }
+    }
+    println!("leader crash, {label}: worst {} ms (bound {} ms, seed {}, {at:?})", worst.0, worst.2, worst.1);
+}
+
+/// The takeover bound over topologies, clock rates, delays and crash
+/// phases. What is asserted: with no fault other than the crash, no loss,
+/// one-way delay at most `d` and clocks within the drift margin, every
+/// slice is served again within `takeover_bound(k = S - 1, r, d, f)` of the
+/// crash, `S` being the surviving data members, `r` the slowest clock of
+/// the trial and `f` the time of one state write (`PERSIST_DELAYS`). Odd
+/// seeds also deliver what the leader had sent before it crashed (the
+/// leading `D` of the bound). Seeds per cell: 50 with `f = 0` and 17 with
+/// `f > 0` by default (`make test`); `PLAT_SIM_SEEDS=n` raises it to `n`
+/// and `n / 3` (300 or more for the nightly job).
+///
+/// Not covered: the driver's adoption time, a state write whose time
+/// varies, loss, and a second fault. The bound itself is above 5 s in some cells
+/// (4 data members at the full margin with 30 ms delay; 5 data members
+/// with 30 ms delay or at the full margin): this test asserts the formula,
+/// not 5 s.
+///
+/// COMPLIANCE MAPPING:
+/// - NIST 800-53: CP-10 (System Recovery and Reconstitution), SC-5(2) -
+///   recovery time after a leader crash; SC-24 (Fail in Known State) - the
+///   invariants of `Sim::check` hold on every event of every trial
+#[test]
+fn leader_crash_bound_holds_across_topologies() {
+    let seeds: u64 = std::env::var("PLAT_SIM_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(0).max(50);
+    let cells = bound_cells();
+    let results = run_bound_cells(&cells, seeds);
+    let bad: Vec<String> = results.iter().flat_map(|(_, b)| b.iter().cloned()).collect();
+    // Worst case per topology and state-write time; then per drift mode.
+    for (members, witness) in TOPOLOGIES {
+        let w = if witness { " + witness" } else { "" };
+        for f in PERSIST_DELAYS {
+            let n = cell_seeds(seeds, f);
+            report_worst(&format!("{members} members{w}, F {f} ms, {n} seeds per cell"), &cells, &results, &|c| {
+                (c.0, c.1, c.4) == (members, witness, f)
+            });
+            for mode in [Rates::Margin, Rates::AllSlow] {
+                report_worst(&format!("{members} members{w}, F {f} ms, {mode:?}"), &cells, &results, &|c| {
+                    (c.0, c.1, c.2, c.4) == (members, witness, mode, f)
+                });
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{} trials outside the bound:\n{}", bad.len(), bad.join("\n"));
+}
+
+/// R1: two followers that campaign within one delivery time of each other
+/// split the vote. The higher id yields, the lower id's round times out
+/// after `heartbeat / 2` and its next round wins: one extra round. Seed 7
+/// is such a schedule; seed 99 is the one that took 13.1 s when a split
+/// cost two election timeouts (plan A.3).
+#[test]
+fn split_vote_costs_one_round() {
+    let t = Trial::new(7, 3, false, Rates::Zero, 2);
+    let o = leader_crash(&t).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!((o.yields, o.timeouts), (1, 1), "seed 7 no longer splits the vote: pin another seed");
+    assert!(o.took <= takeover_bound(1, 0, t.delay, 0), "split vote: {} ms", o.took);
+
+    let t = Trial::new(99, 3, false, Rates::Zero, 2);
+    assert_eq!(t.phase, 191, "the trial derivation changed: seed 99 is no longer the recorded schedule");
+    let o = leader_crash(&t).unwrap_or_else(|e| panic!("{e}"));
+    assert!(o.took <= takeover_bound(1, 0, t.delay, 0), "seed 99: {} ms", o.took);
+}
+
+/// R2: with a witness only one member campaigns. A pre-vote that reaches
+/// the other voter before its lease promise ran out (later ack, or a slower
+/// clock) is refused; the pre-candidate asks again instead of backing off
+/// for two election timeouts. Margin seed 168 took 11.9 s and 100 ppm seed
+/// 749 took 10.9 s before (plan A.3); seed 168 and (100 ppm, 30 ms) seed 12
+/// still see refusals.
+#[test]
+fn refused_early_prevote_recovers_with_witness() {
+    for (seed, mode, delay, refused) in
+        [(168, Rates::Margin, 2, true), (749, Rates::Ppm100, 2, false), (12, Rates::Ppm100, 30, true)]
+    {
+        let t = Trial::new(seed, 2, true, mode, delay);
+        let o = leader_crash(&t).unwrap_or_else(|e| panic!("{e}"));
+        if refused {
+            assert!(o.prevote_refusals > 0, "seed {seed} no longer has a refused pre-vote: pin another seed");
+        }
+        assert_eq!((o.timeouts, o.yields), (0, 0), "seed {seed}: one campaigner cannot split the vote");
+        assert!(o.took <= t.bound(), "seed {seed}: {} ms, bound {} ms", o.took, t.bound());
+    }
+    let t = Trial::new(168, 2, true, Rates::Margin, 2);
+    assert_eq!((t.rates.as_slice(), t.phase), ([-69_495, 77_184, -92_122].as_slice(), 513), "trial derivation changed");
+}
+
+/// C1: the new leader's first view drops the crashed leader, and nothing
+/// puts it back: `last_ack_recv` starting at the election time does not
+/// make a member that never answered in this term reachable. Exactly one
+/// view of the new term from the crash until well after `safe`.
+#[test]
+fn new_leader_does_not_readd_the_crashed_leader() {
+    for members in [3u16, 4, 5] {
+        for seed in 0..8 {
+            let t = Trial::new(seed, members, false, Rates::Zero, 20);
+            let mut o = leader_crash(&t).unwrap_or_else(|e| panic!("{e}"));
+            o.sim.run_for(2 * SAFE);
+            let term = o.sim.nodes[o.new_leader].m.as_ref().map_or(0, Membership::term);
+            let views: Vec<&View> = o
+                .sim
+                .adopted
+                .iter()
+                .filter(|(_, node, v)| *node == o.new_leader && plat_cluster::term_of(v.epoch) == term)
+                .map(|(_, _, v)| v)
+                .collect();
+            assert_eq!(views.len(), 1, "members {members} seed {seed}: {views:?}");
+            let old = o.old_leader as u16;
+            assert!(!views[0].is_live(old) && !views[0].is_standby(old), "{:?}", views[0]);
+            assert_eq!(views[0].live.len(), usize::from(members) - 1);
+            assert!(o.sim.unserved_since.is_none(), "service lost after the takeover\n{}", o.sim.dump());
+        }
+    }
+}
+
+/// C2 and C3: once a leader is elected, every slice (the survivors' own
+/// included) is served again after the view and first heartbeat, their
+/// acks, and the expedited next heartbeat: three deliveries and a tick, not
+/// one or two heartbeat periods.
+#[test]
+fn follower_lease_follows_the_election_without_a_heartbeat_period() {
+    for members in [3u16, 4, 5] {
+        for delay in [2u64, 30] {
+            let limit = 3 * delay + TICK;
+            assert!(limit < HB);
+            for seed in 0..20 {
+                let t = Trial::new(seed, members, false, Rates::Zero, delay);
+                let o = leader_crash(&t).unwrap_or_else(|e| panic!("{e}"));
+                assert!(
+                    o.after_election <= limit,
+                    "members {members} delay {delay} seed {seed}: served {} ms after the election, limit {limit} ms",
+                    o.after_election
+                );
+                let st = o.sim.nodes[o.new_leader].m.as_ref().map(Membership::election_stats).unwrap_or_default();
+                assert!(st.heartbeats_expedited > 0);
+            }
+        }
+    }
+}
+
+/// C5: with a state write of 150 ms the first candidate round (250 ms)
+/// cannot finish: the candidate writes once and each voter twice before
+/// the ack leaves. The round length doubles, so the second round does.
+/// With a fixed round no leader is ever elected (checked by hand while
+/// writing this test). `2 * safe` is a ceiling for this test, not a bound
+/// that is claimed anywhere.
+#[test]
+fn slow_persist_does_not_livelock_the_election() {
+    for members in [3u16, 4] {
+        for seed in 0..10 {
+            let mut t = Trial::new(seed, members, false, Rates::Zero, 2);
+            t.persist_delay = 150;
+            let o = leader_crash(&t).unwrap_or_else(|e| panic!("{e}"));
+            assert!(o.timeouts >= 1, "members {members} seed {seed}: the first round was expected to time out");
+            assert!(o.took <= 2 * SAFE, "members {members} seed {seed}: {} ms", o.took);
+        }
+    }
 }

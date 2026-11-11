@@ -38,5 +38,9 @@ proptest.workspace = true
 name = "nat64"
 harness = false
 
+[[bench]]
+name = "adopt_slice"
+harness = false
+
 [lints]
 workspace = true

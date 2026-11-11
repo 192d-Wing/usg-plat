@@ -1088,3 +1088,267 @@ fn restarted_member_relearns_homes_and_refuses_missteered() {
     drop(a);
     w.shutdown();
 }
+
+/// A stand-in for the witness whose peer channel is owned by the test: it
+/// votes and acks through a real `Membership` in the witness role and
+/// records when each `Heartbeat` arrives. Nothing in the members changes.
+struct HeartbeatProbe {
+    net: Arc<super::peer::Net>,
+    beats: Arc<Mutex<Vec<(u16, Instant)>>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    driver: Option<std::thread::JoinHandle<()>>,
+}
+
+struct ProbeInbound {
+    tx: std::sync::mpsc::SyncSender<(u16, Msg)>,
+    beats: Arc<Mutex<Vec<(u16, Instant)>>>,
+}
+
+impl super::peer::Inbound for ProbeInbound {
+    fn control(&self, from: u16, msg: Msg) {
+        if matches!(msg, Msg::Heartbeat { .. }) {
+            self.beats.lock().push((from, Instant::now()));
+        }
+        let _ = self.tx.try_send((from, msg));
+    }
+
+    fn data(&self, _from: u16, _msg: Msg) -> Result<(), super::peer::Refusal> {
+        Ok(())
+    }
+
+    fn link(&self, _peer: u16, _up: bool) {}
+}
+
+impl HeartbeatProbe {
+    fn start(l: &Layout, pki: &Pki, state: &Path) -> Self {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use plat_cluster::{Action, Membership, MembershipConfig, Persisted};
+
+        use super::control::{Voter, peer_specs};
+        use super::replicator::mono_ms;
+
+        let f = witness_file(l, pki, state);
+        let (w, me) = (&f.witness, f.witness_id());
+        let mut voters: Vec<Voter> = w
+            .members
+            .iter()
+            .map(|m| Voter {
+                id: m.id,
+                name: format!("plat-{}", m.id),
+                identity: m.identity.clone(),
+                addr: m.addr,
+                witness: false,
+            })
+            .collect();
+        voters.push(Voter {
+            id: me,
+            name: w.name.clone(),
+            identity: w.identity.clone(),
+            addr: w.listen,
+            witness: true,
+        });
+        let tls = plat_tls::peer_configs(&plat_tls::PeerSettings::from_config(&w.tls, f.tls.pq_hybrid, None)).unwrap();
+        let digest = f.digest();
+        let cfg = super::peer::NetConfig {
+            me,
+            name: w.name.clone(),
+            listen: w.listen,
+            i_am_witness: true,
+            peers: peer_specs(&voters, me).unwrap(),
+            digest_full: digest,
+            digest_vote: digest,
+            max_frame: 64 << 10,
+            queue_bytes: 1 << 20,
+            keepalive: Duration::from_millis(w.heartbeat_ms),
+            idle_timeout: Duration::from_millis(w.lease_ms * 2),
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let net = super::peer::Net::new(cfg, tls, collector(4096).0, stop.clone()).unwrap();
+        let beats: Arc<Mutex<Vec<(u16, Instant)>>> = Arc::default();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1024);
+        net.set_inbound(Arc::new(ProbeInbound { tx, beats: beats.clone() }));
+        let mcfg = MembershipConfig {
+            self_id: me,
+            members: w.members.iter().map(|m| (m.id, u32::from(m.weight))).collect(),
+            witness: Some(me),
+            slice_count: 1,
+            lease_ms: w.lease_ms,
+            heartbeat_ms: w.heartbeat_ms,
+            drift_margin_pct: u64::from(w.drift_margin_pct),
+            failback_delay_ms: 0,
+            auto_failover: true,
+            seed: 7,
+        };
+        // Votes are kept in memory only: the probe never restarts.
+        let (mut m, initial) = Membership::new(mcfg, Persisted::default(), mono_ms()).unwrap();
+        net.spawn().unwrap();
+        let (dnet, dstop) = (net.clone(), stop.clone());
+        let driver = std::thread::spawn(move || {
+            let exec = |actions: Vec<Action>| {
+                for a in actions {
+                    if let Action::Send { to, msg } = a {
+                        dnet.send(to, &msg);
+                    }
+                }
+            };
+            exec(initial);
+            let tick = Duration::from_millis(m.tick_interval_ms());
+            let mut next = Instant::now();
+            while !dstop.load(Ordering::Relaxed) {
+                if let Ok((from, msg)) = rx.recv_timeout(next.saturating_duration_since(Instant::now())) {
+                    exec(m.on_msg(mono_ms(), from, &msg));
+                }
+                if Instant::now() >= next {
+                    next = Instant::now() + tick;
+                    exec(m.on_tick(mono_ms()));
+                }
+            }
+        });
+        Self { net, beats, stop, driver: Some(driver) }
+    }
+
+    /// Arrival times of the heartbeats `from` sent, oldest first.
+    fn beats_from(&self, from: u16) -> Vec<Instant> {
+        self.beats.lock().iter().filter(|b| b.0 == from).map(|b| b.1).collect()
+    }
+}
+
+impl Drop for HeartbeatProbe {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(d) = self.driver.take() {
+            let _ = d.join();
+        }
+        self.net.wake_all();
+        self.net.join();
+    }
+}
+
+/// Longest interval between consecutive instants, counting only intervals
+/// that end inside `[from, to]`.
+fn longest_gap(beats: &[Instant], from: Instant, to: Instant) -> Duration {
+    beats
+        .windows(2)
+        .filter_map(|w| match w {
+            [a, b] if *b >= from && *b <= to => Some(b.duration_since(*a)),
+            _ => None,
+        })
+        .max()
+        .unwrap_or_default()
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+/// POAM-007 (2), measurement only: `Ctl::acquire` adopts every slice of a
+/// crashed member inline on the `plat-cluster-ctl` thread, which also sends
+/// the leader's heartbeats. The leader adopts the other member's slices
+/// (one block per subscriber, `PLAT_HB_GAP_SUBS` x `PLAT_HB_GAP_PORTS`
+/// BIBs) while a test-owned witness records when its heartbeats arrive.
+/// Prints the longest gap before the crash and during the adoption; the
+/// assertion is a sanity limit only (timing on a shared host).
+#[test]
+fn heartbeat_gap_during_large_adoption() {
+    const HEARTBEAT: Duration = Duration::from_millis(100);
+    let subs = env_usize("PLAT_HB_GAP_SUBS", 2000);
+    let ports = env_usize("PLAT_HB_GAP_PORTS", 16).clamp(1, 256);
+    let _serial = crate::test_pki::FIPS_HOOK.lock();
+    let pki = Pki::new();
+    let l = Layout::new(2, true);
+    let (sa, sb, sw) = (ShortDir::new("a"), ShortDir::new("b"), ShortDir::new("w"));
+    let probe = HeartbeatProbe::start(&l, &pki, &sw.0);
+    let mut nodes = [
+        Node::start(member_cfg(&l, 0, l.ports[0], &pki, &sa.0, "", None)),
+        Node::start(member_cfg(&l, 1, l.ports[1], &pki, &sb.0, "", None)),
+    ];
+    wait("16 slices", Duration::from_secs(15), || {
+        nodes.iter().all(|n| n.active() > 0) && total_active(&[&nodes[0], &nodes[1]]) == 16
+    });
+    // The leader survives, so its heartbeats to the witness never stop.
+    let leader = nodes[0].h().shared.view().unwrap().leader;
+    let (li, vi) = (usize::from(leader), usize::from(1 - leader));
+    wait_protected(&[&nodes[0], &nodes[1]]);
+
+    // Load on the victim: `subs` subscribers with one block and `ports`
+    // UDP mappings each. A new subscriber waits for a block reserved with
+    // the backup, so a refused first packet is retried.
+    let fill = Instant::now();
+    for i in 0..subs as u128 {
+        let client = 0x2001_0db8_0100_0000_0000_0000_0000_0000 | (i << 64) | 1;
+        let t = Instant::now();
+        while nodes[vi].send(client, 40000).is_none() {
+            assert!(t.elapsed() < Duration::from_secs(10), "no block for subscriber {i}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        for p in 1..ports as u16 {
+            assert!(nodes[vi].send(client, 40000 + p).is_some(), "subscriber {i} port {p}");
+        }
+    }
+    let fill = fill.elapsed();
+    let victim_slices = nodes[vi].active();
+    let repl = nodes[li].h().shared.repl.clone().unwrap();
+    let synced = wait("backup holds every block and BIB, in sync", Duration::from_secs(120), || {
+        let g = repl.lock();
+        let (mut blocks, mut bibs) = (0, 0);
+        for s in 0..16 {
+            let c = g.shadow_counts(s);
+            blocks += c.0;
+            bibs += c.1;
+            if c.0 > 0 && !g.shadow.in_sync(s) {
+                return false;
+            }
+        }
+        (blocks, bibs) == (subs, subs * ports)
+    });
+    wait_protected(&[&nodes[0], &nodes[1]]);
+
+    // Baseline: one second of undisturbed heartbeats.
+    std::thread::sleep(Duration::from_secs(1));
+    let mark = nodes[li].events.lock().len();
+    let killed = Instant::now();
+    let baseline = longest_gap(&probe.beats_from(leader), killed.checked_sub(Duration::from_secs(1)).unwrap(), killed);
+    nodes[vi].kill();
+    let took = wait("takeover by the leader", Duration::from_secs(30), || nodes[li].active() == 16);
+    // Heartbeats delayed by the adoption arrive after it ends.
+    std::thread::sleep(3 * HEARTBEAT);
+    let gap = longest_gap(&probe.beats_from(leader), killed, Instant::now());
+
+    let (mut blocks, mut bibs, mut slices) = (0u64, 0u64, 0usize);
+    wait("acquire records", Duration::from_secs(5), || {
+        (blocks, bibs, slices) = (0, 0, 0);
+        for e in nodes[li].events.lock().iter().skip(mark) {
+            if let Event::ClusterSliceAcquire { acquire, .. } = e
+                && acquire.reason == AuditAcquire::Takeover
+            {
+                blocks += u64::from(acquire.blocks_adopted);
+                bibs += acquire.bibs_adopted;
+                slices += 1;
+            }
+        }
+        slices >= victim_slices
+    });
+    // A stall longer than the lease costs the leader its own lease: it
+    // then fences what it serves and a new view follows.
+    let (views, released) = nodes[li].events.lock().iter().skip(mark).fold((0, 0), |(v, r), e| match e {
+        Event::ClusterViewChange { .. } => (v + 1, r),
+        Event::ClusterSliceRelease { .. } => (v, r + 1),
+        _ => (v, r),
+    });
+    println!(
+        "heartbeat_gap_during_large_adoption: adopted {slices} slices, {blocks} blocks, {bibs} BIBs \
+         (load {fill:?}, backup in sync after {synced:?}); crash to all slices Active {took:?}; \
+         longest heartbeat gap: {baseline:?} before the crash, {gap:?} during the takeover; \
+         after the crash the leader adopted {views} views and released {released} slices \
+         (heartbeat {HEARTBEAT:?}, lease {LEASE_MS} ms; this host, {} build)",
+        if cfg!(debug_assertions) { "debug" } else { "release" }
+    );
+    assert_eq!((blocks, bibs), (subs as u64, (subs * ports) as u64), "the whole load was adopted");
+    assert!(baseline > Duration::ZERO && gap > Duration::ZERO, "the probe saw the leader's heartbeats");
+    // Sanity only: the measured value is the printed one.
+    assert!(gap < Duration::from_secs(10), "heartbeat gap {gap:?}");
+    for n in &mut nodes {
+        n.stop();
+    }
+}

@@ -13,7 +13,7 @@ into work and does not replace that register.
 | Stateful NAT64 / 464XLAT PLAT (RFC 6146, 7915, 6052) | Implemented: TUN data path, run-to-completion workers, fragments and reassembly (POAM-001), ICMP error generation (POAM-002), TCP simultaneous open (POAM-008), port blocks with cool-down and per-subscriber / per-aggregate limits |
 | Attribution logging (AU-*) | Implemented: schema 8, JSON/CEF, syslog UDP/TCP/TLS 1.3, SHA-256 chained files with `verify-log`; chain is unkeyed (POAM-003) |
 | FIPS / TLS (SC-8, SC-13, IA-*) | Implemented: aws-lc-rs FIPS, TLS 1.3 only, mTLS management, OCSP/CRL revocation; CMVP certificate for AWS-LC-FIPS 4.x pending (POAM-026) |
-| Cluster scale-out and HA (CP-10) | Partial (POAM-007): slices, replication, leases, witness, takeover; three-VM runs with an FRR BGP/BFD edge (LINUX_VERIFICATION L19–L23) PASS (round 6, 2026-10-29): `kill -9` takeover 3.8 s and VM loss 3.4 s with 200/200 TCP flows, leader crash max 4.5 s over 27 trials (≤ 5 s target; the simulated worst case of ~6.2 s is not excluded); sessions not replicated (POAM-028) |
+| Cluster scale-out and HA (CP-10) | Partial (POAM-007): slices, replication, leases, witness, takeover; three-VM runs with an FRR BGP/BFD edge (LINUX_VERIFICATION L19–L23) PASS (round 6, 2026-10-29): `kill -9` takeover 3.8 s and VM loss 3.4 s with 200/200 TCP flows, leader crash max 4.5 s over 27 trials (≤ 5 s target; old election; the new election's simulated bound excludes adoption time and has no VM trials yet); sessions not replicated (POAM-028) |
 | Host hardening (AC-6, SC-7, SC-39) | Implemented: capability-free `platd`, nftables forward policy with `plat-fwguard`; verified on one Ubuntu 24.04 VM |
 | XDP fast path (POAM-016) | Phase 1 code-complete (PRs #23–#28): established UDP in eBPF, `platd` as slow path, loader and systemd units, schema 8 records, `[xdp]` off by default, kernel ≥ 6.6. CI checks are required on `main` on x86_64 and aarch64 (#29). Speed-up not measured |
 | Releases and install-time verification (SI-7, SR-4, SR-11, CM-14) | Implemented, Partial (POAM-044): `v*` tags signed with cosign keyless and build provenance (v0.2.1 onwards, `scripts/verify-release.sh`); apt/dnf repository at https://192d-wing.github.io/usg-plat-packages/ and an offline tarball per tag; install-time gate `usg-plat-verify` (v0.4.0 onwards; apt hook + dnf4 plugin, `platd` depends on it). Packages install on EL9, Debian 12 and Ubuntu 22.04/24.04 (glibc floor 2.34). Live installs through the gate: L35 (v0.4.0, fixed in v0.4.1), L36 (v0.4.1) PASS; L37 offline mirror PARTIAL (apt fixed in v0.4.2, live re-run open). arm64 containers only |
@@ -36,8 +36,11 @@ Ordered by value for the effort, with what each needs.
    criterion, and L27 on a real NIC. This is the evidence POAM-016 exists
    for.
 3. **HA verification (POAM-007).** L19–L23 PASS on three VMs with FRR
-   (2026-10-29, round 6). Left: show the leader-crash worst case (~6.2 s in
-   simulation) cannot occur or tighten it, and session pickup (POAM-028).
+   (2026-10-29, round 6). Leader-crash election changes C1–C7 have a simulated
+   bound (`leader_crash_bound_holds_across_topologies`, adoption time
+   excluded). Left: chunked slice adoption (POAM-047, separate PR first),
+   VM trials of the new election on a three-data-member bed (WU-A5), and
+   session pickup (POAM-028).
 
 Done since the last update:
 
@@ -110,6 +113,9 @@ Done since the last update:
 
 - POAM-017: leader-side batching of slice moves; handover bursts on
   membership change; legacy `contiguous` mode.
+- POAM-047: chunked slice adoption (about 64k BIBs per chunk, heartbeats
+  between, slice Pending until done); before session hints.
+- POAM-007 (2): VM trials of the new election (WU-A5).
 - POAM-028: sessions are not replicated (TCP pickup window after takeover).
 - POAM-029 to POAM-033: subscriber-home directory, leader-coordinated
   graceful shutdown, one-sided peer-address pinning, single trust domain,

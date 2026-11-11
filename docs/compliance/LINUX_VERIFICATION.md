@@ -524,7 +524,9 @@ Open timing item for L19: the in-process simulation
 bounds a member crash at about 4.7 s but a **leader crash at about 6.2 s**,
 above the 5 s target of F1. F1 must be run with the leader as the crashed
 node as well; the result decides whether the target or `lease_ms` changes
-(POAM-007).
+(POAM-007). Update (`feat/ha-election-bound`): the election changed (C1–C7)
+and the 6.2 s figure no longer applies; the new simulated bound and its
+limits are in POAM-007 (2). F1 has not been re-run with the new election.
 
 Result: **NOT RUN.**
 
