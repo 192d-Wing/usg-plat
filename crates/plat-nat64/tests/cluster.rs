@@ -901,3 +901,383 @@ fn qa_held_syn_on_adopted_bib_after_takeover() {
     assert_eq!(b.fx.ctx.counters.get(Counter::TcpSynHeldMatched), 1);
     assert!(run(&mut b.fx, &tcp4(OTHER, 5000, v4, p4, SYN | ACK)).is_ok());
 }
+
+// ------------------------------------------------- POAM-047 chunked adoption (QA)
+
+/// `(k6, (v4, port4))` of one flow.
+type Flow = (Key6, (u32, u16));
+
+/// A node with `subs` subscribers on every slice (`ports` UDP flows each),
+/// its replicated state in a shadow (snapshot complete), and the slice
+/// holding the most subscribers with its flows.
+fn loaded(subs: u16, ports: u16) -> (Shadow, u16, Vec<Flow>) {
+    let mut a = node(&[]);
+    start_all(&a);
+    let _ = drain(&a);
+    let mut flows = Vec::new();
+    for n in 1..=subs {
+        flows.extend((0..ports).map(|p| (n, 1000 + p, proto::UDP)));
+    }
+    let made = make_flows(&mut a, &flows);
+    // Snapshot export (the ring may overflow at this load).
+    let shadow = shadow_for(&a);
+    for s in 0..4 {
+        shadow.snapshot_begin(s).unwrap();
+        let mut cur = Some(ExportCursor::default());
+        while let Some(c) = cur {
+            let (recs, next) = a.fx.nat.state().export_slice(s, c, 256);
+            shadow.snapshot_records(s, &recs).unwrap();
+            cur = next;
+        }
+        shadow.snapshot_end(s).unwrap();
+    }
+    let slice = (0..4u16).max_by_key(|&s| made.iter().filter(|m| (m.1.0 & 3) as u16 == s).count()).unwrap();
+    let mine: Vec<_> = made.into_iter().filter(|m| (m.1.0 & 3) as u16 == slice).collect();
+    assert!(mine.len() >= usize::from(ports) * 3, "{} flows on slice {slice}", mine.len());
+    (shadow, slice, mine)
+}
+
+fn past() -> std::time::Instant {
+    let now = std::time::Instant::now();
+    now.checked_sub(Duration::from_secs(1)).unwrap_or(now)
+}
+
+/// A record queued by someone else (fills the audit queue).
+fn foreign() -> Event {
+    Event::ClusterSliceAcquire {
+        ts_us: 0,
+        acquire: Arc::new(plat_audit::SliceAcquire {
+            slice: plat_audit::SliceCidr { net: 0, len: 32 },
+            epoch: 0,
+            prev_owner: None,
+            reason: AcquireReason::Startup,
+            blocks_adopted: 0,
+            bibs_adopted: 0,
+            blocks_quarantined: 0,
+            in_sync: true,
+        }),
+    }
+}
+
+fn is_foreign(e: &Event) -> bool {
+    matches!(e, Event::ClusterSliceAcquire { acquire, .. } if acquire.epoch == 0)
+}
+
+/// `(v4, port_lo)` of every adopt / release record.
+fn adopts(evs: &[Event]) -> Vec<(u32, u16)> {
+    let mut v: Vec<_> = evs
+        .iter()
+        .filter_map(|e| match e {
+            Event::PortBlockAdopt { adopt, .. } => Some((adopt.v4, adopt.port_lo)),
+            _ => None,
+        })
+        .collect();
+    v.sort_unstable();
+    v
+}
+
+fn releases(evs: &[Event]) -> Vec<(u32, u16, Option<BlockReleaseReason>)> {
+    let mut v: Vec<_> = evs
+        .iter()
+        .filter_map(|e| match e {
+            Event::PortBlockRelease { v4, port_lo, reason, .. } => Some((*v4, *port_lo, *reason)),
+            _ => None,
+        })
+        .collect();
+    v.sort_unstable_by_key(|x| (x.0, x.1));
+    v
+}
+
+/// Nothing of `slice` serves: inbound to every imported mapping and the
+/// subscribers' outbound are dropped, and `want` is the drop for inbound.
+fn serves_nothing(b: &mut Node, flows: &[(Key6, (u32, u16))], want: DropReason) {
+    for (k6, (v4, p4)) in flows {
+        assert_eq!(run(&mut b.fx, &udp4(SERVER, 53, *v4, *p4, b"r")).unwrap_err(), want, "inbound {v4:x}:{p4}");
+        if let Ok(o) = run(&mut b.fx, &udp6(k6.addr, k6.port, SERVER, 53, b"q")) {
+            assert_ne!(tuple4(&o).0 & 3, v4 & 3, "outbound used the adopting slice");
+        }
+    }
+}
+
+/// POAM-047, AU-12, AU-5 (plan §8): the chunked variant of
+/// `adoption_is_logged_before_use_and_refused_without_queue_room`. Under
+/// `refuse_new_bindings` the queue is full when the log phase is reached
+/// and is drained a little between steps: every refused step leaves the
+/// slice Adopting and serving nothing; the acquire record and one adopt
+/// record per block are queued exactly once, the acquire first; the slice
+/// is Active, with the same mappings, only after the last of them.
+#[test]
+fn chunked_adoption_logged_before_use_with_queue_room_freed_between_steps() {
+    let (shadow, slice, flows) = loaded(24, 3);
+    let input = shadow.take(slice, 0);
+    let mut b = node_with(&[], 1024, SteeringMode::Drop, 1, 64);
+    let st = b.fx.nat.state();
+    while st.audit().emit(foreign()) && b.fx.rx.len() < 64 {}
+    let mut a =
+        st.adopt_begin(slice, plat_nat64::AdoptSource::Input(input.clone()), meta(AcquireReason::Takeover)).unwrap();
+    let mut seen: Vec<Event> = Vec::new();
+    let (mut steps, mut refused) = (0, 0);
+    loop {
+        steps += 1;
+        assert!(steps < 10_000, "no progress");
+        let r = b.fx.nat.state().adopt_step(&mut a, past());
+        match r {
+            Ok(plat_nat64::Step::Done(s)) => {
+                assert_eq!(s.blocks_adopted as usize, input.blocks.len());
+                break;
+            }
+            Ok(plat_nat64::Step::More) => {}
+            Err(AdoptError::AuditUnavailable) => {
+                refused += 1;
+                assert_eq!(a.phase(), "log");
+                // Slow logger: three records per refused step.
+                seen.extend(b.fx.rx.try_iter().take(3));
+            }
+            Err(e) => panic!("{e:?}"),
+        }
+        if b.fx.nat.state().slice_state(slice) == Some(SliceState::Adopting) {
+            serves_nothing(&mut b, &flows, DropReason::ClusterFenced);
+        }
+    }
+    let after_done = b.fx.rx.len();
+    seen.extend(b.fx.rx.try_iter());
+    assert!(refused >= 3, "{refused} refused steps: the queue was not full across steps");
+    let ours: Vec<Event> = seen.into_iter().filter(|e| !is_foreign(e)).collect();
+    let Event::ClusterSliceAcquire { acquire, .. } = &ours[0] else { panic!("acquire first: {ours:?}") };
+    assert_eq!((acquire.epoch, acquire.blocks_adopted as usize), (7, input.blocks.len()));
+    assert_eq!(ours.iter().filter(|e| matches!(e, Event::ClusterSliceAcquire { .. })).count(), 1);
+    let ad = adopts(&ours);
+    let mut dedup = ad.clone();
+    dedup.dedup();
+    assert_eq!((ad.len(), dedup.len()), (input.blocks.len(), input.blocks.len()), "every adopt record once");
+    assert!(after_done >= ours.len(), "every record of the adoption was queued before the slice went Active");
+    assert_eq!(b.fx.nat.state().slice_state(slice), Some(SliceState::Active));
+    check_same(&mut b, &flows);
+}
+
+/// Steps `a` until `stop` holds (the slice still Adopting).
+fn step_until(b: &Node, a: &mut plat_nat64::Adoption, mut stop: impl FnMut(&Node) -> bool) {
+    for _ in 0..100_000 {
+        if stop(b) {
+            return;
+        }
+        assert_eq!(b.fx.nat.state().adopt_step(a, past()), Ok(plat_nat64::Step::More));
+    }
+    panic!("condition not reached");
+}
+
+/// SC-24, AU-12 (plan §5 abandon rows: lease lost / reassigned): abandoned
+/// while importing BIBs, before any record: no release record, nothing of
+/// the slice is left or served, the slice ends Inactive (`WrongNode`, not
+/// Fenced) and a new adoption of the same data is complete.
+#[test]
+fn abandon_mid_import_logs_nothing_and_readopts_in_full() {
+    let (shadow, slice, flows) = loaded(24, 3);
+    let input = shadow.take(slice, 0);
+    let mut b = node(&[]);
+    let mut a =
+        b.fx.nat
+            .state()
+            .adopt_begin(slice, plat_nat64::AdoptSource::Input(input.clone()), meta(AcquireReason::Takeover))
+            .unwrap();
+    let k6 = flows[0].0;
+    step_until(&b, &mut a, |b| b.fx.nat.state().lookup6(k6).is_some());
+    assert_eq!(a.phase(), "import_bibs");
+    serves_nothing(&mut b, &flows, DropReason::ClusterFenced);
+    assert!(b.fx.nat.state().adopt_abandon(&mut a, std::time::Instant::now() + Duration::from_secs(5), None));
+    assert!(events(&b.fx).is_empty(), "nothing was logged, so nothing is released");
+    let st = b.fx.nat.state();
+    assert_eq!((st.subscriber_count(), st.session_count()), (0, 0));
+    assert!(flows.iter().all(|(k6, _)| st.lookup6(*k6).is_none()));
+    assert_eq!(st.slice_state(slice), Some(SliceState::Inactive));
+    serves_nothing(&mut b, &flows, DropReason::WrongNode);
+    // Regain: adopted again in full, not taken as complete.
+    let s = b.fx.nat.state().adopt_slice(slice, &input, meta(AcquireReason::Takeover)).unwrap();
+    assert_eq!((s.blocks_adopted as usize, s.bibs_adopted as usize), (input.blocks.len(), input.bibs.len()));
+    assert_eq!(adopts(&events(&b.fx)).len(), input.blocks.len());
+    check_same(&mut b, &flows);
+}
+
+/// AU-12, AU-10 (plan §5 handover row, decision 2): abandoned after every
+/// adopt record was queued but before the slice went Active: each logged
+/// block gets exactly one release record with the handover reason, the
+/// set of released blocks equals the set of adopted ones, nothing served
+/// in between, and the slice ends Inactive and re-adopts in full.
+#[test]
+fn abandon_after_log_releases_exactly_the_logged_blocks() {
+    let (shadow, slice, flows) = loaded(24, 3);
+    let input = shadow.take(slice, 0);
+    let mut b = node(&[]);
+    let mut a =
+        b.fx.nat
+            .state()
+            .adopt_begin(slice, plat_nat64::AdoptSource::Input(input.clone()), meta(AcquireReason::Handover))
+            .unwrap();
+    let mut evs = Vec::new();
+    step_until(&b, &mut a, |b| {
+        evs.extend(events(&b.fx));
+        adopts(&evs).len() == input.blocks.len()
+    });
+    assert_eq!(a.phase(), "activate", "the activation runs in a step of its own");
+    serves_nothing(&mut b, &flows, DropReason::ClusterFenced);
+    let rel = b.fx.nat.state().adopt_abandon_all(&mut a, Some(BlockReleaseReason::Handover));
+    assert_eq!(rel.blocks_released as usize, input.blocks.len());
+    let r = releases(&events(&b.fx));
+    let logged: Vec<_> = adopts(&evs).into_iter().map(|(v, p)| (v, p, Some(BlockReleaseReason::Handover))).collect();
+    assert_eq!(r, logged, "one release (handover) per logged block, none other");
+    assert_eq!(b.fx.nat.state().slice_state(slice), Some(SliceState::Inactive));
+    serves_nothing(&mut b, &flows, DropReason::WrongNode);
+    let s = b.fx.nat.state().adopt_slice(slice, &input, meta(AcquireReason::Takeover)).unwrap();
+    assert_eq!(s.bibs_adopted as usize, input.bibs.len());
+    check_same(&mut b, &flows);
+}
+
+/// Plan §5 "newer snapshot for the slice": once detached, a snapshot that
+/// reaches the shadow for the same slice does not reach the cursor. The
+/// adoption completes with exactly the detached state; the new snapshot
+/// stays in the shadow, charged to `max_bibs` alone once the cursor is done
+/// (SC-5).
+#[test]
+fn newer_snapshot_during_adoption_does_not_reach_the_cursor() {
+    let (shadow, slice, flows) = loaded(24, 3);
+    let (blocks, bibs) = shadow.counts(slice);
+    let mut b = node(&[]);
+    let d = shadow.detach(slice, 0);
+    let mut a =
+        b.fx.nat
+            .state()
+            .adopt_begin(slice, plat_nat64::AdoptSource::Detached(d), meta(AcquireReason::Takeover))
+            .unwrap();
+    step_until(&b, &mut a, |b| b.fx.nat.state().lookup6(flows[0].0).is_some());
+    // A newer snapshot of the slice: one subscriber, one block, one BIB.
+    let w = plat_cluster::WireBlock { addr: POOL_BASE | u32::from(slice), block: 125 };
+    let s9 = sub(900, 0);
+    let bib = plat_cluster::WireBib {
+        sub: s9,
+        proto: proto::UDP,
+        v6: s9 | 1,
+        port6: 7,
+        v4: w.addr,
+        port4: 1024 + 125 * 512,
+        created_wall_us: 1,
+    };
+    shadow.snapshot_begin(slice).unwrap();
+    shadow
+        .snapshot_records(slice, &[SnapRecord::Block { sub: s9, block: w, alloc_wall_us: 1 }, SnapRecord::Bib(bib)])
+        .unwrap();
+    shadow.snapshot_end(slice).unwrap();
+    let s = loop {
+        if let plat_nat64::Step::Done(s) = b.fx.nat.state().adopt_step(&mut a, past()).unwrap() {
+            break s;
+        }
+    };
+    assert_eq!((s.blocks_adopted as usize, s.bibs_adopted as usize), (blocks, bibs));
+    assert!(b.fx.nat.state().lookup6(Key6 { proto: proto::UDP, addr: s9 | 1, port: 7 }).is_none());
+    assert_eq!(shadow.counts(slice), (1, 1));
+    assert_eq!(shadow.bibs_charged(), (0..4).map(|s| shadow.counts(s).1 as u64).sum::<u64>());
+    check_same(&mut b, &flows);
+}
+
+/// Decision 1, SI-10: across step boundaries, `cluster_slice_acquire`
+/// carries the validated count (proto, subscriber mask, block owned by the
+/// same subscriber in the slice), which includes an in-input duplicate
+/// `k6` (rejected at insert); `AdoptStats.bibs_adopted` is the inserted
+/// count. Invalid records spread through a large set are rejected, never
+/// imported, and do not stop the adoption.
+#[test]
+fn bibs_adopted_is_the_validated_count_across_steps() {
+    let (shadow, slice, flows) = loaded(40, 60);
+    let mut input = shadow.take(slice, 0);
+    let good = input.bibs.len();
+    assert!(good > 64 * 4, "{good} BIBs: several steps of import");
+    let mut bad = Vec::new();
+    for (i, x) in input.bibs.iter().enumerate().step_by(97) {
+        let mut d = *x;
+        match i % 3 {
+            0 => d.proto = 47,                                    // GRE: invalid
+            1 => d.v6 ^= 1 << 100,                                // outside the subscriber
+            _ => d.v4 = POOL_BASE | ((u32::from(slice) + 1) & 3), // other slice
+        }
+        d.port6 = d.port6.wrapping_add(5000);
+        bad.push(d);
+    }
+    // In-input duplicate k6 (malformed peer input): validated, then refused.
+    // Same k6, another port of the same block (blocks are 512-aligned).
+    let mut dup = input.bibs[3];
+    dup.port4 ^= 1;
+    // Same k6 and k4: a duplicate on both sides.
+    let dup2 = input.bibs[3];
+    input.bibs.splice(good / 2..good / 2, bad.iter().copied().chain([dup, dup2]));
+    let b = node(&[]);
+    let mut a =
+        b.fx.nat
+            .state()
+            .adopt_begin(slice, plat_nat64::AdoptSource::Input(input.clone()), meta(AcquireReason::Takeover))
+            .unwrap();
+    let (s, steps) = (1..)
+        .find_map(|n| match b.fx.nat.state().adopt_step(&mut a, past()).unwrap() {
+            plat_nat64::Step::Done(s) => Some((s, n)),
+            plat_nat64::Step::More => None,
+        })
+        .unwrap();
+    assert!(steps > 4, "{steps} steps");
+    assert_eq!(s.bibs_adopted as usize, good, "inserted count");
+    assert_eq!(s.rejected as usize, bad.len() + 2);
+    let acq = events(&b.fx).into_iter().find_map(|e| match e {
+        Event::ClusterSliceAcquire { acquire, .. } => Some(acquire.bibs_adopted),
+        _ => None,
+    });
+    assert_eq!(acq, Some((good + 2) as u64), "validated count, including the duplicates");
+    for d in &bad {
+        assert!(b.fx.nat.state().lookup6(Key6 { proto: d.proto, addr: d.v6, port: d.port6 }).is_none());
+    }
+    let _ = flows;
+}
+
+/// POAM-047 regression (plan §5, lease-lost row: "a regain re-adopts from
+/// scratch"; task: "the slice ends Inactive and re-adopts in full"): the
+/// cursor owns the detached shadow slice, and an abandon drops it. After a
+/// lease loss with no new owner (the previous owner is dead and this node
+/// is its only backup), the regain detaches an empty, out-of-sync shadow
+/// slice, so every subscriber mapping of the slice is lost and every block
+/// is held back, where the inline path kept them (Fenced regain). The
+/// replicated state must survive an abandon that hands the slice to nobody.
+#[test]
+fn regain_after_lease_lost_abandon_readopts_in_full() {
+    let (shadow, slice, flows) = loaded(24, 3);
+    let before = shadow.counts(slice);
+    let mut b = node(&[]);
+    let d = shadow.detach(slice, 0);
+    let mut a =
+        b.fx.nat
+            .state()
+            .adopt_begin(slice, plat_nat64::AdoptSource::Detached(d), meta(AcquireReason::Takeover))
+            .unwrap();
+    step_until(&b, &mut a, |b| b.fx.nat.state().lookup6(flows[0].0).is_some());
+    // Lease lost, no new owner (ctl: Release { reason: LeaseLost, new_owner: None }).
+    b.fx.nat.state().adopt_abandon_all(&mut a, None);
+    drop(a);
+    assert_eq!(b.fx.nat.state().slice_state(slice), Some(SliceState::Inactive));
+    // Regain in the next view: the ctl detaches the shadow again.
+    let d = shadow.detach(slice, 0);
+    let mut a =
+        b.fx.nat
+            .state()
+            .adopt_begin(
+                slice,
+                plat_nat64::AdoptSource::Detached(d),
+                AdoptMeta { epoch: 8, ..meta(AcquireReason::Takeover) },
+            )
+            .unwrap();
+    let s = loop {
+        if let plat_nat64::Step::Done(s) = b.fx.nat.state().adopt_step(&mut a, past()).unwrap() {
+            break s;
+        }
+    };
+    assert_eq!(
+        (s.blocks_adopted as usize, s.bibs_adopted as usize, s.blocks_held),
+        (before.0, before.1, 0),
+        "the regain re-adopts the replicated state in full (shadow before: {before:?})"
+    );
+    check_same(&mut b, &flows);
+}

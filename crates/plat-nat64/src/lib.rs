@@ -24,7 +24,9 @@
 //! block/BIB/subscriber changes into their own bounded ring
 //! ([`repl::ReplProducer`]); the replicator (platd) drains them. The
 //! subscriber [`repl::Directory`] has its own shards and is a leaf after
-//! every engine lock.
+//! every engine lock. A takeover is a resumable [`Adoption`] cursor that
+//! the control thread steps under a time budget; the slice stays
+//! `Adopting` (unusable) until its last step (POAM-047).
 
 pub mod engine;
 pub mod frag;
@@ -45,7 +47,8 @@ pub use held::{HeldSynExpiry, SynMeta};
 pub use mirror::ModelMirror;
 pub use mirror::{Mirror, MirrorEntry, MirrorFail, MirrorKeys, NoMirror};
 pub use pool::{AllocFail, SliceState};
-pub use repl::{AdoptInput, Directory, Home, ReplHub, ReplProducer, ReplRecord, Shadow, ShadowError};
+pub use repl::{AdoptInput, Detached, Directory, Home, ReplHub, ReplProducer, ReplRecord, Shadow, ShadowError};
 pub use state::{
-    AdoptError, AdoptMeta, AdoptStats, ClusterSetup, ExportCursor, MAX_REPL_RING_BYTES, ReleaseStats, check_ring_memory,
+    ADOPT_BATCH, ADOPT_STEP_BUDGET, ADOPT_STEP_MAX_ITEMS, AdoptError, AdoptMeta, AdoptSource, AdoptStats, Adoption,
+    ClusterSetup, ExportCursor, MAX_REPL_RING_BYTES, ReleaseStats, Step, check_ring_memory,
 };

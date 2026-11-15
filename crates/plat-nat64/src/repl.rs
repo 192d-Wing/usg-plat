@@ -602,6 +602,109 @@ pub struct AdoptInput {
     pub hold_unknown: bool,
 }
 
+/// The state of one shadow slice moved out by [`Shadow::detach`] for a
+/// chunked adoption: the maps as replicated (unsorted), keyed like the
+/// shadow.
+#[derive(Debug)]
+pub struct Detached {
+    /// `(addr, block) -> (sub, original allocation time)`.
+    pub blocks: Map<(u32, u16), (u128, u64)>,
+    pub reserved_unseen: Vec<WireBlock>,
+    pub released: Vec<(WireBlock, u64)>,
+    /// `(proto, v4, port4) -> BIB`: the key already makes the IPv4 side
+    /// unique.
+    pub bibs: Map<(u8, u32, u16), WireBib>,
+    pub in_sync: bool,
+    pub hold_unknown: bool,
+    pub(crate) charge: ShadowCharge,
+    /// Where an abandoned adoption returns the state (see
+    /// [`ShadowHome::restore`]).
+    pub(crate) home: Option<Box<ShadowHome>>,
+}
+
+/// The shadow slice a [`Detached`] came from, with the reservations and
+/// release times as they were (bounded by the slice's block count).
+#[derive(Debug)]
+pub(crate) struct ShadowHome {
+    slices: Arc<[Mutex<ShadowSlice>]>,
+    slice: SliceId,
+    reserved: HashSet<(u32, u16), RandomState>,
+    released: Map<(u32, u16), u64>,
+    ctr: Arc<AtomicU64>,
+    /// Snapshot generations of every slice, and this slice's at detach.
+    gens: Arc<[AtomicU64]>,
+    gen_at_detach: u64,
+}
+
+impl ShadowHome {
+    /// Gives the state of an abandoned adoption back to the shadow slice
+    /// (lease lost with no new owner: the regain must find it, POAM-047
+    /// F1), in O(1) under the slice mutex, when the slice is still empty and
+    /// no snapshot began since the detach (the usual case: nothing
+    /// replicates to the would-be owner). Otherwise the shadow got newer
+    /// state from the owner, which is authoritative: the returned state is
+    /// dropped and the slice marked not in sync (SEC-002, PERF-003: no
+    /// merge, so no large work under the mutex and no resurrected deletes).
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: CP-10, AU-10 - attribution continuity across an
+    ///   abandoned takeover: the regain adopts the same mappings
+    /// - NIST 800-53: SC-24 - a stale copy never overrides newer replicated
+    ///   state; the regain then holds back unknown blocks
+    /// - NIST 800-53: SC-5 - the returned BIBs are counted against
+    ///   `max_bibs` (they were while detached)
+    pub(crate) fn restore(
+        self,
+        blocks: Map<(u32, u16), (u128, u64)>,
+        bibs: Map<(u8, u32, u16), WireBib>,
+        in_sync: bool,
+        charge: Option<ShadowCharge>,
+    ) {
+        let Some(m) = self.slices.get(usize::from(self.slice)) else { return };
+        let mut g = m.lock();
+        let newer =
+            self.gens.get(usize::from(self.slice)).map_or(0, |x| x.load(Ordering::Relaxed)) != self.gen_at_detach;
+        let empty = g.blocks.is_empty() && g.bibs.is_empty() && g.reserved.is_empty() && g.released.is_empty();
+        if empty && !newer {
+            self.ctr.fetch_add(bibs.len() as u64, Ordering::Relaxed);
+            *g = ShadowSlice { blocks, reserved: self.reserved, released: self.released, bibs, in_sync };
+        } else {
+            g.in_sync = false;
+        }
+        drop(g);
+        drop(charge);
+    }
+}
+
+impl Detached {
+    fn empty(ctr: Arc<AtomicU64>) -> Self {
+        Self {
+            blocks: Map::with_hasher(RandomState::new()),
+            reserved_unseen: Vec::new(),
+            released: Vec::new(),
+            bibs: Map::with_hasher(RandomState::new()),
+            in_sync: true,
+            hold_unknown: false,
+            charge: ShadowCharge { ctr, n: 0 },
+            home: None,
+        }
+    }
+}
+
+/// BIBs of a [`Detached`] slice still counted against the shadow's
+/// `max_bibs`; returned when dropped (SC-5).
+#[derive(Debug)]
+pub(crate) struct ShadowCharge {
+    ctr: Arc<AtomicU64>,
+    n: u64,
+}
+
+impl Drop for ShadowCharge {
+    fn drop(&mut self) {
+        self.ctr.fetch_sub(self.n, Ordering::Relaxed);
+    }
+}
+
 #[derive(Debug)]
 struct ShadowSlice {
     blocks: Map<(u32, u16), (u128, u64)>,
@@ -638,16 +741,22 @@ pub struct Shadow {
     block_size: u16,
     blocks_per_addr: u16,
     cooldown_ms: u64,
-    slices: Box<[Mutex<ShadowSlice>]>,
-    bibs: AtomicU64,
+    slices: Arc<[Mutex<ShadowSlice>]>,
+    /// BIBs held, including those of detached slices still being adopted
+    /// (shared with their [`Detached`]).
+    bibs: Arc<AtomicU64>,
     max_bibs: u64,
+    /// Per-slice snapshot generation, bumped by every `snapshot_begin`
+    /// (a restore after a newer snapshot is dropped, SEC-002).
+    gens: Arc<[AtomicU64]>,
 }
 
 impl Shadow {
     pub fn new(map: SliceMap, port_min: u16, port_max: u16, block_size: u16, cooldown_ms: u64, max_bibs: u64) -> Self {
         let range = (u32::from(port_max) + 1).saturating_sub(u32::from(port_min));
         let bpa = (range / u32::from(block_size.max(1))).min(u32::from(u16::MAX)) as u16;
-        let slices = (0..map.len()).map(|_| Mutex::new(ShadowSlice::new())).collect();
+        let slices: Arc<[Mutex<ShadowSlice>]> = (0..map.len()).map(|_| Mutex::new(ShadowSlice::new())).collect();
+        let gens: Arc<[AtomicU64]> = (0..map.len()).map(|_| AtomicU64::new(0)).collect();
         Self {
             map,
             port_min,
@@ -655,8 +764,9 @@ impl Shadow {
             blocks_per_addr: bpa,
             cooldown_ms,
             slices,
-            bibs: AtomicU64::new(0),
+            bibs: Arc::new(AtomicU64::new(0)),
             max_bibs,
+            gens,
         }
     }
 
@@ -749,6 +859,9 @@ impl Shadow {
         let mut g = self.slice(slice)?.lock();
         self.bibs.fetch_sub(g.bibs.len() as u64, Ordering::Relaxed);
         *g = ShadowSlice::new();
+        if let Some(x) = self.gens.get(usize::from(slice)) {
+            x.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(())
     }
 
@@ -785,6 +898,12 @@ impl Shadow {
         self.slice(slice).is_ok_and(|m| m.lock().in_sync)
     }
 
+    /// BIBs charged to `max_bibs`: held, plus detached and not yet
+    /// imported by an adoption.
+    pub fn bibs_charged(&self) -> u64 {
+        self.bibs.load(Ordering::Relaxed)
+    }
+
     /// `(blocks, bibs)` held for `slice`.
     pub fn counts(&self, slice: SliceId) -> (usize, usize) {
         self.slice(slice).map_or((0, 0), |m| {
@@ -798,8 +917,54 @@ impl Shadow {
         let _ = self.snapshot_begin(slice);
     }
 
-    /// Takes the state of `slice` for adoption and clears it. Releases
-    /// older than the cool-down are dropped.
+    /// Moves the state of `slice` out for a chunked adoption
+    /// ([`crate::state::State::adopt_begin`]) and clears it. The swap under
+    /// the slice mutex is O(1); the BIB and block maps are handed over
+    /// unsorted. Only the reservations and recent releases (bounded by the
+    /// slice's block count) are copied, outside the mutex. Releases older
+    /// than the cool-down are dropped.
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: SC-5 - the detached BIBs stay charged to `max_bibs`
+    ///   until the adoption drops them, so shadow plus in-flight adoption
+    ///   never exceed the cap
+    pub fn detach(&self, slice: SliceId, now_ms: u64) -> Detached {
+        let Ok(m) = self.slice(slice) else { return Detached::empty(self.bibs.clone()) };
+        let s = std::mem::replace(&mut *m.lock(), ShadowSlice::new());
+        let reserved_unseen = s.reserved.iter().map(|&(addr, block)| WireBlock { addr, block }).collect();
+        let released = s
+            .released
+            .iter()
+            .filter_map(|(&(addr, block), &t)| {
+                let age = now_ms.saturating_sub(t);
+                (age < self.cooldown_ms).then_some((WireBlock { addr, block }, age))
+            })
+            .collect();
+        let charge = ShadowCharge { ctr: self.bibs.clone(), n: s.bibs.len() as u64 };
+        let home = ShadowHome {
+            slices: self.slices.clone(),
+            slice,
+            reserved: s.reserved,
+            released: s.released,
+            ctr: self.bibs.clone(),
+            gens: self.gens.clone(),
+            gen_at_detach: self.gens.get(usize::from(slice)).map_or(0, |x| x.load(Ordering::Relaxed)),
+        };
+        Detached {
+            blocks: s.blocks,
+            reserved_unseen,
+            released,
+            bibs: s.bibs,
+            in_sync: s.in_sync,
+            hold_unknown: !s.in_sync,
+            charge,
+            home: Some(Box::new(home)),
+        }
+    }
+
+    /// Takes the state of `slice` for adoption and clears it, sorted (tests
+    /// and the bench; platd uses [`Shadow::detach`]). Releases older than
+    /// the cool-down are dropped.
     pub fn take(&self, slice: SliceId, now_ms: u64) -> AdoptInput {
         let Ok(m) = self.slice(slice) else { return AdoptInput::default() };
         let mut g = m.lock();

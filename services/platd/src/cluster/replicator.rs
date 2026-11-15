@@ -46,7 +46,7 @@ use std::time::{Duration, Instant};
 use plat_audit::{AuditSink, AuditText, ClusterMemberChange, Event, MemberState};
 use plat_cluster::{MemberId, Msg, RejectReason, SliceId, SliceMap, SnapRecord, View, WireBib, WireBlock};
 use plat_common::Ipv6Cidr;
-use plat_nat64::{AdoptInput, Directory, ExportCursor, Home, Nat64, ReplHub, ReplRecord, Shadow, SliceState};
+use plat_nat64::{Detached, Directory, ExportCursor, Home, Nat64, ReplHub, ReplRecord, Shadow, SliceState};
 
 use super::peer::{Net, Refusal};
 use super::slice_cidr;
@@ -774,12 +774,14 @@ impl Replicator {
         self.seq.get(usize::from(s)).copied().unwrap_or(0)
     }
 
-    /// The backup's state of `s` for adoption (cleared).
-    pub fn take(&mut self, s: SliceId) -> AdoptInput {
+    /// The backup's state of `s` for adoption (cleared). O(1) under the
+    /// shadow slice mutex: the maps are moved, not sorted or copied, so the
+    /// replicator mutex is held for microseconds (POAM-047).
+    pub fn detach(&mut self, s: SliceId) -> Detached {
         if let Some(r) = self.rx_from.get_mut(usize::from(s)) {
             *r = None;
         }
-        self.shadow.take(s, mono_ms())
+        self.shadow.detach(s, mono_ms())
     }
 
     /// Whether the target of an Active slice is in sync.

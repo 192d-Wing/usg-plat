@@ -38,7 +38,8 @@ Ordered by value for the effort, with what each needs.
 3. **HA verification (POAM-007).** L19–L23 PASS on three VMs with FRR
    (2026-10-29, round 6). Leader-crash election changes C1–C7 have a simulated
    bound (`leader_crash_bound_holds_across_topologies`, adoption time
-   excluded). Left: chunked slice adoption (POAM-047, separate PR first),
+   excluded). Chunked slice adoption done (POAM-047 closed,
+   `feat/chunked-adoption`). Left: chunked Active-slice release (POAM-048),
    VM trials of the new election on a three-data-member bed (WU-A5), and
    session pickup (POAM-028).
 
@@ -113,8 +114,8 @@ Done since the last update:
 
 - POAM-017: leader-side batching of slice moves; handover bursts on
   membership change; legacy `contiguous` mode.
-- POAM-047: chunked slice adoption (about 64k BIBs per chunk, heartbeats
-  between, slice Pending until done); before session hints.
+- POAM-048: chunk the Active-slice release walk (`State::release_slice`)
+  as POAM-047 did for adoption.
 - POAM-007 (2): VM trials of the new election (WU-A5).
 - POAM-028: sessions are not replicated (TCP pickup window after takeover).
 - POAM-029 to POAM-033: subscriber-home directory, leader-coordinated
