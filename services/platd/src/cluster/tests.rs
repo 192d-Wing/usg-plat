@@ -1242,6 +1242,112 @@ fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
+/// Load on the victim: `subs` subscribers with one block and `ports` UDP
+/// mappings each. A new subscriber waits for a block reserved with the
+/// backup, so a refused first packet is retried. Returns the load time.
+fn hb_load(n: &mut Node, subs: usize, ports: usize) -> Duration {
+    let fill = Instant::now();
+    for i in 0..subs as u128 {
+        let client = 0x2001_0db8_0100_0000_0000_0000_0000_0000 | (i << 64) | 1;
+        let t = Instant::now();
+        while n.send(client, 40000).is_none() {
+            assert!(t.elapsed() < Duration::from_secs(10), "no block for subscriber {i}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        for p in 1..ports as u16 {
+            assert!(n.send(client, 40000 + p).is_some(), "subscriber {i} port {p}");
+        }
+    }
+    fill.elapsed()
+}
+
+/// Waits until the leader's shadow holds every block and BIB, in sync.
+fn hb_wait_synced(leader: &Node, subs: usize, ports: usize) -> Duration {
+    let repl = leader.h().shared.repl.clone().unwrap();
+    wait("backup holds every block and BIB, in sync", Duration::from_secs(120), || {
+        let g = repl.lock();
+        let (mut blocks, mut bibs) = (0, 0);
+        for s in 0..16 {
+            let c = g.shadow_counts(s);
+            blocks += c.0;
+            bibs += c.1;
+            if c.0 > 0 && !g.shadow.in_sync(s) {
+                return false;
+            }
+        }
+        (blocks, bibs) == (subs, subs * ports)
+    })
+}
+
+/// When each victim slice was first seen Adopting and Active on the leader.
+struct HbTimeline {
+    first_adopting: Vec<Option<Duration>>,
+    active_at: Vec<Option<Duration>>,
+    max_adopting: usize,
+    took: Duration,
+}
+
+/// Samples the leader every 0.5 ms until it serves all 16 slices.
+fn hb_timeline(leader: &Node, theirs: &[SliceId], killed: Instant) -> HbTimeline {
+    let (mut first_adopting, mut active_at) = (vec![None; 16], vec![None; 16]);
+    let mut max_adopting = 0;
+    let st = leader.nat.state();
+    while leader.active() < 16 {
+        assert!(killed.elapsed() < Duration::from_secs(30), "timed out waiting for the takeover");
+        let now = killed.elapsed();
+        let mut adopting = 0;
+        for &x in theirs {
+            match st.slice_state(x) {
+                Some(SliceState::Adopting) => {
+                    adopting += 1;
+                    first_adopting[usize::from(x)].get_or_insert(now);
+                }
+                Some(SliceState::Active) => {
+                    active_at[usize::from(x)].get_or_insert(now);
+                }
+                _ => {}
+            }
+        }
+        max_adopting = max_adopting.max(adopting);
+        std::thread::sleep(Duration::from_micros(500));
+    }
+    let took = killed.elapsed();
+    for &x in theirs {
+        active_at[usize::from(x)].get_or_insert(took);
+    }
+    HbTimeline { first_adopting, active_at, max_adopting, took }
+}
+
+/// Sums the takeover acquire records after `mark`: (blocks, BIBs, slices).
+fn hb_acquired(leader: &Node, mark: usize, victim_slices: usize) -> (u64, u64, usize) {
+    let (mut blocks, mut bibs, mut slices) = (0u64, 0u64, 0usize);
+    wait("acquire records", Duration::from_secs(5), || {
+        (blocks, bibs, slices) = (0, 0, 0);
+        for e in leader.events.lock().iter().skip(mark) {
+            if let Event::ClusterSliceAcquire { acquire, .. } = e
+                && acquire.reason == AuditAcquire::Takeover
+            {
+                blocks += u64::from(acquire.blocks_adopted);
+                bibs += acquire.bibs_adopted;
+                slices += 1;
+            }
+        }
+        slices >= victim_slices
+    });
+    (blocks, bibs, slices)
+}
+
+/// Each slice went Active when its own adoption ended, in turn: the next
+/// one is first seen Adopting no earlier than the previous Active (within
+/// one sample).
+fn hb_check_in_turn(order: &[(Duration, Option<Duration>, SliceId)]) {
+    for w in order.windows(2) {
+        if let (Some(a1), Some(a2)) = (w[0].1, w[1].1) {
+            assert!(a1 <= a2 && w[0].0 <= a2 + Duration::from_millis(2), "not one after the other: {w:?}");
+        }
+    }
+}
+
 /// POAM-047, POAM-007 (2): the `plat-cluster-ctl` thread adopts every
 /// slice of a crashed member in bounded steps between the leader's
 /// heartbeats. The leader adopts the other member's slices (one block per
@@ -1288,34 +1394,9 @@ fn heartbeat_gap_during_large_adoption() {
     // Load on the victim: `subs` subscribers with one block and `ports`
     // UDP mappings each. A new subscriber waits for a block reserved with
     // the backup, so a refused first packet is retried.
-    let fill = Instant::now();
-    for i in 0..subs as u128 {
-        let client = 0x2001_0db8_0100_0000_0000_0000_0000_0000 | (i << 64) | 1;
-        let t = Instant::now();
-        while nodes[vi].send(client, 40000).is_none() {
-            assert!(t.elapsed() < Duration::from_secs(10), "no block for subscriber {i}");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        for p in 1..ports as u16 {
-            assert!(nodes[vi].send(client, 40000 + p).is_some(), "subscriber {i} port {p}");
-        }
-    }
-    let fill = fill.elapsed();
+    let fill = hb_load(&mut nodes[vi], subs, ports);
     let victim_slices = nodes[vi].active();
-    let repl = nodes[li].h().shared.repl.clone().unwrap();
-    let synced = wait("backup holds every block and BIB, in sync", Duration::from_secs(120), || {
-        let g = repl.lock();
-        let (mut blocks, mut bibs) = (0, 0);
-        for s in 0..16 {
-            let c = g.shadow_counts(s);
-            blocks += c.0;
-            bibs += c.1;
-            if c.0 > 0 && !g.shadow.in_sync(s) {
-                return false;
-            }
-        }
-        (blocks, bibs) == (subs, subs * ports)
-    });
+    let synced = hb_wait_synced(&nodes[li], subs, ports);
     wait_protected(&[&nodes[0], &nodes[1]]);
 
     // Baseline: one second of undisturbed heartbeats.
@@ -1330,50 +1411,12 @@ fn heartbeat_gap_during_large_adoption() {
     // Timeline (QA): when each of the victim's slices first shows
     // Adopting and Active on the leader, sampled every 0.5 ms; at most one
     // Adopting at a time (decision 3).
-    let (mut first_adopting, mut active_at) = (vec![None; 16], vec![None; 16]);
-    let mut max_adopting = 0;
-    let st = nodes[li].nat.state();
-    while nodes[li].active() < 16 {
-        assert!(killed.elapsed() < Duration::from_secs(30), "timed out waiting for the takeover");
-        let now = killed.elapsed();
-        let mut adopting = 0;
-        for &x in &theirs {
-            match st.slice_state(x) {
-                Some(SliceState::Adopting) => {
-                    adopting += 1;
-                    first_adopting[usize::from(x)].get_or_insert(now);
-                }
-                Some(SliceState::Active) => {
-                    active_at[usize::from(x)].get_or_insert(now);
-                }
-                _ => {}
-            }
-        }
-        max_adopting = max_adopting.max(adopting);
-        std::thread::sleep(Duration::from_micros(500));
-    }
-    let took = killed.elapsed();
-    for &x in &theirs {
-        active_at[usize::from(x)].get_or_insert(took);
-    }
+    let HbTimeline { first_adopting, active_at, max_adopting, took } = hb_timeline(&nodes[li], &theirs, killed);
     // Heartbeats delayed by the adoption arrive after it ends.
     std::thread::sleep(3 * HEARTBEAT);
     let gap = longest_gap(&probe.beats_from(leader), killed, Instant::now());
 
-    let (mut blocks, mut bibs, mut slices) = (0u64, 0u64, 0usize);
-    wait("acquire records", Duration::from_secs(5), || {
-        (blocks, bibs, slices) = (0, 0, 0);
-        for e in nodes[li].events.lock().iter().skip(mark) {
-            if let Event::ClusterSliceAcquire { acquire, .. } = e
-                && acquire.reason == AuditAcquire::Takeover
-            {
-                blocks += u64::from(acquire.blocks_adopted);
-                bibs += acquire.bibs_adopted;
-                slices += 1;
-            }
-        }
-        slices >= victim_slices
-    });
+    let (blocks, bibs, slices) = hb_acquired(&nodes[li], mark, victim_slices);
     let view_us = nodes[li].events.lock().iter().skip(mark).find_map(|e| match e {
         Event::ClusterViewChange { ts_us, .. } => Some(ts_us.saturating_sub(killed_wall)),
         _ => None,
@@ -1394,14 +1437,7 @@ fn heartbeat_gap_during_large_adoption() {
     let steps: Vec<&str> = m.lines().filter(|l| l.starts_with("plat_cluster_adopt_step")).collect();
     println!("heartbeat_gap steps: {steps:?}");
     assert!(max_adopting <= 1, "{max_adopting} slices Adopting at once (decision 3)");
-    // Each slice went Active when its own adoption ended, in turn: the
-    // next one is first seen Adopting no earlier than the previous Active
-    // (within one sample).
-    for w in order.windows(2) {
-        if let (Some(a1), Some(a2)) = (w[0].1, w[1].1) {
-            assert!(a1 <= a2 && w[0].0 <= a2 + Duration::from_millis(2), "not one after the other: {w:?}");
-        }
-    }
+    hb_check_in_turn(&order);
     // A stall longer than the lease costs the leader its own lease: it
     // then fences what it serves and a new view follows.
     let (views, released) = nodes[li].events.lock().iter().skip(mark).fold((0, 0), |(v, r), e| match e {

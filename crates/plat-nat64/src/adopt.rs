@@ -354,6 +354,32 @@ impl Adoption {
         self.meta = meta;
     }
 
+    /// Abandon with the state kept: drains the unread rest of the detached
+    /// source for the shadow, budgeted. True when done (or nothing to do).
+    fn drain_unread(&mut self, b: &mut Budget) -> bool {
+        let Some(ab) = self.abandon.as_mut() else { return true };
+        if !ab.draining {
+            return true;
+        }
+        while !b.out() {
+            if let Some(x) = self.blocks.as_mut().and_then(BlockSrc::next) {
+                self.orig_blocks.push(x);
+            } else if let Some(w) = self.bibs.as_mut().and_then(BibSrc::next) {
+                ab.back.insert((w.proto, w.v4, w.port4), w);
+            } else {
+                break;
+            }
+            b.spend(1);
+        }
+        if b.out() {
+            return false;
+        }
+        ab.draining = false;
+        self.blocks = None;
+        self.bibs = None;
+        true
+    }
+
     fn drop_sources(&mut self) {
         self.blocks = None;
         self.bibs = None;
@@ -482,55 +508,15 @@ impl State {
             return true;
         }
         if a.abandon.is_none() {
-            let stale = a.phase == Phase::Stale;
-            let mut logged = HashSet::with_hasher(self.hasher.clone());
-            logged.extend(a.adopted.iter().take(a.logged_hi).filter(|x| x.imported).map(|x| x.r));
-            let mut walk = if stale { std::mem::take(&mut a.walk) } else { Walk::default() };
-            // Imported BIBs go back to the shadow with the rest (stale
-            // leftovers are not the shadow's).
-            if a.home.is_some() && !stale {
-                walk.collect = Some(Map::with_hasher(self.hasher.clone()));
-            }
-            a.abandon = Some(Abandon {
-                walk,
-                stale,
-                logged,
-                reason,
-                stats: ReleaseStats::default(),
-                done: false,
-                draining: a.home.is_some(),
-                back: Map::with_hasher(self.hasher.clone()),
-            });
-            a.adopted = Vec::new();
-            a.held = Vec::new();
-            a.cooling = Vec::new();
-            if a.home.is_none() {
-                a.drop_sources();
-            }
+            self.abandon_init(a, reason);
         }
-        let Some(ab) = a.abandon.as_mut() else { return true };
-        if ab.done {
+        if a.abandon.as_ref().is_none_or(|ab| ab.done) {
             return true;
         }
-        if ab.draining {
-            // The unread rest of the detached source, back for the shadow.
-            while !b.out() {
-                if let Some(x) = a.blocks.as_mut().and_then(BlockSrc::next) {
-                    a.orig_blocks.push(x);
-                } else if let Some(w) = a.bibs.as_mut().and_then(BibSrc::next) {
-                    ab.back.insert((w.proto, w.v4, w.port4), w);
-                } else {
-                    break;
-                }
-                b.spend(1);
-            }
-            if b.out() {
-                return false;
-            }
-            ab.draining = false;
-            a.blocks = None;
-            a.bibs = None;
+        if !a.drain_unread(b) {
+            return false;
         }
+        let Some(ab) = a.abandon.as_mut() else { return true };
         let (emit, why) = if ab.stale { (Emit::All, None) } else { (Emit::Only(&ab.logged), ab.reason) };
         if !self.walk_slice(a.slice, &mut ab.walk, b, &emit, why, &mut ab.stats) {
             return false;
@@ -541,23 +527,58 @@ impl State {
         }
         ab.done = true;
         a.phase = Phase::Done;
-        if let Some(home) = a.home.take() {
-            // Replicated entries only: the unread source, plus the imported
-            // BIBs the walk removed (collected only outside the stale phase,
-            // so this node's own leftovers never reach the shadow). A
-            // replicated entry wins over any other with the same key.
-            let mut bibs = std::mem::replace(&mut ab.back, Map::with_hasher(RandomState::new()));
-            for (k, v) in ab.walk.collect.take().into_iter().flatten() {
-                bibs.entry(k).or_insert(v);
-            }
-            let mut blocks = Map::with_hasher(self.hasher.clone());
-            for (sub, w, wall) in std::mem::take(&mut a.orig_blocks) {
-                blocks.entry((w.addr, w.block)).or_insert((sub, wall));
-            }
-            home.restore(blocks, bibs, a.in_sync, a.charge.take());
-        }
+        self.restore_home(a);
         a.drop_sources();
         true
+    }
+
+    /// First abandon call: what was logged (released later), the walk to
+    /// run, and what goes back to the shadow.
+    fn abandon_init(&self, a: &mut Adoption, reason: Option<BlockReleaseReason>) {
+        let stale = a.phase == Phase::Stale;
+        let mut logged = HashSet::with_hasher(self.hasher.clone());
+        logged.extend(a.adopted.iter().take(a.logged_hi).filter(|x| x.imported).map(|x| x.r));
+        let mut walk = if stale { std::mem::take(&mut a.walk) } else { Walk::default() };
+        // Imported BIBs go back to the shadow with the rest (stale
+        // leftovers are not the shadow's).
+        if a.home.is_some() && !stale {
+            walk.collect = Some(Map::with_hasher(self.hasher.clone()));
+        }
+        a.abandon = Some(Abandon {
+            walk,
+            stale,
+            logged,
+            reason,
+            stats: ReleaseStats::default(),
+            done: false,
+            draining: a.home.is_some(),
+            back: Map::with_hasher(self.hasher.clone()),
+        });
+        a.adopted = Vec::new();
+        a.held = Vec::new();
+        a.cooling = Vec::new();
+        if a.home.is_none() {
+            a.drop_sources();
+        }
+    }
+
+    /// The abandon is complete: returns the replicated state to the
+    /// shadow, if it is kept.
+    fn restore_home(&self, a: &mut Adoption) {
+        let (Some(home), Some(ab)) = (a.home.take(), a.abandon.as_mut()) else { return };
+        // Replicated entries only: the unread source, plus the imported
+        // BIBs the walk removed (collected only outside the stale phase, so
+        // this node's own leftovers never reach the shadow). A replicated
+        // entry wins over any other with the same key.
+        let mut bibs = std::mem::replace(&mut ab.back, Map::with_hasher(RandomState::new()));
+        for (k, v) in ab.walk.collect.take().into_iter().flatten() {
+            bibs.entry(k).or_insert(v);
+        }
+        let mut blocks = Map::with_hasher(self.hasher.clone());
+        for (sub, w, wall) in std::mem::take(&mut a.orig_blocks) {
+            blocks.entry((w.addr, w.block)).or_insert((sub, wall));
+        }
+        home.restore(blocks, bibs, a.in_sync, a.charge.take());
     }
 
     pub(super) fn adopt_run(&self, a: &mut Adoption, b: &mut Budget) -> Result<Step, AdoptError> {
@@ -1197,11 +1218,44 @@ mod tests {
         unreachable!()
     }
 
-    /// One unit at a time until the log phase (a full step may pass it).
-    fn to_log(st: &State, a: &mut Adoption) {
-        while a.phase != Phase::Log {
+    /// Bound of the test helpers below: far more units than any test
+    /// adoption needs, so a regression fails instead of hanging.
+    const STEP_LIMIT: usize = 1 << 20;
+
+    /// One unit at a time until `phase` (a full step may pass it).
+    fn run_to(st: &State, a: &mut Adoption, phase: Phase) {
+        for _ in 0..STEP_LIMIT {
+            if a.phase == phase {
+                return;
+            }
             assert_eq!(st.adopt_run(a, &mut Budget::new(None, 1)), Ok(Step::More));
         }
+        panic!("did not reach {phase:?}");
+    }
+
+    fn to_log(st: &State, a: &mut Adoption) {
+        run_to(st, a, Phase::Log);
+    }
+
+    /// Steps with an expired deadline until at least `n` BIBs are imported.
+    fn step_until_bibs(st: &State, a: &mut Adoption, n: usize) {
+        for _ in 0..STEP_LIMIT {
+            if st.bib4.len() >= n {
+                return;
+            }
+            assert_eq!(st.adopt_step(a, past()), Ok(Step::More));
+        }
+        panic!("{n} BIBs not imported");
+    }
+
+    /// Abandons with an expired deadline per call until clean.
+    fn abandon_bounded(st: &State, a: &mut Adoption, reason: Option<BlockReleaseReason>) {
+        for _ in 0..STEP_LIMIT {
+            if st.adopt_abandon(a, past(), reason) {
+                return;
+            }
+        }
+        panic!("abandon did not finish");
     }
 
     fn kinds(rx: &crossbeam_channel::Receiver<Event>) -> (usize, usize, usize) {
@@ -1242,9 +1296,7 @@ mod tests {
     fn adopt_step_respects_deadline() {
         let (st, _rx, _) = state(1 << 16);
         let mut a = st.adopt_begin(0, AdoptSource::Input(input(100, 50)), meta(7)).unwrap();
-        while a.phase != Phase::ImportBibs {
-            assert_eq!(st.adopt_run(&mut a, &mut Budget::new(None, 1)), Ok(Step::More));
-        }
+        run_to(&st, &mut a, Phase::ImportBibs);
         let mut b = Budget::new(Some(past()), ADOPT_STEP_MAX_ITEMS);
         assert_eq!(st.adopt_run(&mut a, &mut b), Ok(Step::More));
         assert_eq!(b.items, ADOPT_BATCH);
@@ -1252,9 +1304,7 @@ mod tests {
         // The hard cap bounds a step without a deadline.
         let (st, _rx, _) = state(1 << 16);
         let mut a = st.adopt_begin(0, AdoptSource::Input(input(126, 512)), meta(7)).unwrap();
-        while a.phase != Phase::ImportBibs {
-            assert_eq!(st.adopt_run(&mut a, &mut Budget::new(None, 1)), Ok(Step::More));
-        }
+        run_to(&st, &mut a, Phase::ImportBibs);
         let mut b = Budget::new(None, 10_000);
         assert_eq!(st.adopt_run(&mut a, &mut b), Ok(Step::More));
         assert_eq!((b.items, st.bib4.len()), (10_000, 10_000 / BIB_IMPORT_COST));
@@ -1297,11 +1347,9 @@ mod tests {
     fn abandon_before_log_emits_no_release() {
         let (st, rx, _) = state(1 << 16);
         let mut a = st.adopt_begin(0, AdoptSource::Input(input(10, 200)), meta(7)).unwrap();
-        while st.bib4.len() < 500 {
-            assert_eq!(st.adopt_step(&mut a, past()), Ok(Step::More));
-        }
+        step_until_bibs(&st, &mut a, 500);
         assert!(st.subscriber_count() > 0);
-        while !st.adopt_abandon(&mut a, past(), Some(BlockReleaseReason::Handover)) {}
+        abandon_bounded(&st, &mut a, Some(BlockReleaseReason::Handover));
         assert_eq!(kinds(&rx), (0, 0, 0));
         assert_eq!((st.bib4.len(), st.bib6.len(), st.subscriber_count()), (0, 0, 0));
         assert_eq!(st.aggregate_count(SUB), 0);
@@ -1364,13 +1412,11 @@ mod tests {
             assert_eq!(sh.counts(0), (0, 0));
             assert_eq!(sh.bibs_charged(), 2000, "charged until the cursor drops it");
             let mut a = st.adopt_begin(0, AdoptSource::Detached(d), meta(7)).unwrap();
-            while st.bib4.len() < 1000 {
-                st.adopt_step(&mut a, past()).unwrap();
-            }
+            step_until_bibs(&st, &mut a, 1000);
             if discard {
                 a.discard_shadow();
             }
-            while !st.adopt_abandon(&mut a, past(), None) {}
+            abandon_bounded(&st, &mut a, None);
             drop(a);
             assert_eq!((st.bib4.len(), st.bib6.len(), st.subscriber_count(), st.session_count()), (0, 0, 0, 0));
             assert_eq!(st.aggregate_count(SUB), 0);
@@ -1440,9 +1486,7 @@ mod tests {
         let sh = shadow(&st);
         fill(&sh, &input(20, 100));
         let mut a = st.adopt_begin(0, AdoptSource::Detached(sh.detach(0, 0)), meta(7)).unwrap();
-        while st.bib4.len() < 500 {
-            st.adopt_step(&mut a, past()).unwrap();
-        }
+        step_until_bibs(&st, &mut a, 500);
         fill(&sh, &input(3, 5));
         assert_eq!(sh.counts(0), (3, 15));
         st.adopt_abandon_all(&mut a, None);
