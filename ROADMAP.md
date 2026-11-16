@@ -39,7 +39,8 @@ Ordered by value for the effort, with what each needs.
    (2026-10-29, round 6). Leader-crash election changes C1–C7 have a simulated
    bound (`leader_crash_bound_holds_across_topologies`, adoption time
    excluded). Chunked slice adoption done (POAM-047 closed,
-   `feat/chunked-adoption`). Left: chunked Active-slice release (POAM-048),
+   `feat/chunked-adoption`); chunked Active-slice release done (POAM-048
+   closed, `feat/chunked-release`). Left:
    VM trials of the new election on a three-data-member bed (WU-A5), and
    session pickup (POAM-028).
 
@@ -114,8 +115,9 @@ Done since the last update:
 
 - POAM-017: leader-side batching of slice moves; handover bursts on
   membership change; legacy `contiguous` mode.
-- POAM-048: chunk the Active-slice release walk (`State::release_slice`)
-  as POAM-047 did for adoption.
+- POAM-048 follow-ups (performance): profile the release step tail on
+  Linux/glibc (up to 47 ms single frees on the macOS host); avoid one
+  `bib4` scan per released slice.
 - POAM-007 (2): VM trials of the new election (WU-A5).
 - POAM-028: sessions are not replicated (TCP pickup window after takeover).
 - POAM-029 to POAM-033: subscriber-home directory, leader-coordinated

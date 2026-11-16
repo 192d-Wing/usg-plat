@@ -163,8 +163,9 @@ fn poam_034_stale_fragment_mapping_within_timeout() {
     // Explicit release of the slice (handover): the BIB is gone.
     a.fx.nat.state().release_slice(slice, Some(BlockReleaseReason::Handover));
     assert!(a.fx.nat.state().lookup4(Key4 { proto: proto::UDP, addr: v4, port: p4 }).is_none());
-    // While fenced, the per-fragment slice check refuses it (SC-24).
-    assert_eq!(run_all(&mut a.fx, &frag(208, 100, 1)).unwrap_err(), DropReason::ClusterFenced);
+    // Released (Inactive, POAM-048 Q2): the per-fragment slice check
+    // refuses it (SC-24).
+    assert_eq!(run_all(&mut a.fx, &frag(208, 100, 1)).unwrap_err(), DropReason::WrongNode);
     // Served again within timeout_ms: the stale mapping is still used.
     a.fx.nat.state().set_slice_state(slice, SliceState::Active);
     let out = run(&mut a.fx, &frag(104, 104, 1)).unwrap();
@@ -578,10 +579,11 @@ fn handover_release_logs_and_clears_the_slice() {
     assert_eq!((st.bibs_removed, st.sessions_removed, st.blocks_released, st.subscribers_removed), (1, 1, 1, 1));
     let evs = events(&a.fx);
     assert!(matches!(&evs[..], [Event::PortBlockRelease { reason: Some(BlockReleaseReason::Handover), .. }]));
-    assert_eq!(a.fx.nat.state().slice_state(slice), Some(SliceState::Fenced));
+    // A finished release leaves the slice Inactive (POAM-048 Q2): a regain
+    // goes through adoption, never the no-import fenced path.
+    assert_eq!(a.fx.nat.state().slice_state(slice), Some(SliceState::Inactive));
+    assert!(!a.fx.nat.state().slice_releasing(slice));
     assert_eq!(a.fx.nat.state().session_count(), 0);
-    assert_eq!(run(&mut a.fx, &udp4(SERVER, 53, v4, p4, b"r")).unwrap_err(), DropReason::ClusterFenced);
-    a.fx.nat.state().set_slice_state(slice, SliceState::Inactive);
     assert_eq!(run(&mut a.fx, &udp4(SERVER, 53, v4, p4, b"r")).unwrap_err(), DropReason::WrongNode);
 }
 
@@ -1280,4 +1282,241 @@ fn regain_after_lease_lost_abandon_readopts_in_full() {
         "the regain re-adopts the replicated state in full (shadow before: {before:?})"
     );
     check_same(&mut b, &flows);
+}
+
+// ------------------------------------------- POAM-048 chunked release (QA)
+
+/// Snapshot export of every slice of `a` into a fresh shadow.
+fn snapshot(a: &Node) -> Shadow {
+    let shadow = shadow_for(a);
+    for s in 0..4 {
+        shadow.snapshot_begin(s).unwrap();
+        let mut cur = Some(ExportCursor::default());
+        while let Some(c) = cur {
+            let (recs, next) = a.fx.nat.state().export_slice(s, c, 256);
+            shadow.snapshot_records(s, &recs).unwrap();
+            cur = next;
+        }
+        shadow.snapshot_end(s).unwrap();
+    }
+    shadow
+}
+
+/// `subs` subscribers with `ports` UDP mappings each on a fresh node; the
+/// slice holding most of them and its mappings.
+fn release_fixture(extra: &[(&str, &str)], subs: u16, ports: u16) -> (Node, u16, Vec<Flow>) {
+    let mut a = node(extra);
+    start_all(&a);
+    let _ = drain(&a);
+    let mut flows = Vec::new();
+    for n in 1..=subs {
+        flows.extend((0..ports).map(|p| (n, 1000 + p, proto::UDP)));
+    }
+    let made = make_flows(&mut a, &flows);
+    let slice = (0..4u16).max_by_key(|&s| made.iter().filter(|m| (m.1.0 & 3) as u16 == s).count()).unwrap();
+    let mine: Vec<_> = made.into_iter().filter(|m| (m.1.0 & 3) as u16 == slice).collect();
+    let _ = events(&a.fx);
+    (a, slice, mine)
+}
+
+/// Steps `r` with expired deadlines until Done; `each` runs after every
+/// non-final step. Returns the stats and the step count.
+fn step_release(
+    n: &mut Node,
+    r: &mut plat_nat64::Release,
+    mut each: impl FnMut(&mut Node),
+) -> (plat_nat64::ReleaseStats, usize) {
+    for steps in 1..100_000 {
+        match n.fx.nat.state().release_step(r, past()) {
+            plat_nat64::ReleaseStep::Done(s) => return (s, steps),
+            plat_nat64::ReleaseStep::More | plat_nat64::ReleaseStep::Paused => each(n),
+        }
+    }
+    panic!("release made no progress");
+}
+
+/// Distinct `(v4, port_lo)` blocks of `flows`.
+fn blocks_of(n: &Node, flows: &[(Key6, (u32, u16))]) -> Vec<(u32, u16)> {
+    let size = n.cfg.nat64.port_block_size;
+    let lo = n.cfg.nat64.port_min;
+    let mut v: Vec<_> = flows.iter().map(|(_, (v4, p))| (*v4, lo + (p - lo) / size * size)).collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// POAM-048, AU-10/AU-12, SC-24 (plan §8): a handover release stepped
+/// with expired deadlines fences the slice from the first step (inbound
+/// `ClusterFenced` throughout, `WrongNode` once Inactive), queues exactly
+/// one `handover` release record per block, and the peer that adopts the
+/// replicated slice logs one adopt record for exactly those blocks and
+/// serves the same mappings: attribution is continuous across nodes.
+#[test]
+fn chunked_handover_release_then_adopt_on_peer() {
+    let (mut a, slice, mine) = release_fixture(&[], 40, 30);
+    let shadow = snapshot(&a);
+    let want = blocks_of(&a, &mine);
+    let mut r = a.fx.nat.state().release_begin(slice, Some(BlockReleaseReason::Handover)).unwrap();
+    assert_eq!(a.fx.nat.state().slice_state(slice), Some(SliceState::Fenced));
+    let probe = mine[0].1;
+    let (stats, steps) = step_release(&mut a, &mut r, |n| {
+        assert!(n.fx.nat.state().slice_releasing(slice));
+        assert_eq!(
+            run(&mut n.fx, &udp4(SERVER, 53, probe.0, probe.1, b"r")).unwrap_err(),
+            DropReason::ClusterFenced,
+            "a releasing slice forwards nothing"
+        );
+    });
+    assert!(steps > 2, "{steps} steps: the release was not chunked");
+    assert_eq!(stats.blocks_released as usize, want.len());
+    assert_eq!(stats.bibs_removed as usize, mine.len());
+    assert_eq!(a.fx.nat.state().slice_state(slice), Some(SliceState::Inactive));
+    assert!(!a.fx.nat.state().slice_releasing(slice));
+    let rel = releases(&events(&a.fx));
+    assert!(rel.iter().all(|x| x.2 == Some(BlockReleaseReason::Handover)), "{rel:?}");
+    let got: Vec<_> = rel.iter().map(|x| (x.0, x.1)).collect();
+    assert_eq!(got, want, "one handover release record per block");
+    for (_, (v4, p4)) in &mine {
+        assert_eq!(run(&mut a.fx, &udp4(SERVER, 53, *v4, *p4, b"r")).unwrap_err(), DropReason::WrongNode);
+    }
+
+    let mut b = node_with(&[], 1024, SteeringMode::Drop, 1, 4096);
+    let input = shadow.take(slice, b.fx.nat.state().now_ms());
+    b.fx.nat.state().adopt_slice(slice, &input, meta(AcquireReason::Failback)).unwrap();
+    assert_eq!(adopts(&events(&b.fx)), want, "the peer adopts exactly the released blocks");
+    check_same(&mut b, &mine);
+}
+
+/// POAM-048 (plan §8, Q2/Q5): a regain of a slice that is still being
+/// released waits: adoption (stepped and one-shot) is refused with
+/// `Releasing`, a second cursor is refused, and the slice stays Fenced.
+/// After the release is Done (Inactive, blocks back in the pool) the same
+/// state is adopted in full and served with the same mappings.
+#[test]
+fn reacquire_mid_release_waits_and_readopts() {
+    let (mut a, slice, mine) = release_fixture(&[], 40, 30);
+    let shadow = snapshot(&a);
+    let input = shadow.take(slice, a.fx.nat.state().now_ms());
+    let want = blocks_of(&a, &mine);
+    let st = a.fx.nat.state();
+    let mut r = st.release_begin(slice, Some(BlockReleaseReason::Handover)).unwrap();
+    assert_eq!(st.release_step(&mut r, past()), plat_nat64::ReleaseStep::More);
+    let m = meta(AcquireReason::Failback);
+    assert_eq!(
+        st.adopt_begin(slice, plat_nat64::AdoptSource::Input(input.clone()), m).err(),
+        Some(AdoptError::Releasing)
+    );
+    assert_eq!(st.adopt_slice(slice, &input, m).err(), Some(AdoptError::Releasing));
+    assert!(st.release_begin(slice, None).is_none(), "one cursor per slice");
+    assert_eq!(st.slice_state(slice), Some(SliceState::Fenced));
+    assert!(st.slice_releasing(slice));
+    let (stats, _) = step_release(&mut a, &mut r, |_| {});
+    assert_eq!(stats.blocks_released as usize, want.len());
+    let st = a.fx.nat.state();
+    assert_eq!(st.slice_state(slice), Some(SliceState::Inactive));
+    let rel: Vec<_> = releases(&events(&a.fx)).iter().map(|x| (x.0, x.1)).collect();
+    assert_eq!(rel, want);
+    let s = st.adopt_slice(slice, &input, m).unwrap();
+    assert_eq!(s.blocks_adopted as usize, want.len());
+    assert_eq!(st.slice_state(slice), Some(SliceState::Active));
+    assert_eq!(adopts(&events(&a.fx)), want);
+    check_same(&mut a, &mine);
+}
+
+/// POAM-048, SC-5 (plan §8): the per-aggregate subscriber count drops by
+/// exactly the subscribers whose blocks a chunked release removed, never
+/// early (mid-release the aggregate is still full) and never twice; after
+/// every slice is released it is zero and admits a new subscriber again.
+#[test]
+fn aggregate_counts_survive_chunked_release() {
+    const AGG3: (&str, &str) = ("max_subscribers_per_aggregate = 256", "max_subscribers_per_aggregate = 3");
+    let (mut a, _, _) = release_fixture(&[AGG3, NO_UNREACH], 3, 1);
+    // Many BIBs per subscriber so each release takes several steps.
+    let mut flows = Vec::new();
+    for n in 1..=3 {
+        flows.extend((1..300).map(|p| (n, 1000 + p, proto::UDP)));
+    }
+    let made = make_flows(&mut a, &flows);
+    let _ = events(&a.fx);
+    let st = a.fx.nat.state();
+    assert_eq!(st.aggregate_count(sub(1, 1)), 3);
+    let slice_of = |n: u16| made.iter().find(|m| m.0.addr == sub(n, 1)).map(|m| (m.1.0 & 3) as u16).unwrap();
+    let mut left = 3;
+    for s in 0..4u16 {
+        let gone = (1..=3).filter(|&n| slice_of(n) == s).count() as u32;
+        let mut r = a.fx.nat.state().release_begin(s, None).unwrap();
+        let before = left;
+        let (stats, steps) = step_release(&mut a, &mut r, |n| {
+            let c = n.fx.nat.state().aggregate_count(sub(1, 1));
+            assert!(c <= before && c + gone >= before, "mid-release count {c}, from {before} removing {gone}");
+        });
+        left -= gone;
+        assert_eq!(stats.subscribers_removed, u64::from(gone), "slice {s}");
+        if gone > 0 {
+            assert!(steps > 1, "slice {s}: {steps} steps");
+        }
+        assert_eq!(a.fx.nat.state().aggregate_count(sub(1, 1)), left, "after slice {s}");
+    }
+    assert_eq!(a.fx.nat.state().subscriber_count(), 0);
+    for s in 0..4 {
+        a.fx.nat.state().adopt_slice(s, &AdoptInput::default(), meta(AcquireReason::Failback)).unwrap();
+    }
+    run(&mut a.fx, &udp6(sub(4, 1), 1000, SERVER, 53, b"q")).unwrap();
+    assert_eq!(a.fx.nat.state().aggregate_count(sub(1, 1)), 1);
+}
+
+/// POAM-048, AU-12/AU-5 (rule 4, Q1), engine level: under
+/// `refuse_new_bindings` with a full queue the release pauses and never
+/// gets past it, the slice stays Fenced and releasing (its blocks are not
+/// back in the pool: adoption of the slice is refused), and freeing one
+/// slot lets exactly one more record through; at Done every block has one
+/// record and none was lost.
+#[test]
+fn full_queue_pauses_release_and_blocks_stay_out_of_the_pool() {
+    let (a, slice, mine) = release_fixture(&[], 40, 2);
+    let want = blocks_of(&a, &mine);
+    assert!(want.len() > 4, "{} blocks", want.len());
+    let st = a.fx.nat.state();
+    assert_eq!(st.audit().capacity(), 4096);
+    while st.audit().emit(foreign()) {}
+    let lost0 = st.audit().stats().lost.load(std::sync::atomic::Ordering::Relaxed);
+    let mut r = st.release_begin(slice, Some(BlockReleaseReason::Handover)).unwrap();
+    // The bibs phase queues nothing (BIB records off): it runs until the
+    // first release record is refused.
+    let mut n = 0;
+    while st.release_step(&mut r, past()) == plat_nat64::ReleaseStep::More {
+        n += 1;
+        assert!(n < 100_000);
+    }
+    for _ in 0..5 {
+        assert_eq!(st.release_step(&mut r, past()), plat_nat64::ReleaseStep::Paused);
+        assert!(st.slice_releasing(slice));
+        assert_eq!(st.slice_state(slice), Some(SliceState::Fenced));
+        assert_eq!(
+            st.adopt_slice(slice, &AdoptInput::default(), meta(AcquireReason::Failback)).err(),
+            Some(AdoptError::Releasing)
+        );
+    }
+    let mut seen = Vec::new();
+    let mut steps = 0;
+    loop {
+        steps += 1;
+        assert!(steps < 100_000);
+        // Slow logger: one slot per step.
+        seen.extend(a.fx.rx.try_recv().ok());
+        match a.fx.nat.state().release_step(&mut r, past()) {
+            plat_nat64::ReleaseStep::Done(s) => {
+                assert_eq!(s.blocks_released as usize, want.len());
+                break;
+            }
+            plat_nat64::ReleaseStep::Paused | plat_nat64::ReleaseStep::More => {
+                assert_eq!(a.fx.nat.state().slice_state(slice), Some(SliceState::Fenced));
+            }
+        }
+    }
+    seen.extend(a.fx.rx.try_iter());
+    let got: Vec<_> = releases(&seen).iter().map(|x| (x.0, x.1)).collect();
+    assert_eq!(got, want, "each block's record queued exactly once");
+    assert_eq!(a.fx.nat.state().audit().stats().lost.load(std::sync::atomic::Ordering::Relaxed), lost0);
+    assert_eq!(a.fx.nat.state().slice_state(slice), Some(SliceState::Inactive));
 }

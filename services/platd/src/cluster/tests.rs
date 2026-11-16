@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use plat_audit::{
-    AcquireReason as AuditAcquire, AuditSink, Event, MemberState, OperatorRefusal, PeerRejectReason, TryEmit,
-    ViewReason,
+    AcquireReason as AuditAcquire, AuditSink, BlockReleaseReason, Event, MemberState, OperatorRefusal,
+    PeerRejectReason, SliceReleaseReason, TryEmit, ViewReason,
 };
 use plat_cluster::{Msg, RejectReason, SliceId, WireBlock};
 use plat_common::{Clock, Config, Counters};
@@ -1466,6 +1466,141 @@ fn heartbeat_gap_during_large_adoption() {
     }
 }
 
+/// `plat_cluster_release_*` lines of `n`'s metrics, and the steps total.
+fn release_metrics(n: &Node) -> (Vec<String>, u64) {
+    let mut m = String::new();
+    n.h().shared.render_metrics(&mut m);
+    let lines: Vec<String> = m.lines().filter(|l| l.starts_with("plat_cluster_releas")).map(str::to_owned).collect();
+    let steps = lines
+        .iter()
+        .find_map(|l| l.strip_prefix("plat_cluster_release_steps_total "))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+    (lines, steps)
+}
+
+/// Per slice: the last `handover` release record of `old` and the first
+/// failback acquire record of `new` (wall µs), after the marks.
+fn handover_order(old: &Node, new: &Node, mark: usize) -> Vec<(SliceId, u64, u64)> {
+    let map = old.nat.state().slice_map().unwrap().clone();
+    let mut last_rel = [0u64; 16];
+    for e in old.events.lock().iter().skip(mark) {
+        if let Event::PortBlockRelease { ts_us, v4, reason: Some(BlockReleaseReason::Handover), .. } = e
+            && let Some(x) = map.slice_of(*v4)
+        {
+            last_rel[usize::from(x)] = last_rel[usize::from(x)].max(*ts_us);
+        }
+    }
+    let mut out = Vec::new();
+    for e in new.events.lock().iter() {
+        if let Event::ClusterSliceAcquire { ts_us, acquire, .. } = e
+            && acquire.reason == AuditAcquire::Failback
+            && let Some(x) = map.slice_of(acquire.slice.net)
+            && last_rel[usize::from(x)] > 0
+        {
+            out.push((x, last_rel[usize::from(x)], *ts_us));
+        }
+    }
+    out
+}
+
+/// POAM-048: the `plat-cluster-ctl` thread releases large Active slices in
+/// bounded steps between its heartbeats. The leader serves every slice
+/// with the load (`PLAT_HB_GAP_SUBS` x `PLAT_HB_GAP_PORTS` BIBs) after the
+/// other member crashed; the member restarts, syncs, and the leader hands
+/// its slices back (failback: release cursors with `handover` records,
+/// then `HandoverFence`). A test-owned witness records the leader's
+/// heartbeats. Asserts the gap budget, that the leader kept its lease (no
+/// lease-loss release), that every handed-over block got one `handover`
+/// release record, and that the new owner acquired each slice only after
+/// the old owner's last release record of it (`HandoverFence` after the
+/// release, Q3), when the release finished within `safe`.
+#[test]
+fn heartbeat_gap_during_large_release() {
+    const HEARTBEAT: Duration = Duration::from_millis(100);
+    const GAP_BUDGET: Duration = Duration::from_millis(150);
+    let subs = env_usize("PLAT_HB_GAP_SUBS", 2000);
+    let ports = env_usize("PLAT_HB_GAP_PORTS", 16).clamp(1, 256);
+    let _serial = crate::test_pki::FIPS_HOOK.lock();
+    let pki = Pki::new();
+    let l = Layout::new(2, true);
+    let (sa, sb, sw) = (ShortDir::new("a"), ShortDir::new("b"), ShortDir::new("w"));
+    let probe = HeartbeatProbe::start(&l, &pki, &sw.0);
+    let nat = "port_block_size = 256";
+    let cfgs =
+        [member_cfg(&l, 0, l.ports[0], &pki, &sa.0, nat, None), member_cfg(&l, 1, l.ports[1], &pki, &sb.0, nat, None)];
+    let mut nodes = [Node::start(cfgs[0].clone()), Node::start(cfgs[1].clone())];
+    wait("16 slices", Duration::from_secs(15), || {
+        nodes.iter().all(|n| n.active() > 0) && total_active(&[&nodes[0], &nodes[1]]) == 16
+    });
+    let leader = nodes[0].h().shared.view().unwrap().leader;
+    let (li, fi) = (usize::from(leader), usize::from(1 - leader));
+    let own = nodes[li].active();
+    wait_protected(&[&nodes[0], &nodes[1]]);
+    nodes[fi].kill();
+    wait("leader serves every slice", Duration::from_secs(10), || nodes[li].active() == 16);
+
+    // Load on the leader, over all 16 slices.
+    let fill = hb_load(&mut nodes[li], subs, ports);
+    std::thread::sleep(Duration::from_secs(1));
+    let mark = nodes[li].events.lock().len();
+    let restart = Instant::now();
+    let baseline =
+        longest_gap(&probe.beats_from(leader), restart.checked_sub(Duration::from_secs(1)).unwrap(), restart);
+    let (_, steps_before) = release_metrics(&nodes[li]);
+    nodes[fi] = Node::start(cfgs[fi].clone());
+    // Failback: the leader is back to its own slices, none releasing.
+    let took = wait("failback", Duration::from_secs(120), || {
+        let st = nodes[li].nat.state();
+        nodes[li].active() == own && nodes[fi].active() == 16 - own && (0..16).all(|x| !st.slice_releasing(x))
+    });
+    std::thread::sleep(3 * HEARTBEAT);
+    let gap = longest_gap(&probe.beats_from(leader), restart, Instant::now());
+    let (lines, steps) = release_metrics(&nodes[li]);
+
+    let (mut handover_blocks, mut lease_lost) = (0u64, 0usize);
+    for e in nodes[li].events.lock().iter().skip(mark) {
+        match e {
+            Event::PortBlockRelease { reason: Some(BlockReleaseReason::Handover), .. } => handover_blocks += 1,
+            Event::ClusterSliceRelease { reason: SliceReleaseReason::LeaseLost, .. } => lease_lost += 1,
+            _ => {}
+        }
+    }
+    let order = handover_order(&nodes[li], &nodes[fi], mark);
+    let span = order.iter().map(|o| o.1).max().zip(order.iter().map(|o| o.1).min());
+    println!(
+        "heartbeat_gap_during_large_release: released {} slices, {handover_blocks} blocks with `handover` \
+         (load {subs} x {ports} BIBs in {fill:?}); restart to failback done {took:?}; \
+         longest heartbeat gap: {baseline:?} before, {gap:?} during the release; \
+         release steps {}; {lines:?}; release records span {:?} ms; \
+         per slice (last release, failback acquire) us: {order:?} (this host, {} build)",
+        order.len(),
+        steps - steps_before,
+        span.map(|(a, b)| a.saturating_sub(b) / 1000),
+        if cfg!(debug_assertions) { "debug" } else { "release" }
+    );
+    assert!(baseline > Duration::ZERO && gap > Duration::ZERO, "the probe saw the leader's heartbeats");
+    assert_eq!(lease_lost, 0, "the leader kept its lease while releasing");
+    assert!(steps > steps_before, "the release ran in steps");
+    assert!(handover_blocks > 0, "handover release records");
+    assert!(!order.is_empty(), "failback acquires");
+    // Q3: the new owner stops waiting `safe` only on `HandoverFence`,
+    // sent after the old owner's last release record of the slice. A
+    // release longer than `safe` lets the new owner proceed first (still
+    // SC-24-safe: the old owner was fenced throughout).
+    let safe_us = (LEASE_MS * 11 / 10 + 200) * 1000;
+    for (x, rel, acq) in &order {
+        if rel.saturating_sub(span.map_or(0, |s| s.1)) < safe_us {
+            assert!(rel <= acq, "slice {x}: acquired at {acq} before the last release record at {rel}");
+        }
+    }
+    // POAM-048: one release step between two ticks.
+    assert!(gap <= GAP_BUDGET, "heartbeat gap {gap:?} over {GAP_BUDGET:?}");
+    for n in &mut nodes {
+        n.stop();
+    }
+}
+
 // ------------------------------------------- POAM-047 abandoned adoptions (QA)
 
 /// An inbound UDP packet from the server to `(v4, port)`; true when `n`
@@ -1770,4 +1905,424 @@ fn adoption_abandoned_on_view_change_reassign() {
     s.a.stop();
     s.b.stop();
     s.w.take().unwrap().shutdown();
+}
+
+// ------------------------------------------- POAM-048 chunked release (QA)
+
+/// Value of the unlabelled series `name` in `n`'s metrics.
+fn metric(n: &Node, name: &str) -> u64 {
+    let mut o = String::new();
+    n.h().shared.render_metrics(&mut o);
+    let key = format!("{name} ");
+    o.lines().find_map(|l| l.strip_prefix(&key)).and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+}
+
+/// A record queued by the test (fills an audit queue).
+fn filler() -> Event {
+    Event::ClusterSliceAcquire {
+        ts_us: 0,
+        acquire: Arc::new(plat_audit::SliceAcquire {
+            slice: plat_audit::SliceCidr { net: 0, len: 32 },
+            epoch: 0,
+            prev_owner: None,
+            reason: AuditAcquire::Startup,
+            blocks_adopted: 0,
+            bibs_adopted: 0,
+            blocks_quarantined: 0,
+            in_sync: true,
+        }),
+    }
+}
+
+/// `(v4, port_lo)` of each `PortBlockRelease` of `n` after `mark`, with the
+/// number of records per block.
+fn release_counts(n: &Node, mark: usize) -> std::collections::BTreeMap<(u32, u16), usize> {
+    let mut m = std::collections::BTreeMap::new();
+    for e in n.events.lock().iter().skip(mark) {
+        if let Event::PortBlockRelease { v4, port_lo, .. } = e {
+            *m.entry((*v4, *port_lo)).or_insert(0) += 1;
+        }
+    }
+    m
+}
+
+/// Two members and a real witness. The other member crashed, the leader
+/// adopted its slices and was loaded (`subs` subscribers, one block each,
+/// over all 16 slices) under `refuse_new_bindings`. Then the leader's
+/// audit queue is filled and no longer drained (gate closed) and the other
+/// member restarts: the failback handover gives the leader release
+/// cursors that pause on the full queue (Q1). Returned once at least one
+/// slice is releasing and a paused step was counted.
+struct Releasing {
+    /// Kept alive for the test: certificates and state directories.
+    _pki: Pki,
+    _dirs: [ShortDir; 3],
+    w: Option<ClusterHandle>,
+    leader: Node,
+    other: Node,
+    gate: Arc<std::sync::atomic::AtomicBool>,
+    /// Slices the leader is handing back (the other member's).
+    theirs: std::collections::BTreeSet<SliceId>,
+    /// `(v4, port_lo)` of every subscriber's block, per slice.
+    blocks: std::collections::BTreeMap<SliceId, Vec<(u32, u16)>>,
+    /// `leader.events` length before the restart.
+    mark: usize,
+}
+
+fn releasing_fixture(subs: usize) -> Releasing {
+    use std::sync::atomic::Ordering;
+    let pki = Pki::new();
+    let l = Layout::new(2, true);
+    let dirs = [ShortDir::new("ra"), ShortDir::new("rb"), ShortDir::new("rw")];
+    let w = super::witness::start(&witness_file(&l, &pki, &dirs[2].0), collector(4096).0).unwrap();
+    let nat = "port_block_size = 256";
+    let cfgs = [
+        member_cfg(&l, 0, l.ports[0], &pki, &dirs[0].0, nat, None),
+        member_cfg(&l, 1, l.ports[1], &pki, &dirs[1].0, nat, None),
+    ];
+    let gates: Vec<_> = (0..2).map(|_| gated_collector(256)).collect();
+    let mut nodes: Vec<Node> = gates
+        .iter()
+        .zip(&cfgs)
+        .map(|((sink, ev, _), c)| Node::start_with(c.clone(), sink.clone(), ev.clone()))
+        .collect();
+    wait("16 slices", Duration::from_secs(15), || {
+        nodes.iter().all(|n| n.active() > 0) && total_active(&[&nodes[0], &nodes[1]]) == 16
+    });
+    wait_protected(&[&nodes[0], &nodes[1]]);
+    let li = usize::from(nodes[0].h().shared.view().unwrap().leader);
+    let fi = 1 - li;
+    let st = nodes[li].nat.state();
+    let theirs: std::collections::BTreeSet<SliceId> =
+        (0..16).filter(|&x| st.slice_state(x) != Some(SliceState::Active)).collect();
+    nodes[fi].kill();
+    wait("leader serves every slice", Duration::from_secs(10), || nodes[li].active() == 16);
+    let mut blocks: std::collections::BTreeMap<SliceId, Vec<(u32, u16)>> = Default::default();
+    let map = nodes[li].nat.state().slice_map().unwrap().clone();
+    for i in 0..subs as u128 {
+        let client = 0x2001_0db8_0100_0000_0000_0000_0000_0000 | (i << 64) | 1;
+        let t = Instant::now();
+        let m = loop {
+            if let Some(m) = nodes[li].send(client, 40000) {
+                break m;
+            }
+            assert!(t.elapsed() < Duration::from_secs(10), "no block for subscriber {i}");
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert!(nodes[li].send(client, 40001).is_some());
+        let lo = 1024 + (m.1 - 1024) / 256 * 256;
+        blocks.entry(map.slice_of(m.0).unwrap()).or_default().push((m.0, lo));
+    }
+    for v in blocks.values_mut() {
+        v.sort_unstable();
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    let gate = gates[li].2.clone();
+    gate.store(false, Ordering::Release);
+    std::thread::sleep(Duration::from_millis(50));
+    let mark = nodes[li].events.lock().len();
+    let audit = nodes[li].nat.state().audit().clone();
+    while audit.emit(filler()) {}
+    let leader = nodes.remove(li);
+    drop(nodes);
+    let other = Node::start_with(cfgs[fi].clone(), gates[fi].0.clone(), gates[fi].1.clone());
+    let st = leader.nat.state();
+    wait("a release paused on the full queue", Duration::from_secs(30), || {
+        (0..16).any(|x| st.slice_releasing(x)) && metric(&leader, "plat_cluster_release_audit_paused_total") > 0
+    });
+    // It stays paused while the queue is full.
+    std::thread::sleep(Duration::from_millis(500));
+    let rel: Vec<_> = (0..16).filter(|&x| st.slice_releasing(x)).collect();
+    assert!(!rel.is_empty() && rel.iter().all(|x| theirs.contains(x)), "releasing {rel:?}, theirs {theirs:?}");
+    for &x in &rel {
+        assert_ne!(st.slice_state(x), Some(SliceState::Active), "slice {x} Active while releasing");
+    }
+    Releasing { _pki: pki, _dirs: dirs, w: Some(w), leader, other, gate, theirs, blocks, mark }
+}
+
+impl Releasing {
+    fn open(&self) {
+        self.gate.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn releasing(&self) -> Vec<SliceId> {
+        let st = self.leader.nat.state();
+        (0..16).filter(|&x| st.slice_releasing(x)).collect()
+    }
+
+    /// No block got two release records; returns the per-slice records.
+    fn check_released_once(&self) -> std::collections::BTreeMap<(u32, u16), usize> {
+        let c = release_counts(&self.leader, self.mark);
+        let twice: Vec<_> = c.iter().filter(|e| *e.1 > 1).collect();
+        assert!(twice.is_empty(), "blocks released twice: {twice:?}");
+        c
+    }
+}
+
+/// POAM-048 (plan §8), SEC-001: an orderly stop while release cursors are
+/// paused on a full queue finishes them before the membership shutdown
+/// (no slice left releasing, every subscriber removed, nothing Active) and
+/// the membership shutdown never releases a block a second time. The
+/// queue stays full past the `shutdown_handover_ms` budget (3 s here): the
+/// stop waits for room that long, then emits the rest, which is counted
+/// lost (reported by the logger as `audit_queue_overflow`).
+#[test]
+fn shutdown_completes_release_in_progress() {
+    let _serial = crate::test_pki::FIPS_HOOK.lock();
+    let mut s = releasing_fixture(400);
+    let rel = s.releasing();
+    let st = s.leader.nat.state();
+    let lost0 = st.audit().stats().lost.load(std::sync::atomic::Ordering::Relaxed);
+    let t = Instant::now();
+    s.leader.stop();
+    let took = t.elapsed();
+    let st = s.leader.nat.state();
+    assert!(s.releasing().is_empty(), "releasing after the stop: {:?}", s.releasing());
+    assert_eq!(st.subscriber_count(), 0, "every subscriber removed");
+    assert!((0..16).all(|x| st.slice_state(x) != Some(SliceState::Active)));
+    let lost = st.audit().stats().lost.load(std::sync::atomic::Ordering::Relaxed) - lost0;
+    assert!(lost > 0, "the queue never drained: records counted lost");
+    assert!(took >= Duration::from_millis(2900), "waited for room within the budget: {took:?}");
+    assert!(took < Duration::from_secs(10), "bounded by the budget: {took:?}");
+    s.open();
+    std::thread::sleep(Duration::from_millis(500));
+    let c = s.check_released_once();
+    println!(
+        "shutdown_completes_release_in_progress: {} slices releasing at the stop, {} release records seen, \
+         {lost} records lost at shutdown (full queue), stop took {took:?}",
+        rel.len(),
+        c.len()
+    );
+    s.other.stop();
+    s.w.take().unwrap().shutdown();
+}
+
+/// SEC-001: the queue drains during the stop, within the budget: the
+/// paused release cursors wait for room, every block of each releasing
+/// slice gets its one release record and nothing is lost.
+#[test]
+fn shutdown_waits_for_audit_room_within_budget() {
+    let _serial = crate::test_pki::FIPS_HOOK.lock();
+    let mut s = releasing_fixture(400);
+    let rel = s.releasing();
+    let st = s.leader.nat.state();
+    let lost0 = st.audit().stats().lost.load(std::sync::atomic::Ordering::Relaxed);
+    let gate = s.gate.clone();
+    let opener = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        gate.store(true, std::sync::atomic::Ordering::Release);
+    });
+    s.leader.stop();
+    let _ = opener.join();
+    let st = s.leader.nat.state();
+    assert!(s.releasing().is_empty(), "releasing after the stop: {:?}", s.releasing());
+    assert_eq!(st.subscriber_count(), 0, "every subscriber removed");
+    let lost = st.audit().stats().lost.load(std::sync::atomic::Ordering::Relaxed) - lost0;
+    assert_eq!(lost, 0, "the queue drained within the budget: nothing lost");
+    std::thread::sleep(Duration::from_millis(500));
+    let c = s.check_released_once();
+    let map = st.slice_map().unwrap().clone();
+    for &x in &rel {
+        let got: Vec<_> = c.keys().filter(|k| map.slice_of(k.0) == Some(x)).copied().collect();
+        assert_eq!(Some(&got), s.blocks.get(&x), "slice {x}: one record per block");
+    }
+    s.other.stop();
+    s.w.take().unwrap().shutdown();
+}
+
+/// NIST-004: a slice handed over and handed back before its release
+/// cursor finished. The other member is killed while the leader's
+/// failback cursors are paused on its full queue, so the leader takes
+/// those slices back: each waits (never Active, never Adopting) while it
+/// is releasing, and once the queue drains its release finishes first
+/// and it is then adopted and served.
+#[test]
+fn regain_mid_release_waits_then_adopts() {
+    let _serial = crate::test_pki::FIPS_HOOK.lock();
+    let mut s = releasing_fixture(400);
+    let rel = s.releasing();
+    let st = s.leader.nat.state();
+    s.other.kill();
+    // The leader keeps its majority with the witness and takes the slices
+    // back; the releasing ones wait for their cursor.
+    let t = Instant::now();
+    while t.elapsed() < Duration::from_secs(3) {
+        for &x in &rel {
+            if st.slice_releasing(x) {
+                let state = st.slice_state(x);
+                assert!(
+                    !matches!(state, Some(SliceState::Active | SliceState::Adopting)),
+                    "slice {x} {state:?} while releasing"
+                );
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!s.releasing().is_empty(), "the cursors wait on the full queue");
+    s.open();
+    wait("every slice served again", Duration::from_secs(30), || s.leader.active() == 16);
+    assert!(s.releasing().is_empty());
+    std::thread::sleep(Duration::from_millis(300));
+    s.check_released_once();
+    // Per slice: its acquire record comes after its last release record.
+    let map = st.slice_map().unwrap().clone();
+    let ev = s.leader.events.lock();
+    for &x in &rel {
+        let cidr = map.cidr(x).unwrap();
+        let last_rel = ev
+            .iter()
+            .enumerate()
+            .skip(s.mark)
+            .filter(|(_, e)| matches!(e, Event::PortBlockRelease { v4, .. } if map.slice_of(*v4) == Some(x)))
+            .map(|(i, _)| i)
+            .max();
+        let acq = ev.iter().enumerate().skip(s.mark).find_map(|(i, e)| match e {
+            Event::ClusterSliceAcquire { acquire, .. } if acquire.slice.net == cidr.network() => Some(i),
+            _ => None,
+        });
+        let (Some(r), Some(a)) = (last_rel, acq) else { panic!("slice {x}: release {last_rel:?}, acquire {acq:?}") };
+        assert!(a > r, "slice {x}: acquire at {a} before its last release record at {r}");
+    }
+    drop(ev);
+    s.leader.stop();
+    s.w.take().unwrap().shutdown();
+}
+
+/// POAM-048 (plan §8): the leader loses its lease (witness and the other
+/// member gone) while its handover release cursors are paused on a full
+/// queue. The cursors are kept: once the queue drains they finish, each
+/// released slice ends Inactive with exactly one release record per
+/// block, and the lease loss neither drops nor restarts them.
+#[test]
+fn lease_lost_during_release_keeps_going() {
+    let _serial = crate::test_pki::FIPS_HOOK.lock();
+    let mut s = releasing_fixture(400);
+    let rel = s.releasing();
+    let st = s.leader.nat.state();
+    let own: Vec<SliceId> =
+        (0..16).filter(|x| !s.theirs.contains(x) && st.slice_state(*x) == Some(SliceState::Active)).collect();
+    assert!(!own.is_empty());
+    s.w.take().unwrap().kill();
+    s.other.kill();
+    wait("lease lost: own slices fenced", Duration::from_secs(10), || {
+        own.iter().all(|&x| st.slice_state(x) == Some(SliceState::Fenced))
+    });
+    assert_eq!(s.releasing(), rel, "the cursors survive the lease loss");
+    s.open();
+    wait("releases done", Duration::from_secs(30), || s.releasing().is_empty());
+    std::thread::sleep(Duration::from_millis(300));
+    let c = s.check_released_once();
+    let map = st.slice_map().unwrap().clone();
+    for &x in &rel {
+        assert_eq!(st.slice_state(x), Some(SliceState::Inactive), "slice {x}");
+        let got: Vec<_> = c.keys().filter(|k| map.slice_of(k.0) == Some(x)).copied().collect();
+        assert_eq!(Some(&got), s.blocks.get(&x), "slice {x}: one record per block");
+    }
+    assert_eq!(metric(&s.leader, "plat_cluster_releasing_slices"), 0);
+    s.leader.stop();
+}
+
+fn live(n: &[Option<Node>]) -> Vec<&Node> {
+    n.iter().flatten().collect()
+}
+
+/// POAM-048 Q4 (plan §8): three members. Member X (the leader) is handing
+/// a restarted member's slices back (release cursors) when a third member
+/// crashes and X takes over some of its slices (an adoption cursor), both
+/// held on X's full audit queue. Once the queue drains both progress on
+/// the one control thread: every release finishes, X adopts its share and
+/// serves it, never more than one slice Adopting at a time.
+#[test]
+fn release_and_adoption_interleave() {
+    use std::sync::atomic::Ordering;
+    let _serial = crate::test_pki::FIPS_HOOK.lock();
+    let pki = Pki::new();
+    let l = Layout::new(3, false);
+    let dirs = [ShortDir::new("ia"), ShortDir::new("ib"), ShortDir::new("ic")];
+    let nat = "port_block_size = 256";
+    let cfgs: Vec<Config> =
+        (0..3).map(|i| member_cfg(&l, i, l.ports[usize::from(i)], &pki, &dirs[usize::from(i)].0, nat, None)).collect();
+    let gates: Vec<_> = (0..3).map(|_| gated_collector(256)).collect();
+    let start = |i: usize| Node::start_with(cfgs[i].clone(), gates[i].0.clone(), gates[i].1.clone());
+    let mut nodes: Vec<Option<Node>> = (0..3).map(|i| Some(start(i))).collect();
+    wait("16 slices", Duration::from_secs(20), || {
+        let v = live(&nodes);
+        v.iter().all(|n| n.active() > 0) && total_active(&v) == 16
+    });
+    wait_protected(&live(&nodes));
+    let xi = usize::from(nodes[0].as_ref().unwrap().h().shared.view().unwrap().leader);
+    let (yi, zi) = ((xi + 1) % 3, (xi + 2) % 3);
+    // Y crashes; X (and Z) take its slices; load X.
+    nodes[yi].take().unwrap().kill();
+    wait("Y's slices taken over", Duration::from_secs(15), || total_active(&live(&nodes)) == 16);
+    {
+        let x = nodes[xi].as_mut().unwrap();
+        for i in 0..600u128 {
+            let client = 0x2001_0db8_0100_0000_0000_0000_0000_0000 | (i << 64) | 1;
+            let t = Instant::now();
+            while x.send(client, 40000).is_none() {
+                assert!(t.elapsed() < Duration::from_secs(10), "no block for subscriber {i}");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+    // Load Z too (its slices are what X adopts later).
+    {
+        let z = nodes[zi].as_mut().unwrap();
+        for i in 1000..1600u128 {
+            let client = 0x2001_0db8_0100_0000_0000_0000_0000_0000 | (i << 64) | 1;
+            let t = Instant::now();
+            while z.send(client, 40000).is_none() {
+                assert!(t.elapsed() < Duration::from_secs(10), "no block for subscriber {i}");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+    wait_protected(&live(&nodes));
+    let x_steps =
+        |n: &Node| (metric(n, "plat_cluster_release_steps_total"), metric(n, "plat_cluster_adopt_steps_total"));
+    // Close X's queue, restart Y: X's failback release cursors pause.
+    gates[xi].2.store(false, Ordering::Release);
+    std::thread::sleep(Duration::from_millis(50));
+    {
+        let x = nodes[xi].as_ref().unwrap();
+        let audit = x.nat.state().audit().clone();
+        while audit.emit(filler()) {}
+    }
+    nodes[yi] = Some(start(yi));
+    {
+        let x = nodes[xi].as_ref().unwrap();
+        let st = x.nat.state();
+        wait("X releasing", Duration::from_secs(30), || (0..16).any(|s| st.slice_releasing(s)));
+    }
+    // Z crashes: X takes some of its slices while still releasing.
+    nodes[zi].take().unwrap().kill();
+    let x = nodes[xi].as_ref().unwrap();
+    let st = x.nat.state();
+    let t = Instant::now();
+    let mut both = false;
+    while t.elapsed() < Duration::from_secs(15) && !both {
+        let adopting = (0..16).any(|s| st.slice_state(s) == Some(SliceState::Adopting));
+        both = adopting && (0..16).any(|s| st.slice_releasing(s));
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(both, "X never held a release and an adoption at once");
+    let before = x_steps(x);
+    gates[xi].2.store(true, Ordering::Release);
+    let mut max_adopting = 0;
+    wait("X done releasing and adopting", Duration::from_secs(60), || {
+        let a = (0..16).filter(|&s| st.slice_state(s) == Some(SliceState::Adopting)).count();
+        max_adopting = max_adopting.max(a);
+        a == 0 && !(0..16).any(|s| st.slice_releasing(s))
+    });
+    let after = x_steps(x);
+    assert!(after.0 > before.0 && after.1 > before.1, "both progressed: {before:?} -> {after:?}");
+    assert!(max_adopting <= 1, "{max_adopting} slices Adopting at once");
+    let c = release_counts(x, 0);
+    let twice: Vec<_> = c.iter().filter(|e| *e.1 > 1).collect();
+    assert!(twice.is_empty(), "released twice: {twice:?}");
+    println!("release_and_adoption_interleave: steps {before:?} -> {after:?}, X active {}", x.active());
+    for n in nodes.iter_mut().flatten() {
+        n.stop();
+    }
 }

@@ -540,7 +540,11 @@ flowchart LR
   `Adopting` until done, one slice at a time; an abandon releases only
   logged blocks and leaves the slice Inactive. A still grows with slice
   size (about 1.4 s at 4M BIBs, host only), so the A = 50 ms assumption is
-  not met at scale. Active-slice release is not chunked (POAM-048). No VM trials of the new election yet
+  not met at scale. Active-slice release is chunked too (POAM-048, `plat-nat64/src/release.rs`,
+  `Ctl::step_release`): the slice is Fenced at once, steps of about 5 ms alternate with
+  adoption steps, blocks return to the pool only after every release record is queued,
+  `HandoverFence` follows the last step and the slice ends Inactive; each slice cursor
+  scans every `bib4` shard (N slices = N scans). No VM trials of the new election yet
   (POAM-007 (2) open).
 
 ## Trust boundaries

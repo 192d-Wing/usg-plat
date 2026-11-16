@@ -26,7 +26,9 @@
 //! subscriber [`repl::Directory`] has its own shards and is a leaf after
 //! every engine lock. A takeover is a resumable [`Adoption`] cursor that
 //! the control thread steps under a time budget; the slice stays
-//! `Adopting` (unusable) until its last step (POAM-047).
+//! `Adopting` (unusable) until its last step (POAM-047). Giving up an
+//! Active slice is a [`Release`] cursor stepped the same way: the slice is
+//! Fenced first and Inactive at the end (POAM-048).
 
 pub mod engine;
 pub mod frag;
@@ -50,5 +52,6 @@ pub use pool::{AllocFail, SliceState};
 pub use repl::{AdoptInput, Detached, Directory, Home, ReplHub, ReplProducer, ReplRecord, Shadow, ShadowError};
 pub use state::{
     ADOPT_BATCH, ADOPT_STEP_BUDGET, ADOPT_STEP_MAX_ITEMS, AdoptError, AdoptMeta, AdoptSource, AdoptStats, Adoption,
-    ClusterSetup, ExportCursor, MAX_REPL_RING_BYTES, ReleaseStats, Step, check_ring_memory,
+    ClusterSetup, ExportCursor, MAX_REPL_RING_BYTES, RELEASE_STEP_BUDGET, Release, ReleaseStats, ReleaseStep,
+    SliceReleasing, Step, check_ring_memory,
 };

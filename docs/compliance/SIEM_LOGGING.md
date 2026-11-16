@@ -980,6 +980,32 @@ for `nat_port_block_release` (same address and range), `service_stop`,
   `reassigned`, `handover`, `shutdown`, `epoch`: the slice left `Adopting`
   under the cursor); these are metrics only, no schema change
   (`cluster_slice_acquire.bibs_adopted` is still the validated BIB count);
+  chunked Active-slice release (POAM-048): counter
+  `plat_cluster_release_steps_total`, gauges
+  `plat_cluster_release_step_seconds_max` (longest step in the last 60 s),
+  `plat_cluster_releasing_slices` (slices with a release cursor) and
+  `plat_cluster_release_oldest_age_seconds` (age of the oldest queued
+  release, 0 when none), counter `plat_cluster_release_audit_paused_total`
+  (steps that paused because the audit queue was full under
+  `refuse_new_bindings`; the refused record is queued first on the next
+  step, each record once; blocks stay out of the pool until every release
+  record of the slice is queued). Runbook: an
+  `plat_cluster_release_oldest_age_seconds` that keeps growing while
+  `plat_cluster_release_audit_paused_total` rises means the audit queue is
+  not draining; check the audit output (`audit_output_failure`,
+  `/healthz`) before the slice is needed elsewhere, since the new owner
+  receives `HandoverFence` only after the release finishes. Records and
+  their order are unchanged, only spread over more time (schema stays 8).
+  Shutdown: release waits and the handover view wait share one
+  `shutdown_handover_ms` budget. Past it, the remaining records go through
+  `release_all`, refused ones are counted lost and reported in
+  `audit_queue_overflow`, and `HandoverFence` is still sent, so the log
+  may lack the release record of a block the new owner then serves;
+  correlate such handovers with `audit_queue_overflow` from the same
+  node. With a stalled logger the release waits can use the whole budget:
+  the view wait then gets no time (takeover falls back to lease expiry,
+  POAM-030 behaviour) and releases queued later go straight to
+  `release_all` (SEC-005);
   and the per-worker
   `plat_cluster_steer_missteered_total`, `plat_cluster_reserve_starved_total`,
   and `plat_pool_paired_exhausted_total` (strict paired pooling refused: the

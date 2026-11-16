@@ -5,6 +5,24 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 ## [Unreleased]
 
 ### Changed
+- Cluster HA (CP-10, SC-24, AU-12, POAM-048): releasing an Active slice
+  (handover, lease lost, reassignment) is now a resumable cursor stepped on
+  the cluster ctl thread with a 5 ms budget, alternating with adoption
+  steps and heartbeats. The slice is Fenced at once and cannot be set
+  Active or adopted until the release finishes; blocks return to the pool
+  only after every release record is queued; `HandoverFence` is sent after
+  the last step; a finished release leaves the slice Inactive (was Fenced).
+  Under `refuse_new_bindings` the release pauses while the audit queue is
+  full. At shutdown, release waits share the `shutdown_handover_ms` budget
+  with the handover view wait; past it, refused records are counted lost
+  (`audit_queue_overflow`). New metrics `plat_cluster_release_steps_total`,
+  `plat_cluster_release_step_seconds_max`, `plat_cluster_releasing_slices`,
+  `plat_cluster_release_audit_paused_total`,
+  `plat_cluster_release_oldest_age_seconds`. No wire, config or log-schema
+  change (`LOG_SCHEMA_VERSION` stays 8). Measured on one macOS host only:
+  step p99 about 5 ms, tail up to 47 ms, heartbeat gap at most 112.5 ms
+  while releasing at 4M BIBs.
+
 - Cluster HA (CP-10, SC-24): faster election after a leader crash. A
   candidate retries on a short timer and yields to a lower member id at
   most once per term; a pre-candidate keeps re-soliciting pre-votes (empty
@@ -54,6 +72,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 - POAM-047 (adoption stalls the control loop) closed.
 - POAM-048 opened: releasing an Active slice still walks every block in
   one pass on the ctl thread.
+- POAM-048 closed (chunked Active-slice release).
 
 ## [0.4.2] - 2026-11-10
 
