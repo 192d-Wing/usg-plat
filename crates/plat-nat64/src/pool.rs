@@ -911,6 +911,12 @@ impl Pool {
     /// `in_use` (adopted), `held` (hold-back until the deadline) and
     /// `cooling` (cool-down until the deadline). Reservations are dropped.
     /// The slice must not be Active.
+    /// Free blocks in slice `id`'s lists, whatever its state (tests).
+    #[cfg(test)]
+    pub(crate) fn slice_free(&self, id: SliceId) -> usize {
+        self.sliced.as_ref().and_then(|s| s.slices.get(usize::from(id))).map_or(0, |m| m.lock().free as usize)
+    }
+
     pub(crate) fn reset_slice(
         &self,
         id: SliceId,

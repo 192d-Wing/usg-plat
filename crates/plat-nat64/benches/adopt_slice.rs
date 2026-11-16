@@ -22,6 +22,11 @@
 //! - the audit queue has `audit.queue_capacity` entries and is drained
 //!   between iterations (in platd the logger thread drains it).
 //!
+//! - `release`: the Active-slice release cursor (POAM-048) of the adopted
+//!   slice, `release_begin` + `release_step` with the 5 ms
+//!   `RELEASE_STEP_BUDGET` until done; the adoption before it is untimed.
+//!   The longest step is printed (`release_step_5ms`).
+//!
 //! Each case reports the time of one adoption; the throughput line is
 //! records (blocks + BIBs) per second. A `blocks_only` case next to a full
 //! one separates the per-block cost (subscriber insert and one
@@ -43,8 +48,8 @@ use plat_cluster::{SliceMap, SnapRecord, WireBib, WireBlock};
 use plat_common::config::SteeringMode;
 use plat_common::{Clock, Config};
 use plat_nat64::{
-    ADOPT_STEP_BUDGET, AdoptInput, AdoptMeta, AdoptSource, AdoptStats, ClusterSetup, Directory, Nat64, Shadow,
-    SliceState, Step,
+    ADOPT_STEP_BUDGET, AdoptInput, AdoptMeta, AdoptSource, AdoptStats, ClusterSetup, Directory, Nat64,
+    RELEASE_STEP_BUDGET, ReleaseStats, ReleaseStep, Shadow, SliceState, Step,
 };
 use plat_packet::proto;
 
@@ -212,6 +217,47 @@ fn check(n: &Node, stats: AdoptStats, blocks: u64, bibs: u64) {
     let _ = n.rx.try_iter().count();
 }
 
+/// Releases the Active [`SLICE`] in steps of `budget`; returns the stats,
+/// the total time and the longest step, and appends every step's time to
+/// `steps`.
+fn release_stepped(n: &Node, budget: Duration, steps: &mut Vec<Duration>) -> (ReleaseStats, Duration, Longest) {
+    let st = n.nat.state();
+    let t = Instant::now();
+    let mut r = st.release_begin(SLICE, None).unwrap();
+    let mut longest = (Duration::ZERO, "");
+    loop {
+        let phase = r.phase(st);
+        let s0 = Instant::now();
+        let res = black_box(st.release_step(&mut r, s0 + budget));
+        let d = s0.elapsed();
+        steps.push(d);
+        if d > longest.0 {
+            longest = (d, if r.phase(st) == phase { phase } else { "phase change" });
+        }
+        match res {
+            ReleaseStep::Done(stats) => return (stats, t.elapsed(), longest),
+            ReleaseStep::More => {}
+            ReleaseStep::Paused => {
+                let _ = n.rx.try_iter().count();
+            }
+        }
+    }
+}
+
+fn print_steps(what: &str, id: &str, steps: &mut [Duration], longest: Longest, budget: Duration) {
+    steps.sort_unstable();
+    let q = |p: usize| steps.get((steps.len() * p / 100).min(steps.len().saturating_sub(1))).copied();
+    println!(
+        "{what}/{id}: {} steps, p50 {:?}, p99 {:?}, p99.9 {:?}, longest {:?} (started in: {}), budget {budget:?}",
+        steps.len(),
+        q(50).unwrap_or_default(),
+        q(99).unwrap_or_default(),
+        steps.get((steps.len() * 999 / 1000).min(steps.len().saturating_sub(1))).copied().unwrap_or_default(),
+        longest.0,
+        longest.1
+    );
+}
+
 /// One timed adoption of a copy of `input` (copied untimed).
 fn adopt_once(n: &Node, input: &AdoptInput, epoch: u64) -> Duration {
     let src = AdoptSource::Input(input.clone());
@@ -281,17 +327,40 @@ fn bench(c: &mut Criterion) {
                         .sum()
                 })
             });
-            steps.sort_unstable();
-            let q = |p: usize| steps.get((steps.len() * p / 100).min(steps.len().saturating_sub(1))).copied();
-            println!(
-                "adopt_step_5ms/{id}: {} steps, p50 {:?}, p99 {:?}, longest {:?} (started in: {}), budget \
-                 {ADOPT_STEP_BUDGET:?}",
-                steps.len(),
-                q(50).unwrap_or_default(),
-                q(99).unwrap_or_default(),
-                longest.0,
-                longest.1
-            );
+            print_steps("adopt_step_5ms", &id, &mut steps, longest, ADOPT_STEP_BUDGET);
+
+            // POAM-048: the release of the adopted slice, 5 ms steps.
+            let mut longest = (Duration::ZERO, "");
+            let mut steps = Vec::new();
+            g.bench_function(format!("release/{id}"), |b| {
+                b.iter_custom(|iters| {
+                    (0..iters)
+                        .map(|_| {
+                            fill(&n, blocks, bibs);
+                            epoch += 1;
+                            let d = n.shadow.detach(SLICE, n.nat.state().now_ms());
+                            let (stats, _, _) = adopt_stepped(
+                                &n,
+                                AdoptSource::Detached(d),
+                                epoch,
+                                Duration::from_secs(3600),
+                                &mut Vec::new(),
+                            );
+                            assert_eq!(stats.bibs_adopted, bibs);
+                            let _ = n.rx.try_iter().count();
+                            let (rel, took, l) = release_stepped(&n, RELEASE_STEP_BUDGET, &mut steps);
+                            assert_eq!((rel.bibs_removed, rel.blocks_released), (bibs, blocks));
+                            assert_eq!(n.nat.state().slice_state(SLICE), Some(SliceState::Inactive));
+                            let _ = n.rx.try_iter().count();
+                            if l.0 > longest.0 {
+                                longest = l;
+                            }
+                            took
+                        })
+                        .sum()
+                })
+            });
+            print_steps("release_step_5ms", &id, &mut steps, longest, RELEASE_STEP_BUDGET);
         }
     }
     g.finish();

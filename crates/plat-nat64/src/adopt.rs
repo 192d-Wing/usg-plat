@@ -48,7 +48,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use ahash::RandomState;
-use plat_audit::{BlockAdopt, BlockReleaseReason, Event, SliceAcquire, SliceCidr};
+use plat_audit::{BlockAdopt, BlockReleaseReason, Event, SliceAcquire, SliceCidr, TryEmit};
 use plat_cluster::{SliceId, WireBib, WireBlock};
 use plat_common::Clock;
 use plat_common::config::{AuditMode, Filtering};
@@ -76,6 +76,13 @@ pub const ADOPT_STEP_MAX_ITEMS: usize = 262_144;
 /// 9-22 ms on the bench host); at 16 the clock is read every 64 BIBs and a
 /// step imports at most 16 384 (the 5 ms deadline usually ends it first).
 pub const BIB_IMPORT_COST: usize = 16;
+/// Items one removed BIB, and one released block with its subscriber, are
+/// charged in a removal walk (POAM-048). A removal takes the `bib6` and
+/// `bib4` locks, retires the mirror entry and frees the BIB's sessions; a
+/// block release builds and queues a record and may drop its subscriber.
+/// At one item each, a batch of 1024 cost up to 20 ms on the bench host
+/// (4M BIBs); at 16 the clock is read every 64 of them.
+pub const RELEASE_ITEM_COST: usize = 16;
 
 /// Where an adoption's records come from.
 #[derive(Debug)]
@@ -181,11 +188,29 @@ struct Adopted {
 pub(super) struct Walk {
     bib_shard: usize,
     sub_shard: usize,
-    /// Scratch: the dead keys of one `bib4` shard (bounded by the shard).
+    /// The in-slice keys of one `bib4` shard (bounded by the shard),
+    /// drained across steps from `dead_pos` (POAM-048): the step unit is
+    /// one BIB removal, not a whole shard.
     dead: Vec<(Key4, Key6)>,
+    dead_pos: usize,
+    /// Release records go through `try_emit`; a full queue pauses the walk
+    /// with the refused record in `pending` (a release under
+    /// `refuse_new_bindings`, see `release.rs`).
+    pub(super) pause_on_full: bool,
+    /// A record refused by a full queue, queued before anything else.
+    pub(super) pending: Option<Event>,
+    /// The last pass stopped on a full queue.
+    pub(super) paused: bool,
     /// When set, the removed BIBs are kept here for the shadow (an abandon
     /// that returns the state, bounded by the detached BIBs).
     collect: Option<Map<(u8, u32, u16), WireBib>>,
+}
+
+impl Walk {
+    /// "bibs" until every `bib4` shard is done, then "blocks".
+    pub(super) fn in_bibs(&self, bib_shards: usize) -> bool {
+        self.bib_shard < bib_shards || self.dead_pos < self.dead.len()
+    }
 }
 
 /// Which removed blocks get a `nat_port_block_release` record.
@@ -408,6 +433,9 @@ impl State {
         let state = self.pool.slice_state(s).ok_or(AdoptError::BadSlice)?;
         if state == SliceState::Active {
             return Err(AdoptError::Active);
+        }
+        if self.slice_releasing(s) {
+            return Err(AdoptError::Releasing);
         }
         c.slices.cidr(s).ok_or(AdoptError::BadSlice)?;
         self.pool.set_slice_state(s, SliceState::Adopting);
@@ -1018,7 +1046,32 @@ impl State {
         st: &mut ReleaseStats,
     ) -> bool {
         let bib_records = matches!(emit, Emit::All) && self.audit_mode == AuditMode::Session;
-        while w.bib_shard < self.bib4.shard_count() {
+        loop {
+            while let Some(&(k4, k6)) = w.dead.get(w.dead_pos) {
+                if b.out() || w.paused {
+                    return false;
+                }
+                w.dead_pos += 1;
+                let mut rec = None;
+                let x = self.remove_slice_bib(k4, k6, bib_records, st, &mut rec);
+                if let (Some(x), Some(c)) = (x, w.collect.as_mut()) {
+                    c.insert((x.proto, x.v4, x.port4), x);
+                }
+                if let Some(ev) = rec
+                    && !self.walk_emit(w.pause_on_full, &mut w.pending, ev)
+                {
+                    w.paused = true;
+                }
+                b.spend(RELEASE_ITEM_COST);
+            }
+            if w.paused {
+                return false;
+            }
+            w.dead.clear();
+            w.dead_pos = 0;
+            if w.bib_shard >= self.bib4.shard_count() {
+                break;
+            }
             if b.out() {
                 return false;
             }
@@ -1027,31 +1080,36 @@ impl State {
                 w.dead.extend(g.iter().filter(|(k4, _)| self.in_slice(s, k4.addr)).map(|(k4, x)| (*k4, x.k6)));
                 g.len()
             };
-            let n = w.dead.len();
-            for (k4, k6) in w.dead.drain(..) {
-                if let (Some(x), Some(c)) = (self.remove_slice_bib(k4, k6, bib_records, st), w.collect.as_mut()) {
-                    c.insert((x.proto, x.v4, x.port4), x);
-                }
-            }
             w.bib_shard += 1;
-            b.spend(1 + scanned + n);
+            b.spend(1 + scanned);
         }
         while w.sub_shard < self.subs.shard_count() {
             if b.out() {
                 return false;
             }
             let i = w.sub_shard;
+            let pause = w.pause_on_full;
+            let (pending, paused) = (&mut w.pending, &mut w.paused);
+            // Budget out mid-shard (PERF-001): the subscribers not yet
+            // visited are kept and the shard is walked again next step.
+            let mut cut = false;
             let mut g = self.subs.lock_index(i);
             let before = g.len();
             g.retain(|sub, sx| {
+                if *paused || cut {
+                    return true;
+                }
+                let sub_released = st.blocks_released;
                 sx.blocks.retain(|x| {
-                    if self.pool.slice_of_idx(x.r.addr_idx) != Some(s) {
+                    // Paused: the rest of the shard is kept for the next
+                    // step (the shard is walked again from its start).
+                    if *paused || self.pool.slice_of_idx(x.r.addr_idx) != Some(s) {
                         return true;
                     }
                     if matches!(emit, Emit::All) || matches!(emit, Emit::Only(l) if l.contains(&x.r)) {
                         let wall = Clock::wall_us();
                         let lo = self.pool.port_lo(x.r);
-                        self.audit.emit(Event::PortBlockRelease {
+                        let ev = Event::PortBlockRelease {
                             ts_us: wall,
                             sub: *sub,
                             sub_len: self.sub_len,
@@ -1060,11 +1118,23 @@ impl State {
                             port_hi: lo + (self.pool.block_size() - 1),
                             held_secs: (wall.saturating_sub(x.wall_us) / 1_000_000) as u32,
                             reason,
-                        });
+                        };
+                        // A refused record stays in `pending` and is queued
+                        // before the slice's blocks return to the pool.
+                        if !self.walk_emit(pause, pending, ev) {
+                            *paused = true;
+                        }
                     }
                     st.blocks_released += 1;
                     false
                 });
+                // At least one subscriber per step; the clock is read
+                // every `ADOPT_BATCH` items, as in the bibs phase.
+                let n = (st.blocks_released - sub_released) as usize;
+                b.spend(1 + n.saturating_mul(RELEASE_ITEM_COST));
+                if b.out() {
+                    cut = true;
+                }
                 let keep = !sx.blocks.is_empty() || sx.sessions.load(Ordering::Relaxed) > 0;
                 if !keep {
                     self.sub_count.fetch_sub(1, Ordering::Relaxed);
@@ -1077,15 +1147,53 @@ impl State {
                 self.subs.note_removal_index(i);
             }
             drop(g);
+            b.spend(1);
+            // Paused or cut: the shard is walked again from its start
+            // (PERF-005). The subscribers already visited hold no block
+            // of the slice any more, so the rescan only costs one
+            // `slice_of_idx` per remaining block, and a paused rescan runs
+            // at most once per tick (`rel_blocked`).
+            if w.paused || cut {
+                return false;
+            }
             w.sub_shard += 1;
-            b.spend(1 + before);
         }
         true
     }
 
+    /// Queues one release-walk record. With `pause` (a release under
+    /// `refuse_new_bindings`) a full queue keeps the record in `pending`
+    /// and returns false (the walk pauses; not counted as lost); a stopped
+    /// logger counts it lost and the walk goes on. Otherwise `emit`.
+    pub(super) fn walk_emit(&self, pause: bool, pending: &mut Option<Event>, ev: Event) -> bool {
+        if !pause {
+            self.audit.emit(ev);
+            return true;
+        }
+        match self.audit.try_emit(ev.clone()) {
+            TryEmit::Queued => true,
+            TryEmit::Full => {
+                *pending = Some(ev);
+                false
+            }
+            TryEmit::Disconnected => {
+                self.audit.count_lost();
+                true
+            }
+        }
+    }
+
     /// Removes one BIB of a slice being given up, with its sessions and
     /// held SYNs (dropped silently: the slice is no longer ours).
-    fn remove_slice_bib(&self, k4: Key4, k6: Key6, bib_records: bool, st: &mut ReleaseStats) -> Option<WireBib> {
+    /// The BIB delete record (session mode) is returned in `rec`.
+    fn remove_slice_bib(
+        &self,
+        k4: Key4,
+        k6: Key6,
+        bib_records: bool,
+        st: &mut ReleaseStats,
+        rec: &mut Option<Event>,
+    ) -> Option<WireBib> {
         let removed = {
             let mut g6 = self.bib6.lock(&k6);
             let mut g4 = self.bib4.lock(&k4);
@@ -1113,7 +1221,7 @@ impl State {
         st.bibs_removed += 1;
         if bib_records {
             let wall = Clock::wall_us();
-            self.audit.emit(Event::BibDelete {
+            *rec = Some(Event::BibDelete {
                 ts_us: wall,
                 proto: k6.proto,
                 v6: k6.addr,

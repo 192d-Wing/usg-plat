@@ -26,6 +26,9 @@ use crate::tcp::{self, Side, TcpState, Timer};
 mod adopt;
 pub use adopt::{ADOPT_BATCH, ADOPT_STEP_BUDGET, ADOPT_STEP_MAX_ITEMS, AdoptSource, Adoption, Step};
 use adopt::{Budget, Emit, Walk};
+#[path = "release.rs"]
+mod release;
+pub use release::{RELEASE_STEP_BUDGET, Release, ReleaseStep};
 
 /// An empty port block is kept this long before returning to the pool, so
 /// short-lived flows do not churn allocate/release records.
@@ -431,6 +434,9 @@ struct ClusterCtx {
     /// wrapper uses it (platd keeps its own cursor); at most one entry per
     /// slice (SC-5).
     adopt_stash: parking_lot::Mutex<Map<SliceId, Adoption>>,
+    /// Per slice: a [`Release`] cursor is in progress (POAM-048). Written
+    /// and read by the control plane only, never by a worker.
+    releasing: Box<[std::sync::atomic::AtomicBool]>,
 }
 
 #[derive(Debug)]
@@ -708,6 +714,7 @@ impl State {
     pub fn new_cluster(cfg: &Config, setup: ClusterSetup, audit: AuditSink, clock: Clock) -> Result<Self, String> {
         let n = &cfg.nat64;
         let pool = Pool::new_sliced(&setup.slices, n.port_min, n.port_max, n.port_block_size, setup.reserve_ahead)?;
+        let n_slices = setup.slices.len();
         let ctx = ClusterCtx {
             self_id: setup.self_id,
             slices: setup.slices,
@@ -716,6 +723,7 @@ impl State {
             tcp_adopt_ms: u64::from(setup.tcp_adopt_secs) * 1000,
             quarantine_ms: u64::from(setup.quarantine_secs) * 1000,
             adopt_stash: parking_lot::Mutex::new(Map::with_hasher(RandomState::new())),
+            releasing: (0..n_slices).map(|_| std::sync::atomic::AtomicBool::new(false)).collect(),
         };
         Ok(Self::build(cfg, pool, Some(Box::new(ctx)), audit, clock))
     }
@@ -2478,7 +2486,14 @@ pub enum AdoptError {
     /// The slice left `Adopting` under the cursor, or the cursor is being
     /// abandoned: abandon it ([`State::adopt_abandon`]).
     Interrupted,
+    /// A [`Release`] of the slice is in progress: adopt after it is done.
+    Releasing,
 }
+
+/// [`State::try_set_slice_state`] refused to set the slice Active: a
+/// [`Release`] of it is in progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SliceReleasing(pub SliceId);
 
 /// Result of [`State::release_slice`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -2511,9 +2526,26 @@ impl State {
 
     /// Sets a slice's ownership state directly (e.g. re-activating a slice
     /// regained with an unbroken view chain). Use [`State::adopt_slice`]
-    /// for a takeover and [`State::fence_slice`] to stop serving.
+    /// for a takeover and [`State::fence_slice`] to stop serving. Returns
+    /// the previous state; `Err` (nothing changed) when `st` is Active and
+    /// a [`Release`] of the slice is in progress.
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: SC-24 - a slice being released is never set Active
+    pub fn try_set_slice_state(&self, s: SliceId, st: SliceState) -> Result<Option<SliceState>, SliceReleasing> {
+        if st == SliceState::Active && self.slice_releasing(s) {
+            return Err(SliceReleasing(s));
+        }
+        Ok(self.pool.set_slice_state(s, st))
+    }
+
+    /// [`State::try_set_slice_state`]; a refusal is a caller bug (debug
+    /// assertion) and returns the current state.
     pub fn set_slice_state(&self, s: SliceId, st: SliceState) -> Option<SliceState> {
-        self.pool.set_slice_state(s, st)
+        self.try_set_slice_state(s, st).unwrap_or_else(|e| {
+            debug_assert!(false, "slice {} set Active while releasing", e.0);
+            self.pool.slice_state(s)
+        })
     }
 
     /// Stops translating and allocating for slice `s` at once; state is
@@ -2649,29 +2681,23 @@ impl State {
         }
     }
 
-    /// Gives up slice `s`: fences it, removes its BIBs and sessions, and
-    /// releases its port blocks (each with a `nat_port_block_release`
-    /// record, `plat.release_reason = reason`), then frees the slice's
-    /// blocks for whichever node owns it next.
+    /// Gives up slice `s` in one call (tests, bench; platd steps a
+    /// [`Release`] instead, see `release.rs`): fences it, removes its BIBs
+    /// and sessions, and releases its port blocks (each with a
+    /// `nat_port_block_release` record, `plat.release_reason = reason`),
+    /// then frees the slice's blocks for whichever node owns it next and
+    /// leaves it Inactive. A slice being adopted or already being released
+    /// is not touched.
     ///
     /// COMPLIANCE MAPPING:
     /// - NIST 800-53: AU-12, AU-10 - a handover ends every block's
     ///   attribution interval on this node with a release record
     ///   (POAM-009 closed for handover)
     pub fn release_slice(&self, s: SliceId, reason: Option<BlockReleaseReason>) -> ReleaseStats {
-        let mut st = ReleaseStats::default();
-        if self.cluster.is_none() || self.pool.slice_state(s).is_none() {
-            return st;
+        match self.release_begin(s, reason) {
+            Some(mut r) => self.release_all(&mut r),
+            None => ReleaseStats::default(),
         }
-        if self.pool.slice_state(s) == Some(SliceState::Active) {
-            self.pool.set_slice_state(s, SliceState::Fenced);
-        }
-        // POAM: POAM-048 an Active slice's release still walks every
-        // `bib4` shard of the node in one call on the control thread; only
-        // adoption (and its abandon) is chunked.
-        self.walk_slice(s, &mut Walk::default(), &mut Budget::unbounded(), &Emit::All, reason, &mut st);
-        self.pool.reset_slice(s, &[], &[], &[]);
-        st
     }
 
     /// Takes over slice `s` from replicated state in one call (tests,

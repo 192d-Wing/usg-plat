@@ -16,10 +16,14 @@
 //!   `max_concurrent_handovers` per call; `refuse_new_bindings` without
 //!   audit room pauses the cursor until the next tick;
 //! - `Release`: fence first, `cluster_slice_release`, withdraw hook; on a
-//!   handover the slice's replication is flushed, its blocks released with
-//!   `plat.release_reason = handover`, then `HandoverFence{final_seq}`. A
-//!   slice still being adopted is abandoned instead (stepwise, release
-//!   records only for blocks already logged) and nothing is handed over.
+//!   handover the slice's replication is flushed, then a release cursor
+//!   (one per slice, FIFO, stepped like an adoption and alternating with
+//!   it, POAM-048) removes its state and releases its blocks with
+//!   `plat.release_reason = handover`; only when it is done is
+//!   `HandoverFence{final_seq}` sent. An adoption of a slice still being
+//!   released waits for it. A slice still being adopted is abandoned
+//!   instead (stepwise, release records only for blocks already logged)
+//!   and nothing is handed over.
 //!
 //! COMPLIANCE MAPPING:
 //! - NIST 800-53: SC-24 - persisted epochs and votes (fsync before use);
@@ -34,6 +38,7 @@
 //! - NIST 800-53: AU-2, AU-3, AU-12 - `cluster_operator_command` before an
 //!   accepted command acts and for every refusal (SEC-5, NIST-002)
 
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write as _};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -57,8 +62,8 @@ use plat_cluster::{
 };
 use plat_common::{Clock, Config};
 use plat_nat64::{
-    ADOPT_STEP_BUDGET, AdoptError, AdoptInput, AdoptMeta, AdoptSource, Adoption, Nat64, ReplHub, Shadow, SliceState,
-    Step,
+    ADOPT_STEP_BUDGET, AdoptError, AdoptInput, AdoptMeta, AdoptSource, Adoption, Nat64, RELEASE_STEP_BUDGET, Release,
+    ReleaseStep, ReplHub, Shadow, SliceState, Step,
 };
 use plat_tls::{AllowList, PeerConfigs};
 
@@ -233,6 +238,7 @@ pub struct Shared {
     handovers: AtomicU64,
     persist_failures: AtomicU64,
     adopt: AdoptMetrics,
+    release: ReleaseMetrics,
     hook_stats: Option<Arc<super::hooks::HookStats>>,
     /// Control thread input (operator commands).
     ctl: SyncSender<In>,
@@ -284,7 +290,12 @@ fn keeps_shadow(reason: ReleaseReason, new_owner: Option<MemberId>, me: MemberId
 /// gone, or a complete fenced slice of this node is regained with one
 /// record) runs ahead of the adoption in progress (POAM-047 F3): decision 3
 /// orders imports only.
-fn runs_ahead(state: Option<SliceState>, prev_owner: Option<MemberId>, me: MemberId) -> bool {
+/// A slice being released never runs ahead: its job waits until the
+/// release is done (POAM-048).
+fn runs_ahead(state: Option<SliceState>, releasing: bool, prev_owner: Option<MemberId>, me: MemberId) -> bool {
+    if releasing {
+        return false;
+    }
     match state {
         Some(SliceState::Active) | None => true,
         Some(SliceState::Fenced) => prev_owner == Some(me),
@@ -330,23 +341,33 @@ struct AdoptMetrics {
     adopting: AtomicU64,
 }
 
+/// Notes one step of `d` in a windowed maximum (`max_ns` since `since_ms`).
+fn note_step(max_ns: &AtomicU64, since_ms: &AtomicU64, d: Duration) {
+    let now = mono_ms();
+    let ns = u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+    if now.saturating_sub(since_ms.load(Ordering::Relaxed)) >= STEP_MAX_WINDOW_MS {
+        since_ms.store(now, Ordering::Relaxed);
+        max_ns.store(ns, Ordering::Relaxed);
+    } else {
+        max_ns.fetch_max(ns, Ordering::Relaxed);
+    }
+}
+
+/// The windowed maximum, 0 once the window has passed.
+fn step_max(max_ns: &AtomicU64, since_ms: &AtomicU64) -> u64 {
+    let fresh = mono_ms().saturating_sub(since_ms.load(Ordering::Relaxed)) < STEP_MAX_WINDOW_MS;
+    if fresh { max_ns.load(Ordering::Relaxed) } else { 0 }
+}
+
 impl AdoptMetrics {
     fn step(&self, d: Duration) {
         self.steps.fetch_add(1, Ordering::Relaxed);
-        let now = mono_ms();
-        let ns = u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
-        if now.saturating_sub(self.max_since_ms.load(Ordering::Relaxed)) >= STEP_MAX_WINDOW_MS {
-            self.max_since_ms.store(now, Ordering::Relaxed);
-            self.step_max_ns.store(ns, Ordering::Relaxed);
-        } else {
-            self.step_max_ns.fetch_max(ns, Ordering::Relaxed);
-        }
+        note_step(&self.step_max_ns, &self.max_since_ms, d);
     }
 
     fn render(&self, o: &mut String) {
         use std::fmt::Write as _;
-        let fresh = mono_ms().saturating_sub(self.max_since_ms.load(Ordering::Relaxed)) < STEP_MAX_WINDOW_MS;
-        let max = if fresh { self.step_max_ns.load(Ordering::Relaxed) } else { 0 };
+        let max = step_max(&self.step_max_ns, &self.max_since_ms);
         let _ = write!(
             o,
             "# TYPE plat_cluster_adopt_steps_total counter\nplat_cluster_adopt_steps_total {}\n\
@@ -361,6 +382,69 @@ impl AdoptMetrics {
             let _ =
                 writeln!(o, "plat_cluster_adoptions_abandoned_total{{reason=\"{l}\"}} {}", c.load(Ordering::Relaxed));
         }
+    }
+}
+
+/// Chunked Active-slice release on the control thread (SI-4, POAM-048).
+#[derive(Debug)]
+struct ReleaseMetrics {
+    steps: AtomicU64,
+    /// Longest step (ns) in the window starting at `max_since_ms`.
+    step_max_ns: AtomicU64,
+    max_since_ms: AtomicU64,
+    /// Slices with a release cursor (in progress or queued).
+    releasing: AtomicU64,
+    /// Steps that stopped on a full audit queue (`refuse_new_bindings`).
+    audit_paused: AtomicU64,
+    /// `mono_ms` at which the oldest queued release started
+    /// (`u64::MAX`: none). A stalled-but-connected logger shows as a
+    /// growing age (SEC-003).
+    oldest_started_ms: AtomicU64,
+}
+
+impl Default for ReleaseMetrics {
+    fn default() -> Self {
+        Self {
+            steps: AtomicU64::new(0),
+            step_max_ns: AtomicU64::new(0),
+            max_since_ms: AtomicU64::new(0),
+            releasing: AtomicU64::new(0),
+            audit_paused: AtomicU64::new(0),
+            oldest_started_ms: AtomicU64::new(u64::MAX),
+        }
+    }
+}
+
+impl ReleaseMetrics {
+    /// Age (s) of the oldest queued release at `now_ms`, 0 if none.
+    fn oldest_age(&self, now_ms: u64) -> f64 {
+        match self.oldest_started_ms.load(Ordering::Relaxed) {
+            u64::MAX => 0.0,
+            t => now_ms.saturating_sub(t) as f64 / 1e3,
+        }
+    }
+
+    fn step(&self, d: Duration) {
+        self.steps.fetch_add(1, Ordering::Relaxed);
+        note_step(&self.step_max_ns, &self.max_since_ms, d);
+    }
+
+    fn render(&self, o: &mut String) {
+        use std::fmt::Write as _;
+        let max = step_max(&self.step_max_ns, &self.max_since_ms);
+        let _ = write!(
+            o,
+            "# TYPE plat_cluster_release_steps_total counter\nplat_cluster_release_steps_total {}\n\
+             # TYPE plat_cluster_release_step_seconds_max gauge\nplat_cluster_release_step_seconds_max {:.6}\n\
+             # TYPE plat_cluster_releasing_slices gauge\nplat_cluster_releasing_slices {}\n\
+             # TYPE plat_cluster_release_audit_paused_total counter\nplat_cluster_release_audit_paused_total {}\n\
+             # TYPE plat_cluster_release_oldest_age_seconds gauge\nplat_cluster_release_oldest_age_seconds {:.3}\n",
+            self.steps.load(Ordering::Relaxed),
+            max as f64 / 1e9,
+            self.releasing.load(Ordering::Relaxed),
+            self.audit_paused.load(Ordering::Relaxed),
+            self.oldest_age(mono_ms())
+        );
     }
 }
 
@@ -526,6 +610,7 @@ impl Shared {
         );
         render_election(o, &s.election);
         self.adopt.render(o);
+        self.release.render(o);
         o.push_str("# TYPE plat_cluster_peer_rejected_total counter\n");
         for r in super::peer::REJECT_REASONS {
             let _ = writeln!(
@@ -586,7 +671,9 @@ impl Shared {
         if let (Some(map), Some(view)) = (&self.map, &s.view) {
             for (s_id, c) in map.iter() {
                 let (p, b) = view.owners(s_id, &s.weights).map_or((None, None), |(p, b)| (Some(p), b));
+                let releasing = self.nat.as_ref().is_some_and(|n| n.state().slice_releasing(s_id));
                 let state = match self.nat.as_ref().and_then(|n| n.state().slice_state(s_id)) {
+                    _ if releasing => "releasing",
                     Some(SliceState::Active) => "active",
                     Some(SliceState::Fenced) => "fenced",
                     Some(SliceState::Adopting) => "adopting",
@@ -700,6 +787,18 @@ impl Cur {
     }
 }
 
+/// An Active-slice release in progress or queued (POAM-048).
+struct Rel {
+    cur: Box<Release>,
+    epoch: u64,
+    /// Handover: the new owner and the flushed final sequence number;
+    /// `HandoverFence` is sent when the cursor is done.
+    fence: Option<(Option<MemberId>, u64)>,
+    started: Instant,
+    /// `started` as `mono_ms` (the oldest-release gauge).
+    started_ms: u64,
+}
+
 /// What starting a pending job did.
 enum Start {
     /// Nothing (more) to do for it.
@@ -721,6 +820,14 @@ struct Ctl {
     /// The log phase was refused for lack of audit queue room
     /// (`refuse_new_bindings`): retried at the next tick, not every pass.
     cur_blocked: bool,
+    /// Release cursors, one per slice (bounded by the slice count), FIFO;
+    /// the front one is stepped (POAM-048).
+    releases: VecDeque<Rel>,
+    /// The front release paused on a full audit queue: retried at the
+    /// next tick.
+    rel_blocked: bool,
+    /// With both an adoption and a release to step, whose turn it is.
+    rel_turn: bool,
     max_handovers: usize,
     auto_failover: bool,
     shutdown_ms: u64,
@@ -738,6 +845,9 @@ struct Ctl {
 /// A standby member repeats its `SyncStatus` this often (a lost report or
 /// a new leader is covered by the next one).
 const SYNC_STATUS_EVERY: Duration = Duration::from_millis(250);
+
+/// At shutdown, a release paused on a full audit queue retries this often.
+const SHUTDOWN_AUDIT_POLL: Duration = Duration::from_millis(5);
 
 fn audit_acquire(r: AcquireReason, manual: bool) -> AuditAcquire {
     if manual {
@@ -859,12 +969,14 @@ impl Ctl {
         let jobs = std::mem::take(&mut self.pending);
         for mut j in jobs {
             let graceful = matches!(j.reason, AcquireReason::Handover | AcquireReason::Failback);
-            let ahead = self
-                .sh
-                .nat
-                .as_ref()
-                .is_some_and(|n| runs_ahead(n.state().slice_state(j.slice), j.prev_owner, self.sh.me));
-            if (self.cur.is_some() && !ahead) || (graceful && handovers >= self.max_handovers) {
+            let (releasing, ahead) = self.sh.nat.as_ref().map_or((false, false), |n| {
+                let st = n.state();
+                let rel = st.slice_releasing(j.slice);
+                (rel, runs_ahead(st.slice_state(j.slice), rel, j.prev_owner, self.sh.me))
+            });
+            // A slice being released is adopted only after its release
+            // is done (SC-24, POAM-048).
+            if releasing || (self.cur.is_some() && !ahead) || (graceful && handovers >= self.max_handovers) {
                 self.pending.push(j);
                 continue;
             }
@@ -1088,22 +1200,192 @@ impl Ctl {
                 // here now. A lease loss with no new owner keeps the fenced
                 // state for a regain.
                 if new_owner.is_some_and(|n| n != me) || reason == ReleaseReason::Shutdown {
-                    st.release_slice(slice, None);
+                    self.queue_release(slice, epoch, None, None);
                 }
             }
         }
     }
 
-    /// Flush the slice's replication, release its blocks (handover
-    /// records), then tell the new owner the final sequence number.
+    /// Flush the slice's replication, then release its blocks (handover
+    /// records) stepwise; the new owner is told the final sequence number
+    /// when the release is done ([`Ctl::release_done`]).
     fn hand_over(&mut self, slice: SliceId, epoch: u64, to: Option<MemberId>) {
-        let Some(nat) = self.sh.nat.clone() else { return };
-        let final_seq = self.sh.repl.as_ref().map_or(0, |r| r.lock().flush(slice));
-        nat.state().release_slice(slice, Some(BlockReleaseReason::Handover));
-        if let Some(n) = to {
-            self.sh.net.send(n, &Msg::HandoverFence { slice, epoch, final_seq });
+        if self.sh.nat.is_none() {
+            return;
         }
-        self.sh.handovers.fetch_add(1, Ordering::Relaxed);
+        let final_seq = self.sh.repl.as_ref().map_or(0, |r| r.lock().flush(slice));
+        self.queue_release(slice, epoch, Some(BlockReleaseReason::Handover), Some((to, final_seq)));
+    }
+
+    /// Starts (O(1): the slice is fenced and marked releasing) or joins the
+    /// release cursor of `slice`. One cursor per slice: a slice already
+    /// being released keeps its cursor (part of its records are queued); a
+    /// handover of it still gets its `HandoverFence` at the end.
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: SC-5 - at most one cursor per slice (queue bounded
+    ///   by the slice count)
+    /// - NIST 800-53: SC-24 - fenced before the first step; never Active
+    ///   again until a fresh adoption
+    fn queue_release(
+        &mut self,
+        slice: SliceId,
+        epoch: u64,
+        reason: Option<BlockReleaseReason>,
+        fence: Option<(Option<MemberId>, u64)>,
+    ) {
+        let Some(nat) = self.sh.nat.clone() else { return };
+        if let Some(r) = self.releases.iter_mut().find(|r| r.cur.slice() == slice) {
+            if fence.is_some() && r.fence.is_none() {
+                r.fence = fence;
+                r.epoch = epoch;
+                // SEC-002: the records still to be built carry the
+                // handover reason; those already queued keep theirs, so a
+                // slice's records may mix (earlier ones first).
+                r.cur.set_reason(reason);
+            }
+            return;
+        }
+        let st = nat.state();
+        match st.release_begin(slice, reason) {
+            Some(cur) => {
+                self.releases.push_back(Rel {
+                    cur: Box::new(cur),
+                    epoch,
+                    fence,
+                    started: Instant::now(),
+                    started_ms: mono_ms(),
+                });
+            }
+            None => {
+                // SEC-004: nothing to release only when unsliced (no state)
+                // or already Inactive; a handover then confirms at once. An
+                // Adopting slice never gets here (`release` abandons it),
+                // and one released elsewhere is not confirmed early.
+                let state = st.slice_state(slice);
+                debug_assert_ne!(state, Some(SliceState::Adopting), "slice {slice} released while Adopting");
+                if matches!(state, None | Some(SliceState::Inactive)) {
+                    self.send_fence(slice, epoch, fence);
+                }
+            }
+        }
+        self.note_releases();
+    }
+
+    /// Updates the release gauges after `releases` changed.
+    fn note_releases(&self) {
+        let m = &self.sh.release;
+        m.releasing.store(self.releases.len() as u64, Ordering::Relaxed);
+        let oldest = self.releases.iter().map(|r| r.started_ms).min().unwrap_or(u64::MAX);
+        m.oldest_started_ms.store(oldest, Ordering::Relaxed);
+    }
+
+    fn send_fence(&self, slice: SliceId, epoch: u64, fence: Option<(Option<MemberId>, u64)>) {
+        if let Some((to, final_seq)) = fence {
+            if let Some(n) = to {
+                self.sh.net.send(n, &Msg::HandoverFence { slice, epoch, final_seq });
+            }
+            self.sh.handovers.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A release cursor reached Done: every release record of the slice is
+    /// queued and its blocks are back in the pool; only now does a
+    /// handover's new owner get `HandoverFence`.
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: AU-12, AU-10 - the new owner stops waiting `safe`
+    ///   only after this node closed every attribution interval of the
+    ///   slice (POAM-048 Q3)
+    fn release_done(&self, r: &Rel, s: plat_nat64::ReleaseStats) {
+        let slice = r.cur.slice();
+        tracing::info!(
+            slice,
+            reason = r.cur.reason().map_or("none", BlockReleaseReason::as_str),
+            bibs = s.bibs_removed,
+            blocks = s.blocks_released,
+            subscribers = s.subscribers_removed,
+            ms = r.started.elapsed().as_millis() as u64,
+            "slice released"
+        );
+        self.send_fence(slice, r.epoch, r.fence);
+    }
+
+    /// One bounded step of the front release cursor, until `deadline`.
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: CP-10, SC-5(2) - heartbeats and lease renewals run
+    ///   between steps, so a large release cannot cost this node its own
+    ///   lease (POAM-048)
+    /// - NIST 800-53: AU-5 - a full queue under `refuse_new_bindings`
+    ///   pauses the cursor until the next tick, nothing lost
+    fn step_release(&mut self, deadline: Instant) {
+        let Some(nat) = self.sh.nat.clone() else {
+            self.releases.clear();
+            return;
+        };
+        let Some(r) = self.releases.front_mut() else { return };
+        let t = Instant::now();
+        let res = nat.state().release_step(&mut r.cur, deadline);
+        self.sh.release.step(t.elapsed());
+        match res {
+            ReleaseStep::More => {}
+            ReleaseStep::Paused => {
+                self.rel_blocked = true;
+                self.sh.release.audit_paused.fetch_add(1, Ordering::Relaxed);
+            }
+            ReleaseStep::Done(s) => {
+                if let Some(r) = self.releases.pop_front() {
+                    self.release_done(&r, s);
+                }
+                self.note_releases();
+                self.run_pending();
+                self.refresh();
+            }
+        }
+    }
+
+    /// Every queued release to completion (shutdown). Returns the slices
+    /// released. Under `refuse_new_bindings` a full queue is waited on in
+    /// bounded steps until `deadline` (the `shutdown_handover_ms` budget);
+    /// past it the rest is emitted (`State::release_all`): refused records
+    /// are counted lost and the logger reports them in
+    /// `audit_queue_overflow`.
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: AU-5, AU-12 - release records at shutdown get queue
+    ///   room for as long as the shutdown budget allows; only then is a
+    ///   record lost, and it is counted (SEC-001)
+    fn finish_releases(&mut self, deadline: Instant) -> Vec<SliceId> {
+        let mut out = Vec::new();
+        let Some(nat) = self.sh.nat.clone() else {
+            self.releases.clear();
+            self.note_releases();
+            return out;
+        };
+        let st = nat.state();
+        while let Some(mut r) = self.releases.pop_front() {
+            let s = loop {
+                if Instant::now() >= deadline {
+                    break st.release_all(&mut r.cur);
+                }
+                let t = Instant::now();
+                let res = st.release_step(&mut r.cur, (t + RELEASE_STEP_BUDGET).min(deadline));
+                self.sh.release.step(t.elapsed());
+                match res {
+                    ReleaseStep::Done(s) => break s,
+                    ReleaseStep::More => {}
+                    ReleaseStep::Paused => {
+                        self.sh.release.audit_paused.fetch_add(1, Ordering::Relaxed);
+                        std::thread::sleep(SHUTDOWN_AUDIT_POLL.min(deadline.saturating_duration_since(Instant::now())));
+                    }
+                }
+            };
+            self.release_done(&r, s);
+            out.push(r.cur.slice());
+            self.note_releases();
+        }
+        out
     }
 
     fn refresh(&mut self) {
@@ -1226,13 +1508,21 @@ impl Ctl {
         }
     }
 
+    fn adopt_ready(&self) -> bool {
+        self.cur.is_some() && !self.cur_blocked
+    }
+
+    fn release_ready(&self) -> bool {
+        !self.releases.is_empty() && !self.rel_blocked
+    }
+
     fn run(mut self, rx: &Receiver<In>, stop: &AtomicBool, killed: &AtomicBool) {
         let tick = Duration::from_millis(self.m.tick_interval_ms());
         let mut next = Instant::now();
         while !stop.load(Ordering::Relaxed) {
             // While adopting, poll: one message (if any), the tick when due,
             // then one bounded adoption step (POAM-047).
-            let stepping = self.cur.is_some() && !self.cur_blocked;
+            let stepping = self.adopt_ready() || self.release_ready();
             let wait = if stepping { Duration::ZERO } else { next.saturating_duration_since(Instant::now()) };
             match rx.recv_timeout(wait) {
                 Ok(In::Msg(from, msg)) => {
@@ -1253,11 +1543,20 @@ impl Ctl {
                 self.member_states();
                 self.sync_status();
                 self.cur_blocked = false;
+                self.rel_blocked = false;
             }
-            if self.cur.is_some() && !self.cur_blocked {
-                // Never past the next tick: the stall between two ticks is
-                // at most one step (ADOPT_STEP_BUDGET plus one batch).
+            // Never past the next tick: the stall between two ticks is at
+            // most one step (ADOPT_STEP_BUDGET plus one batch). With both
+            // an adoption and a release, they alternate (POAM-048 Q4), so
+            // a crash takeover is not starved by releases.
+            let (adopt, rel) = (self.adopt_ready(), self.release_ready());
+            if adopt && (!rel || !self.rel_turn) {
                 self.step((Instant::now() + ADOPT_STEP_BUDGET).min(next));
+            } else if rel {
+                self.step_release((Instant::now() + RELEASE_STEP_BUDGET).min(next));
+            }
+            if adopt && rel {
+                self.rel_turn = !self.rel_turn;
             }
         }
         if !killed.load(Ordering::Relaxed) {
@@ -1276,6 +1575,9 @@ impl Ctl {
         // lease * (1 + margin)), not by a leader-coordinated handover view.
         // A partial slice is undone before anything is handed over: it
         // never served, so it is released without a handover of its own.
+        // One budget (`shutdown_handover_ms`) for the release waits and the
+        // view wait together (SEC-001).
+        let budget = Instant::now() + Duration::from_millis(self.shutdown_ms);
         let mut abandoned = None;
         if let Some(c) = self.cur.take()
             && let Some(nat) = self.sh.nat.clone()
@@ -1295,11 +1597,17 @@ impl Ctl {
             self.sh.adopt.adopting.store(0, Ordering::Relaxed);
         }
         self.pending.clear();
+        // Releases in progress complete first (their `HandoverFence` is
+        // sent); membership's shutdown never releases them twice.
+        let released = self.finish_releases(budget);
         let now = mono_ms();
         let actions = self.m.shutdown(now);
         let mut handed = false;
         for a in actions {
             let Action::Release { slice, epoch, reason, .. } = a else { continue };
+            if released.contains(&slice) {
+                continue;
+            }
             let backup = self.sh.repl.as_ref().and_then(|r| r.lock().in_sync_target(slice));
             let how = shutdown_release(slice, abandoned, self.auto_failover, backup);
             if how == ShutdownRelease::NeverServed {
@@ -1333,10 +1641,12 @@ impl Ctl {
                 self.release(slice, epoch, None, reason);
             }
         }
+        // Done before the wait: the backups get `HandoverFence` now.
+        self.finish_releases(budget);
         self.refresh();
         let peers_up = || self.sh.voters.iter().any(|v| v.id != self.sh.me && !v.witness && self.sh.net.is_up(v.id));
         if handed && peers_up() {
-            let deadline = Instant::now() + Duration::from_millis(self.shutdown_ms);
+            let deadline = budget;
             while Instant::now() < deadline && peers_up() {
                 match rx.recv_timeout(Duration::from_millis(50)) {
                     Ok(In::Msg(_, Msg::ViewPropose { view, .. }))
@@ -1496,6 +1806,7 @@ pub fn launch(core: Core) -> Result<ClusterHandle, String> {
         handovers: AtomicU64::new(0),
         persist_failures: AtomicU64::new(0),
         adopt: AdoptMetrics::default(),
+        release: ReleaseMetrics::default(),
         hook_stats: core.hooks.as_ref().map(|h| h.stats.clone()),
         ctl: tx.clone(),
         audit: core.audit.clone(),
@@ -1520,6 +1831,9 @@ pub fn launch(core: Core) -> Result<ClusterHandle, String> {
         pending: Vec::new(),
         cur: None,
         cur_blocked: false,
+        releases: VecDeque::new(),
+        rel_blocked: false,
+        rel_turn: false,
         max_handovers: core.max_handovers.max(1),
         auto_failover: core.mcfg.auto_failover,
         shutdown_ms: core.shutdown_ms,
@@ -1821,9 +2135,11 @@ pub fn cli_request(state_dir: &Path, line: &str) -> Result<String, String> {
 #[cfg(test)]
 mod metric_tests {
     use super::{
-        ElectionStats, ReleaseReason, ShutdownRelease, SliceState, keeps_shadow, render_election, runs_ahead,
-        shutdown_release,
+        ElectionStats, ReleaseMetrics, ReleaseReason, ShutdownRelease, SliceState, keeps_shadow, render_election,
+        runs_ahead, shutdown_release,
     };
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
 
     /// F1: the detached state goes back to the shadow only when the slice
     /// went to nobody else.
@@ -1841,13 +2157,17 @@ mod metric_tests {
     /// nothing to do) runs ahead of the adoption in progress; imports wait.
     #[test]
     fn no_import_jobs_run_ahead_of_the_cursor() {
-        assert!(runs_ahead(Some(SliceState::Fenced), Some(1), 1));
-        assert!(runs_ahead(Some(SliceState::Active), Some(2), 1));
-        assert!(runs_ahead(None, None, 1));
-        assert!(!runs_ahead(Some(SliceState::Fenced), Some(2), 1));
-        assert!(!runs_ahead(Some(SliceState::Fenced), None, 1));
-        assert!(!runs_ahead(Some(SliceState::Inactive), Some(1), 1));
-        assert!(!runs_ahead(Some(SliceState::Adopting), Some(1), 1));
+        assert!(runs_ahead(Some(SliceState::Fenced), false, Some(1), 1));
+        assert!(runs_ahead(Some(SliceState::Active), false, Some(2), 1));
+        assert!(runs_ahead(None, false, None, 1));
+        assert!(!runs_ahead(Some(SliceState::Fenced), false, Some(2), 1));
+        assert!(!runs_ahead(Some(SliceState::Fenced), false, None, 1));
+        assert!(!runs_ahead(Some(SliceState::Inactive), false, Some(1), 1));
+        assert!(!runs_ahead(Some(SliceState::Adopting), false, Some(1), 1));
+        // POAM-048: a slice being released never runs ahead, whatever its
+        // state.
+        assert!(!runs_ahead(Some(SliceState::Fenced), true, Some(1), 1));
+        assert!(!runs_ahead(Some(SliceState::Inactive), true, None, 1));
     }
 
     /// F5: at shutdown the slice whose adoption was just abandoned is never
@@ -1875,5 +2195,43 @@ mod metric_tests {
              # TYPE plat_cluster_heartbeats_expedited_total counter\n\
              plat_cluster_heartbeats_expedited_total 7\n"
         );
+    }
+
+    /// SI-4 (POAM-048, QA): the release series render under their
+    /// documented names, types and units (the step maximum in seconds,
+    /// the largest step of the window).
+    #[test]
+    fn metrics_render_release_series() {
+        let m = ReleaseMetrics::default();
+        let mut o = String::new();
+        m.render(&mut o);
+        assert_eq!(
+            o,
+            "# TYPE plat_cluster_release_steps_total counter\nplat_cluster_release_steps_total 0\n\
+             # TYPE plat_cluster_release_step_seconds_max gauge\nplat_cluster_release_step_seconds_max 0.000000\n\
+             # TYPE plat_cluster_releasing_slices gauge\nplat_cluster_releasing_slices 0\n\
+             # TYPE plat_cluster_release_audit_paused_total counter\nplat_cluster_release_audit_paused_total 0\n\
+             # TYPE plat_cluster_release_oldest_age_seconds gauge\nplat_cluster_release_oldest_age_seconds 0.000\n"
+        );
+        m.step(Duration::from_millis(3));
+        m.step(Duration::from_micros(7250));
+        m.step(Duration::from_millis(1));
+        m.releasing.store(2, Ordering::Relaxed);
+        m.audit_paused.store(5, Ordering::Relaxed);
+        let mut o = String::new();
+        m.render(&mut o);
+        assert!(o.contains("plat_cluster_release_steps_total 3\n"), "{o}");
+        assert!(o.contains("plat_cluster_release_step_seconds_max 0.007250\n"), "{o}");
+        assert!(o.contains("plat_cluster_releasing_slices 2\n"), "{o}");
+        assert!(o.contains("plat_cluster_release_audit_paused_total 5\n"), "{o}");
+        // SEC-003: the oldest queued release's age (fixed `now` for the test).
+        m.oldest_started_ms.store(10_000, Ordering::Relaxed);
+        assert_eq!(m.oldest_age(12_500), 2.5);
+        assert_eq!(m.oldest_age(9_000), 0.0);
+        let mut o = String::new();
+        m.render(&mut o);
+        assert!(o.contains("# TYPE plat_cluster_release_oldest_age_seconds gauge\n"), "{o}");
+        m.oldest_started_ms.store(u64::MAX, Ordering::Relaxed);
+        assert_eq!(m.oldest_age(12_500), 0.0);
     }
 }

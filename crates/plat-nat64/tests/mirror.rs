@@ -413,7 +413,9 @@ fn fencing_stops_the_mirror_at_once_and_generations_retire_stale_entries() {
     // Handover: release removes the sessions and their entries.
     let rel = fx.nat.state().release_slice(sl, None);
     assert_eq!(rel.sessions_removed, 1);
-    assert_eq!(m.slice(sl), Some((SliceState::Fenced, 2)), "release fences");
+    // Fenced first (before any entry is retired), Inactive once done
+    // (POAM-048); never Active in between.
+    assert_eq!(m.slice(sl), Some((SliceState::Inactive, 2)), "release ends Inactive");
     assert!(m.is_empty());
 
     // Takeover again: a new generation; new sessions mirror with it.
