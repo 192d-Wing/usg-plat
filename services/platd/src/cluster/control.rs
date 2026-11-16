@@ -1578,24 +1578,7 @@ impl Ctl {
         // One budget (`shutdown_handover_ms`) for the release waits and the
         // view wait together (SEC-001).
         let budget = Instant::now() + Duration::from_millis(self.shutdown_ms);
-        let mut abandoned = None;
-        if let Some(c) = self.cur.take()
-            && let Some(nat) = self.sh.nat.clone()
-        {
-            abandoned = Some(c.slice());
-            let (mut a, why) = match c {
-                Cur::Adopt(_, a) => {
-                    if let Some(x) = self.sh.adopt.abandoned.get(abandon_ix(ReleaseReason::Shutdown)) {
-                        x.fetch_add(1, Ordering::Relaxed);
-                    }
-                    (a, None)
-                }
-                Cur::Abandon(a, why) => (a, why),
-            };
-            a.discard_shadow();
-            nat.state().adopt_abandon_all(&mut a, why);
-            self.sh.adopt.adopting.store(0, Ordering::Relaxed);
-        }
+        let abandoned = self.shutdown_abandon();
         self.pending.clear();
         // Releases in progress complete first (their `HandoverFence` is
         // sent); membership's shutdown never releases them twice.
@@ -1646,24 +1629,51 @@ impl Ctl {
         self.refresh();
         let peers_up = || self.sh.voters.iter().any(|v| v.id != self.sh.me && !v.witness && self.sh.net.is_up(v.id));
         if handed && peers_up() {
-            let deadline = budget;
-            while Instant::now() < deadline && peers_up() {
-                match rx.recv_timeout(Duration::from_millis(50)) {
-                    Ok(In::Msg(_, Msg::ViewPropose { view, .. }))
-                        if !view.is_live(self.sh.me) && !view.is_standby(self.sh.me) =>
-                    {
-                        break;
-                    }
-                    Ok(In::Cmd(c, cred, reply)) => {
-                        audit_operator(&self.audit, false, c.audit(), cred, Some(OperatorRefusal::Rejected));
-                        let _ = reply.try_send("error: shutting down\n".into());
-                    }
-                    _ => {}
-                }
-            }
+            self.shutdown_wait(rx, budget);
         }
         if let Some(mut h) = self.hooks.take() {
             h.join();
+        }
+    }
+
+    /// Undoes an adoption (or abandon) in progress at shutdown; returns
+    /// its slice, which never served.
+    fn shutdown_abandon(&mut self) -> Option<SliceId> {
+        let c = self.cur.take()?;
+        let nat = self.sh.nat.clone()?;
+        let slice = c.slice();
+        let (mut a, why) = match c {
+            Cur::Adopt(_, a) => {
+                if let Some(x) = self.sh.adopt.abandoned.get(abandon_ix(ReleaseReason::Shutdown)) {
+                    x.fetch_add(1, Ordering::Relaxed);
+                }
+                (a, None)
+            }
+            Cur::Abandon(a, why) => (a, why),
+        };
+        a.discard_shadow();
+        nat.state().adopt_abandon_all(&mut a, why);
+        self.sh.adopt.adopting.store(0, Ordering::Relaxed);
+        Some(slice)
+    }
+
+    /// Waits (until `deadline`) for a view that no longer has this node
+    /// live or standby, while a peer is up; operator commands are refused.
+    fn shutdown_wait(&self, rx: &Receiver<In>, deadline: Instant) {
+        let peers_up = || self.sh.voters.iter().any(|v| v.id != self.sh.me && !v.witness && self.sh.net.is_up(v.id));
+        while Instant::now() < deadline && peers_up() {
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(In::Msg(_, Msg::ViewPropose { view, .. }))
+                    if !view.is_live(self.sh.me) && !view.is_standby(self.sh.me) =>
+                {
+                    break;
+                }
+                Ok(In::Cmd(c, cred, reply)) => {
+                    audit_operator(&self.audit, false, c.audit(), cred, Some(OperatorRefusal::Rejected));
+                    let _ = reply.try_send("error: shutting down\n".into());
+                }
+                _ => {}
+            }
         }
     }
 }

@@ -182,6 +182,16 @@ struct Adopted {
     imported: bool,
 }
 
+/// What the subscribers phase of a release walk drops and records.
+#[derive(Clone, Copy)]
+struct SubRelease<'a> {
+    s: SliceId,
+    emit: &'a Emit<'a>,
+    reason: Option<BlockReleaseReason>,
+    /// Pause on a full audit queue (`refuse_new_bindings`).
+    pause: bool,
+}
+
 /// Resume point of a walk that removes a slice's BIBs (`bib4` shards),
 /// then its blocks and emptied subscribers (`subs` shards).
 #[derive(Debug, Default)]
@@ -1046,31 +1056,40 @@ impl State {
         st: &mut ReleaseStats,
     ) -> bool {
         let bib_records = matches!(emit, Emit::All) && self.audit_mode == AuditMode::Session;
-        loop {
-            while let Some(&(k4, k6)) = w.dead.get(w.dead_pos) {
-                if b.out() || w.paused {
-                    return false;
-                }
-                w.dead_pos += 1;
-                let mut rec = None;
-                let x = self.remove_slice_bib(k4, k6, bib_records, st, &mut rec);
-                if let (Some(x), Some(c)) = (x, w.collect.as_mut()) {
-                    c.insert((x.proto, x.v4, x.port4), x);
-                }
-                if let Some(ev) = rec
-                    && !self.walk_emit(w.pause_on_full, &mut w.pending, ev)
-                {
-                    w.paused = true;
-                }
-                b.spend(RELEASE_ITEM_COST);
+        if !self.walk_slice_bibs(s, w, b, bib_records, st) {
+            return false;
+        }
+        while w.sub_shard < self.subs.shard_count() {
+            if b.out() {
+                return false;
             }
-            if w.paused {
+            if !self.walk_sub_shard(s, w, b, emit, reason, st) {
+                return false;
+            }
+            w.sub_shard += 1;
+        }
+        true
+    }
+
+    /// Bibs phase of [`Self::walk_slice`]: drains the collected dead list,
+    /// then scans the next `bib4` shard. False when the budget runs out or
+    /// the walk pauses.
+    fn walk_slice_bibs(
+        &self,
+        s: SliceId,
+        w: &mut Walk,
+        b: &mut Budget,
+        bib_records: bool,
+        st: &mut ReleaseStats,
+    ) -> bool {
+        loop {
+            if !self.walk_dead(w, b, bib_records, st) {
                 return false;
             }
             w.dead.clear();
             w.dead_pos = 0;
             if w.bib_shard >= self.bib4.shard_count() {
-                break;
+                return true;
             }
             if b.out() {
                 return false;
@@ -1083,82 +1102,123 @@ impl State {
             w.bib_shard += 1;
             b.spend(1 + scanned);
         }
-        while w.sub_shard < self.subs.shard_count() {
-            if b.out() {
+    }
+
+    /// Removes the collected BIBs from `w.dead_pos` on. False when the
+    /// budget runs out or the walk pauses (the rest is kept).
+    fn walk_dead(&self, w: &mut Walk, b: &mut Budget, bib_records: bool, st: &mut ReleaseStats) -> bool {
+        while let Some(&(k4, k6)) = w.dead.get(w.dead_pos) {
+            if b.out() || w.paused {
                 return false;
             }
-            let i = w.sub_shard;
-            let pause = w.pause_on_full;
-            let (pending, paused) = (&mut w.pending, &mut w.paused);
-            // Budget out mid-shard (PERF-001): the subscribers not yet
-            // visited are kept and the shard is walked again next step.
-            let mut cut = false;
-            let mut g = self.subs.lock_index(i);
-            let before = g.len();
-            g.retain(|sub, sx| {
-                if *paused || cut {
-                    return true;
-                }
-                let sub_released = st.blocks_released;
-                sx.blocks.retain(|x| {
-                    // Paused: the rest of the shard is kept for the next
-                    // step (the shard is walked again from its start).
-                    if *paused || self.pool.slice_of_idx(x.r.addr_idx) != Some(s) {
-                        return true;
-                    }
-                    if matches!(emit, Emit::All) || matches!(emit, Emit::Only(l) if l.contains(&x.r)) {
-                        let wall = Clock::wall_us();
-                        let lo = self.pool.port_lo(x.r);
-                        let ev = Event::PortBlockRelease {
-                            ts_us: wall,
-                            sub: *sub,
-                            sub_len: self.sub_len,
-                            v4: self.pool.addr(x.r.addr_idx),
-                            port_lo: lo,
-                            port_hi: lo + (self.pool.block_size() - 1),
-                            held_secs: (wall.saturating_sub(x.wall_us) / 1_000_000) as u32,
-                            reason,
-                        };
-                        // A refused record stays in `pending` and is queued
-                        // before the slice's blocks return to the pool.
-                        if !self.walk_emit(pause, pending, ev) {
-                            *paused = true;
-                        }
-                    }
-                    st.blocks_released += 1;
-                    false
-                });
-                // At least one subscriber per step; the clock is read
-                // every `ADOPT_BATCH` items, as in the bibs phase.
-                let n = (st.blocks_released - sub_released) as usize;
-                b.spend(1 + n.saturating_mul(RELEASE_ITEM_COST));
-                if b.out() {
-                    cut = true;
-                }
-                let keep = !sx.blocks.is_empty() || sx.sessions.load(Ordering::Relaxed) > 0;
-                if !keep {
-                    self.sub_count.fetch_sub(1, Ordering::Relaxed);
-                    self.agg_release(*sub);
-                    st.subscribers_removed += 1;
-                }
-                keep
-            });
-            if g.len() != before {
-                self.subs.note_removal_index(i);
+            w.dead_pos += 1;
+            let mut rec = None;
+            let x = self.remove_slice_bib(k4, k6, bib_records, st, &mut rec);
+            if let (Some(x), Some(c)) = (x, w.collect.as_mut()) {
+                c.insert((x.proto, x.v4, x.port4), x);
             }
-            drop(g);
-            b.spend(1);
-            // Paused or cut: the shard is walked again from its start
-            // (PERF-005). The subscribers already visited hold no block
-            // of the slice any more, so the rescan only costs one
-            // `slice_of_idx` per remaining block, and a paused rescan runs
-            // at most once per tick (`rel_blocked`).
-            if w.paused || cut {
-                return false;
+            if let Some(ev) = rec
+                && !self.walk_emit(w.pause_on_full, &mut w.pending, ev)
+            {
+                w.paused = true;
             }
-            w.sub_shard += 1;
+            b.spend(RELEASE_ITEM_COST);
         }
-        true
+        !w.paused
+    }
+
+    /// Subscribers phase of [`Self::walk_slice`] for shard `w.sub_shard`.
+    /// False when the walk paused or the budget ran out mid-shard.
+    fn walk_sub_shard(
+        &self,
+        s: SliceId,
+        w: &mut Walk,
+        b: &mut Budget,
+        emit: &Emit<'_>,
+        reason: Option<BlockReleaseReason>,
+        st: &mut ReleaseStats,
+    ) -> bool {
+        let i = w.sub_shard;
+        let c = SubRelease { s, emit, reason, pause: w.pause_on_full };
+        let (pending, paused) = (&mut w.pending, &mut w.paused);
+        // Budget out mid-shard (PERF-001): the subscribers not yet
+        // visited are kept and the shard is walked again next step.
+        let mut cut = false;
+        let mut g = self.subs.lock_index(i);
+        let before = g.len();
+        g.retain(|sub, sx| {
+            if *paused || cut {
+                return true;
+            }
+            let sub_released = st.blocks_released;
+            self.release_sub_blocks(c, *sub, sx, pending, paused, st);
+            // At least one subscriber per step; the clock is read
+            // every `ADOPT_BATCH` items, as in the bibs phase.
+            let n = (st.blocks_released - sub_released) as usize;
+            b.spend(1 + n.saturating_mul(RELEASE_ITEM_COST));
+            if b.out() {
+                cut = true;
+            }
+            let keep = !sx.blocks.is_empty() || sx.sessions.load(Ordering::Relaxed) > 0;
+            if !keep {
+                self.sub_count.fetch_sub(1, Ordering::Relaxed);
+                self.agg_release(*sub);
+                st.subscribers_removed += 1;
+            }
+            keep
+        });
+        if g.len() != before {
+            self.subs.note_removal_index(i);
+        }
+        drop(g);
+        b.spend(1);
+        // Paused or cut: the shard is walked again from its start
+        // (PERF-005). The subscribers already visited hold no block
+        // of the slice any more, so the rescan only costs one
+        // `slice_of_idx` per remaining block, and a paused rescan runs
+        // at most once per tick (`rel_blocked`).
+        !(w.paused || cut)
+    }
+
+    /// Drops one subscriber's blocks of slice `s`, queueing a release
+    /// record for each one `emit` selects.
+    fn release_sub_blocks(
+        &self,
+        c: SubRelease<'_>,
+        sub: u128,
+        sx: &mut Subscriber,
+        pending: &mut Option<Event>,
+        paused: &mut bool,
+        st: &mut ReleaseStats,
+    ) {
+        sx.blocks.retain(|x| {
+            // Paused: the rest of the shard is kept for the next
+            // step (the shard is walked again from its start).
+            if *paused || self.pool.slice_of_idx(x.r.addr_idx) != Some(c.s) {
+                return true;
+            }
+            if matches!(c.emit, Emit::All) || matches!(c.emit, Emit::Only(l) if l.contains(&x.r)) {
+                let wall = Clock::wall_us();
+                let lo = self.pool.port_lo(x.r);
+                let ev = Event::PortBlockRelease {
+                    ts_us: wall,
+                    sub,
+                    sub_len: self.sub_len,
+                    v4: self.pool.addr(x.r.addr_idx),
+                    port_lo: lo,
+                    port_hi: lo + (self.pool.block_size() - 1),
+                    held_secs: (wall.saturating_sub(x.wall_us) / 1_000_000) as u32,
+                    reason: c.reason,
+                };
+                // A refused record stays in `pending` and is queued
+                // before the slice's blocks return to the pool.
+                if !self.walk_emit(c.pause, pending, ev) {
+                    *paused = true;
+                }
+            }
+            st.blocks_released += 1;
+            false
+        });
     }
 
     /// Queues one release-walk record. With `pause` (a release under
