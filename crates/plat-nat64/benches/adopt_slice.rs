@@ -1,9 +1,16 @@
 //! Takeover adoption time (`A` in the leader-crash bound, POAM-007 (2)):
-//! `State::adopt_slice` for one slice, from the 10 blocks seen on the test
-//! VMs up to everything a slice of the example configuration can hold, and
-//! `Shadow::take`, which builds its input. Both run inline on the
-//! `plat-cluster-ctl` thread (`Ctl::acquire`), so the new owner sends no
-//! heartbeat while they run.
+//! one slice, from the 10 blocks seen on the test VMs up to everything a
+//! slice of the example configuration can hold.
+//!
+//! - `adopt`: the adoption cursor run to completion from a sorted
+//!   `AdoptInput` (`adopt_begin` + `adopt_step` with no effective
+//!   deadline, so only the per-step item cap splits it); the input copy is
+//!   made outside the timed region. Comparable to the pre-POAM-047
+//!   one-shot `adopt_slice` figures.
+//! - `adopt_detached`: what platd runs: `Shadow::detach` (O(1)), then
+//!   `adopt_step` with the 5 ms `ADOPT_STEP_BUDGET` until done, from the
+//!   unsorted detached maps. The longest step of each case is printed
+//!   (`adopt_step_5ms`): that is the control thread's stall per step.
 //!
 //! Sizes come from the example configuration, not from literals:
 //!
@@ -35,7 +42,10 @@ use plat_audit::{AcquireReason, AuditSink, Event};
 use plat_cluster::{SliceMap, SnapRecord, WireBib, WireBlock};
 use plat_common::config::SteeringMode;
 use plat_common::{Clock, Config};
-use plat_nat64::{AdoptInput, AdoptMeta, ClusterSetup, Directory, Nat64, Shadow, SliceState};
+use plat_nat64::{
+    ADOPT_STEP_BUDGET, AdoptInput, AdoptMeta, AdoptSource, AdoptStats, ClusterSetup, Directory, Nat64, Shadow,
+    SliceState, Step,
+};
 use plat_packet::proto;
 
 /// The slice measured (the first of the pool).
@@ -151,25 +161,62 @@ fn take(n: &Node) -> AdoptInput {
     n.shadow.take(SLICE, n.nat.state().now_ms())
 }
 
-/// One timed adoption of `input`, then (untimed) the checks, the release of
-/// the slice and the drain of the audit queue.
-fn adopt_once(n: &Node, input: &AdoptInput, epoch: u64) -> Duration {
+/// The longest step of a stepped adoption and the phase it started in
+/// ("phase change" when it ended in another one).
+type Longest = (Duration, &'static str);
+
+/// Steps `src` to completion with `budget` per step; returns the stats,
+/// the total time and the longest step, and appends every step's time to
+/// `steps`.
+fn adopt_stepped(
+    n: &Node,
+    src: AdoptSource,
+    epoch: u64,
+    budget: Duration,
+    steps: &mut Vec<Duration>,
+) -> (AdoptStats, Duration, Longest) {
     let st = n.nat.state();
     let meta = AdoptMeta { epoch, prev_owner: Some(1), reason: AcquireReason::Takeover };
     let t = Instant::now();
-    let stats = black_box(st.adopt_slice(SLICE, black_box(input), meta)).unwrap();
-    let d = t.elapsed();
+    let mut a = st.adopt_begin(SLICE, src, meta).unwrap();
+    let mut longest = (Duration::ZERO, "");
+    loop {
+        let phase = a.phase();
+        let s0 = Instant::now();
+        let r = black_box(st.adopt_step(&mut a, s0 + budget)).unwrap();
+        let d = s0.elapsed();
+        steps.push(d);
+        if d > longest.0 {
+            longest = (d, if a.phase() == phase { phase } else { "phase change" });
+        }
+        if let Step::Done(stats) = r {
+            return (stats, t.elapsed(), longest);
+        }
+    }
+}
+
+/// The checks after one adoption (untimed), the release of the slice and
+/// the drain of the audit queue.
+fn check(n: &Node, stats: AdoptStats, blocks: u64, bibs: u64) {
+    let st = n.nat.state();
     assert_eq!(
         (u64::from(stats.blocks_adopted), stats.bibs_adopted, stats.rejected),
-        (input.blocks.len() as u64, input.bibs.len() as u64, 0),
+        (blocks, bibs, 0),
         "everything replicated is adopted"
     );
     assert_eq!(st.slice_state(SLICE), Some(SliceState::Active));
     // AU-12: the acquire record and one adopt record per block were queued.
-    assert_eq!(n.rx.try_iter().count(), input.blocks.len() + 1);
+    assert_eq!(n.rx.try_iter().count() as u64, blocks + 1);
     let rel = st.release_slice(SLICE, None);
-    assert_eq!(rel.bibs_removed, input.bibs.len() as u64);
+    assert_eq!(rel.bibs_removed, bibs);
     let _ = n.rx.try_iter().count();
+}
+
+/// One timed adoption of a copy of `input` (copied untimed).
+fn adopt_once(n: &Node, input: &AdoptInput, epoch: u64) -> Duration {
+    let src = AdoptSource::Input(input.clone());
+    let (stats, d, _) = adopt_stepped(n, src, epoch, Duration::from_secs(3600), &mut Vec::new());
+    check(n, stats, input.blocks.len() as u64, input.bibs.len() as u64);
     d
 }
 
@@ -211,21 +258,40 @@ fn bench(c: &mut Criterion) {
             });
             drop(input);
 
-            // The ctl thread also builds the input (`Replicator::take`).
-            g.bench_function(format!("shadow_take/{id}"), |b| {
+            // What platd runs: detach, then 5 ms steps from the maps.
+            let mut longest = (Duration::ZERO, "");
+            let mut steps = Vec::new();
+            g.bench_function(format!("adopt_detached/{id}"), |b| {
                 b.iter_custom(|iters| {
                     (0..iters)
                         .map(|_| {
                             fill(&n, blocks, bibs);
+                            epoch += 1;
                             let t = Instant::now();
-                            let input = black_box(take(&n));
-                            let d = t.elapsed();
-                            assert_eq!(input.bibs.len() as u64, bibs);
-                            d
+                            let d = n.shadow.detach(SLICE, n.nat.state().now_ms());
+                            let detach = t.elapsed();
+                            let (stats, took, l) =
+                                adopt_stepped(&n, AdoptSource::Detached(d), epoch, ADOPT_STEP_BUDGET, &mut steps);
+                            if l.0 > longest.0 {
+                                longest = l;
+                            }
+                            check(&n, stats, blocks, bibs);
+                            detach + took
                         })
                         .sum()
                 })
             });
+            steps.sort_unstable();
+            let q = |p: usize| steps.get((steps.len() * p / 100).min(steps.len().saturating_sub(1))).copied();
+            println!(
+                "adopt_step_5ms/{id}: {} steps, p50 {:?}, p99 {:?}, longest {:?} (started in: {}), budget \
+                 {ADOPT_STEP_BUDGET:?}",
+                steps.len(),
+                q(50).unwrap_or_default(),
+                q(99).unwrap_or_default(),
+                longest.0,
+                longest.1
+            );
         }
     }
     g.finish();

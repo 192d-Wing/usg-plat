@@ -1242,54 +1242,29 @@ fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
-/// POAM-007 (2), measurement only: `Ctl::acquire` adopts every slice of a
-/// crashed member inline on the `plat-cluster-ctl` thread, which also sends
-/// the leader's heartbeats. The leader adopts the other member's slices
-/// (one block per subscriber, `PLAT_HB_GAP_SUBS` x `PLAT_HB_GAP_PORTS`
-/// BIBs) while a test-owned witness records when its heartbeats arrive.
-/// Prints the longest gap before the crash and during the adoption; the
-/// assertion is a sanity limit only (timing on a shared host).
-#[test]
-fn heartbeat_gap_during_large_adoption() {
-    const HEARTBEAT: Duration = Duration::from_millis(100);
-    let subs = env_usize("PLAT_HB_GAP_SUBS", 2000);
-    let ports = env_usize("PLAT_HB_GAP_PORTS", 16).clamp(1, 256);
-    let _serial = crate::test_pki::FIPS_HOOK.lock();
-    let pki = Pki::new();
-    let l = Layout::new(2, true);
-    let (sa, sb, sw) = (ShortDir::new("a"), ShortDir::new("b"), ShortDir::new("w"));
-    let probe = HeartbeatProbe::start(&l, &pki, &sw.0);
-    let mut nodes = [
-        Node::start(member_cfg(&l, 0, l.ports[0], &pki, &sa.0, "", None)),
-        Node::start(member_cfg(&l, 1, l.ports[1], &pki, &sb.0, "", None)),
-    ];
-    wait("16 slices", Duration::from_secs(15), || {
-        nodes.iter().all(|n| n.active() > 0) && total_active(&[&nodes[0], &nodes[1]]) == 16
-    });
-    // The leader survives, so its heartbeats to the witness never stop.
-    let leader = nodes[0].h().shared.view().unwrap().leader;
-    let (li, vi) = (usize::from(leader), usize::from(1 - leader));
-    wait_protected(&[&nodes[0], &nodes[1]]);
-
-    // Load on the victim: `subs` subscribers with one block and `ports`
-    // UDP mappings each. A new subscriber waits for a block reserved with
-    // the backup, so a refused first packet is retried.
+/// Load on the victim: `subs` subscribers with one block and `ports` UDP
+/// mappings each. A new subscriber waits for a block reserved with the
+/// backup, so a refused first packet is retried. Returns the load time.
+fn hb_load(n: &mut Node, subs: usize, ports: usize) -> Duration {
     let fill = Instant::now();
     for i in 0..subs as u128 {
         let client = 0x2001_0db8_0100_0000_0000_0000_0000_0000 | (i << 64) | 1;
         let t = Instant::now();
-        while nodes[vi].send(client, 40000).is_none() {
+        while n.send(client, 40000).is_none() {
             assert!(t.elapsed() < Duration::from_secs(10), "no block for subscriber {i}");
             std::thread::sleep(Duration::from_millis(1));
         }
         for p in 1..ports as u16 {
-            assert!(nodes[vi].send(client, 40000 + p).is_some(), "subscriber {i} port {p}");
+            assert!(n.send(client, 40000 + p).is_some(), "subscriber {i} port {p}");
         }
     }
-    let fill = fill.elapsed();
-    let victim_slices = nodes[vi].active();
-    let repl = nodes[li].h().shared.repl.clone().unwrap();
-    let synced = wait("backup holds every block and BIB, in sync", Duration::from_secs(120), || {
+    fill.elapsed()
+}
+
+/// Waits until the leader's shadow holds every block and BIB, in sync.
+fn hb_wait_synced(leader: &Node, subs: usize, ports: usize) -> Duration {
+    let repl = leader.h().shared.repl.clone().unwrap();
+    wait("backup holds every block and BIB, in sync", Duration::from_secs(120), || {
         let g = repl.lock();
         let (mut blocks, mut bibs) = (0, 0);
         for s in 0..16 {
@@ -1301,24 +1276,54 @@ fn heartbeat_gap_during_large_adoption() {
             }
         }
         (blocks, bibs) == (subs, subs * ports)
-    });
-    wait_protected(&[&nodes[0], &nodes[1]]);
+    })
+}
 
-    // Baseline: one second of undisturbed heartbeats.
-    std::thread::sleep(Duration::from_secs(1));
-    let mark = nodes[li].events.lock().len();
-    let killed = Instant::now();
-    let baseline = longest_gap(&probe.beats_from(leader), killed.checked_sub(Duration::from_secs(1)).unwrap(), killed);
-    nodes[vi].kill();
-    let took = wait("takeover by the leader", Duration::from_secs(30), || nodes[li].active() == 16);
-    // Heartbeats delayed by the adoption arrive after it ends.
-    std::thread::sleep(3 * HEARTBEAT);
-    let gap = longest_gap(&probe.beats_from(leader), killed, Instant::now());
+/// When each victim slice was first seen Adopting and Active on the leader.
+struct HbTimeline {
+    first_adopting: Vec<Option<Duration>>,
+    active_at: Vec<Option<Duration>>,
+    max_adopting: usize,
+    took: Duration,
+}
 
+/// Samples the leader every 0.5 ms until it serves all 16 slices.
+fn hb_timeline(leader: &Node, theirs: &[SliceId], killed: Instant) -> HbTimeline {
+    let (mut first_adopting, mut active_at) = (vec![None; 16], vec![None; 16]);
+    let mut max_adopting = 0;
+    let st = leader.nat.state();
+    while leader.active() < 16 {
+        assert!(killed.elapsed() < Duration::from_secs(30), "timed out waiting for the takeover");
+        let now = killed.elapsed();
+        let mut adopting = 0;
+        for &x in theirs {
+            match st.slice_state(x) {
+                Some(SliceState::Adopting) => {
+                    adopting += 1;
+                    first_adopting[usize::from(x)].get_or_insert(now);
+                }
+                Some(SliceState::Active) => {
+                    active_at[usize::from(x)].get_or_insert(now);
+                }
+                _ => {}
+            }
+        }
+        max_adopting = max_adopting.max(adopting);
+        std::thread::sleep(Duration::from_micros(500));
+    }
+    let took = killed.elapsed();
+    for &x in theirs {
+        active_at[usize::from(x)].get_or_insert(took);
+    }
+    HbTimeline { first_adopting, active_at, max_adopting, took }
+}
+
+/// Sums the takeover acquire records after `mark`: (blocks, BIBs, slices).
+fn hb_acquired(leader: &Node, mark: usize, victim_slices: usize) -> (u64, u64, usize) {
     let (mut blocks, mut bibs, mut slices) = (0u64, 0u64, 0usize);
     wait("acquire records", Duration::from_secs(5), || {
         (blocks, bibs, slices) = (0, 0, 0);
-        for e in nodes[li].events.lock().iter().skip(mark) {
+        for e in leader.events.lock().iter().skip(mark) {
             if let Event::ClusterSliceAcquire { acquire, .. } = e
                 && acquire.reason == AuditAcquire::Takeover
             {
@@ -1329,6 +1334,110 @@ fn heartbeat_gap_during_large_adoption() {
         }
         slices >= victim_slices
     });
+    (blocks, bibs, slices)
+}
+
+/// Each slice went Active when its own adoption ended, in turn: the next
+/// one is first seen Adopting no earlier than the previous Active (within
+/// one sample).
+fn hb_check_in_turn(order: &[(Duration, Option<Duration>, SliceId)]) {
+    for w in order.windows(2) {
+        if let (Some(a1), Some(a2)) = (w[0].1, w[1].1) {
+            assert!(a1 <= a2 && w[0].0 <= a2 + Duration::from_millis(2), "not one after the other: {w:?}");
+        }
+    }
+}
+
+/// POAM-047, POAM-007 (2): the `plat-cluster-ctl` thread adopts every
+/// slice of a crashed member in bounded steps between the leader's
+/// heartbeats. The leader adopts the other member's slices (one block per
+/// subscriber, `PLAT_HB_GAP_SUBS` x `PLAT_HB_GAP_PORTS` BIBs) while a
+/// test-owned witness records when its heartbeats arrive. Prints the
+/// longest gap before the crash and during the adoption, and asserts the
+/// gap budget (heartbeat + tick + step, with margin) and that the leader
+/// kept its lease (one view, no slice released).
+#[test]
+fn heartbeat_gap_during_large_adoption() {
+    const HEARTBEAT: Duration = Duration::from_millis(100);
+    const GAP_BUDGET: Duration = Duration::from_millis(150);
+    let subs = env_usize("PLAT_HB_GAP_SUBS", 2000);
+    let ports = env_usize("PLAT_HB_GAP_PORTS", 16).clamp(1, 256);
+    let _serial = crate::test_pki::FIPS_HOOK.lock();
+    let pki = Pki::new();
+    let l = Layout::new(2, true);
+    let (sa, sb, sw) = (ShortDir::new("a"), ShortDir::new("b"), ShortDir::new("w"));
+    let probe = HeartbeatProbe::start(&l, &pki, &sw.0);
+    // QA (flake at 4M): with 512-port blocks a /28 holds 2016 blocks, so a
+    // victim that drew 6 of the 16 slices could not hold 15624 one-block
+    // subscribers. 256-port blocks (4032 per /28, still one block and up
+    // to 256 mappings per subscriber) fit 4M BIBs in 4 slices; the split is
+    // checked below, before the load.
+    let nat = "port_block_size = 256";
+    let mut nodes = [
+        Node::start(member_cfg(&l, 0, l.ports[0], &pki, &sa.0, nat, None)),
+        Node::start(member_cfg(&l, 1, l.ports[1], &pki, &sb.0, nat, None)),
+    ];
+    wait("16 slices", Duration::from_secs(15), || {
+        nodes.iter().all(|n| n.active() > 0) && total_active(&[&nodes[0], &nodes[1]]) == 16
+    });
+    // The leader survives, so its heartbeats to the witness never stop.
+    let leader = nodes[0].h().shared.view().unwrap().leader;
+    let (li, vi) = (usize::from(leader), usize::from(1 - leader));
+    wait_protected(&[&nodes[0], &nodes[1]]);
+    let room = nodes[vi].nat.state().pool.free_blocks();
+    assert!(
+        room as usize >= subs,
+        "fixture: the victim owns {} slices ({room} free blocks) for {subs} one-block subscribers",
+        nodes[vi].active()
+    );
+
+    // Load on the victim: `subs` subscribers with one block and `ports`
+    // UDP mappings each. A new subscriber waits for a block reserved with
+    // the backup, so a refused first packet is retried.
+    let fill = hb_load(&mut nodes[vi], subs, ports);
+    let victim_slices = nodes[vi].active();
+    let synced = hb_wait_synced(&nodes[li], subs, ports);
+    wait_protected(&[&nodes[0], &nodes[1]]);
+
+    // Baseline: one second of undisturbed heartbeats.
+    std::thread::sleep(Duration::from_secs(1));
+    let mark = nodes[li].events.lock().len();
+    let killed = Instant::now();
+    let baseline = longest_gap(&probe.beats_from(leader), killed.checked_sub(Duration::from_secs(1)).unwrap(), killed);
+    let killed_wall = Clock::wall_us();
+    let theirs: Vec<SliceId> =
+        (0..16).filter(|&x| nodes[vi].nat.state().slice_state(x) == Some(SliceState::Active)).collect();
+    nodes[vi].kill();
+    // Timeline (QA): when each of the victim's slices first shows
+    // Adopting and Active on the leader, sampled every 0.5 ms; at most one
+    // Adopting at a time (decision 3).
+    let HbTimeline { first_adopting, active_at, max_adopting, took } = hb_timeline(&nodes[li], &theirs, killed);
+    // Heartbeats delayed by the adoption arrive after it ends.
+    std::thread::sleep(3 * HEARTBEAT);
+    let gap = longest_gap(&probe.beats_from(leader), killed, Instant::now());
+
+    let (blocks, bibs, slices) = hb_acquired(&nodes[li], mark, victim_slices);
+    let view_us = nodes[li].events.lock().iter().skip(mark).find_map(|e| match e {
+        Event::ClusterViewChange { ts_us, .. } => Some(ts_us.saturating_sub(killed_wall)),
+        _ => None,
+    });
+    let start = theirs.iter().filter_map(|&x| first_adopting[usize::from(x)]).min();
+    let mut order: Vec<(Duration, Option<Duration>, SliceId)> =
+        theirs.iter().map(|&x| (active_at[usize::from(x)].unwrap(), first_adopting[usize::from(x)], x)).collect();
+    order.sort_unstable();
+    println!(
+        "heartbeat_gap timeline: view after {:?}, first Adopting {start:?}, all Active {took:?}, adoption window {:?}, \
+         max concurrent Adopting {max_adopting}; per slice (Adopting seen, Active): {:?}",
+        view_us.map(Duration::from_micros),
+        start.map(|s| took.saturating_sub(s)),
+        order.iter().map(|o| (o.1, o.0)).collect::<Vec<_>>()
+    );
+    let mut m = String::new();
+    nodes[li].h().shared.render_metrics(&mut m);
+    let steps: Vec<&str> = m.lines().filter(|l| l.starts_with("plat_cluster_adopt_step")).collect();
+    println!("heartbeat_gap steps: {steps:?}");
+    assert!(max_adopting <= 1, "{max_adopting} slices Adopting at once (decision 3)");
+    hb_check_in_turn(&order);
     // A stall longer than the lease costs the leader its own lease: it
     // then fences what it serves and a new view follows.
     let (views, released) = nodes[li].events.lock().iter().skip(mark).fold((0, 0), |(v, r), e| match e {
@@ -1346,9 +1455,319 @@ fn heartbeat_gap_during_large_adoption() {
     );
     assert_eq!((blocks, bibs), (subs as u64, (subs * ports) as u64), "the whole load was adopted");
     assert!(baseline > Duration::ZERO && gap > Duration::ZERO, "the probe saw the leader's heartbeats");
-    // Sanity only: the measured value is the printed one.
-    assert!(gap < Duration::from_secs(10), "heartbeat gap {gap:?}");
+    // POAM-047: adoption runs in steps of ADOPT_STEP_BUDGET between the
+    // ctl thread's ticks, so the longest gap stays within one heartbeat,
+    // one tick and one step (100 + ~10 + 5 ms, asserted with margin), and
+    // the leader keeps its lease: no new view, nothing released.
+    assert!(gap <= GAP_BUDGET, "heartbeat gap {gap:?} over {GAP_BUDGET:?}");
+    assert_eq!((views, released), (1, 0), "the leader kept its lease while adopting");
     for n in &mut nodes {
         n.stop();
     }
+}
+
+// ------------------------------------------- POAM-047 abandoned adoptions (QA)
+
+/// An inbound UDP packet from the server to `(v4, port)`; true when `n`
+/// forwards it.
+fn inbound_forwards(n: &mut Node, v4: u32, port: u16) -> bool {
+    use plat_xlat::siit::write_v4_header;
+    let mut p = vec![0u8; 29];
+    write_v4_header(&mut p, 0, 29, 1, true, false, 0, 64, proto::UDP, SERVER, v4);
+    put16(&mut p, 20, 5353);
+    put16(&mut p, 22, port);
+    put16(&mut p, 24, 9);
+    p[28] = b'r';
+    let c = ck::finish(ck::pseudo_v4(SERVER, v4, proto::UDP, 9) + ck::sum(&p[20..]));
+    put16(&mut p, 26, ck::udp_nonzero(c));
+    let mut buf = vec![0u8; HEADROOM + 2048];
+    buf[HEADROOM..HEADROOM + p.len()].copy_from_slice(&p);
+    matches!(n.nat.process(&mut buf, HEADROOM, p.len(), &mut n.ctx), Verdict::Forward { .. })
+}
+
+/// `plat_cluster_adoptions_abandoned_total{reason=...}` of `n`.
+fn abandoned(sh: &super::control::Shared, reason: &str) -> u64 {
+    let mut o = String::new();
+    sh.render_metrics(&mut o);
+    let key = format!("plat_cluster_adoptions_abandoned_total{{reason=\"{reason}\"}} ");
+    o.lines().find_map(|l| l.strip_prefix(&key)).and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+}
+
+/// Blocks of `slice` in adopt / release records of `n` (from `mark`).
+/// `(v4, port_lo)` of port blocks.
+type Blocks = Vec<(u32, u16)>;
+
+fn slice_records(n: &Node, slice: SliceId, mark: usize) -> (Blocks, Blocks) {
+    let map = n.nat.state().slice_map().unwrap().clone();
+    let (mut ad, mut rel) = (Vec::new(), Vec::new());
+    for e in n.events.lock().iter().skip(mark) {
+        match e {
+            Event::PortBlockAdopt { adopt, .. } if map.slice_of(adopt.v4) == Some(slice) => {
+                ad.push((adopt.v4, adopt.port_lo));
+            }
+            Event::PortBlockRelease { v4, port_lo, .. } if map.slice_of(*v4) == Some(slice) => {
+                rel.push((*v4, *port_lo));
+            }
+            _ => {}
+        }
+    }
+    ad.sort_unstable();
+    rel.sort_unstable();
+    (ad, rel)
+}
+
+/// Two members and a witness, both with an audit queue of 64, smaller
+/// than the records of any slice the victim serves (> 64 blocks each), so
+/// under `refuse_new_bindings` the leader's takeover of the victim's first
+/// slice reaches the log phase and waits there: a deterministic
+/// half-adopted slice (imported, not logged, not Active). The other slices
+/// wait behind it (decision 3). The leader survives (it keeps its lease),
+/// the other member is the victim. `b` is the survivor, `a` the victim.
+struct Stuck {
+    pki: Pki,
+    l: Layout,
+    dirs: [ShortDir; 3],
+    w: Option<ClusterHandle>,
+    a: Node,
+    b: Node,
+    /// Member id of `a`.
+    ai: u16,
+    slice: SliceId,
+    /// The victim's slices (those holding its load).
+    theirs: std::collections::BTreeSet<SliceId>,
+    /// The victim's mappings in `slice`.
+    mapped: Vec<(u32, u16)>,
+    /// `b.events` length at the crash.
+    mark: usize,
+}
+
+fn stuck_adoption(auto: bool) -> Stuck {
+    let pki = Pki::new();
+    let mut l = Layout::new(2, true);
+    l.auto = Some(auto);
+    let dirs = [ShortDir::new("sa"), ShortDir::new("sb"), ShortDir::new("sw")];
+    let w = super::witness::start(&witness_file(&l, &pki, &dirs[2].0), collector(4096).0).unwrap();
+    let start = |i: u16| {
+        let (sink, ev) = collector(64);
+        Node::start_with(member_cfg(&l, i, l.ports[usize::from(i)], &pki, &dirs[usize::from(i)].0, "", None), sink, ev)
+    };
+    let mut nodes = vec![start(0), start(1)];
+    wait("16 slices", Duration::from_secs(15), || {
+        nodes.iter().all(|n| n.active() > 0) && total_active(&[&nodes[0], &nodes[1]]) == 16
+    });
+    wait_protected(&[&nodes[0], &nodes[1]]);
+    let leader = nodes[0].h().shared.view().unwrap().leader;
+    let ai = 1 - leader;
+    let b = nodes.remove(usize::from(leader));
+    let mut a = nodes.remove(0);
+    let subs = 120 * a.active();
+    let mut v4s = Vec::new();
+    for i in 0..subs as u128 {
+        let client = 0x2001_0db8_0100_0000_0000_0000_0000_0000 | (i << 64) | 1;
+        let t = Instant::now();
+        loop {
+            if let Some(m) = a.send(client, 40000) {
+                v4s.push(m);
+                break;
+            }
+            assert!(t.elapsed() < Duration::from_secs(10), "no block for subscriber {i}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    let repl = b.h().shared.repl.clone().unwrap();
+    wait("the survivor's shadow holds every block, in sync", Duration::from_secs(60), || {
+        let g = repl.lock();
+        let n: usize = (0..16).map(|s| g.shadow_counts(s).0).sum();
+        n == subs && (0..16).all(|s| g.shadow_counts(s).0 == 0 || g.shadow.in_sync(s))
+    });
+    wait_protected(&[&a, &b]);
+    let mark = b.events.lock().len();
+    a.kill();
+    if !auto {
+        wait("link down", Duration::from_secs(5), || !b.h().shared.net.is_up(ai));
+        let r = b.h().command(Command::Takeover(ai, false));
+        assert!(r.starts_with("ok"), "{r}");
+    }
+    let st = b.nat.state();
+    let mut slice = None;
+    wait("the survivor adopting a slice", Duration::from_secs(15), || {
+        slice = (0..16).find(|&s| st.slice_state(s) == Some(SliceState::Adopting));
+        slice.is_some()
+    });
+    let slice = slice.unwrap();
+    // It stays half-adopted: the queue can never take its records at once.
+    std::thread::sleep(Duration::from_millis(1500));
+    let adopting: Vec<_> = (0..16).filter(|&s| st.slice_state(s) == Some(SliceState::Adopting)).collect();
+    assert_eq!(adopting, vec![slice], "one adoption at a time (decision 3)");
+    let map = st.slice_map().unwrap().clone();
+    let theirs: std::collections::BTreeSet<SliceId> = v4s.iter().filter_map(|m| map.slice_of(m.0)).collect();
+    assert!(theirs.contains(&slice));
+    let served: Vec<_> = theirs.iter().filter(|&&x| st.slice_state(x) == Some(SliceState::Active)).collect();
+    assert!(served.is_empty(), "victim slices {served:?} Active while the first is adopted");
+    let mapped: Vec<_> = v4s.into_iter().filter(|m| map.slice_of(m.0) == Some(slice)).collect();
+    assert!(mapped.len() > 64, "{} blocks in slice {slice}", mapped.len());
+    Stuck { pki, l, dirs, w: Some(w), a, b, ai, slice, theirs, mapped, mark }
+}
+
+impl Stuck {
+    /// Nothing of the slice serves on B and no adopt or release record of
+    /// it was queued (none was logged, so none may be released).
+    fn check_nothing_served_or_logged(&mut self, what: &str) {
+        let (ad, rel) = slice_records(&self.b, self.slice, self.mark);
+        assert!(ad.is_empty(), "{what}: adopt records {ad:?}");
+        assert!(rel.is_empty(), "{what}: release records for blocks never logged: {rel:?}");
+        let mapped = self.mapped.clone();
+        for (v4, p) in mapped {
+            assert!(!inbound_forwards(&mut self.b, v4, p), "{what}: {v4:x}:{p} served");
+        }
+    }
+}
+
+/// SC-24, AU-12 (plan §5 shutdown row): an orderly stop in the middle of an
+/// adoption abandons it first: nothing of the slice served or logged, no
+/// release record for unlogged blocks, the slice not Active, the abandon
+/// counted `shutdown`.
+#[test]
+fn adoption_abandoned_on_shutdown() {
+    let _serial = crate::test_pki::FIPS_HOOK.lock();
+    let mut s = stuck_adoption(true);
+    s.check_nothing_served_or_logged("adopting");
+    let sh = s.b.h().shared.clone();
+    s.b.stop();
+    assert_eq!(abandoned(&sh, "shutdown"), 1);
+    assert_ne!(s.b.nat.state().slice_state(s.slice), Some(SliceState::Active));
+    assert_eq!(s.b.nat.state().subscriber_count(), 0, "every imported subscriber removed");
+    // Records reach `events` through the collector thread.
+    std::thread::sleep(Duration::from_millis(200));
+    s.check_nothing_served_or_logged("after the stop");
+    if let Some(w) = s.w.take() {
+        w.shutdown();
+    }
+}
+
+/// SC-24 (plan §5 lease-lost row): the witness goes away while the
+/// survivor adopts, so it (one vote of three) loses its lease: the adoption
+/// is abandoned (`lease_lost`), the slice ends Inactive (not Fenced),
+/// nothing of it was served or released. When the witness is back the
+/// slice must be adopted again in full: here that cannot finish (the queue
+/// is too small), so it must not be Active, or if Active, with every
+/// replicated block adopted.
+///
+/// FAILS (QA, POAM-047 finding): the abandon dropped the detached shadow
+/// slice, so the regain adopts an empty, out-of-sync shadow: the slice goes
+/// Active at once with 0 blocks adopted and every block held back; the
+/// victim's subscribers lose their mappings. See
+/// `regain_after_lease_lost_abandon_readopts_in_full` (plat-nat64).
+#[test]
+fn adoption_abandoned_on_lease_lost() {
+    let _serial = crate::test_pki::FIPS_HOOK.lock();
+    let mut s = stuck_adoption(true);
+    s.w.take().unwrap().kill();
+    let sh = s.b.h().shared.clone();
+    wait("abandoned on lease loss", Duration::from_secs(10), || abandoned(&sh, "lease_lost") == 1);
+    let st = s.b.nat.state();
+    wait("slice Inactive", Duration::from_secs(5), || st.slice_state(s.slice) == Some(SliceState::Inactive));
+    std::thread::sleep(Duration::from_millis(200));
+    s.check_nothing_served_or_logged("lease lost");
+    let mark = s.b.events.lock().len();
+    // Witness back: the survivor regains the slice.
+    s.w = Some(super::witness::start(&witness_file(&s.l, &s.pki, &s.dirs[2].0), collector(4096).0).unwrap());
+    let st = s.b.nat.state();
+    wait("regain", Duration::from_secs(15), || {
+        s.theirs.iter().any(|&x| st.slice_state(x) == Some(SliceState::Adopting))
+            || st.slice_state(s.slice) == Some(SliceState::Active)
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    let net = st.slice_map().unwrap().cidr(s.slice).unwrap().network();
+    let acq: Vec<(u32, u32)> =
+        s.b.events
+            .lock()
+            .iter()
+            .skip(mark)
+            .filter_map(|e| match e {
+                Event::ClusterSliceAcquire { acquire, .. } if acquire.slice.net == net => {
+                    Some((acquire.blocks_adopted, acquire.blocks_quarantined))
+                }
+                _ => None,
+            })
+            .collect();
+    if st.slice_state(s.slice) == Some(SliceState::Active) {
+        assert_eq!(
+            acq.first().map(|a| a.0 as usize),
+            Some(s.mapped.len()),
+            "regained slice Active without its replicated blocks (adopted, quarantined): {acq:?}"
+        );
+    }
+    s.b.stop();
+    s.w.take().unwrap().shutdown();
+}
+
+/// POAM-047 F3: while a takeover is stuck in its log phase, the survivor
+/// loses its lease (witness gone) and regains it (witness back). Its own
+/// fenced slices need one record and no import, so they are Active again
+/// at once instead of waiting behind the stuck adoption (decision 3 orders
+/// imports only).
+#[test]
+fn own_slices_regain_while_a_takeover_is_stuck() {
+    let _serial = crate::test_pki::FIPS_HOOK.lock();
+    let mut s = stuck_adoption(true);
+    let st = s.b.nat.state();
+    let own: Vec<SliceId> =
+        (0..16).filter(|x| !s.theirs.contains(x) && st.slice_state(*x) == Some(SliceState::Active)).collect();
+    assert!(!own.is_empty());
+    s.w.take().unwrap().kill();
+    wait("own slices fenced", Duration::from_secs(10), || {
+        own.iter().all(|&x| st.slice_state(x) == Some(SliceState::Fenced))
+    });
+    s.w = Some(super::witness::start(&witness_file(&s.l, &s.pki, &s.dirs[2].0), collector(4096).0).unwrap());
+    wait("own slices Active again while a takeover is pending", Duration::from_secs(15), || {
+        own.iter().all(|&x| st.slice_state(x) == Some(SliceState::Active))
+    });
+    let victim_active = s.theirs.iter().filter(|&&x| st.slice_state(x) == Some(SliceState::Active)).count();
+    assert!(victim_active < s.theirs.len(), "the stuck takeover is still not done");
+    s.b.stop();
+    s.w.take().unwrap().shutdown();
+}
+
+/// Plan §5 reassigned / handed-back rows (decision 2): manual failover.
+/// The operator has the survivor take over the crashed member; the member
+/// restarts and the operator restores its slices while the survivor is
+/// still adopting the first one: the survivor abandons it (`reassigned` or
+/// `handover`), never serves it, and releases none of its unlogged blocks.
+#[test]
+fn adoption_abandoned_on_view_change_reassign() {
+    let _serial = crate::test_pki::FIPS_HOOK.lock();
+    let mut s = stuck_adoption(false);
+    let sh = s.b.h().shared.clone();
+    s.a = Node::start(member_cfg(
+        &s.l,
+        s.ai,
+        s.l.ports[usize::from(s.ai)],
+        &s.pki,
+        &s.dirs[usize::from(s.ai)].0,
+        "",
+        None,
+    ));
+    wait("peer link", Duration::from_secs(10), || s.b.h().shared.net.is_up(s.ai));
+    let r = s.b.h().command(Command::Restore(s.ai));
+    assert!(r.starts_with("ok"), "{r}");
+    let t = Instant::now();
+    while abandoned(&sh, "reassigned") + abandoned(&sh, "handover") != 1 {
+        let mut m = String::new();
+        sh.render_metrics(&mut m);
+        let m: Vec<_> = m.lines().filter(|l| l.contains("abandon") || l.contains("adopting")).collect();
+        assert!(
+            t.elapsed() < Duration::from_secs(10),
+            "abandon: {m:?}\n{}\n{}",
+            sh.view_json(),
+            s.a.h().shared.view_json()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_ne!(s.b.nat.state().slice_state(s.slice), Some(SliceState::Active));
+    std::thread::sleep(Duration::from_millis(200));
+    s.check_nothing_served_or_logged("reassigned");
+    s.a.stop();
+    s.b.stop();
+    s.w.take().unwrap().shutdown();
 }

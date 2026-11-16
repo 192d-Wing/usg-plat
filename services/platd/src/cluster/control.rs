@@ -6,15 +6,20 @@
 //! - `Persist`: `state_dir/cluster.state` written, fsynced and renamed
 //!   before anything later in the batch; if that fails the rest of the
 //!   batch sends nothing and acquires nothing (fencing still runs);
-//! - `Acquire`: replicated state taken from the shadow (an incomplete
-//!   shadow holds back every unknown block), `State::adopt_slice` queues
-//!   `cluster_slice_acquire` and the adopt records before the slice is
-//!   Active, then the announce hook; a handover answers `HandoverDone`.
-//!   Handover/failback adoptions run at most `max_concurrent_handovers`
-//!   per tick; `refuse_new_bindings` without audit room retries;
+//! - `Acquire`: replicated state detached from the shadow (an incomplete
+//!   shadow holds back every unknown block) into an adoption cursor; one
+//!   adoption at a time, in order, stepped by the run loop between its
+//!   message and tick work (`ADOPT_STEP_BUDGET` per step, POAM-047). The
+//!   last step queues `cluster_slice_acquire` and the adopt records, then
+//!   sets the slice Active; then the announce hook, and a handover answers
+//!   `HandoverDone`. Handover/failback adoptions start at most
+//!   `max_concurrent_handovers` per call; `refuse_new_bindings` without
+//!   audit room pauses the cursor until the next tick;
 //! - `Release`: fence first, `cluster_slice_release`, withdraw hook; on a
 //!   handover the slice's replication is flushed, its blocks released with
-//!   `plat.release_reason = handover`, then `HandoverFence{final_seq}`.
+//!   `plat.release_reason = handover`, then `HandoverFence{final_seq}`. A
+//!   slice still being adopted is abandoned instead (stepwise, release
+//!   records only for blocks already logged) and nothing is handed over.
 //!
 //! COMPLIANCE MAPPING:
 //! - NIST 800-53: SC-24 - persisted epochs and votes (fsync before use);
@@ -51,7 +56,10 @@ use plat_cluster::{
     SliceMap, View,
 };
 use plat_common::{Clock, Config};
-use plat_nat64::{AdoptError, AdoptInput, AdoptMeta, Nat64, ReplHub, Shadow, SliceState};
+use plat_nat64::{
+    ADOPT_STEP_BUDGET, AdoptError, AdoptInput, AdoptMeta, AdoptSource, Adoption, Nat64, ReplHub, Shadow, SliceState,
+    Step,
+};
 use plat_tls::{AllowList, PeerConfigs};
 
 use super::hooks::{HookJob, Hooks, check_hook};
@@ -224,6 +232,7 @@ pub struct Shared {
     takeovers: [AtomicU64; 5],
     handovers: AtomicU64,
     persist_failures: AtomicU64,
+    adopt: AdoptMetrics,
     hook_stats: Option<Arc<super::hooks::HookStats>>,
     /// Control thread input (operator commands).
     ctl: SyncSender<In>,
@@ -245,6 +254,115 @@ impl std::fmt::Debug for Shared {
 }
 
 const TAKEOVER_LABELS: [&str; 5] = ["startup", "takeover", "handover", "failback", "manual"];
+
+/// `plat_cluster_adoptions_abandoned_total` labels; "epoch": the slice left
+/// `Adopting` under the cursor (`AdoptError::Interrupted`).
+const ABANDON_LABELS: [&str; 5] = ["lease_lost", "reassigned", "handover", "shutdown", "epoch"];
+const ABANDON_EPOCH: usize = 4;
+/// Window of `plat_cluster_adopt_step_seconds_max`.
+const STEP_MAX_WINDOW_MS: u64 = 60_000;
+
+fn abandon_ix(r: ReleaseReason) -> usize {
+    match r {
+        ReleaseReason::LeaseLost => 0,
+        ReleaseReason::Fenced => 1,
+        ReleaseReason::Handover => 2,
+        ReleaseReason::Shutdown => 3,
+    }
+}
+
+/// Whether an abandoned adoption returns its detached state to the shadow
+/// (POAM-047 fix round 1): only when the slice went to nobody else (lease
+/// lost or fenced with no other owner), so a regain adopts it in full. A
+/// slice given to another member or handed back is that member's state,
+/// and a stopping node keeps nothing.
+fn keeps_shadow(reason: ReleaseReason, new_owner: Option<MemberId>, me: MemberId) -> bool {
+    matches!(reason, ReleaseReason::LeaseLost | ReleaseReason::Fenced) && new_owner.is_none_or(|n| n == me)
+}
+
+/// A pending job that needs no import (the slice is already Active or
+/// gone, or a complete fenced slice of this node is regained with one
+/// record) runs ahead of the adoption in progress (POAM-047 F3): decision 3
+/// orders imports only.
+fn runs_ahead(state: Option<SliceState>, prev_owner: Option<MemberId>, me: MemberId) -> bool {
+    match state {
+        Some(SliceState::Active) | None => true,
+        Some(SliceState::Fenced) => prev_owner == Some(me),
+        Some(_) => false,
+    }
+}
+
+/// How `shutdown` releases one slice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShutdownRelease {
+    /// The slice was being adopted and was just abandoned: it never served,
+    /// so it is not fenced or handed over (no `HandoverFence`, like
+    /// decision 2); only its `cluster_slice_release` record.
+    NeverServed,
+    HandOver(MemberId),
+    Release,
+}
+
+fn shutdown_release(
+    slice: SliceId,
+    abandoned: Option<SliceId>,
+    auto_failover: bool,
+    backup: Option<MemberId>,
+) -> ShutdownRelease {
+    if abandoned == Some(slice) {
+        return ShutdownRelease::NeverServed;
+    }
+    match backup {
+        Some(b) if auto_failover => ShutdownRelease::HandOver(b),
+        _ => ShutdownRelease::Release,
+    }
+}
+
+/// Chunked adoption on the control thread (SI-4, POAM-047).
+#[derive(Debug, Default)]
+struct AdoptMetrics {
+    steps: AtomicU64,
+    /// Longest step (ns) in the window starting at `max_since_ms`.
+    step_max_ns: AtomicU64,
+    max_since_ms: AtomicU64,
+    abandoned: [AtomicU64; 5],
+    /// 1 while an adoption (or its abandon) is in progress.
+    adopting: AtomicU64,
+}
+
+impl AdoptMetrics {
+    fn step(&self, d: Duration) {
+        self.steps.fetch_add(1, Ordering::Relaxed);
+        let now = mono_ms();
+        let ns = u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+        if now.saturating_sub(self.max_since_ms.load(Ordering::Relaxed)) >= STEP_MAX_WINDOW_MS {
+            self.max_since_ms.store(now, Ordering::Relaxed);
+            self.step_max_ns.store(ns, Ordering::Relaxed);
+        } else {
+            self.step_max_ns.fetch_max(ns, Ordering::Relaxed);
+        }
+    }
+
+    fn render(&self, o: &mut String) {
+        use std::fmt::Write as _;
+        let fresh = mono_ms().saturating_sub(self.max_since_ms.load(Ordering::Relaxed)) < STEP_MAX_WINDOW_MS;
+        let max = if fresh { self.step_max_ns.load(Ordering::Relaxed) } else { 0 };
+        let _ = write!(
+            o,
+            "# TYPE plat_cluster_adopt_steps_total counter\nplat_cluster_adopt_steps_total {}\n\
+             # TYPE plat_cluster_adopt_step_seconds_max gauge\nplat_cluster_adopt_step_seconds_max {:.6}\n\
+             # TYPE plat_cluster_adopting_slices gauge\nplat_cluster_adopting_slices {}\n\
+             # TYPE plat_cluster_adoptions_abandoned_total counter\n",
+            self.steps.load(Ordering::Relaxed),
+            max as f64 / 1e9,
+            self.adopting.load(Ordering::Relaxed)
+        );
+        for (l, c) in ABANDON_LABELS.iter().zip(&self.abandoned) {
+            let _ =
+                writeln!(o, "plat_cluster_adoptions_abandoned_total{{reason=\"{l}\"}} {}", c.load(Ordering::Relaxed));
+        }
+    }
+}
 
 fn takeover_ix(r: AuditAcquire) -> usize {
     match r {
@@ -407,6 +525,7 @@ impl Shared {
             self.persist_failures.load(Ordering::Relaxed)
         );
         render_election(o, &s.election);
+        self.adopt.render(o);
         o.push_str("# TYPE plat_cluster_peer_rejected_total counter\n");
         for r in super::peer::REJECT_REASONS {
             let _ = writeln!(
@@ -562,7 +681,32 @@ struct Job {
     prev_owner: Option<MemberId>,
     reason: AcquireReason,
     manual: bool,
-    input: Option<AdoptInput>,
+}
+
+/// The one slice adoption in progress on this node (POAM-047): stepped by
+/// [`Ctl::run`] between its message and tick work.
+enum Cur {
+    Adopt(Job, Box<Adoption>),
+    /// Undoing an adoption that will not complete; block release records
+    /// carry the reason.
+    Abandon(Box<Adoption>, Option<BlockReleaseReason>),
+}
+
+impl Cur {
+    fn slice(&self) -> SliceId {
+        match self {
+            Self::Adopt(_, a) | Self::Abandon(a, _) => a.slice(),
+        }
+    }
+}
+
+/// What starting a pending job did.
+enum Start {
+    /// Nothing (more) to do for it.
+    Done,
+    /// Retry at the next tick.
+    Retry,
+    Adopting(Box<Adoption>),
 }
 
 struct Ctl {
@@ -572,6 +716,11 @@ struct Ctl {
     audit: AuditSink,
     hooks: Option<Hooks>,
     pending: Vec<Job>,
+    /// At most one adoption at a time, FIFO over `pending` (SC-5).
+    cur: Option<Cur>,
+    /// The log phase was refused for lack of audit queue room
+    /// (`refuse_new_bindings`): retried at the next tick, not every pass.
+    cur_blocked: bool,
     max_handovers: usize,
     auto_failover: bool,
     shutdown_ms: u64,
@@ -674,7 +823,16 @@ impl Ctl {
                         // hold (SEC-R1-1).
                         let manual =
                             self.manual_cmd || (!self.auto_failover && matches!(reason, AcquireReason::Takeover));
-                        self.pending.push(Job { slice, epoch, prev_owner, reason, manual, input: None });
+                        match &mut self.cur {
+                            // Granted again (a newer view) while adopting:
+                            // keep the imported state, log with the new
+                            // epoch (records not yet queued are re-queued).
+                            Some(Cur::Adopt(j, a)) if j.slice == slice => {
+                                j.epoch = epoch;
+                                a.rebase(AdoptMeta { epoch, ..a.meta() });
+                            }
+                            _ => self.pending.push(Job { slice, epoch, prev_owner, reason, manual }),
+                        }
                     }
                 }
                 Action::Release { slice, epoch, new_owner, reason } => self.release(slice, epoch, new_owner, reason),
@@ -689,8 +847,10 @@ impl Ctl {
         h.submit(HookJob { kind, slice: c, epoch, reason });
     }
 
-    /// Adoptions due now: every startup/takeover, at most
-    /// `max_concurrent_handovers` handovers/failbacks per tick.
+    /// Starts the next adoption when none is in progress: pending jobs in
+    /// order (every startup/takeover, at most `max_concurrent_handovers`
+    /// handovers/failbacks per call). A job that needs no import completes
+    /// here; the first that does becomes [`Ctl::cur`] and later ones wait.
     fn run_pending(&mut self) {
         // POAM: POAM-017(a) the limit is per member and per tick; a leader
         // that hands over many slices at once to several members still
@@ -699,31 +859,45 @@ impl Ctl {
         let jobs = std::mem::take(&mut self.pending);
         for mut j in jobs {
             let graceful = matches!(j.reason, AcquireReason::Handover | AcquireReason::Failback);
-            if graceful && handovers >= self.max_handovers {
+            let ahead = self
+                .sh
+                .nat
+                .as_ref()
+                .is_some_and(|n| runs_ahead(n.state().slice_state(j.slice), j.prev_owner, self.sh.me));
+            if (self.cur.is_some() && !ahead) || (graceful && handovers >= self.max_handovers) {
                 self.pending.push(j);
                 continue;
             }
             handovers += usize::from(graceful);
-            if !self.acquire(&mut j) {
-                self.pending.push(j);
+            match self.start(&mut j) {
+                Start::Done => {}
+                Start::Retry => self.pending.push(j),
+                Start::Adopting(a) => {
+                    self.cur = Some(Cur::Adopt(j, a));
+                    self.cur_blocked = false;
+                }
             }
         }
+        self.sh.adopt.adopting.store(u64::from(self.cur.is_some()), Ordering::Relaxed);
     }
 
-    /// `true` when done (or impossible), `false` to retry next tick.
-    fn acquire(&mut self, j: &mut Job) -> bool {
-        let Some(nat) = self.sh.nat.clone() else { return true };
+    /// Starts job `j`: an adoption cursor (O(1); the shadow is detached,
+    /// not copied), or the regain of a complete fenced slice at once.
+    fn start(&mut self, j: &mut Job) -> Start {
+        let Some(nat) = self.sh.nat.clone() else { return Start::Done };
         let st = nat.state();
         let me = self.sh.me;
         let areason = audit_acquire(j.reason, j.manual);
         let cidr = self.sh.map.as_ref().and_then(|m| m.cidr(j.slice));
         match st.slice_state(j.slice) {
-            Some(SliceState::Active) | None => return true,
+            Some(SliceState::Active) | None => Start::Done,
             Some(SliceState::Fenced) if j.prev_owner == Some(me) => {
                 // Regained after a lease loss with an unbroken view chain
                 // (membership reports this node as the previous owner):
                 // nobody else held it, the fenced state is complete. Same
-                // log-before-use gate as an adoption (NIST-001).
+                // log-before-use gate as an adoption (NIST-001). Only a
+                // slice that was Active is Fenced: an abandoned adoption
+                // ends Inactive and is adopted again in full (SC-24).
                 if let Some(c) = cidr {
                     let ev = Event::ClusterSliceAcquire {
                         ts_us: Clock::wall_us(),
@@ -743,50 +917,113 @@ impl Ctl {
                             TryEmit::Queued => {}
                             // Not queued, so nothing is logged twice on the
                             // retry; the slice stays fenced until then.
-                            TryEmit::Full | TryEmit::Disconnected => return false,
+                            TryEmit::Full | TryEmit::Disconnected => return Start::Retry,
                         }
                     } else {
                         self.audit.emit(ev);
                     }
                 }
                 st.set_slice_state(j.slice, SliceState::Active);
+                self.finish(j);
+                Start::Done
             }
             Some(state) => {
-                let input = j.input.take().unwrap_or_else(|| match (j.prev_owner, &self.sh.repl) {
-                    (Some(_), Some(r)) => r.lock().take(j.slice),
+                let src = match (j.prev_owner, &self.sh.repl) {
+                    (Some(_), Some(r)) => AdoptSource::Detached(r.lock().detach(j.slice)),
                     // Fenced here, but the view chain broke (no previous
                     // owner known): another member may have served it in a
                     // view this node missed. The local state is not known
                     // to be current: hold back every block not adopted.
                     (None, _) if state == SliceState::Fenced => {
-                        AdoptInput { in_sync: false, hold_unknown: true, ..AdoptInput::default() }
+                        AdoptSource::Input(AdoptInput { in_sync: false, hold_unknown: true, ..AdoptInput::default() })
                     }
                     // Nobody owned it: nothing to inherit, complete.
-                    _ => AdoptInput { in_sync: true, ..AdoptInput::default() },
-                });
+                    _ => AdoptSource::Input(AdoptInput { in_sync: true, ..AdoptInput::default() }),
+                };
                 let meta = AdoptMeta { epoch: j.epoch, prev_owner: j.prev_owner, reason: areason };
-                match st.adopt_slice(j.slice, &input, meta) {
-                    Ok(s) => tracing::info!(
-                        slice = j.slice,
-                        reason = areason.as_str(),
-                        blocks = s.blocks_adopted,
-                        bibs = s.bibs_adopted,
-                        held = s.blocks_held,
-                        "slice acquired"
-                    ),
-                    Err(AdoptError::AuditUnavailable) => {
-                        j.input = Some(input);
-                        return false;
-                    }
-                    Err(AdoptError::Active) => return true,
+                match st.adopt_begin(j.slice, src, meta) {
+                    Ok(a) => Start::Adopting(Box::new(a)),
+                    Err(AdoptError::Active) => Start::Done,
                     Err(e) => {
                         tracing::error!(slice = j.slice, "adopt: {e:?}");
-                        return true;
+                        Start::Done
                     }
                 }
             }
         }
-        if let Some(d) = st.directory() {
+    }
+
+    /// One bounded step of the adoption (or abandon) in progress, until
+    /// `deadline`; the next pending job starts when it ends.
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: CP-10, SC-5(2) - heartbeats and lease renewals run
+    ///   between steps, so a large takeover cannot cost this node its own
+    ///   lease (POAM-047)
+    /// - NIST 800-53: AU-12, AU-5 - the slice goes Active in the step that
+    ///   queued its last record; a full queue under `refuse_new_bindings`
+    ///   pauses the cursor until the next tick
+    fn step(&mut self, deadline: Instant) {
+        let Some(nat) = self.sh.nat.clone() else {
+            self.cur = None;
+            return;
+        };
+        let st = nat.state();
+        let t = Instant::now();
+        let mut ended = false;
+        self.cur = match self.cur.take() {
+            Some(Cur::Adopt(j, mut a)) => match st.adopt_step(&mut a, deadline) {
+                Ok(Step::More) => Some(Cur::Adopt(j, a)),
+                Ok(Step::Done(s)) => {
+                    tracing::info!(
+                        slice = j.slice,
+                        reason = a.meta().reason.as_str(),
+                        blocks = s.blocks_adopted,
+                        bibs = s.bibs_adopted,
+                        held = s.blocks_held,
+                        "slice acquired"
+                    );
+                    self.finish(&j);
+                    ended = true;
+                    None
+                }
+                Err(AdoptError::AuditUnavailable) => {
+                    self.cur_blocked = true;
+                    Some(Cur::Adopt(j, a))
+                }
+                Err(e) => {
+                    tracing::warn!(slice = j.slice, phase = a.phase(), "adoption abandoned: {e:?}");
+                    if let Some(c) = self.sh.adopt.abandoned.get(ABANDON_EPOCH) {
+                        c.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Some(Cur::Abandon(a, None))
+                }
+            },
+            Some(Cur::Abandon(mut a, why)) => {
+                if st.adopt_abandon(&mut a, deadline, why) {
+                    ended = true;
+                    None
+                } else {
+                    Some(Cur::Abandon(a, why))
+                }
+            }
+            None => None,
+        };
+        self.sh.adopt.step(t.elapsed());
+        if ended {
+            self.run_pending();
+            self.refresh();
+        }
+        self.sh.adopt.adopting.store(u64::from(self.cur.is_some()), Ordering::Relaxed);
+    }
+
+    /// After the slice of `j` is Active: directory, homes, announce hook,
+    /// `HandoverDone`, counters.
+    fn finish(&self, j: &Job) {
+        let Some(nat) = self.sh.nat.as_ref() else { return };
+        let me = self.sh.me;
+        let areason = audit_acquire(j.reason, j.manual);
+        if let Some(d) = nat.state().directory() {
             d.rehome_slice(j.slice, me, me);
         }
         // B-9: peers learn the adopted subscribers' new home.
@@ -802,15 +1039,36 @@ impl Ctl {
         if let Some(c) = self.sh.takeovers.get(takeover_ix(areason)) {
             c.fetch_add(1, Ordering::Relaxed);
         }
-        true
     }
 
     /// Fence first, then audit, withdraw, and hand state over or drop it.
+    ///
+    /// A slice still being adopted is abandoned instead (SC-24): it never
+    /// served, so it is not fenced (an abandoned adoption ends Inactive),
+    /// and a handover of it sends nothing: no flush, no `HandoverFence`,
+    /// no `HandoverDone`; the requester waits `safe` as for any
+    /// unconfirmed handover.
     fn release(&mut self, slice: SliceId, epoch: u64, new_owner: Option<MemberId>, reason: ReleaseReason) {
         self.pending.retain(|j| j.slice != slice);
         let Some(nat) = self.sh.nat.clone() else { return };
         let st = nat.state();
-        st.fence_slice(slice);
+        let adopting = self.cur.as_ref().is_some_and(|c| c.slice() == slice);
+        if adopting {
+            // Already abandoning: the cleanup goes on as it is.
+            if let Some(Cur::Adopt(j, mut a)) = self.cur.take_if(|c| matches!(c, Cur::Adopt(..))) {
+                tracing::warn!(slice, phase = a.phase(), reason = ?reason, epoch = j.epoch, "adoption abandoned");
+                if !keeps_shadow(reason, new_owner, self.sh.me) {
+                    a.discard_shadow();
+                }
+                if let Some(c) = self.sh.adopt.abandoned.get(abandon_ix(reason)) {
+                    c.fetch_add(1, Ordering::Relaxed);
+                }
+                let why = (reason == ReleaseReason::Handover).then_some(BlockReleaseReason::Handover);
+                self.cur = Some(Cur::Abandon(a, why));
+            }
+        } else {
+            st.fence_slice(slice);
+        }
         if let Some(c) = self.sh.map.as_ref().and_then(|m| m.cidr(slice)) {
             self.audit.emit(Event::ClusterSliceRelease {
                 ts_us: Clock::wall_us(),
@@ -823,6 +1081,7 @@ impl Ctl {
         self.hook(plat_audit::HookKind::Withdraw, slice, epoch, audit_release(reason).as_str());
         let me = self.sh.me;
         match reason {
+            _ if adopting => {}
             ReleaseReason::Handover => self.hand_over(slice, epoch, new_owner),
             ReleaseReason::Fenced | ReleaseReason::LeaseLost | ReleaseReason::Shutdown => {
                 // Given to another member: end the attribution intervals
@@ -971,7 +1230,11 @@ impl Ctl {
         let tick = Duration::from_millis(self.m.tick_interval_ms());
         let mut next = Instant::now();
         while !stop.load(Ordering::Relaxed) {
-            match rx.recv_timeout(next.saturating_duration_since(Instant::now())) {
+            // While adopting, poll: one message (if any), the tick when due,
+            // then one bounded adoption step (POAM-047).
+            let stepping = self.cur.is_some() && !self.cur_blocked;
+            let wait = if stepping { Duration::ZERO } else { next.saturating_duration_since(Instant::now()) };
+            match rx.recv_timeout(wait) {
                 Ok(In::Msg(from, msg)) => {
                     let a = self.m.on_msg(mono_ms(), from, &msg);
                     self.exec(a);
@@ -989,6 +1252,12 @@ impl Ctl {
                 self.exec(a);
                 self.member_states();
                 self.sync_status();
+                self.cur_blocked = false;
+            }
+            if self.cur.is_some() && !self.cur_blocked {
+                // Never past the next tick: the stall between two ticks is
+                // at most one step (ADOPT_STEP_BUDGET plus one batch).
+                self.step((Instant::now() + ADOPT_STEP_BUDGET).min(next));
             }
         }
         if !killed.load(Ordering::Relaxed) {
@@ -1005,13 +1274,47 @@ impl Ctl {
         // POAM: POAM-030 - plat-cluster has no leave message: the backups
         // take over when the leader drops this silent node (about
         // lease * (1 + margin)), not by a leader-coordinated handover view.
+        // A partial slice is undone before anything is handed over: it
+        // never served, so it is released without a handover of its own.
+        let mut abandoned = None;
+        if let Some(c) = self.cur.take()
+            && let Some(nat) = self.sh.nat.clone()
+        {
+            abandoned = Some(c.slice());
+            let (mut a, why) = match c {
+                Cur::Adopt(_, a) => {
+                    if let Some(x) = self.sh.adopt.abandoned.get(abandon_ix(ReleaseReason::Shutdown)) {
+                        x.fetch_add(1, Ordering::Relaxed);
+                    }
+                    (a, None)
+                }
+                Cur::Abandon(a, why) => (a, why),
+            };
+            a.discard_shadow();
+            nat.state().adopt_abandon_all(&mut a, why);
+            self.sh.adopt.adopting.store(0, Ordering::Relaxed);
+        }
+        self.pending.clear();
         let now = mono_ms();
         let actions = self.m.shutdown(now);
         let mut handed = false;
         for a in actions {
             let Action::Release { slice, epoch, reason, .. } = a else { continue };
             let backup = self.sh.repl.as_ref().and_then(|r| r.lock().in_sync_target(slice));
-            if self.auto_failover && backup.is_some() {
+            let how = shutdown_release(slice, abandoned, self.auto_failover, backup);
+            if how == ShutdownRelease::NeverServed {
+                if let Some(c) = self.sh.map.as_ref().and_then(|m| m.cidr(slice)) {
+                    self.audit.emit(Event::ClusterSliceRelease {
+                        ts_us: Clock::wall_us(),
+                        slice: slice_cidr(c),
+                        epoch,
+                        new_owner: None,
+                        reason: SliceReleaseReason::Shutdown,
+                    });
+                }
+                self.hook(plat_audit::HookKind::Withdraw, slice, epoch, "shutdown");
+            } else if let ShutdownRelease::HandOver(backup) = how {
+                let backup = Some(backup);
                 let Some(nat) = self.sh.nat.clone() else { continue };
                 nat.state().fence_slice(slice);
                 if let Some(c) = self.sh.map.as_ref().and_then(|m| m.cidr(slice)) {
@@ -1192,6 +1495,7 @@ pub fn launch(core: Core) -> Result<ClusterHandle, String> {
         takeovers: Default::default(),
         handovers: AtomicU64::new(0),
         persist_failures: AtomicU64::new(0),
+        adopt: AdoptMetrics::default(),
         hook_stats: core.hooks.as_ref().map(|h| h.stats.clone()),
         ctl: tx.clone(),
         audit: core.audit.clone(),
@@ -1214,6 +1518,8 @@ pub fn launch(core: Core) -> Result<ClusterHandle, String> {
         audit: core.audit,
         hooks: core.hooks,
         pending: Vec::new(),
+        cur: None,
+        cur_blocked: false,
         max_handovers: core.max_handovers.max(1),
         auto_failover: core.mcfg.auto_failover,
         shutdown_ms: core.shutdown_ms,
@@ -1514,7 +1820,46 @@ pub fn cli_request(state_dir: &Path, line: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod metric_tests {
-    use super::{ElectionStats, render_election};
+    use super::{
+        ElectionStats, ReleaseReason, ShutdownRelease, SliceState, keeps_shadow, render_election, runs_ahead,
+        shutdown_release,
+    };
+
+    /// F1: the detached state goes back to the shadow only when the slice
+    /// went to nobody else.
+    #[test]
+    fn abandon_keeps_the_shadow_only_without_another_owner() {
+        assert!(keeps_shadow(ReleaseReason::LeaseLost, None, 1));
+        assert!(keeps_shadow(ReleaseReason::Fenced, Some(1), 1));
+        assert!(!keeps_shadow(ReleaseReason::LeaseLost, Some(2), 1));
+        assert!(!keeps_shadow(ReleaseReason::Fenced, Some(2), 1));
+        assert!(!keeps_shadow(ReleaseReason::Handover, None, 1));
+        assert!(!keeps_shadow(ReleaseReason::Shutdown, None, 1));
+    }
+
+    /// F3: a regain of this node's complete fenced slice (and a job with
+    /// nothing to do) runs ahead of the adoption in progress; imports wait.
+    #[test]
+    fn no_import_jobs_run_ahead_of_the_cursor() {
+        assert!(runs_ahead(Some(SliceState::Fenced), Some(1), 1));
+        assert!(runs_ahead(Some(SliceState::Active), Some(2), 1));
+        assert!(runs_ahead(None, None, 1));
+        assert!(!runs_ahead(Some(SliceState::Fenced), Some(2), 1));
+        assert!(!runs_ahead(Some(SliceState::Fenced), None, 1));
+        assert!(!runs_ahead(Some(SliceState::Inactive), Some(1), 1));
+        assert!(!runs_ahead(Some(SliceState::Adopting), Some(1), 1));
+    }
+
+    /// F5: at shutdown the slice whose adoption was just abandoned is never
+    /// handed over (no `HandoverFence`), even with an in-sync backup.
+    #[test]
+    fn shutdown_never_hands_over_an_abandoned_slice() {
+        assert_eq!(shutdown_release(3, Some(3), true, Some(2)), ShutdownRelease::NeverServed);
+        assert_eq!(shutdown_release(3, Some(3), false, None), ShutdownRelease::NeverServed);
+        assert_eq!(shutdown_release(4, Some(3), true, Some(2)), ShutdownRelease::HandOver(2));
+        assert_eq!(shutdown_release(4, Some(3), false, Some(2)), ShutdownRelease::Release);
+        assert_eq!(shutdown_release(4, None, true, None), ShutdownRelease::Release);
+    }
 
     /// SI-4: the election counters render under their documented names.
     #[test]

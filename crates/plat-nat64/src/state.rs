@@ -8,9 +8,7 @@ use std::time::{Duration, Instant};
 use ahash::RandomState;
 use crossbeam_utils::CachePadded;
 use parking_lot::MutexGuard;
-use plat_audit::{
-    AcquireReason, AuditSink, BlockAdopt, BlockReleaseReason, Event, LimitKind, SliceAcquire, SliceCidr, TryEmit,
-};
+use plat_audit::{AcquireReason, AuditSink, BlockReleaseReason, Event, LimitKind, TryEmit};
 use plat_cluster::{MemberId, SliceId, SliceMap, SnapRecord, WireBib, WireBlock};
 use plat_common::config::{AuditMode, Config, Filtering, OverflowPolicy, SteeringMode};
 use plat_common::{Clock, Counter, Counters, DropReason, Ipv4Cidr, Ipv6Cidr};
@@ -24,11 +22,19 @@ use crate::repl::{AdoptInput, Directory, ReplProducer, ReplRecord};
 use crate::shard::{Map, Sharded, lower_due};
 use crate::tcp::{self, Side, TcpState, Timer};
 
+#[path = "adopt.rs"]
+mod adopt;
+pub use adopt::{ADOPT_BATCH, ADOPT_STEP_BUDGET, ADOPT_STEP_MAX_ITEMS, AdoptSource, Adoption, Step};
+use adopt::{Budget, Emit, Walk};
+
 /// An empty port block is kept this long before returning to the pool, so
 /// short-lived flows do not churn allocate/release records.
 pub const BLOCK_LINGER_MS: u64 = 60_000;
 /// An empty BIB is kept for at least this long (avoids racing a session insert).
 pub const BIB_GRACE_MS: u64 = 2_000;
+/// The sweeper looks again this soon at a block or BIB it would expire but
+/// keeps because its slice is still being adopted.
+const ADOPTING_RECHECK_MS: u64 = 1_000;
 
 /// IPv6 transport address. `proto` uses IPv4 numbering (6, 17, 1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -419,19 +425,12 @@ struct ClusterCtx {
     directory: Arc<Directory>,
     tcp_adopt_ms: u64,
     quarantine_ms: u64,
-    /// Audit records already queued by an adoption that was refused part
-    /// way (`AuditUnavailable`), per slice: a retry with the same epoch
-    /// skips them, so each record is queued exactly once (NIST-004).
-    /// Control thread only; at most one entry per slice (SC-5).
-    adopt_log: parking_lot::Mutex<Map<SliceId, AdoptLog>>,
-}
-
-/// Progress of one adoption's audit records (see `ClusterCtx::adopt_log`).
-#[derive(Debug)]
-struct AdoptLog {
-    epoch: u64,
-    acquire: bool,
-    blocks: std::collections::HashSet<BlockRef, RandomState>,
+    /// Cursor of an [`State::adopt_slice`] refused part way
+    /// (`AuditUnavailable`), per slice: the retry resumes it, so each
+    /// record is queued exactly once (NIST-004). Only the run-to-completion
+    /// wrapper uses it (platd keeps its own cursor); at most one entry per
+    /// slice (SC-5).
+    adopt_stash: parking_lot::Mutex<Map<SliceId, Adoption>>,
 }
 
 #[derive(Debug)]
@@ -716,7 +715,7 @@ impl State {
             directory: setup.directory,
             tcp_adopt_ms: u64::from(setup.tcp_adopt_secs) * 1000,
             quarantine_ms: u64::from(setup.quarantine_secs) * 1000,
-            adopt_log: parking_lot::Mutex::new(Map::with_hasher(RandomState::new())),
+            adopt_stash: parking_lot::Mutex::new(Map::with_hasher(RandomState::new())),
         };
         Ok(Self::build(cfg, pool, Some(Box::new(ctx)), audit, clock))
     }
@@ -2177,7 +2176,12 @@ impl State {
                 (now + BIB_GRACE_MS).max(bib.adopt_until_ms)
             }
             // A session inserted before the removal lowers the hint again.
+            // An imported BIB of a slice still being adopted is kept, as
+            // its blocks are (`sweep_sub`).
             Some(t) if now.saturating_sub(t) >= BIB_GRACE_MS && bib.adopt_until_ms <= now => {
+                if self.pool.index(k4.addr).is_some_and(|i| self.adopting_idx(i)) {
+                    return now + ADOPTING_RECHECK_MS;
+                }
                 dead.push((k4, bib.k6));
                 u64::MAX
             }
@@ -2348,6 +2352,16 @@ impl State {
                 next = next.min(t + BLOCK_LINGER_MS);
                 return true;
             }
+            // COMPLIANCE MAPPING:
+            // - NIST 800-53: AU-12, SC-24 - an imported block of a slice
+            //   still being adopted is kept: its adopt record may not be
+            //   queued yet (the log phase can wait for audit room), so a
+            //   release now would precede it; the adoption or its abandon
+            //   owns the block until the slice is Active
+            if self.adopting_idx(b.r.addr_idx) {
+                next = next.min(now + ADOPTING_RECHECK_MS);
+                return true;
+            }
             let wall = Clock::wall_us();
             let lo = self.pool.port_lo(b.r);
             // COMPLIANCE MAPPING:
@@ -2461,6 +2475,9 @@ pub enum AdoptError {
     /// `refuse_new_bindings` and the audit queue cannot take every acquire
     /// and adopt record: the slice stays Adopting; retry later.
     AuditUnavailable,
+    /// The slice left `Adopting` under the cursor, or the cursor is being
+    /// abandoned: abandon it ([`State::adopt_abandon`]).
+    Interrupted,
 }
 
 /// Result of [`State::release_slice`].
@@ -2512,6 +2529,11 @@ impl State {
         let idx = self.pool.index(w.addr)?;
         (self.pool.slice_of_idx(idx) == Some(s) && w.block < self.pool.blocks_per_addr())
             .then_some(BlockRef { addr_idx: idx, block: w.block })
+    }
+
+    /// Pool index `idx` is in a slice being adopted (sweeper only).
+    fn adopting_idx(&self, idx: u32) -> bool {
+        self.pool.slice_of_idx(idx).and_then(|s| self.pool.slice_state(s)) == Some(SliceState::Adopting)
     }
 
     fn in_slice(&self, s: SliceId, a: u32) -> bool {
@@ -2644,94 +2666,22 @@ impl State {
         if self.pool.slice_state(s) == Some(SliceState::Active) {
             self.pool.set_slice_state(s, SliceState::Fenced);
         }
-        let mut dead: Vec<(Key4, Key6)> = Vec::new();
-        for i in 0..self.bib4.shard_count() {
-            let g = self.bib4.lock_index(i);
-            dead.extend(g.iter().filter(|(k4, _)| self.in_slice(s, k4.addr)).map(|(k4, b)| (*k4, b.k6)));
-        }
-        for (k4, k6) in dead {
-            let removed = {
-                let mut g6 = self.bib6.lock(&k6);
-                let mut g4 = self.bib4.lock(&k4);
-                if g6.get(&k6).is_some_and(|m| m.k4 == k4) {
-                    g6.remove(&k6);
-                }
-                self.bib4.note_removal(&k4);
-                let b = g4.remove(&k4);
-                // The slice is already fenced in the mirror; its entries
-                // also go with their sessions, in this critical section.
-                if let Some(b) = &b {
-                    self.mirror_retire_bib(k4, b);
-                }
-                b
-            };
-            let Some(mut bib) = removed else { continue };
-            // The slice is no longer ours: held SYNs are dropped silently.
-            if bib.held.is_some() {
-                let mut spill = None;
-                self.expire_held(k4, &mut bib, self.clock.now_ms(), true, false, &mut spill);
-            }
-            let n = bib.sessions.len() as u64;
-            self.sessions.fetch_sub(n, Ordering::Relaxed);
-            bib.sub_sessions.fetch_sub(n as u32, Ordering::Relaxed);
-            st.sessions_removed += n;
-            st.bibs_removed += 1;
-            if self.audit_mode == AuditMode::Session {
-                let wall = Clock::wall_us();
-                self.audit.emit(Event::BibDelete {
-                    ts_us: wall,
-                    proto: k6.proto,
-                    v6: k6.addr,
-                    v6_port: k6.port,
-                    v4: k4.addr,
-                    v4_port: k4.port,
-                    held_secs: (wall.saturating_sub(bib.created_wall_us) / 1_000_000) as u32,
-                });
-            }
-        }
-        for i in 0..self.subs.shard_count() {
-            let mut g = self.subs.lock_index(i);
-            let before = g.len();
-            g.retain(|sub, sx| {
-                sx.blocks.retain(|b| {
-                    if self.pool.slice_of_idx(b.r.addr_idx) != Some(s) {
-                        return true;
-                    }
-                    let wall = Clock::wall_us();
-                    let lo = self.pool.port_lo(b.r);
-                    self.audit.emit(Event::PortBlockRelease {
-                        ts_us: wall,
-                        sub: *sub,
-                        sub_len: self.sub_len,
-                        v4: self.pool.addr(b.r.addr_idx),
-                        port_lo: lo,
-                        port_hi: lo + (self.pool.block_size() - 1),
-                        held_secs: (wall.saturating_sub(b.wall_us) / 1_000_000) as u32,
-                        reason,
-                    });
-                    st.blocks_released += 1;
-                    false
-                });
-                let keep = !sx.blocks.is_empty() || sx.sessions.load(Ordering::Relaxed) > 0;
-                if !keep {
-                    self.sub_count.fetch_sub(1, Ordering::Relaxed);
-                    self.agg_release(*sub);
-                    st.subscribers_removed += 1;
-                }
-                keep
-            });
-            if g.len() != before {
-                self.subs.note_removal_index(i);
-            }
-        }
+        // POAM: POAM-048 an Active slice's release still walks every
+        // `bib4` shard of the node in one call on the control thread; only
+        // adoption (and its abandon) is chunked.
+        self.walk_slice(s, &mut Walk::default(), &mut Budget::unbounded(), &Emit::All, reason, &mut st);
         self.pool.reset_slice(s, &[], &[], &[]);
         st
     }
 
-    /// Takes over slice `s` from replicated state: queues
+    /// Takes over slice `s` from replicated state in one call (tests,
+    /// bench; platd steps an [`Adoption`] instead, see `adopt.rs`): imports
+    /// the blocks and BIBs (no sessions) into the not-yet-Active slice,
+    /// holds back blocks whose fate is unknown, queues
     /// `cluster_slice_acquire` and one `nat_port_block_adopt` per adopted
-    /// block, imports the blocks and BIBs (no sessions), holds back blocks
-    /// whose fate is unknown, and only then sets the slice Active.
+    /// block, and only then sets the slice Active. A call refused with
+    /// `AuditUnavailable` keeps its cursor; the next call for `s` resumes
+    /// it (its `input` is then not used).
     ///
     /// Blocks reserved with the backup but never seen allocated, blocks
     /// over a subscriber limit, and (with `hold_unknown`) every block not
@@ -2752,264 +2702,25 @@ impl State {
     ///   reused before the hold-back ends
     pub fn adopt_slice(&self, s: SliceId, input: &AdoptInput, meta: AdoptMeta) -> Result<AdoptStats, AdoptError> {
         let Some(c) = &self.cluster else { return Err(AdoptError::NotSliced) };
-        let state = self.pool.slice_state(s).ok_or(AdoptError::BadSlice)?;
-        if state == SliceState::Active {
-            return Err(AdoptError::Active);
-        }
-        let cidr = c.slices.cidr(s).ok_or(AdoptError::BadSlice)?;
-        self.pool.set_slice_state(s, SliceState::Adopting);
-        let mut st = AdoptStats { stale: self.release_slice(s, None), ..AdoptStats::default() };
-        let now = self.clock.now_ms();
-
-        // Plan: validate everything before any record is queued.
-        let mut owner: Map<BlockRef, (u128, u64)> = Map::with_hasher(self.hasher.clone());
-        for &(sub, w, wall) in &input.blocks {
-            match self.block_ref(s, w) {
-                Some(r) if sub & self.sub_mask == sub && !owner.contains_key(&r) => {
-                    owner.insert(r, (sub, wall));
-                }
-                _ => st.rejected += 1,
+        let stashed = c.adopt_stash.lock().remove(&s);
+        let mut a = match stashed {
+            Some(mut a) if self.pool.slice_state(s) == Some(SliceState::Adopting) => {
+                a.rebase(meta);
+                a
             }
-        }
-        let mut held: Vec<(u64, BlockRef)> = Vec::new();
-        let hold_until = now + c.quarantine_ms;
-        // Per-subscriber block limit and subscriber-table bound (SC-5).
-        let mut per_sub: Map<u128, Vec<BlockRef>> = Map::with_hasher(self.hasher.clone());
-        let mut refs: Vec<BlockRef> = owner.keys().copied().collect();
-        refs.sort_unstable_by_key(|r| (r.addr_idx, r.block));
-        for r in refs {
-            if let Some(&(sub, _)) = owner.get(&r) {
-                per_sub.entry(sub).or_default().push(r);
-            }
-        }
-        let mut new_subs = 0u64;
-        // New subscribers planned per aggregate (POAM-013); bounded by the
-        // input like `per_sub`.
-        let mut new_per_agg: Map<u128, u32> = Map::with_hasher(self.hasher.clone());
-        for (sub, blocks) in per_sub.iter_mut() {
-            let (have, exists) = {
-                let g = self.subs.lock(sub);
-                g.get(sub).map_or((0, false), |x| (x.blocks.len(), true))
-            };
-            let agg = *sub & self.agg_mask;
-            let agg_room = || {
-                let planned = new_per_agg.get(&agg).copied().unwrap_or(0);
-                self.aggregate_count(*sub).saturating_add(planned) < self.max_per_agg
-            };
-            let room = if exists || (self.sub_count.load(Ordering::Relaxed) + new_subs < self.max_subs && agg_room()) {
-                usize::from(self.max_blocks).saturating_sub(have)
-            } else {
-                0
-            };
-            if !exists && room > 0 {
-                new_subs += 1;
-                *new_per_agg.entry(agg).or_insert(0) += 1;
-            }
-            for r in blocks.drain(room.min(blocks.len())..) {
-                owner.remove(&r);
-                held.push((hold_until, r));
-            }
-        }
-        let mut bibs: Vec<(Key6, Key4, &WireBib)> = Vec::new();
-        let mut seen6: Map<Key6, ()> = Map::with_hasher(self.hasher.clone());
-        let mut seen4: Map<Key4, ()> = Map::with_hasher(self.hasher.clone());
-        for b in &input.bibs {
-            let k6 = Key6 { proto: b.proto, addr: b.v6, port: b.port6 };
-            let k4 = Key4 { proto: b.proto, addr: b.v4, port: b.port4 };
-            let ok = matches!(b.proto, proto::TCP | proto::UDP | proto::ICMP)
-                && b.v6 & self.sub_mask == b.sub
-                && self.pool.index(b.v4).and_then(|i| self.pool.block_of(i, b.port4)).is_some_and(|r| {
-                    self.pool.slice_of_idx(r.addr_idx) == Some(s) && owner.get(&r).is_some_and(|o| o.0 == b.sub)
-                })
-                && seen6.insert(k6, ()).is_none()
-                && seen4.insert(k4, ()).is_none();
-            if ok {
-                bibs.push((k6, k4, b));
-            } else {
-                st.rejected += 1;
-            }
-        }
-        for w in &input.reserved_unseen {
-            if let Some(r) = self.block_ref(s, *w)
-                && !owner.contains_key(&r)
-            {
-                held.push((hold_until, r));
-            }
-        }
-        let mut cooling: Vec<(u64, BlockRef)> = Vec::new();
-        for &(w, age) in &input.released {
-            if let Some(r) = self.block_ref(s, w)
-                && !owner.contains_key(&r)
-            {
-                cooling.push((now + self.cooldown_ms.saturating_sub(age), r));
-            }
-        }
-        if input.hold_unknown
-            && let Some((lo, hi)) = self.pool.slice_range(s)
-        {
-            let mut known: std::collections::HashSet<BlockRef, RandomState> =
-                std::collections::HashSet::with_hasher(self.hasher.clone());
-            known.extend(owner.keys().copied());
-            known.extend(held.iter().map(|h| h.1));
-            known.extend(cooling.iter().map(|h| h.1));
-            for idx in lo..hi {
-                for block in 0..self.pool.blocks_per_addr() {
-                    let r = BlockRef { addr_idx: idx, block };
-                    if !known.contains(&r) {
-                        held.push((hold_until, r));
-                    }
-                }
-            }
-        }
-        st.blocks_adopted = owner.len() as u32;
-        st.bibs_adopted = bibs.len() as u64;
-        st.blocks_held = held.len() as u32;
-        st.blocks_cooling = cooling.len() as u32;
-
-        // Log before use. A retry of a partly logged adoption (same epoch)
-        // skips the records already queued; another epoch starts afresh.
-        let mut logs = c.adopt_log.lock();
-        let log = logs.entry(s).or_insert_with(|| AdoptLog {
-            epoch: meta.epoch,
-            acquire: false,
-            blocks: std::collections::HashSet::with_hasher(RandomState::new()),
-        });
-        if log.epoch != meta.epoch {
-            *log = AdoptLog {
-                epoch: meta.epoch,
-                acquire: false,
-                blocks: std::collections::HashSet::with_hasher(RandomState::new()),
-            };
-        }
-        let todo = owner.keys().filter(|r| !log.blocks.contains(*r)).count() + usize::from(!log.acquire);
-        if self.refuse_on_overflow
-            && (!self.audit.has_room() || self.audit.capacity().saturating_sub(self.audit.queued()) < todo)
-        {
-            return Err(AdoptError::AuditUnavailable);
-        }
-        let wall = Clock::wall_us();
-        let acquire = SliceAcquire {
-            slice: SliceCidr { net: cidr.network(), len: cidr.prefix_len() },
-            epoch: meta.epoch,
-            prev_owner: meta.prev_owner,
-            reason: meta.reason,
-            blocks_adopted: st.blocks_adopted,
-            bibs_adopted: st.bibs_adopted,
-            blocks_quarantined: st.blocks_held,
-            in_sync: input.in_sync,
+            _ => self.adopt_begin(s, AdoptSource::Input(input.clone()), meta)?,
         };
-        if !log.acquire {
-            if !self.adopt_emit(Event::ClusterSliceAcquire { ts_us: wall, acquire: Arc::new(acquire) }) {
-                return Err(AdoptError::AuditUnavailable);
-            }
-            log.acquire = true;
-        }
-        let size = self.pool.block_size();
-        let mut adopted: Vec<(BlockRef, u128, u64)> = owner.iter().map(|(r, &(sub, w))| (*r, sub, w)).collect();
-        adopted.sort_unstable_by_key(|a| (a.0.addr_idx, a.0.block));
-        for &(r, sub, alloc_wall) in &adopted {
-            if log.blocks.contains(&r) {
-                continue;
-            }
-            let lo = self.pool.port_lo(r);
-            let rec = BlockAdopt {
-                sub,
-                sub_len: self.sub_len,
-                v4: self.pool.addr(r.addr_idx),
-                port_lo: lo,
-                port_hi: lo + (size - 1),
-                allocated_us: alloc_wall,
-                prev_owner: meta.prev_owner,
-                epoch: meta.epoch,
-            };
-            if !self.adopt_emit(Event::PortBlockAdopt { ts_us: wall, adopt: Arc::new(rec) }) {
-                return Err(AdoptError::AuditUnavailable);
-            }
-            log.blocks.insert(r);
-        }
-        // Every record is queued: the next adoption of `s` logs afresh.
-        logs.remove(&s);
-        drop(logs);
-
-        // Import (the slice is not Active: no worker allocates in it).
-        let mut in_use: Vec<BlockRef> = Vec::with_capacity(adopted.len());
-        let mut sessions_of: Map<u128, Arc<AtomicU32>> = Map::with_hasher(self.hasher.clone());
-        for &(r, sub, alloc_wall) in &adopted {
-            let (mut g, due) = self.subs.lock_due(&sub);
-            // An adopted block starts empty (lingering) until a BIB marks it.
-            lower_due(due, now + BLOCK_LINGER_MS);
-            let sx = match g.entry(sub) {
-                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    if self.sub_count.fetch_add(1, Ordering::Relaxed) >= self.max_subs {
-                        // Raced with new subscribers: the record is queued
-                        // but the block cannot be served here; hold it back.
-                        self.sub_count.fetch_sub(1, Ordering::Relaxed);
-                        held.push((hold_until, r));
-                        continue;
-                    }
-                    if !self.agg_acquire(sub) {
-                        // Same race against the aggregate limit (POAM-013).
-                        self.sub_count.fetch_sub(1, Ordering::Relaxed);
-                        held.push((hold_until, r));
-                        continue;
-                    }
-                    e.insert(Subscriber {
-                        blocks: Vec::new(),
-                        sessions: Arc::new(AtomicU32::new(0)),
-                        rng: self.seed.fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed) | 1,
-                    })
+        loop {
+            match self.adopt_run(&mut a, &mut Budget::new(None, ADOPT_STEP_MAX_ITEMS)) {
+                Ok(Step::More) => {}
+                Ok(Step::Done(st)) => return Ok(st),
+                Err(AdoptError::AuditUnavailable) => {
+                    c.adopt_stash.lock().insert(s, a);
+                    return Err(AdoptError::AuditUnavailable);
                 }
-            };
-            sx.blocks.push(Block::new(r, size, alloc_wall, now));
-            sessions_of.insert(sub, sx.sessions.clone());
-            in_use.push(r);
-        }
-        for (k6, k4, b) in bibs {
-            let Some(sub_sessions) = sessions_of.get(&b.sub).cloned() else { continue };
-            let Some(idx) = self.pool.index(k4.addr) else { continue };
-            let until = now + if k4.proto == proto::TCP { c.tcp_adopt_ms } else { self.timeout(k4.proto, None) };
-            let inserted = {
-                let mut g6 = self.bib6.lock(&k6);
-                let (mut g4, due) = self.bib4.lock_due(&k4);
-                if g6.contains_key(&k6) || g4.contains_key(&k4) {
-                    false
-                } else {
-                    lower_due(due, now);
-                    g4.insert(
-                        k4,
-                        Bib {
-                            k6,
-                            sub: b.sub,
-                            created_wall_us: b.created_wall_us,
-                            adopt_until_ms: until,
-                            empty_since: None,
-                            sub_sessions,
-                            sessions: Map::with_hasher(self.hasher.clone()),
-                            remotes: (self.filtering == Filtering::AddressDependent)
-                                .then(|| Box::new(Map::with_hasher(self.hasher.clone()))),
-                            held: None,
-                        },
-                    );
-                    g6.insert(k6, Mapped { k4, idx });
-                    true
-                }
-            };
-            if !inserted {
-                st.bibs_adopted -= 1;
-                st.rejected += 1;
-                continue;
-            }
-            let Some(ai) = self.pool.index(k4.addr) else { continue };
-            let Some(r) = self.pool.block_of(ai, k4.port) else { continue };
-            let mut g = self.subs.lock(&b.sub);
-            if let Some(blk) = g.get_mut(&b.sub).and_then(|sx| sx.blocks.iter_mut().find(|x| x.r == r)) {
-                blk.mark(proto_idx(k4.proto), k4.port - self.pool.port_lo(r));
+                Err(e) => return Err(e),
             }
         }
-        self.pool.reset_slice(s, &in_use, &held, &cooling);
-        self.pool.set_slice_state(s, SliceState::Active);
-        Ok(st)
     }
 
     /// Queues one adoption record. Under `refuse_new_bindings` a full
@@ -3157,107 +2868,5 @@ mod tests {
         CHURN.set(false);
         assert_eq!(st.session_count(), 0, "{cycles} cycles, largest shard {largest}");
         assert!(cycles > 2, "churn broke the snapshots");
-    }
-
-    fn cluster_state() -> (State, crossbeam_channel::Receiver<Event>) {
-        let t = include_str!("../../../config/platd.example.toml")
-            .replace("192.0.2.0/24", "192.0.2.0/30")
-            .replace("allow_non_global_destinations = false", "allow_non_global_destinations = true");
-        let cfg = Config::from_toml(&t).unwrap();
-        let setup = ClusterSetup {
-            slices: SliceMap::new(&cfg.nat64.pool, 32).unwrap(),
-            self_id: 1,
-            steering: SteeringMode::Drop,
-            directory: Arc::new(Directory::new(16, 1000)),
-            tcp_adopt_secs: 300,
-            quarantine_secs: 600,
-            reserve_ahead: 2,
-        };
-        let (sink, rx) = AuditSink::bounded(64);
-        (State::new_cluster(&cfg, setup, sink, Clock::new()).unwrap(), rx)
-    }
-
-    fn input() -> AdoptInput {
-        let sub = 0x2001_0db8_0000_0001_u128 << 64;
-        AdoptInput {
-            blocks: (0..3).map(|b| (sub, WireBlock { addr: 0xc000_0200, block: b }, 1)).collect(),
-            in_sync: true,
-            ..AdoptInput::default()
-        }
-    }
-
-    fn seed(st: &State, epoch: u64, acquire: bool, blocks: &[u16]) {
-        let c = st.cluster.as_ref().unwrap();
-        let mut set = std::collections::HashSet::with_hasher(RandomState::new());
-        set.extend(blocks.iter().map(|&b| BlockRef { addr_idx: 0, block: b }));
-        c.adopt_log.lock().insert(0, AdoptLog { epoch, acquire, blocks: set });
-    }
-
-    fn meta(epoch: u64) -> AdoptMeta {
-        AdoptMeta { epoch, prev_owner: Some(2), reason: AcquireReason::Takeover }
-    }
-
-    /// NIST-004: a retry after an adoption refused part way (the acquire
-    /// and block 0 already queued) queues only the missing records.
-    #[test]
-    fn adopt_retry_queues_each_record_once() {
-        let (st, rx) = cluster_state();
-        seed(&st, 7, true, &[0]);
-        let stats = st.adopt_slice(0, &input(), meta(7)).unwrap();
-        assert_eq!(stats.blocks_adopted, 3);
-        let evs: Vec<_> = rx.try_iter().collect();
-        assert_eq!(evs.len(), 2, "{evs:?}");
-        assert!(evs.iter().all(|e| matches!(e, Event::PortBlockAdopt { .. })));
-        assert!(st.cluster.as_ref().unwrap().adopt_log.lock().is_empty(), "progress cleared on success");
-        assert_eq!(st.slice_state(0), Some(SliceState::Active));
-    }
-
-    /// Progress of another epoch is discarded: a new adoption logs afresh.
-    #[test]
-    fn adopt_log_of_another_epoch_is_ignored() {
-        let (st, rx) = cluster_state();
-        seed(&st, 6, true, &[0, 1]);
-        st.adopt_slice(0, &input(), meta(7)).unwrap();
-        let evs: Vec<_> = rx.try_iter().collect();
-        assert_eq!(evs.len(), 4);
-        assert!(matches!(evs[0], Event::ClusterSliceAcquire { .. }));
-    }
-
-    /// A refused adoption records what it queued; the retry completes it
-    /// with every record exactly once.
-    #[test]
-    fn refused_then_retried_adoption_logs_each_record_once() {
-        let (st, rx) = cluster_state();
-        // Fill the queue so only 2 slots are left: the room check refuses.
-        for _ in 0..62 {
-            assert!(st.audit.emit(Event::ClusterSliceAcquire {
-                ts_us: 0,
-                acquire: Arc::new(SliceAcquire {
-                    slice: SliceCidr { net: 0, len: 32 },
-                    epoch: 0,
-                    prev_owner: None,
-                    reason: AcquireReason::Startup,
-                    blocks_adopted: 0,
-                    bibs_adopted: 0,
-                    blocks_quarantined: 0,
-                    in_sync: true,
-                }),
-            }));
-        }
-        assert_eq!(st.adopt_slice(0, &input(), meta(7)), Err(AdoptError::AuditUnavailable));
-        assert_eq!(rx.try_iter().count(), 62, "nothing of the adoption queued");
-        // Simulate the race the room check cannot close: acquire and block
-        // 1 were queued before the queue filled.
-        seed(&st, 7, true, &[1]);
-        st.adopt_slice(0, &input(), meta(7)).unwrap();
-        let blocks: Vec<u16> = rx
-            .try_iter()
-            .filter_map(|e| match e {
-                Event::PortBlockAdopt { adopt, .. } => Some((adopt.port_lo - 1024) / 512),
-                Event::ClusterSliceAcquire { .. } => panic!("acquire queued twice"),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(blocks, [0, 2]);
     }
 }

@@ -972,7 +972,15 @@ for `nat_port_block_release` (same address and range), `service_stop`,
   `plat_cluster_hook_failures_total{hook}`,
   `plat_cluster_state_persist_failures_total`,
   `plat_cluster_election_rounds_total{result}` (`won`, `timeout`, `yield`),
-  `plat_cluster_heartbeats_expedited_total`, and the per-worker
+  `plat_cluster_heartbeats_expedited_total`; chunked adoption (POAM-047):
+  counter `plat_cluster_adopt_steps_total`, gauges
+  `plat_cluster_adopt_step_seconds_max` (longest step in the last 60 s) and
+  `plat_cluster_adopting_slices` (0 or 1), counter
+  `plat_cluster_adoptions_abandoned_total{reason}` (`lease_lost`,
+  `reassigned`, `handover`, `shutdown`, `epoch`: the slice left `Adopting`
+  under the cursor); these are metrics only, no schema change
+  (`cluster_slice_acquire.bibs_adopted` is still the validated BIB count);
+  and the per-worker
   `plat_cluster_steer_missteered_total`, `plat_cluster_reserve_starved_total`,
   and `plat_pool_paired_exhausted_total` (strict paired pooling refused: the
   subscriber's address is full while other addresses have free blocks).

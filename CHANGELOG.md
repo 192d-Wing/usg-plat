@@ -16,7 +16,23 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
   interoperate; the faster bound holds only once every voter is upgraded.
   POAM-007 (2) stays open (VM takeover trials not re-run).
 
+- Cluster HA (CP-10, SC-5, POAM-047): takeover slice adoption is now a
+  resumable cursor stepped on the cluster ctl thread with a 5 ms budget per
+  step, interleaved with heartbeats. Replicated state is handed over in
+  O(1) (`Replicator::detach`). One importing adoption runs at a time;
+  regains with nothing to import run ahead. An adoption abandoned on lease
+  loss, reassignment, handover or shutdown releases exactly the blocks it
+  already logged (AU-12, AU-5); the slice ends Inactive and no
+  HandoverDone/HandoverFence is sent for a slice that never served. On
+  lease loss with no new owner the replicated state is kept for the regain.
+  No wire, config or log-schema change (`LOG_SCHEMA_VERSION` stays 8);
+  `bibs_adopted` keeps its meaning.
+
 ### Added
+- Metrics `plat_cluster_adopt_steps_total`,
+  `plat_cluster_adopt_step_seconds_max` (60 s window),
+  `plat_cluster_adopting_slices` and
+  `plat_cluster_adoptions_abandoned_total{reason="lease_lost|reassigned|handover|shutdown|epoch"}` (SI-4).
 - Metrics `plat_cluster_election_rounds_total{result="won|timeout|yield"}`
   and `plat_cluster_heartbeats_expedited_total` (SI-4).
 - `adopt_slice` criterion bench in `plat-nat64`, run by `make bench`.
@@ -25,6 +41,19 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
   default.
 - POAM-047: slice adoption can stall the control loop on large slices
   (new, open).
+
+### Fixed
+- Large takeovers no longer stall heartbeats. On one macOS M2 Max host
+  (2 members + witness, heartbeat 100 ms, lease 1 s, 2.56M BIBs) the
+  longest heartbeat gap during takeover fell from 2.79 s (3 views, 16
+  slices released, all Active after 3.9-4.5 s) to about 113 ms (1 view, 0
+  released, all Active after 2.2-2.3 s); at 4M BIBs 113-115 ms, all Active
+  after 2.8-3.1 s. Not measured on Linux VMs.
+
+### Security
+- POAM-047 (adoption stalls the control loop) closed.
+- POAM-048 opened: releasing an Active slice still walks every block in
+  one pass on the ctl thread.
 
 ## [0.4.2] - 2026-11-10
 

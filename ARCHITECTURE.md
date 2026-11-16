@@ -535,8 +535,12 @@ flowchart LR
   Leader crash: simulated bound `B(D, F, k, r)` excluding slice-adoption
   time A (`leader_crash_bound_holds_across_topologies`); ≤ 5 s for 3 data
   members at 10 % drift only for peer delay ≤ 24 ms with A = 50 ms, 4 members
-  only at ≤ 1 % drift, 5+ not. A runs inline on `plat-cluster-ctl` and is
-  not bounded at scale (POAM-047). No VM trials of the new election yet
+  only at ≤ 1 % drift, 5+ not. Adoption is chunked (POAM-047, `plat-nat64/src/adopt.rs`,
+  `Ctl::step`): steps of at most 5 ms between heartbeats, the slice stays
+  `Adopting` until done, one slice at a time; an abandon releases only
+  logged blocks and leaves the slice Inactive. A still grows with slice
+  size (about 1.4 s at 4M BIBs, host only), so the A = 50 ms assumption is
+  not met at scale. Active-slice release is not chunked (POAM-048). No VM trials of the new election yet
   (POAM-007 (2) open).
 
 ## Trust boundaries
