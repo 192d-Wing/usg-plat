@@ -40,6 +40,15 @@ struct Node {
 }
 
 fn node_with(extra: &[(&str, &str)], ring: usize, steering: SteeringMode, id: u16, q: usize) -> Node {
+    node_full(extra, ring, steering, id, q, false)
+}
+
+/// A node with `cluster.ha.session_hints = "tcp"` (`hints`) or `"off"`.
+fn node_h(extra: &[(&str, &str)], id: u16, hints: bool) -> Node {
+    node_full(extra, 1024, SteeringMode::Drop, id, 4096, hints)
+}
+
+fn node_full(extra: &[(&str, &str)], ring: usize, steering: SteeringMode, id: u16, q: usize, hints: bool) -> Node {
     let cfg = config(extra);
     let slices = SliceMap::new(&cfg.nat64.pool, 32).unwrap();
     assert_eq!(slices.len(), 4);
@@ -50,6 +59,7 @@ fn node_with(extra: &[(&str, &str)], ring: usize, steering: SteeringMode, id: u1
         steering,
         directory: dir.clone(),
         tcp_adopt_secs: 300,
+        session_hints: hints,
         quarantine_secs: 600,
         reserve_ahead: 2,
     };
@@ -664,6 +674,7 @@ fn paired_subscribers_under_connection_load_get_reserved_blocks() {
         steering: SteeringMode::Drop,
         directory: Arc::new(Directory::new(16, 1000)),
         tcp_adopt_secs: 300,
+        session_hints: false,
         quarantine_secs: 600,
         reserve_ahead: 1,
     };
@@ -1519,4 +1530,954 @@ fn full_queue_pauses_release_and_blocks_stay_out_of_the_pool() {
     assert_eq!(got, want, "each block's record queued exactly once");
     assert_eq!(a.fx.nat.state().audit().stats().lost.load(std::sync::atomic::Ordering::Relaxed), lost0);
     assert_eq!(a.fx.nat.state().slice_state(slice), Some(SliceState::Inactive));
+}
+
+// ------------------------------------------------------------ session hints
+
+fn hints_of(recs: &[ReplRecord]) -> Vec<ReplRecord> {
+    recs.iter().copied().filter(|r| matches!(r, ReplRecord::SessHint { .. })).collect()
+}
+
+/// TCP handshake from subscriber `n` port `port` to `SERVER:443`; returns
+/// the IPv4 side of the mapping.
+fn establish(a: &mut Node, n: u16, port: u16) -> (u32, u16) {
+    let s = sub(n, 1);
+    let o = run(&mut a.fx, &tcp6(s, port, SERVER, 443, SYN)).unwrap();
+    let (v4, p4) = tuple4(&o);
+    run(&mut a.fx, &tcp4(SERVER, 443, v4, p4, SYN | ACK)).unwrap();
+    run(&mut a.fx, &tcp6(s, port, SERVER, 443, ACK)).unwrap();
+    (v4, p4)
+}
+
+/// Streams `a`'s ring into a fresh shadow; every slice in sync, hinted as
+/// given (the primary's `SnapshotEnd.hints`).
+fn stream_shadow(a: &Node, hinted: bool) -> Shadow {
+    let shadow = shadow_for(a);
+    for r in drain(a) {
+        shadow.apply(&r, 0).unwrap();
+    }
+    for x in 0..4 {
+        shadow.snapshot_end_hinted(x, hinted).unwrap();
+    }
+    shadow
+}
+
+/// CP-10, SC-5: a hint is emitted once per connection, when it first
+/// becomes ESTABLISHED; ACK traffic and TRANS → ESTABLISHED never emit.
+#[test]
+fn hint_emitted_once_on_establish() {
+    let mut a = node_h(&[], 0, true);
+    start_all(&a);
+    let _ = drain(&a);
+    let (v4, p4) = establish(&mut a, 1, 4000);
+    let s = sub(1, 1);
+    for _ in 0..5 {
+        run(&mut a.fx, &tcp6(s, 4000, SERVER, 443, ACK)).unwrap();
+        run(&mut a.fx, &tcp4(SERVER, 443, v4, p4, ACK)).unwrap();
+    }
+    let h = hints_of(&drain(&a));
+    let slice = (v4 & 3) as u16;
+    assert_eq!(h, vec![ReplRecord::SessHint { slice, v4, port4: p4, raddr: SERVER, rport: 443 }]);
+    // RST then ACK: TRANS → ESTABLISHED, no new hint (T3).
+    run(&mut a.fx, &tcp4(SERVER, 443, v4, p4, RST | ACK)).unwrap();
+    run(&mut a.fx, &tcp6(s, 4000, SERVER, 443, ACK)).unwrap();
+    run(&mut a.fx, &tcp4(SERVER, 443, v4, p4, ACK)).unwrap();
+    assert!(hints_of(&drain(&a)).is_empty());
+    // UDP never emits.
+    run(&mut a.fx, &udp6(s, 5000, SERVER, 53, b"q")).unwrap();
+    assert!(hints_of(&drain(&a)).is_empty());
+}
+
+/// Off mode is today: no hint reaches the ring, no `Sess` is exported.
+#[test]
+fn off_mode_emits_and_exports_no_hints() {
+    let mut a = node_h(&[], 0, false);
+    start_all(&a);
+    let _ = drain(&a);
+    let (v4, _) = establish(&mut a, 1, 4000);
+    assert!(hints_of(&drain(&a)).is_empty());
+    let (recs, _) = a.fx.nat.state().export_slice((v4 & 3) as u16, ExportCursor::default(), 1 << 20);
+    assert!(!recs.iter().any(|r| matches!(r, SnapRecord::Sess(_))));
+    assert!(!a.fx.nat.state().strict_tcp((v4 & 3) as u16));
+}
+
+/// The snapshot carries ESTABLISHED sessions only, each right after its BIB.
+#[test]
+fn export_includes_established_only() {
+    let mut a = node_h(&[], 0, true);
+    start_all(&a);
+    let (v4, p4) = establish(&mut a, 1, 4000);
+    // Same BIB, a second remote left in V6 INIT (no answer).
+    run(&mut a.fx, &tcp6(sub(1, 1), 4000, SERVER + 1, 443, SYN)).unwrap();
+    let (recs, _) = a.fx.nat.state().export_slice((v4 & 3) as u16, ExportCursor::default(), 1 << 20);
+    let i = recs.iter().position(|r| matches!(r, SnapRecord::Bib(b) if b.v4 == v4 && b.port4 == p4)).unwrap();
+    let sess: Vec<_> = recs.iter().filter(|r| matches!(r, SnapRecord::Sess(_))).collect();
+    assert_eq!(sess.len(), 1);
+    assert_eq!(
+        recs.get(i + 1),
+        Some(&SnapRecord::Sess(plat_cluster::WireHint { proto: 6, v4, port4: p4, raddr: SERVER, rport: 443 }))
+    );
+}
+
+/// CP-10, SC-7(5): after an in-sync, hinted takeover a restored session
+/// accepts the server's packet first under ADF (and APDF); other remotes
+/// stay filtered; un-hinted non-SYN outbound segments are refused
+/// (RFC 6146 §3.5.2.2 strict again).
+#[test]
+fn hinted_tcp_session_accepts_inbound_first_after_takeover() {
+    for filtering in ["address_dependent", "address_port_dependent"] {
+        let f = ("filtering = \"address_dependent\"", &*format!("filtering = \"{filtering}\""));
+        let mut a = node_h(&[f], 0, true);
+        start_all(&a);
+        let (v4, p4) = establish(&mut a, 1, 4000);
+        // A second TCP BIB that never reached ESTABLISHED.
+        let o = run(&mut a.fx, &tcp6(sub(1, 1), 4001, SERVER, 443, SYN)).unwrap();
+        let (v4b, p4b) = tuple4(&o);
+        let shadow = stream_shadow(&a, true);
+        assert_eq!(shadow.hint_count((v4 & 3) as u16), 1);
+        let mut b = node_h(&[f], 1, true);
+        let slice = (v4 & 3) as u16;
+        let input = shadow.take(slice, 0);
+        assert!(input.hinted && input.in_sync);
+        let st = b.fx.nat.state().adopt_slice(slice, &input, meta(AcquireReason::Takeover)).unwrap();
+        assert_eq!((st.sessions_restored, st.sessions_refused.total()), (1, 0), "{filtering}");
+        assert!(b.fx.nat.state().strict_tcp(slice));
+        let _ = events(&b.fx);
+        // Server speaks first.
+        let o = run(&mut b.fx, &tcp4(SERVER, 443, v4, p4, ACK)).unwrap();
+        assert_eq!(be16(&o, 42), 4000, "{filtering}: delivered to the subscriber port");
+        // Another port of the same server: filtered (APDF), or (ADF) the
+        // address is known, so it passes the filter but needs a SYN.
+        let other = run(&mut b.fx, &tcp4(SERVER, 444, v4, p4, ACK));
+        assert!(other.is_err(), "{filtering}: {other:?}");
+        assert_eq!(
+            run(&mut b.fx, &tcp4(SERVER + 9, 443, v4, p4, ACK)).unwrap_err(),
+            DropReason::Filtered,
+            "{filtering}: unknown remote"
+        );
+        if v4b & 3 == v4 & 3 {
+            // Strict: an un-hinted non-SYN outbound segment is refused, a
+            // SYN still opens.
+            assert_eq!(run(&mut b.fx, &tcp6(sub(1, 1), 4001, SERVER, 443, ACK)).unwrap_err(), DropReason::TcpNoState);
+            assert!(run(&mut b.fx, &tcp6(sub(1, 1), 4001, SERVER, 443, SYN)).is_ok());
+            let _ = p4b;
+        }
+    }
+}
+
+/// POAM-028 decision B4: pickup stays where hints were not active (the
+/// primary had hints off, the shadow lost a hint, or this node has hints
+/// off), so those configurations behave as before.
+#[test]
+fn not_in_sync_or_unhinted_adoption_keeps_pickup() {
+    // (primary hints, shadow hinted, adopter hints)
+    for (pa, hinted, pb) in [(false, false, true), (true, false, true), (true, true, false)] {
+        let mut a = node_h(&[], 0, pa);
+        start_all(&a);
+        let (v4, _) = establish(&mut a, 1, 4000);
+        let shadow = stream_shadow(&a, hinted);
+        let slice = (v4 & 3) as u16;
+        let mut b = node_h(&[], 1, pb);
+        let st = b.fx.nat.state().adopt_slice(slice, &shadow.take(slice, 0), meta(AcquireReason::Takeover)).unwrap();
+        let restored = pa && hinted && pb;
+        assert_eq!(st.sessions_restored, u64::from(restored), "{pa} {hinted} {pb}");
+        assert!(!b.fx.nat.state().strict_tcp(slice));
+        let _ = events(&b.fx);
+        // The un-hinted pickup of an outbound ACK works as today.
+        assert!(run(&mut b.fx, &tcp6(sub(1, 1), 4000, SERVER, 443, ACK)).is_ok(), "{pa} {hinted} {pb}");
+    }
+    // Not in sync: hinted is false whatever the primary sent.
+    let mut a = node_h(&[], 0, true);
+    start_all(&a);
+    let (v4, _) = establish(&mut a, 1, 4000);
+    let shadow = stream_shadow(&a, true);
+    let slice = (v4 & 3) as u16;
+    shadow.mark_gap(slice);
+    let input = shadow.take(slice, 0);
+    assert!(!input.hinted && !input.in_sync);
+}
+
+/// The restored session lives for the pickup window and the IPv6 side
+/// alone does not extend it; the IPv4 side makes it ESTABLISHED.
+#[test]
+fn restored_session_needs_the_v4_side() {
+    let mut a = node_h(&[], 0, true);
+    start_all(&a);
+    let (v4, p4) = establish(&mut a, 1, 4000);
+    let (v4b, p4b) = establish(&mut a, 1, 4001);
+    let shadow = stream_shadow(&a, true);
+    let mut b = node_h(&[], 1, true);
+    adopt_from(&b, &shadow);
+    let _ = drain(&b);
+    let _ = events(&b.fx);
+    for _ in 0..3 {
+        run(&mut b.fx, &tcp6(sub(1, 1), 4000, SERVER, 443, ACK)).unwrap();
+    }
+    run(&mut b.fx, &tcp4(SERVER, 443, v4b, p4b, ACK)).unwrap();
+    // The promoted session re-emits its hint for the new backup.
+    assert_eq!(hints_of(&drain(&b)).len(), 1);
+    b.fx.clock.advance(Duration::from_secs(301));
+    let st = b.fx.nat.state();
+    st.sweep();
+    let k = |v4, p4| Key4 { proto: proto::TCP, addr: v4, port: p4 };
+    assert!(!st.has_session(k(v4, p4), (SERVER, 443)), "IPv6-only: gone at the window end");
+    assert!(st.has_session(k(v4b, p4b), (SERVER, 443)), "confirmed: TCP_EST");
+}
+
+/// SC-5: restore passes the node session cap; the BIB is still imported.
+#[test]
+fn restore_respects_session_caps() {
+    let mut a = node_h(&[], 0, true);
+    start_all(&a);
+    let (v4, _) = establish(&mut a, 1, 4000);
+    let slice = (v4 & 3) as u16;
+    let mut flows = 1;
+    for port in 4001..4020 {
+        let (x, _) = establish(&mut a, 1, port);
+        flows += usize::from(x & 3 == v4 & 3);
+    }
+    let shadow = stream_shadow(&a, true);
+    let b = node_h(&[("max_sessions = 4000000", "max_sessions = 3")], 1, true);
+    let st = b.fx.nat.state().adopt_slice(slice, &shadow.take(slice, 0), meta(AcquireReason::Takeover)).unwrap();
+    assert_eq!(st.bibs_adopted as usize, flows);
+    assert_eq!(st.sessions_restored, 3.min(flows as u64));
+    assert_eq!(st.sessions_refused.session_limit, flows.saturating_sub(3) as u64);
+    assert_eq!(b.fx.nat.state().session_count(), st.sessions_restored);
+}
+
+/// SC-7: a restored remote passes the outbound destination policy.
+#[test]
+fn restore_checks_destination_policy() {
+    let mut a = node_h(&[], 0, true);
+    start_all(&a);
+    let (v4, _) = establish(&mut a, 1, 4000);
+    let slice = (v4 & 3) as u16;
+    let shadow = stream_shadow(&a, true);
+    // The adopter denies non-global destinations (SERVER is TEST-NET-2).
+    let cfg = config_strict(&[]);
+    let setup = ClusterSetup {
+        slices: SliceMap::new(&cfg.nat64.pool, 32).unwrap(),
+        self_id: 1,
+        steering: SteeringMode::Drop,
+        directory: Arc::new(Directory::new(16, 1000)),
+        tcp_adopt_secs: 300,
+        session_hints: true,
+        quarantine_secs: 600,
+        reserve_ahead: 2,
+    };
+    let (sink, _rx) = AuditSink::bounded(4096);
+    let nat = Nat64::new_cluster(&cfg, setup, sink, Clock::new()).unwrap();
+    let st = nat.state().adopt_slice(slice, &shadow.take(slice, 0), meta(AcquireReason::Takeover)).unwrap();
+    assert_eq!((st.bibs_adopted, st.sessions_restored, st.sessions_refused.policy), (1, 0, 1));
+}
+
+/// SC-24: an abandoned adoption with restored sessions frees them all.
+#[test]
+fn abandon_after_restore_frees_sessions() {
+    let mut a = node_h(&[], 0, true);
+    start_all(&a);
+    let (v4, _) = establish(&mut a, 1, 4000);
+    let slice = (v4 & 3) as u16;
+    let shadow = stream_shadow(&a, true);
+    let b = node_h(&[], 1, true);
+    let st = b.fx.nat.state();
+    let mut ad = st
+        .adopt_begin(slice, plat_nat64::AdoptSource::Detached(shadow.detach(slice, 0)), meta(AcquireReason::Takeover))
+        .unwrap();
+    step_until(&b, &mut ad, |b| b.fx.nat.state().session_count() == 1);
+    assert_eq!(st.slice_state(slice), Some(SliceState::Adopting));
+    st.adopt_abandon_all(&mut ad, None);
+    assert_eq!(st.session_count(), 0);
+    assert_eq!(st.slice_state(slice), Some(SliceState::Inactive));
+    // The hints went back to the shadow with the BIB.
+    assert_eq!(shadow.hint_count(slice), 1);
+    assert!(shadow.hinted(slice));
+}
+
+/// A TCP BIB of subscriber 1 in `slice`, left in V6 INIT towards
+/// `SERVER:443` (no hint): `(port6, v4, port4)`.
+fn syn_bib_in_slice(a: &mut Node, slice: u16, from: u16) -> (u16, u32, u16) {
+    for port in from..from + 64 {
+        let (v4, p4) = tuple4(&run(&mut a.fx, &tcp6(sub(1, 1), port, SERVER, 443, SYN)).unwrap());
+        if (v4 & 3) as u16 == slice {
+            return (port, v4, p4);
+        }
+    }
+    panic!("no BIB in slice {slice}");
+}
+
+/// Runs a chunked adoption of `d` on `b` to the end.
+fn adopt_detached(b: &Node, slice: u16, d: plat_nat64::Detached) -> plat_nat64::AdoptStats {
+    let st = b.fx.nat.state();
+    let mut ad = st.adopt_begin(slice, plat_nat64::AdoptSource::Detached(d), meta(AcquireReason::Takeover)).unwrap();
+    loop {
+        if let plat_nat64::Step::Done(x) = st.adopt_step(&mut ad, past()).unwrap() {
+            return x;
+        }
+    }
+}
+
+/// SEC-002 / RFC-02, SC-5, CP-10: five ESTABLISHED sessions on one TCP BIB.
+/// The fifth hint evicts the oldest (counted); the BIB is adopted
+/// hint-incomplete, so under strict mode the evicted (live) flow is still
+/// picked up on that BIB, while a complete BIB of the same slice refuses
+/// an ACK-only segment. RFC-03: a FIN segment is picked up under strict
+/// mode (V6 FIN RCV), a RST never.
+#[test]
+fn evicted_hint_keeps_pickup_on_its_bib_and_fin_is_picked_up() {
+    let mut a = node_h(&[], 0, true);
+    start_all(&a);
+    let s = sub(1, 1);
+    let (v4, p4) = establish(&mut a, 1, 4000);
+    for i in 1..5u32 {
+        run(&mut a.fx, &tcp6(s, 4000, SERVER + i, 443, SYN)).unwrap();
+        run(&mut a.fx, &tcp4(SERVER + i, 443, v4, p4, SYN | ACK)).unwrap();
+        run(&mut a.fx, &tcp6(s, 4000, SERVER + i, 443, ACK)).unwrap();
+    }
+    let slice = (v4 & 3) as u16;
+    let (cport, cv4, cp4) = syn_bib_in_slice(&mut a, slice, 5000);
+    let shadow = stream_shadow(&a, true);
+    assert_eq!(shadow.hint_stats().evicted.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(shadow.hint_count(slice), plat_nat64::repl::MAX_HINTS);
+    let input = shadow.take(slice, 0);
+    assert_eq!(input.hints_lossy, vec![(v4, p4)]);
+    assert!(input.hinted, "an eviction does not un-hint the slice");
+    let mut b = node_h(&[], 1, true);
+    let st = b.fx.nat.state().adopt_slice(slice, &input, meta(AcquireReason::Takeover)).unwrap();
+    assert_eq!(st.sessions_restored, 4);
+    assert!(b.fx.nat.state().strict_tcp(slice));
+    let _ = events(&b.fx);
+    // A restored remote: server speaks first.
+    assert!(run(&mut b.fx, &tcp4(SERVER + 4, 443, v4, p4, ACK)).is_ok());
+    // The evicted remote (SERVER): picked up on its hint-incomplete BIB.
+    assert!(run(&mut b.fx, &tcp6(s, 4000, SERVER, 443, ACK)).is_ok());
+    // The complete BIB: ACK-only and RST refused, FIN picked up.
+    let _ = (cv4, cp4);
+    assert_eq!(run(&mut b.fx, &tcp6(s, cport, SERVER, 443, ACK)).unwrap_err(), DropReason::TcpNoState);
+    assert_eq!(run(&mut b.fx, &tcp6(s, cport, SERVER + 7, 443, RST | ACK)).unwrap_err(), DropReason::TcpNoState);
+    assert!(run(&mut b.fx, &tcp6(s, cport, SERVER, 443, 0x01 | ACK)).is_ok());
+    let k = Key4 { proto: proto::TCP, addr: cv4, port: cp4 };
+    assert!(b.fx.nat.state().has_session(k, (SERVER, 443)));
+    // V6 FIN RCV runs on the transitory timer (240 s) and the IPv6 side
+    // alone does not extend it.
+    b.fx.clock.advance(Duration::from_secs(241));
+    b.fx.nat.state().sweep();
+    assert!(!b.fx.nat.state().has_session(k, (SERVER, 443)));
+}
+
+/// SEC-004, SC-10: a FIN picked up under strict mode stays on TCP_TRANS
+/// while only the IPv6 side sends; an IPv4 packet promotes it to V6 FIN
+/// RCV on TCP_EST as before.
+#[test]
+fn strict_fin_pickup_needs_the_v4_side_to_reach_tcp_est() {
+    for v4_speaks in [false, true] {
+        let mut a = node_h(&[], 0, true);
+        start_all(&a);
+        let s = sub(1, 1);
+        let (v4, _) = establish(&mut a, 1, 4000);
+        let slice = (v4 & 3) as u16;
+        let (cport, cv4, cp4) = syn_bib_in_slice(&mut a, slice, 5000);
+        let shadow = stream_shadow(&a, true);
+        let input = shadow.take(slice, 0);
+        let mut b = node_h(&[], 1, true);
+        b.fx.nat.state().adopt_slice(slice, &input, meta(AcquireReason::Takeover)).unwrap();
+        assert!(b.fx.nat.state().strict_tcp(slice));
+        let _ = events(&b.fx);
+        let k = Key4 { proto: proto::TCP, addr: cv4, port: cp4 };
+        assert!(run(&mut b.fx, &tcp6(s, cport, SERVER, 443, 0x01 | ACK)).is_ok());
+        b.fx.clock.advance(Duration::from_secs(120));
+        if v4_speaks {
+            assert!(run(&mut b.fx, &tcp4(SERVER, 443, cv4, cp4, ACK)).is_ok());
+        }
+        // The IPv6 side keeps sending (ACK, FIN retransmit) past TCP_TRANS.
+        for f in [ACK, 0x01 | ACK, ACK] {
+            assert!(run(&mut b.fx, &tcp6(s, cport, SERVER, 443, f)).is_ok());
+            b.fx.clock.advance(Duration::from_secs(50));
+        }
+        b.fx.clock.advance(Duration::from_secs(1));
+        b.fx.nat.state().sweep();
+        assert_eq!(b.fx.nat.state().has_session(k, (SERVER, 443)), v4_speaks, "v4_speaks {v4_speaks}");
+    }
+}
+
+/// SEC-001, SC-10: a hint learned more than TCP_EST (7440 s here) before
+/// the takeover is not restored (counted `aged`) and its BIB keeps
+/// pickup; one exactly TCP_EST old is restored. Chunked (detached) path.
+#[test]
+fn hints_older_than_tcp_est_are_not_restored() {
+    for (age_s, restored) in [(7440u64, 1u64), (7441, 0)] {
+        let mut a = node_h(&[], 0, true);
+        start_all(&a);
+        let (v4, p4) = establish(&mut a, 1, 4000);
+        let slice = (v4 & 3) as u16;
+        let shadow = stream_shadow(&a, true);
+        let mut b = node_h(&[], 1, true);
+        let st = adopt_detached(&b, slice, shadow.detach(slice, age_s * 1000));
+        assert_eq!((st.sessions_restored, st.sessions_refused.aged), (restored, 1 - restored), "age {age_s}");
+        assert!(b.fx.nat.state().strict_tcp(slice));
+        let _ = events(&b.fx);
+        let inbound = run(&mut b.fx, &tcp4(SERVER, 443, v4, p4, ACK));
+        assert_eq!(inbound.is_ok(), restored == 1, "age {age_s}: {inbound:?}");
+        // Either way the flow continues from the IPv6 side.
+        assert!(run(&mut b.fx, &tcp6(sub(1, 1), 4000, SERVER, 443, ACK)).is_ok(), "age {age_s}");
+    }
+}
+
+/// SEC-001: a completed snapshot replaces a BIB's hints (no merge with the
+/// hints streamed before it).
+#[test]
+fn resync_snapshot_replaces_streamed_hints() {
+    let mut a = node_h(&[], 0, true);
+    start_all(&a);
+    let (v4, p4) = establish(&mut a, 1, 4000);
+    let slice = (v4 & 3) as u16;
+    let shadow = stream_shadow(&a, true);
+    assert_eq!(shadow.hint_count(slice), 1);
+    // The flow ends on the primary (RST): no longer ESTABLISHED.
+    run(&mut a.fx, &tcp4(SERVER, 443, v4, p4, RST | ACK)).unwrap();
+    let (recs, _) = a.fx.nat.state().export_slice(slice, ExportCursor::default(), 1 << 20);
+    assert!(!recs.iter().any(|r| matches!(r, SnapRecord::Sess(_))));
+    // Snapshot records over the existing copy (no begin): the BIB's hints
+    // are replaced by the (empty) exported set.
+    shadow.snapshot_records(slice, &recs).unwrap();
+    shadow.snapshot_end_hinted(slice, true).unwrap();
+    assert_eq!(shadow.hint_count(slice), 0);
+}
+
+/// The chunked restore (expired deadline: one batch per step) gives the
+/// same sessions as the one-shot adoption.
+#[test]
+fn chunked_restore_matches_single_shot() {
+    let mut a = node_h(&[BIG_BLOCKS], 0, true);
+    start_all(&a);
+    for port in 4000..4100 {
+        establish(&mut a, 1 + port % 7, port);
+    }
+    let shadow = stream_shadow(&a, true);
+    let one = shadow_for(&a);
+    for s in 0..4 {
+        let input = shadow.take(s, 0);
+        for b in &input.bibs {
+            one.apply(&ReplRecord::BibCreate { slice: s, bib: *b }, 0).unwrap();
+        }
+        for h in &input.hints {
+            one.apply(&ReplRecord::SessHint { slice: s, v4: h.v4, port4: h.port4, raddr: h.raddr, rport: h.rport }, 0)
+                .unwrap();
+        }
+        for x in &input.blocks {
+            one.apply(&ReplRecord::BlockAlloc { slice: s, sub: x.0, block: x.1, wall_us: x.2 }, 0).unwrap();
+        }
+        one.snapshot_end_hinted(s, true).unwrap();
+        let b1 = node_h(&[BIG_BLOCKS], 1, true);
+        let r1 = b1.fx.nat.state().adopt_slice(s, &input, meta(AcquireReason::Takeover)).unwrap();
+        let b2 = node_h(&[BIG_BLOCKS], 1, true);
+        let mut ad = b2
+            .fx
+            .nat
+            .state()
+            .adopt_begin(s, plat_nat64::AdoptSource::Detached(one.detach(s, 0)), meta(AcquireReason::Takeover))
+            .unwrap();
+        let r2 = loop {
+            if let plat_nat64::Step::Done(x) = b2.fx.nat.state().adopt_step(&mut ad, past()).unwrap() {
+                break x;
+            }
+        };
+        assert_eq!((r1.sessions_restored, r1.bibs_adopted), (r2.sessions_restored, r2.bibs_adopted));
+        assert_eq!(b1.fx.nat.state().session_count(), b2.fx.nat.state().session_count());
+        assert_eq!(r1.sessions_restored as usize, input.hints.len());
+    }
+}
+
+/// The snapshot path carries the hints too (export → `Sess` → shadow →
+/// adoption), and the restored set equals the exported ESTABLISHED set.
+#[test]
+fn snapshot_hints_round_trip() {
+    let mut a = node_h(&[], 0, true);
+    start_all(&a);
+    let mut est = Vec::new();
+    for port in 4000..4012 {
+        est.push((establish(&mut a, 1 + port % 3, port), port));
+    }
+    let shadow = shadow_for(&a);
+    for s in 0..4 {
+        shadow.snapshot_begin(s).unwrap();
+        let mut cur = Some(ExportCursor::default());
+        while let Some(c) = cur {
+            let (recs, next) = a.fx.nat.state().export_slice(s, c, 3);
+            shadow.snapshot_records(s, &recs).unwrap();
+            cur = next;
+        }
+        shadow.snapshot_end_hinted(s, true).unwrap();
+    }
+    let b = node_h(&[], 1, true);
+    adopt_from(&b, &shadow);
+    let st = b.fx.nat.state();
+    assert_eq!(st.session_count(), est.len() as u64);
+    for ((v4, p4), _) in est {
+        assert!(st.has_session(Key4 { proto: proto::TCP, addr: v4, port: p4 }, (SERVER, 443)));
+    }
+}
+
+/// Q1: a hint drained before its `BibCreate` (another ring) is refused
+/// with `NoBib`, and the slice is no longer hinted until a resync.
+#[test]
+fn no_bib_hint_marks_gap() {
+    let mut a = node_h(&[], 0, true);
+    start_all(&a);
+    let _ = drain(&a);
+    let (v4, _) = establish(&mut a, 1, 4000);
+    let slice = (v4 & 3) as u16;
+    let shadow = shadow_for(&a);
+    shadow.snapshot_end_hinted(slice, true).unwrap();
+    let recs = drain(&a);
+    for r in hints_of(&recs) {
+        assert_eq!(shadow.apply(&r, 0), Err(plat_nat64::ShadowError::NoBib));
+    }
+    assert!(!shadow.hinted(slice));
+    for r in recs.iter().filter(|r| !matches!(r, ReplRecord::SessHint { .. })) {
+        shadow.apply(r, 0).unwrap();
+    }
+    let input = shadow.take(slice, 0);
+    assert!(input.in_sync && !input.hinted, "un-hinted pickup stays for this adoption");
+}
+
+// ------------------------------------------------------- QA: session hints
+
+/// Counters of `n` as (drops, counters) vectors, in `ALL` order.
+fn counter_snapshot(n: &Node) -> (Vec<u64>, Vec<u64>) {
+    let c = &n.fx.ctx.counters;
+    (DropReason::ALL.iter().map(|&r| c.drops(r)).collect(), Counter::ALL.iter().map(|&k| c.get(k)).collect())
+}
+
+/// A fixed mixed sequence: TCP handshakes, data, RST, a half-open SYN, a
+/// SYN/ACK from an unknown server, UDP both ways, and unsolicited inbound.
+fn mixed_traffic(n: &mut Node) -> Vec<Result<Vec<u8>, DropReason>> {
+    let mut out = Vec::new();
+    for i in 0..6u16 {
+        let s = sub(1 + i % 3, 1);
+        let port = 4000 + i;
+        let o = run(&mut n.fx, &tcp6(s, port, SERVER, 443, SYN));
+        let (v4, p4) = o.as_ref().map(|p| tuple4(p)).unwrap_or((0, 0));
+        out.push(o);
+        out.push(run(&mut n.fx, &tcp4(SERVER, 443, v4, p4, SYN | ACK)));
+        out.push(run(&mut n.fx, &tcp6(s, port, SERVER, 443, ACK)));
+        out.push(run(&mut n.fx, &tcp4(SERVER, 443, v4, p4, ACK)));
+        out.push(run(&mut n.fx, &tcp4(SERVER + 1, 443, v4, p4, ACK)));
+        if i % 2 == 0 {
+            out.push(run(&mut n.fx, &tcp4(SERVER, 443, v4, p4, RST | ACK)));
+        }
+        out.push(run(&mut n.fx, &tcp6(s, port, SERVER + 2, 80, SYN)));
+        let u = run(&mut n.fx, &udp6(s, 5000 + i, SERVER, 53, b"q"));
+        let (u4, up4) = u.as_ref().map(|p| tuple4(p)).unwrap_or((0, 0));
+        out.push(u);
+        out.push(run(&mut n.fx, &udp4(SERVER, 53, u4, up4, b"r")));
+        out.push(run(&mut n.fx, &udp4(SERVER + 5, 53, u4, up4, b"r")));
+    }
+    out
+}
+
+/// Off mode is today (plan §1.9, brief acceptance): the same traffic on a
+/// node with `session_hints = "off"` and one with `"tcp"` gives identical
+/// verdicts, bytes, counters, audit records and snapshots, except that only
+/// `"tcp"` emits `SessHint` and exports `Sess`; an off adopter of a hinted
+/// shadow restores nothing and is never strict, as before.
+#[test]
+fn qa_off_mode_equivalent_except_for_hints() {
+    let mut off = node_h(&[], 0, false);
+    let mut on = node_h(&[], 0, true);
+    start_all(&off);
+    start_all(&on);
+    let r_off = mixed_traffic(&mut off);
+    let r_on = mixed_traffic(&mut on);
+    // Ports and IP IDs are randomised per node: compare the verdict, the
+    // family and the length of every output.
+    let shape = |r: &[Result<Vec<u8>, DropReason>]| -> Vec<Result<(u8, usize), DropReason>> {
+        r.iter().map(|x| x.as_ref().map(|p| (p[0] >> 4, p.len())).map_err(|e| *e)).collect()
+    };
+    assert_eq!(shape(&r_off), shape(&r_on), "verdicts");
+    assert_eq!(counter_snapshot(&off), counter_snapshot(&on));
+    let (e_off, e_on) = (events(&off.fx), events(&on.fx));
+    assert_eq!(e_off.len(), e_on.len(), "no new audit record kinds with hints on (Q4)");
+    for (a, b) in e_off.iter().zip(&e_on) {
+        assert_eq!(std::mem::discriminant(a), std::mem::discriminant(b));
+    }
+    let (rec_off, rec_on) = (drain(&off), drain(&on));
+    assert!(hints_of(&rec_off).is_empty(), "off emits no SessHint");
+    assert!(!hints_of(&rec_on).is_empty());
+    let no_hints: Vec<_> = rec_on.iter().copied().filter(|r| !matches!(r, ReplRecord::SessHint { .. })).collect();
+    let kind = |r: &ReplRecord| std::mem::discriminant(r);
+    assert_eq!(rec_off.iter().map(kind).collect::<Vec<_>>(), no_hints.iter().map(kind).collect::<Vec<_>>());
+    for s in 0..4 {
+        let (x_off, _) = off.fx.nat.state().export_slice(s, ExportCursor::default(), 1 << 20);
+        let (x_on, _) = on.fx.nat.state().export_slice(s, ExportCursor::default(), 1 << 20);
+        assert!(!x_off.iter().any(|r| matches!(r, SnapRecord::Sess(_))));
+        let stripped: Vec<_> = x_on.into_iter().filter(|r| !matches!(r, SnapRecord::Sess(_))).collect();
+        let kind = |r: &SnapRecord| std::mem::discriminant(r);
+        assert_eq!(
+            x_off.iter().map(kind).collect::<Vec<_>>(),
+            stripped.iter().map(kind).collect::<Vec<_>>(),
+            "slice {s}"
+        );
+    }
+    // Takeover by an off adopter from a hinted, in-sync shadow: as today.
+    let shadow = shadow_for(&on);
+    for r in &rec_on {
+        shadow.apply(r, 0).unwrap();
+    }
+    for s in 0..4 {
+        shadow.snapshot_end_hinted(s, true).unwrap();
+    }
+    let mut b = node_h(&[], 1, false);
+    for s in 0..4 {
+        let st = b.fx.nat.state().adopt_slice(s, &shadow.take(s, 0), meta(AcquireReason::Takeover)).unwrap();
+        assert_eq!(st.sessions_restored, 0);
+        assert_eq!(st.sessions_refused.total(), 0);
+        assert!(!b.fx.nat.state().strict_tcp(s));
+    }
+    assert_eq!(b.fx.nat.state().session_count(), 0);
+    let _ = events(&b.fx);
+    assert!(run(&mut b.fx, &tcp6(sub(2, 1), 4001, SERVER, 443, ACK)).is_ok(), "un-hinted pickup as today");
+    assert!(hints_of(&drain(&b)).is_empty());
+}
+
+/// Plan §8 boundary: a connection burst that overflows the ring never
+/// blocks or panics; the losses are counted, the slices are dirty, and a
+/// backup that saw the gap is neither in sync nor hinted, so its adoption
+/// keeps the un-hinted pickup. A resync snapshot then restores every
+/// ESTABLISHED session.
+#[test]
+fn qa_ring_full_connection_burst_is_bounded_and_keeps_pickup() {
+    let mut a = node_full(&[BIG_BLOCKS], 4, SteeringMode::Drop, 0, 1 << 16, true);
+    start_all(&a);
+    let _ = drain(&a);
+    let shadow = shadow_for(&a);
+    for s in 0..4 {
+        shadow.snapshot_begin(s).unwrap();
+        shadow.snapshot_end_hinted(s, true).unwrap();
+    }
+    let mut flows = Vec::new();
+    for port in 4000..4200u16 {
+        flows.push(establish(&mut a, 1 + port % 5, port));
+    }
+    assert!(a.hub.backlog() <= 4, "ring bounded: {}", a.hub.backlog());
+    let lost = a.hub.dropped_total();
+    assert!(lost > 0);
+    assert_eq!(a.hub.pushed_total(), 4);
+    let dirty = a.hub.take_dirty();
+    assert!(!dirty.is_empty());
+    // The backup: what arrived, then the replicator's gap handling.
+    for r in drain(&a) {
+        if shadow.apply(&r, 0).is_err()
+            && let ReplRecord::SessHint { slice, .. } = r
+        {
+            shadow.mark_gap(slice);
+        }
+    }
+    for &s in &dirty {
+        shadow.mark_gap(s);
+    }
+    for &s in &dirty {
+        let input = shadow.take(s, 0);
+        assert!(!input.in_sync && !input.hinted, "slice {s}");
+        let mut b = node_h(&[BIG_BLOCKS], 1, true);
+        let st = b.fx.nat.state().adopt_slice(s, &input, meta(AcquireReason::Takeover)).unwrap();
+        assert_eq!(st.sessions_restored, 0);
+        assert!(!b.fx.nat.state().strict_tcp(s));
+        let _ = events(&b.fx);
+        // Any flow of this slice whose BIB reached the backup is picked up.
+        for (i, &(v4, _)) in flows.iter().enumerate() {
+            if (v4 & 3) as u16 == s && input.bibs.iter().any(|x| x.v4 == v4) {
+                let port = 4000 + i as u16;
+                let _ = run(&mut b.fx, &tcp6(sub(1 + port % 5, 1), port, SERVER, 443, ACK));
+            }
+        }
+    }
+    // Resync by snapshot: hinted again, every ESTABLISHED flow restored.
+    let fresh = shadow_for(&a);
+    let mut b = node_h(&[BIG_BLOCKS], 1, true);
+    for s in 0..4 {
+        fresh.snapshot_begin(s).unwrap();
+        let mut cur = Some(ExportCursor::default());
+        while let Some(c) = cur {
+            let (recs, next) = a.fx.nat.state().export_slice(s, c, 64);
+            fresh.snapshot_records(s, &recs).unwrap();
+            cur = next;
+        }
+        fresh.snapshot_end_hinted(s, true).unwrap();
+        let input = fresh.take(s, 0);
+        assert!(input.in_sync && input.hinted);
+        b.fx.nat.state().adopt_slice(s, &input, meta(AcquireReason::Takeover)).unwrap();
+    }
+    assert_eq!(b.fx.nat.state().session_count(), flows.len() as u64);
+    let _ = events(&b.fx);
+    for &(v4, p4) in &flows {
+        assert!(run(&mut b.fx, &tcp4(SERVER, 443, v4, p4, ACK)).is_ok(), "{v4:#x}:{p4}");
+    }
+}
+
+/// SC-24, extends `half_adopted_slice_never_forwards` (plan §8): while a
+/// hinted slice is Adopting, its restored sessions exist but forward
+/// nothing in either direction; only after `Done` does the server's packet
+/// reach the subscriber.
+#[test]
+fn qa_half_adopted_slice_never_forwards_restored_sessions() {
+    let mut a = node_h(&[BIG_BLOCKS], 0, true);
+    start_all(&a);
+    let mut flows = Vec::new();
+    for port in 4000..4300u16 {
+        flows.push((establish(&mut a, 1 + port % 7, port), port));
+    }
+    let slice = (flows[0].0.0 & 3) as u16;
+    let mine: Vec<_> = flows.iter().copied().filter(|f| (f.0.0 & 3) as u16 == slice).collect();
+    let shadow = stream_shadow(&a, true);
+    let mut b = node_h(&[BIG_BLOCKS], 1, true);
+    let st = b.fx.nat.state();
+    let mut ad = st
+        .adopt_begin(slice, plat_nat64::AdoptSource::Detached(shadow.detach(slice, 0)), meta(AcquireReason::Takeover))
+        .unwrap();
+    let mut seen_restored = 0;
+    let mut reasons = std::collections::HashSet::new();
+    let done = loop {
+        if let plat_nat64::Step::Done(x) = b.fx.nat.state().adopt_step(&mut ad, past()).unwrap() {
+            break x;
+        }
+        let st = b.fx.nat.state();
+        assert_eq!(st.slice_state(slice), Some(SliceState::Adopting));
+        assert!(!st.strict_tcp(slice), "strict only once Active");
+        let n = st.session_count();
+        seen_restored = seen_restored.max(n);
+        for &((v4, p4), port) in mine.iter().step_by(7) {
+            let k = Key4 { proto: proto::TCP, addr: v4, port: p4 };
+            if !b.fx.nat.state().has_session(k, (SERVER, 443)) {
+                continue;
+            }
+            let i = run(&mut b.fx, &tcp4(SERVER, 443, v4, p4, ACK)).expect_err("inbound on Adopting");
+            let o = run(&mut b.fx, &tcp6(sub(1 + port % 7, 1), port, SERVER, 443, ACK)).expect_err("outbound");
+            reasons.insert((i, o));
+        }
+    };
+    assert!(seen_restored > 0, "some step ended with restored sessions on the Adopting slice");
+    assert_eq!(done.sessions_restored as usize, mine.len());
+    eprintln!("half-adopted drop reasons (inbound, outbound): {reasons:?}");
+    assert!(
+        reasons.iter().all(|&(i, o)| i == DropReason::ClusterFenced && o == DropReason::ClusterFenced),
+        "{reasons:?}"
+    );
+    assert!(b.fx.nat.state().strict_tcp(slice));
+    let _ = events(&b.fx);
+    for &((v4, p4), port) in &mine {
+        let o = run(&mut b.fx, &tcp4(SERVER, 443, v4, p4, ACK)).unwrap();
+        assert_eq!(be16(&o, 42), port);
+    }
+}
+
+fn env_or(name: &str, d: usize) -> usize {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+}
+
+/// Q1 measurement harness (plan §1.7, §8): 8 workers open TCP connections
+/// at full speed; each SYN is handled by one worker (its `BibCreate` goes
+/// to that worker's ring) and the SYN/ACK by the next worker (the hint goes
+/// to another ring), as with RSS on the two address families. A drainer
+/// thread empties the hub like the replicator (batch 4096, round-robin)
+/// and applies to a shadow, counting `NoBib` refusals. Prints the rate.
+///
+/// Scale with `QA_RACE_CONNS` (per worker, default 2000), `QA_RACE_RING`
+/// (default 65536), `QA_RACE_DRAIN_US` (pause between drains, default 0)
+/// `QA_RACE_GAP_US` (per-worker pause between SYNs, default 0) and
+/// `QA_RACE_RTT_US` (delay from a SYN to its SYN/ACK, default 0) and
+/// `QA_RACE_HINTS` (0: hints off, the control run) and `QA_RACE_ROUNDS`
+/// (drain rounds per pump, default 8 like platd; 1: one round). Asserts
+/// only that nothing panics, nothing is lost silently and every hint is
+/// either applied or refused `NoBib`.
+#[test]
+fn qa_no_bib_race_rate_with_8_workers() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    const W: usize = 8;
+    let conns = env_or("QA_RACE_CONNS", 2000);
+    let ring = env_or("QA_RACE_RING", 65_536);
+    let pause = Duration::from_micros(env_or("QA_RACE_DRAIN_US", 0) as u64);
+    let gap = Duration::from_micros(env_or("QA_RACE_GAP_US", 0) as u64);
+    let hints_on = env_or("QA_RACE_HINTS", 1) != 0;
+    let rtt = Duration::from_micros(env_or("QA_RACE_RTT_US", 0) as u64);
+    // Drain rounds per pump while a round is cut (platd `DRAIN_ROUNDS`).
+    let rounds = env_or("QA_RACE_ROUNDS", 8);
+    let cfg = config(&[("max_sessions = 4000000", "max_sessions = 4000000")]);
+    let setup = ClusterSetup {
+        slices: SliceMap::new(&cfg.nat64.pool, 32).unwrap(),
+        self_id: 0,
+        steering: SteeringMode::Drop,
+        directory: Arc::new(Directory::new(16, 1000)),
+        tcp_adopt_secs: 300,
+        session_hints: hints_on,
+        quarantine_secs: 600,
+        reserve_ahead: 2,
+    };
+    let (sink, rx) = AuditSink::bounded(1 << 20);
+    let nat = Arc::new(Nat64::new_cluster(&cfg, setup, sink, Clock::new()).unwrap());
+    let (hub, prods) = ReplHub::new(W + 1, ring, 4);
+    for s in 0..4 {
+        nat.state()
+            .adopt_slice(
+                s,
+                &AdoptInput::default(),
+                AdoptMeta { epoch: 1, prev_owner: None, reason: AcquireReason::Startup },
+            )
+            .unwrap();
+    }
+    let c = &cfg.nat64;
+    let shadow = Arc::new(Shadow::new(
+        SliceMap::new(&c.pool, 32).unwrap(),
+        c.port_min,
+        c.port_max,
+        c.port_block_size,
+        120_000,
+        1 << 22,
+    ));
+    for s in 0..4 {
+        shadow.snapshot_begin(s).unwrap();
+        shadow.snapshot_end_hinted(s, true).unwrap();
+    }
+    let audit_drain = std::thread::spawn(move || while rx.recv().is_ok() {});
+    let done = Arc::new(AtomicBool::new(false));
+    let drainer = {
+        let (hub, shadow, done) = (hub.clone(), shadow.clone(), done.clone());
+        std::thread::spawn(move || {
+            let (mut buf, mut hints, mut no_bib, mut other, mut drains) = (Vec::new(), 0u64, 0u64, 0u64, 0u64);
+            loop {
+                let fin = done.load(Ordering::Acquire);
+                buf.clear();
+                let n = hub.drain_rounds(4096, rounds, &mut buf);
+                drains += u64::from(n > 0);
+                for r in &buf {
+                    let h = matches!(r, ReplRecord::SessHint { .. });
+                    hints += u64::from(h);
+                    match shadow.apply(r, 0) {
+                        Ok(()) => {}
+                        Err(plat_nat64::ShadowError::NoBib) if h => no_bib += 1,
+                        Err(_) => other += 1,
+                    }
+                }
+                if n == 0 && fin {
+                    return (hints, no_bib, other, drains);
+                }
+                if !pause.is_zero() {
+                    std::thread::sleep(pause);
+                }
+            }
+        })
+    };
+    let (txs, rxs): (Vec<_>, Vec<_>) =
+        (0..W).map(|_| mpsc::channel::<(std::time::Instant, Option<Option<(u32, u16)>>)>()).unzip();
+    let t0 = std::time::Instant::now();
+    let workers: Vec<_> = prods
+        .into_iter()
+        .take(W)
+        .zip(rxs)
+        .enumerate()
+        .map(|(i, (prod, inbox))| {
+            let nat = nat.clone();
+            let next = txs[(i + 1) % W].clone();
+            std::thread::spawn(move || {
+                let mut ctx = nat.new_worker(Arc::new(Counters::default()), i as u16 + 1).with_repl(prod);
+                let mut buf = vec![0u8; plat_xlat::HEADROOM + 2048];
+                let mut go = |pkt: &[u8], ctx: &mut WorkerCtx| {
+                    buf[plat_xlat::HEADROOM..plat_xlat::HEADROOM + pkt.len()].copy_from_slice(pkt);
+                    match nat.process(&mut buf, plat_xlat::HEADROOM, pkt.len(), ctx) {
+                        plat_nat64::Verdict::Forward { start, len } => Some(tuple4(&buf[start..start + len])),
+                        _ => None,
+                    }
+                };
+                let (mut sent, mut answered, mut open, mut syn_drops) = (0usize, 0usize, true, 0usize);
+                let mut pending = std::collections::VecDeque::new();
+                while open || sent < conns || !pending.is_empty() {
+                    if sent < conns {
+                        let s = sub((i * 40 + sent % 40) as u16, 1);
+                        let port = 1024 + (sent / 40) as u16;
+                        let r = go(&tcp6(s, port, SERVER, 443, SYN), &mut ctx);
+                        syn_drops += usize::from(r.is_none());
+                        let _ = next.send((std::time::Instant::now() + rtt, Some(r)));
+                        sent += 1;
+                        if !gap.is_zero() {
+                            let t = std::time::Instant::now();
+                            while t.elapsed() < gap {
+                                std::hint::spin_loop();
+                            }
+                        }
+                        if sent == conns {
+                            let _ = next.send((std::time::Instant::now(), None));
+                        }
+                    }
+                    loop {
+                        match inbox.try_recv() {
+                            Ok((_, None)) | Err(mpsc::TryRecvError::Disconnected) => {
+                                open = false;
+                                break;
+                            }
+                            Ok((due, Some(m))) => pending.push_back((due, m)),
+                            Err(mpsc::TryRecvError::Empty) => break,
+                        }
+                    }
+                    // The SYN/ACKs of the previous worker's connections,
+                    // one emulated RTT after their SYN.
+                    let now = std::time::Instant::now();
+                    while pending.front().is_some_and(|p: &(std::time::Instant, _)| p.0 <= now) {
+                        if let Some((_, Some((v4, p4)))) = pending.pop_front() {
+                            answered += usize::from(go(&tcp4(SERVER, 443, v4, p4, SYN | ACK), &mut ctx).is_some());
+                        }
+                    }
+                    if sent >= conns {
+                        std::thread::yield_now();
+                    }
+                }
+                (answered, syn_drops, ctx.counters.clone())
+            })
+        })
+        .collect();
+    drop(txs);
+    let res: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+    let answered: usize = res.iter().map(|r| r.0).sum();
+    let syn_drops: usize = res.iter().map(|r| r.1).sum();
+    let reasons: Vec<_> = DropReason::ALL
+        .iter()
+        .map(|&d| (d, res.iter().map(|r| r.2.drops(d)).sum::<u64>()))
+        .filter(|x| x.1 > 0)
+        .collect();
+    let starved: u64 = res.iter().map(|r| r.2.get(Counter::ClusterReserveStarved)).sum();
+    let paired: u64 = res.iter().map(|r| r.2.get(Counter::PoolPairedExhausted)).sum();
+    let elapsed = t0.elapsed();
+    done.store(true, Ordering::Release);
+    let (hints, no_bib, other, drains) = drainer.join().unwrap();
+    let dropped = hub.dropped_total();
+    eprintln!(
+        "QA no_bib race: workers {W}, conns {} ({answered} established) in {elapsed:?} ({:.0} conn/s), ring {ring}, \
+         drain pause {pause:?}, SYN gap {gap:?}, RTT {rtt:?}: hints {hints}, no_bib {no_bib} ({:.4} %), other refusals {other}, ring drops {dropped}, \
+         non-empty drains {drains}, truncated drains {}, rounds {rounds}",
+        W * conns,
+        (W * conns) as f64 / elapsed.as_secs_f64(),
+        100.0 * no_bib as f64 / hints.max(1) as f64,
+        hub.drains_truncated(),
+    );
+    assert_eq!(
+        (answered, syn_drops),
+        (W * conns, 0),
+        "every connection established; drops {reasons:?}, reserve starved {starved}, paired exhausted {paired}, subscribers {}",
+        nat.state().subscriber_count()
+    );
+    assert_eq!(dropped, 0, "measurement needs a loss-free ring");
+    assert_eq!(hints, if hints_on { answered as u64 } else { 0 }, "one hint per connection");
+    assert_eq!(other, 0);
+    // Hints follow the BIB records of their drain (decision Q1 revised), so
+    // only a drain cut at its limit can still split a SYN's `BibCreate`
+    // from its SYN/ACK's hint.
+    let truncated = hub.drains_truncated();
+    if hints_on && truncated == 0 {
+        assert_eq!(no_bib, 0, "no truncated drain, yet {no_bib} hints arrived before their BIB");
+    }
+    if no_bib > 0 {
+        assert!((0..4).any(|s| !shadow.hinted(s)), "a no_bib refusal must leave its slice un-hinted");
+    }
+    drop(nat);
+    let _ = audit_drain.join();
 }

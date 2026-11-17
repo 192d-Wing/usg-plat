@@ -25,9 +25,18 @@
 //! audited without touching the shadow. Subscribers and BIB addresses
 //! must lie in `translation.client_prefixes`.
 //!
+//! Session hints (`cluster.ha.session_hints = "tcp"`, POAM-028): the rings
+//! carry one `SessHint` per TCP connection that reached ESTABLISHED, sent
+//! as slice records; snapshots carry `Sess` records after each TCP BIB, and
+//! `SnapshotEnd.hints` tells the backup whether this primary sends hints.
+//! A hint the backup cannot place (its BIB is not in the shadow, e.g. it
+//! overtook the `BibCreate` from another ring) is not a peer fault: the
+//! slice is marked gapped (un-hinted, resynced), never closed.
+//!
 //! COMPLIANCE MAPPING:
 //! - NIST 800-53: CP-10, AU-10 - replicated blocks and BIBs let the backup
-//!   keep every subscriber's mapping and attribution on takeover
+//!   keep every subscriber's mapping and attribution on takeover; session
+//!   hints keep its established TCP sessions
 //! - NIST 800-53: SC-5 - workers never wait: bounded rings and peer queues,
 //!   counted loss, resync by snapshot; snapshot in flight is throttled
 //! - NIST 800-53: SI-4, AU-2 - `plat_cluster_repl_*` metrics and
@@ -46,13 +55,19 @@ use std::time::{Duration, Instant};
 use plat_audit::{AuditSink, AuditText, ClusterMemberChange, Event, MemberState};
 use plat_cluster::{MemberId, Msg, RejectReason, SliceId, SliceMap, SnapRecord, View, WireBib, WireBlock};
 use plat_common::Ipv6Cidr;
-use plat_nat64::{Detached, Directory, ExportCursor, Home, Nat64, ReplHub, ReplRecord, Shadow, SliceState};
+use plat_nat64::{
+    Detached, Directory, ExportCursor, Home, Nat64, ReplHub, ReplRecord, Shadow, ShadowError, SliceState,
+};
 
 use super::peer::{Net, Refusal};
 use super::slice_cidr;
 
-/// Records drained per pump.
+/// Records drained per round (see `DRAIN_ROUNDS`).
 const DRAIN_BATCH: usize = 4096;
+/// Drain rounds per pump while a round is cut at its limit (PERF-002): a
+/// `BibCreate` left in a ring is taken before its hint is sent, so the
+/// slice is not gapped (`no_bib`). Bounds one batch to 8 × `DRAIN_BATCH`.
+const DRAIN_ROUNDS: usize = 8;
 /// Concurrent snapshots per node.
 const MAX_SNAPSHOTS: usize = 4;
 /// Upper bound on records per snapshot chunk (a record is at most ~52
@@ -151,6 +166,9 @@ pub struct ReplStats {
     pub rx_gaps: AtomicU64,
     /// Primary side: awaited acks given up ([`ACK_TIMEOUT`]).
     pub ack_timeouts: AtomicU64,
+    /// Primary side: session hints queued to a peer
+    /// (`plat_cluster_session_hints_total{result="sent"}`).
+    pub hints_sent: AtomicU64,
 }
 
 pub struct Replicator {
@@ -427,7 +445,7 @@ impl Replicator {
     fn route_records(&mut self) -> usize {
         let mut buf = std::mem::take(&mut self.buf);
         buf.clear();
-        let n = self.hub.drain(DRAIN_BATCH, &mut buf);
+        let n = self.hub.drain_rounds(DRAIN_BATCH, DRAIN_ROUNDS, &mut buf);
         for r in &buf {
             match r.slice() {
                 None => {
@@ -445,6 +463,9 @@ impl Replicator {
                         continue; // the snapshot will carry it
                     }
                     let seq = self.next_seq(s);
+                    if matches!(r, ReplRecord::SessHint { .. }) {
+                        self.stats.hints_sent.fetch_add(1, Ordering::Relaxed);
+                    }
                     self.batch_slice(t, s, &r.to_msg(seq));
                 }
             }
@@ -700,7 +721,8 @@ impl Replicator {
                 Some(n) => cur = n,
                 None => {
                     let seq = self.next_seq(s);
-                    if self.net.send(t, &Msg::SnapshotEnd { slice: s, seq }) {
+                    let hints = self.nat.state().session_hints();
+                    if self.net.send(t, &Msg::SnapshotEnd { slice: s, seq, hints }) {
                         self.set_phase(s, Phase::AwaitEnd(seq));
                     } else {
                         self.set_phase(s, Phase::Start);
@@ -852,7 +874,24 @@ impl Replicator {
             | ReplRecord::SubHome { sub, .. }
             | ReplRecord::SubGone { sub } => self.sub_ok(*sub),
             ReplRecord::BibCreate { bib, .. } => self.bib_ok(bib),
-            ReplRecord::BibDelete { .. } => true,
+            // Addresses are checked against the slice by the shadow.
+            ReplRecord::BibDelete { .. } | ReplRecord::SessHint { .. } => true,
+        }
+    }
+
+    /// A shadow refusal: a hint without its BIB marks the slice gapped (a
+    /// resync follows, rate-limited); anything else closes the connection.
+    fn shadow_result(&mut self, s: SliceId, r: Result<(), ShadowError>) -> Result<(), Refusal> {
+        match r {
+            Ok(()) => Ok(()),
+            Err(ShadowError::NoBib) => {
+                self.shadow.mark_gap(s);
+                if let Some(g) = self.gapped.get_mut(usize::from(s)) {
+                    *g = true;
+                }
+                Ok(())
+            }
+            Err(e) => Err(Self::invalid(e)),
         }
     }
 
@@ -945,14 +984,16 @@ impl Replicator {
                 let valid = records.iter().all(|r| match r {
                     SnapRecord::Block { sub, .. } => self.sub_ok(*sub),
                     SnapRecord::Bib(b) => self.bib_ok(b),
+                    SnapRecord::Sess(_) => true,
                 });
                 if !valid {
                     return Err(err("snapshot record outside the client prefixes"));
                 }
                 self.check_seq(from, slice, seq);
-                self.shadow.snapshot_records(slice, &records).map_err(Self::invalid)?;
+                let r = self.shadow.snapshot_records_at(slice, &records, mono_ms());
+                self.shadow_result(slice, r)?;
             }
-            Msg::SnapshotEnd { slice, seq } => {
+            Msg::SnapshotEnd { slice, seq, hints } => {
                 if self.serving(slice) {
                     self.stats.rx_ignored.fetch_add(1, Ordering::Relaxed);
                     return Ok(());
@@ -963,7 +1004,7 @@ impl Replicator {
                     && self.rx_seq.get(i).copied().unwrap_or(0).wrapping_add(1) == seq;
                 self.check_seq(from, slice, seq);
                 if ok {
-                    self.shadow.snapshot_end(slice).map_err(Self::invalid)?;
+                    self.shadow.snapshot_end_hinted(slice, hints).map_err(Self::invalid)?;
                     self.net.send(from, &Msg::Ack { slice, seq });
                 }
             }
@@ -982,7 +1023,8 @@ impl Replicator {
                     return Err(err("record outside the client prefixes"));
                 }
                 self.check_seq(from, s, seq);
-                self.shadow.apply(&rec, mono_ms()).map_err(Self::invalid)?;
+                let r = self.shadow.apply(&rec, mono_ms());
+                self.shadow_result(s, r)?;
             }
         }
         Ok(())

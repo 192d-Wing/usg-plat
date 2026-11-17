@@ -24,6 +24,16 @@ never limits forwarding.
 | 7 | Branch `feat/cluster-ha` (unreleased). Cluster high availability. New records `cluster_view_change`, `cluster_member_state`, `cluster_slice_acquire`, `cluster_slice_release`, `nat_port_block_adopt`, `cluster_peer_rejected`, `cluster_peer_suppressed`, `cluster_replication_gap`, `cluster_hook`, `cluster_operator_command`. `nat_port_block_release` may carry `plat.release_reason` (`handover`; CEF `reason`). `service_start` may carry `cluster.node_id`, `cluster.mode`, `cluster.config_digest`, `cluster.slices`, `cluster.slice_count`, `cluster.member_count` (CEF `cs2`/`cs3`/`cs4`/`cn3`). `tls_revocation_check` gains roles `cluster_peer_client` / `cluster_peer_server`. Additive within schema 7 (branch `fix/poams-020-024-013`): `nat_resource_limit` `event.reason` value `aggregate_subscriber_limit` (POAM-013); `cluster.config_digest` now also covers `cross_node_hairpin`, `aggregate_prefix_len` and `max_subscribers_per_aggregate` (value changes, field unchanged). Chain format unchanged. |
 | 8 | Branch `feat/xdp-wu5`, merged on `main` @ `9a9c752` (unreleased). XDP fast path for established UDP sessions (POAM-016 Phase 1). `service_start` gains `plat.xdp.mode` (`off` / `native` / `generic`, always present when written by `platd`) and, with `[xdp]` enabled, `plat.xdp.object_sha256` (SHA-256 of the embedded eBPF object) and `plat.xdp.interfaces` (configured names, space-separated); CEF `cs5` (`xdpMode`), `flexString1` (`xdpObjectSha256`), `flexString2` (`xdpInterfaces`). New record `xdp_fastpath_state` (`plat.xdp.state` `enabled` / `disabled`, `event.reason`; CEF `cs1` `xdpState`, `reason`). `dataplane_counter` gains the `plat.counter.name` value `xdp_aborted`. No per-packet or per-session record from the fast path; attribution records unchanged. Chain format unchanged. |
 
+Branch `feat/session-hints` (unreleased, HA TCP session hints, POAM-028)
+adds only Prometheus metrics (see "Metrics and health"); no record type or
+field changes, so the schema stays 8 (decision Q4: restored sessions and
+strict-mode refusals are not audited). During a slice adoption, a session
+restore refused by a session or subscriber cap can emit the existing
+rate-limited `nat_resource_limit` record (`subscriber_session_limit` or
+`global_session_limit`); `source.ip` is then the subscriber of an adopted
+BIB, and the record may appear before the slice's `cluster_slice_acquire`
+completes its `nat_port_block_adopt` series.
+
 Branch `feat/protocol-completeness` (unreleased) adds drop reasons, counters
 and one gauge but changes no record type or field name, so the schema stays
 7. New `plat.counter.name` values can appear in `dataplane_counter` records
@@ -1006,6 +1016,29 @@ for `nat_port_block_release` (same address and range), `service_stop`,
   the view wait then gets no time (takeover falls back to lease expiry,
   POAM-030 behaviour) and releases queued later go straight to
   `release_all` (SEC-005);
+  session hints (POAM-028, `feat/session-hints`, unreleased; metrics only,
+  schema stays 8): gauge `plat_cluster_session_hints_enabled` (1 when
+  `cluster.ha.session_hints = "tcp"`), counters
+  `plat_cluster_session_hints_total{result}` (`sent`: hints batched to
+  backups by this node as primary; `applied`: hints stored in this node's
+  shadow as backup),
+  `plat_cluster_session_hints_refused_total{reason}` (`no_bib`: the hint's
+  BIB was not in the shadow, the slice is marked gapped and resyncs;
+  `outside_slice`; `invalid`; `sess_orphan`: a snapshot `Sess` record
+  without its `Bib`), `plat_cluster_session_hints_evicted_total` (a fifth
+  remote on one BIB replaced the oldest; that BIB adopts lenient),
+  `plat_cluster_session_hints_superseded_total` (a hint dropped because
+  its BIB was deleted later in the same drain),
+  `plat_cluster_repl_drains_truncated_total` (replicator pumps whose last
+  of 8 drain rounds was still cut at its limit; the residual that can
+  produce `no_bib`), `plat_cluster_sessions_restored_total` (sessions
+  restored by completed adoptions) and
+  `plat_cluster_session_restore_refused_total{reason}` (`session_limit`,
+  `subscriber_limit`, `policy`: remote refused by the destination policy,
+  `duplicate`, `aged`: hint older than TCP_EST). Runbook: a rising
+  `no_bib` together with `repl_drains_truncated_total` means hint bursts
+  exceed the pump; affected slices fall back to un-hinted pickup until
+  their resync. The `slice acquired` journal line gains `sessions`;
   and the per-worker
   `plat_cluster_steer_missteered_total`, `plat_cluster_reserve_starved_total`,
   and `plat_pool_paired_exhausted_total` (strict paired pooling refused: the

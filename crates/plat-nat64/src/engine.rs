@@ -12,7 +12,7 @@ use plat_packet::{
 use plat_xlat::icmp::{
     self, icmp4_err_to_v6, icmp4_error_local, icmp6_err_to_v4, icmp6_error_local, quoted_v4, quoted_v6,
 };
-use plat_xlat::rfc6052::{is_never_translatable_v4, is_non_global_v4};
+use plat_xlat::rfc6052::is_never_translatable_v4;
 use plat_xlat::siit::{
     FRAG6_HDR, FragSink, proto_4to6, v4_frag_to_v6, v4_frag_to_v6_split, v6_frag_to_v4, v6_frag_to_v4_split,
     write_v4_header, write_v6_header,
@@ -25,7 +25,7 @@ use crate::frag::{Acct, FragKey, FragTable, Fwd, Kind, Reassembled, St};
 use crate::held::{HeldSynExpiry, SynMeta};
 use crate::ident::{IdentKey, IdentState};
 use crate::repl::ReplProducer;
-use crate::state::{ClusterSetup, Key4, Key6, Mapped, State};
+use crate::state::{ClusterSetup, Key4, Key6, Mapped, SessionOpts, State};
 use crate::tcp::{self, Side};
 
 /// Result of processing one packet.
@@ -551,7 +551,7 @@ impl Nat64 {
     /// never-translatable pools and the WKP with a non-global pool.
     #[inline]
     fn dst_forbidden(&self, a: u32) -> bool {
-        is_never_translatable_v4(a) || (self.deny_non_global_dst && self.non_global_foreign(a))
+        crate::state::dst_forbidden_v4(a, self.deny_non_global_dst, &self.cluster_pool)
     }
 
     /// A wire IPv4 source that only a spoofer can send: this node's own
@@ -575,7 +575,7 @@ impl Nat64 {
     /// table check.
     #[inline]
     fn non_global_foreign(&self, a: u32) -> bool {
-        is_non_global_v4(a) && !self.cluster_pool.iter().any(|c| c.contains(a))
+        crate::state::non_global_foreign_v4(a, &self.cluster_pool)
     }
 
     /// IPv6 → IPv4 (outbound from the CLAT side).
@@ -679,16 +679,36 @@ impl Nat64 {
         // index, so this is one load (PERF-002); no code in legacy mode.
         self.state.pool.check_idx_in(M::SLICED, m4.idx)?;
         let mirror = self.mirror_eligible(k6.proto);
-        if let Err(e) = self.state.outbound_with(m4.k4, (dst4, dport), flags, mirror, &ctx.counters) {
+        if let Err(e) = self.session_out::<M>(m4.k4, (dst4, dport), flags, mirror, ctx) {
             if e != DropReason::NoBinding {
                 return Err(e);
             }
             // BIB expired between lookup and session update; recreate once.
             m4 = self.state.bib_for(k6, create, &ctx.counters, &ctx.repl)?;
             self.state.pool.check_idx_in(M::SLICED, m4.idx)?;
-            self.state.outbound_with(m4.k4, (dst4, dport), flags, mirror, &ctx.counters)?;
+            self.session_out::<M>(m4.k4, (dst4, dport), flags, mirror, ctx)?;
         }
         Ok(m4)
+    }
+
+    /// The outbound session update. Session hints exist only with a sliced
+    /// pool (HA): the legacy engine calls the copy without a ring, with
+    /// the same arguments as before hints (PERF-001).
+    #[inline(always)]
+    fn session_out<M: Mode>(
+        &self,
+        k4: Key4,
+        remote: (u32, u16),
+        flags: u8,
+        mirror: bool,
+        ctx: &WorkerCtx,
+    ) -> Result<(), DropReason> {
+        if M::SLICED {
+            let opts = SessionOpts { mirror, repl: ctx.repl.as_ref() };
+            self.state.outbound_with(k4, remote, flags, opts, &ctx.counters)
+        } else {
+            self.state.outbound_mirror(k4, remote, flags, mirror, &ctx.counters)
+        }
     }
 
     /// An IPv6 packet of at most 1280 bytes (or a reassembled datagram)
@@ -1077,7 +1097,8 @@ impl Nat64 {
             .then(|| syn_meta(pkt, &h))
             .flatten();
         let mirror = !hairpin && self.mirror_eligible(p);
-        let k6 = match self.state.inbound_with(k4, (h.src, sport), flags, syn, mirror, &ctx.counters) {
+        let opts = SessionOpts { mirror, repl: if M::SLICED { ctx.repl.as_ref() } else { None } };
+        let k6 = match self.state.inbound_with(k4, (h.src, sport), flags, syn, opts, &ctx.counters) {
             Ok(Some(k6)) => k6,
             Ok(None) => return Ok(Out::Held),
             Err(e) => return self.inbound_refused(buf, start, &h, hairpin || p == proto::TCP, e, ctx),
@@ -1918,5 +1939,80 @@ impl Nat64 {
         let n =
             icmp4_err_to_v6(pkt, &h, &ih, outer, &inner, self.mtu4, self.mtu6, &mut ctx.scratch).map_err(from_xlat)?;
         Self::emit_scratch(buf, start, n, ctx, Counter::IcmpErrorsTranslated)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::repl::Directory;
+    use plat_cluster::SliceMap;
+    use plat_common::config::SteeringMode;
+
+    fn cluster(allow_non_global: bool, hairpin: bool) -> Nat64 {
+        let t = include_str!("../../../config/platd.example.toml")
+            .replace("192.0.2.0/24", "192.0.2.0/30")
+            .replace(
+                "allow_non_global_destinations = false",
+                &format!("allow_non_global_destinations = {allow_non_global}"),
+            )
+            .replace(
+                "cross_node_hairpin = false\n# cluster_interfaces = [\"eth1\"]",
+                if hairpin {
+                    "cross_node_hairpin = true\ncluster_interfaces = [\"eth1\"]"
+                } else {
+                    "cross_node_hairpin = false"
+                },
+            );
+        let cfg = Config::from_toml(&t).unwrap();
+        let setup = ClusterSetup {
+            slices: SliceMap::new(&cfg.nat64.pool, 32).unwrap(),
+            self_id: 1,
+            steering: SteeringMode::Drop,
+            directory: Arc::new(Directory::new(16, 1000)),
+            tcp_adopt_secs: 300,
+            session_hints: true,
+            quarantine_secs: 600,
+            reserve_ahead: 2,
+        };
+        let (sink, _rx) = AuditSink::bounded(16);
+        Nat64::new_cluster(&cfg, setup, sink, Clock::new()).unwrap()
+    }
+
+    /// SEC-003 / NIST-001: the restore check is the outbound destination
+    /// check, plus only the pool-remote rule, for every policy setting.
+    #[test]
+    fn restore_dest_policy_matches_outbound_policy() {
+        let table: [u32; 14] = [
+            0x0000_0000, // 0.0.0.0
+            0x0a00_0001, // 10.0.0.1
+            0x7f00_0001, // 127.0.0.1
+            0x6440_0001, // 100.64.0.1
+            0xa9fe_0101, // 169.254.1.1
+            0xc000_0201, // 192.0.2.1 (pool)
+            0xc000_0203, // 192.0.2.3 (pool)
+            0xc000_0209, // 192.0.2.9 (TEST-NET-1, outside the pool)
+            0xc633_6401, // 198.51.100.1
+            0xcb00_7105, // 203.0.113.5
+            0xe000_0001, // 224.0.0.1
+            0xffff_ffff, // 255.255.255.255
+            0x0808_0808, // 8.8.8.8
+            0x0101_0101, // 1.1.1.1
+        ];
+        for allow in [false, true] {
+            for hairpin in [false, true] {
+                let n = cluster(allow, hairpin);
+                for &a in &table {
+                    let in_pool = n.cluster_pool.iter().any(|c| c.contains(a));
+                    let want = a != 0 && !n.dst_forbidden(a) && (!in_pool || hairpin);
+                    assert_eq!(
+                        n.state().restore_dest_ok((a, 443)),
+                        want,
+                        "{a:#010x} allow_non_global {allow} cross_node_hairpin {hairpin}"
+                    );
+                    assert!(!n.state().restore_dest_ok((a, 0)), "port 0");
+                }
+            }
+        }
     }
 }

@@ -170,10 +170,14 @@ attrib() {
 
 # --- traffic (deploy/tests/cluster/flows.py on the edge) --------------------
 # traffic_start <seconds> [flows] [udp-pps] [new-conn/s]
+# PUSH_FLOWS / IDLE_FLOWS (default 0) add server-speaks-first and
+# idle-then-push TCP flows (POAM-028 session hints); IDLE_SECS (default 20,
+# the server's fixed value) is the silence before an idle flow's first push.
 traffic_start() {
     vm "$E" "systemctl stop plat-flows 2>/dev/null; systemctl reset-failed plat-flows 2>/dev/null; rm -f /run/plat-flows.json
         systemd-run --unit plat-flows --collect ip netns exec cli python3 /opt/plat-test/flows.py client \
             --target $SERVER6 --duration $1 --flows ${2:-200} --udp-pps ${3:-200} --cps ${4:-20} \
+            --push-flows ${PUSH_FLOWS:-0} --idle-flows ${IDLE_FLOWS:-0} --idle-secs ${IDLE_SECS:-20} \
             --sources 8 --out /run/plat-flows.json" >/dev/null
 }
 traffic_wait() {
@@ -199,6 +203,20 @@ check_flows() {
         npct=$((ok * 100 / (ok + bad + 1)))
         if [ "$npct" -ge "$3" ]; then pass "new connections $ok ok / $bad failed"; else fail "new connections $ok ok / $bad failed (< $3%)"; fi
     fi
+}
+
+# check_pushed <min-survival-%>: server-speaks-first and idle-then-push flows
+# (only when started with PUSH_FLOWS / IDLE_FLOWS). They survive a takeover
+# only through restored session hints (ADF/APDF refuse the server's first
+# packet otherwise), so this is the session-hints acceptance check.
+check_pushed() {
+    for k in push idle; do
+        total=$(flows_field ${k}_flows)
+        [ "${total:-0}" -gt 0 ] || continue
+        alive=$(flows_field ${k}_survived)
+        pct=$((alive * 100 / total))
+        if [ "$pct" -ge "$1" ]; then pass "$k flows $alive/$total ($pct% >= $1%)"; else fail "$k flows $alive/$total ($pct% < $1%)"; fi
+    done
 }
 
 # --- edge capture: translated IPv4 leaving the nodes towards the edge --------

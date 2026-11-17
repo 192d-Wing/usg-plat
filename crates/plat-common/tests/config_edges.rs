@@ -355,7 +355,14 @@ fn ha_numeric_edges() {
         ("heartbeat_ms = 50", "heartbeat_ms = 49", "heartbeat_ms"),
         ("drift_margin_pct = 1", "drift_margin_pct = 0", "drift_margin_pct"),
         ("drift_margin_pct = 50", "drift_margin_pct = 51", "drift_margin_pct"),
-        ("tcp_adopt_secs = 0", "tcp_adopt_secs = 3601", "tcp_adopt_secs"),
+        (
+            "tcp_adopt_secs = 0\nsession_hints = \"off\"",
+            "tcp_adopt_secs = 3601\nsession_hints = \"off\"",
+            "tcp_adopt_secs",
+        ),
+        // With hints on (default): at least tcp_transitory_secs (240).
+        ("tcp_adopt_secs = 240", "tcp_adopt_secs = 239", "tcp_adopt_secs"),
+        ("tcp_adopt_secs = 240", "tcp_adopt_secs = 0", "tcp_transitory_secs"),
         ("tcp_adopt_secs = 3600", "tcp_adopt_secs = 3601", "tcp_adopt_secs"),
         // Longest of udp 300 / tcp_trans 240 / icmp 60 in the example.
         ("takeover_quarantine_secs = 300", "takeover_quarantine_secs = 299", "takeover_quarantine_secs"),
@@ -665,4 +672,55 @@ fn xdp_deadline_is_capped_by_the_ha_lease() {
         Err(ConfigError::Invalid(m)) => assert!(m.contains("lease_ms"), "{m}"),
         other => panic!("{other:?}"),
     }
+}
+
+#[test]
+fn ha_session_hints_values() {
+    use plat_common::config::SessionHints;
+    let h = ha(2, "").unwrap();
+    assert_eq!(h.cluster.ha_active().unwrap().session_hints, SessionHints::Tcp, "default tcp");
+    let h = ha(2, "session_hints = \"off\"").unwrap();
+    assert_eq!(h.cluster.ha_active().unwrap().session_hints, SessionHints::Off);
+    assert!(!h.cluster.ha_active().unwrap().hints_on());
+    for bad in ["\"tcp_udp\"", "\"udp\"", "\"TCP\"", "\"\"", "1", "true"] {
+        assert!(
+            matches!(ha(2, &format!("session_hints = {bad}")), Err(ConfigError::Parse(_))),
+            "session_hints = {bad} must not parse"
+        );
+    }
+}
+
+/// QA (CM-6, Q2): the hints-on lower bound follows the configured
+/// `timeouts.tcp_transitory_secs`, explicit `"tcp"` equals the default, the
+/// rule applies only with HA enabled, and the 3600 cap holds in both modes.
+#[test]
+fn qa_tcp_adopt_secs_follows_tcp_transitory_secs() {
+    let trans = |adopt: &str, t: u32| {
+        with(&[(NC, &ha_section(2, adopt, "")), ("tcp_transitory_secs = 240", &format!("tcp_transitory_secs = {t}"))])
+    };
+    assert!(trans("tcp_adopt_secs = 600", 600).is_ok());
+    match trans("tcp_adopt_secs = 599", 600) {
+        Err(ConfigError::Invalid(m)) => assert!(m.contains("tcp_transitory_secs"), "{m}"),
+        other => panic!("599 < 600 must be refused: {other:?}"),
+    }
+    match trans("tcp_adopt_secs = 599\nsession_hints = \"tcp\"", 600) {
+        Err(ConfigError::Invalid(m)) => assert!(m.contains("tcp_adopt_secs"), "{m}"),
+        other => panic!("explicit tcp must behave like the default: {other:?}"),
+    }
+    assert!(trans("tcp_adopt_secs = 599\nsession_hints = \"off\"", 600).is_ok());
+    // Default tcp_adopt_secs is accepted with the default hints.
+    let c = ha_valid(2, "");
+    let h = c.cluster.ha_active().unwrap();
+    assert!(h.hints_on() && h.tcp_adopt_secs >= c.timeouts.tcp_transitory_secs);
+    ha_valid(2, "tcp_adopt_secs = 3600\nsession_hints = \"tcp\"");
+    ha_valid(2, "tcp_adopt_secs = 3600\nsession_hints = \"off\"");
+    ha_invalid(2, "tcp_adopt_secs = 3601\nsession_hints = \"tcp\"", "tcp_adopt_secs");
+    ha_invalid(2, "tcp_adopt_secs = 3601\nsession_hints = \"off\"", "tcp_adopt_secs");
+    // HA present but disabled: the HA-only rule does not apply.
+    let off = ha_section(2, "tcp_adopt_secs = 0", "").replace("enabled = true", "enabled = false");
+    let c = with(&[(NC, &off)]).unwrap_or_else(|e| panic!("disabled HA: {e}"));
+    assert!(!c.cluster.ha_enabled());
+    // Unknown keys next to session_hints are still refused.
+    assert!(matches!(ha(2, "session_hint = \"tcp\""), Err(ConfigError::Parse(_))));
+    assert!(matches!(ha(2, "session_hints = [\"tcp\"]"), Err(ConfigError::Parse(_))));
 }

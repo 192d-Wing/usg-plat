@@ -135,6 +135,8 @@ impl State {
         if flag.swap(true, Ordering::AcqRel) {
             return None;
         }
+        // The next owner decides its own pickup mode (adoption Activate).
+        self.set_strict_tcp(s, false);
         let mut walk = Walk::default();
         walk.pause_on_full = self.refuse_on_overflow;
         Some(Release { slice: s, reason, walk, stats: ReleaseStats::default(), done: false })
@@ -235,6 +237,7 @@ mod tests {
             steering: SteeringMode::Drop,
             directory: Arc::new(Directory::new(16, 1000)),
             tcp_adopt_secs: 300,
+            session_hints: false,
             quarantine_secs: 600,
             reserve_ahead: 2,
         };

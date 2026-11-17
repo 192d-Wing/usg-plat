@@ -29,7 +29,12 @@ node_count = 1
 # witness = { addr = "198.51.100.20:7946", identity = "dns:witness.cluster.example" }
 # lease_ms = 3000               # 1000..=30000; heartbeat_ms <= lease_ms / 4
 # heartbeat_ms = 500
-# tcp_adopt_secs = 300          # TCP pickup window after takeover, 0..=3600
+# tcp_adopt_secs = 300          # TCP pickup window / restored-session lifetime after
+#                               # takeover; tcp_transitory_secs..=3600 with hints on,
+#                               # 0..=3600 with session_hints = "off"
+# session_hints = "tcp"         # "tcp" | "off": replicate ESTABLISHED TCP sessions to
+#                               # backups (per node, not in the digest; UDP not covered).
+#                               # Peer protocol 2: upgrade every member together.
 # takeover_quarantine_secs = 600
 # failback_delay_secs = 60      # 0 = manual failback
 # state_dir = "/var/lib/plat/cluster"

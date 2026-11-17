@@ -20,7 +20,7 @@ use plat_nat64::SliceState;
 use plat_nat64::{Nat64, ReplHub, ReplProducer, Verdict, WorkerCtx};
 use plat_packet::{be16, be32, checksum as ck, proto, put16};
 use plat_xlat::HEADROOM;
-use plat_xlat::siit::write_v6_header;
+use plat_xlat::siit::{write_v4_header, write_v6_header};
 
 use super::control::{ClusterHandle, Command, cli_request};
 use super::witness::WitnessFile;
@@ -263,9 +263,29 @@ impl Node {
     /// Translates one UDP packet from `client`; returns the IPv4 source
     /// (address, port) it was mapped to.
     fn send(&mut self, client: u128, sport: u16) -> Option<(u32, u16)> {
-        let pkt = udp6(client, sport, b"x");
+        self.process(&udp6(client, sport, b"x"))
+    }
+
+    /// One TCP segment from the client; the IPv4 side of the mapping.
+    fn tcp_out(&mut self, client: u128, sport: u16, flags: u8) -> Option<(u32, u16)> {
+        self.process(&tcp6(client, sport, flags))
+    }
+
+    /// One TCP segment from the server to `(v4, port)`; the IPv6
+    /// destination port when forwarded.
+    fn tcp_in(&mut self, v4: u32, port: u16, flags: u8) -> Option<u16> {
+        let pkt = tcp4(v4, port, flags);
         let mut buf = vec![0u8; HEADROOM + 2048];
         buf[HEADROOM..HEADROOM + pkt.len()].copy_from_slice(&pkt);
+        match self.nat.process(&mut buf, HEADROOM, pkt.len(), &mut self.ctx) {
+            Verdict::Forward { start, len } => Some(be16(&buf[start..start + len], 42)),
+            _ => None,
+        }
+    }
+
+    fn process(&mut self, pkt: &[u8]) -> Option<(u32, u16)> {
+        let mut buf = vec![0u8; HEADROOM + 2048];
+        buf[HEADROOM..HEADROOM + pkt.len()].copy_from_slice(pkt);
         match self.nat.process(&mut buf, HEADROOM, pkt.len(), &mut self.ctx) {
             Verdict::Forward { start, len } => {
                 let v4 = &buf[start..start + len];
@@ -281,6 +301,34 @@ impl Drop for Node {
         self.kill();
     }
 }
+
+fn tcp6(src: u128, sport: u16, flags: u8) -> Vec<u8> {
+    let mut p = vec![0u8; 60];
+    let dst = PREFIX | u128::from(SERVER);
+    write_v6_header(&mut p, 0, 20, proto::TCP, 64, src, dst);
+    put16(&mut p, 40, sport);
+    put16(&mut p, 42, 443);
+    p[52] = 5 << 4;
+    p[53] = flags;
+    let c = ck::finish(ck::pseudo_v6(src, dst, proto::TCP, 20) + ck::sum(&p[40..]));
+    put16(&mut p, 56, c);
+    p
+}
+
+fn tcp4(dst: u32, dport: u16, flags: u8) -> Vec<u8> {
+    let mut p = vec![0u8; 40];
+    write_v4_header(&mut p, 0, 40, 0, true, false, 0, 64, proto::TCP, SERVER, dst);
+    put16(&mut p, 20, 443);
+    put16(&mut p, 22, dport);
+    p[32] = 5 << 4;
+    p[33] = flags;
+    let c = ck::finish(ck::pseudo_v4(SERVER, dst, proto::TCP, 20) + ck::sum(&p[20..]));
+    put16(&mut p, 36, c);
+    p
+}
+
+const SYN: u8 = 0x02;
+const ACK: u8 = 0x10;
 
 fn udp6(src: u128, sport: u16, payload: &[u8]) -> Vec<u8> {
     let l = 8 + payload.len();
@@ -392,8 +440,16 @@ fn join_replicate_takeover_rejoin_failback() {
     }
     let (client, (v4, port)) = mapped.expect("A translates for its own slices");
     let s = a.nat.state().slice_map().unwrap().slice_of(v4).unwrap();
+    // POAM-028: an established TCP connection of the same subscriber whose
+    // server speaks next (no packet from the client after the takeover).
+    let (tv4, tport) = a.tcp_out(client, 40001, SYN).unwrap();
+    assert_eq!(a.tcp_in(tv4, tport, SYN | ACK), Some(40001));
+    assert!(a.tcp_out(client, 40001, ACK).is_some());
+    let ts = a.nat.state().slice_map().unwrap().slice_of(tv4).unwrap();
     let repl_b = b.h().shared.repl.clone().unwrap();
-    wait("block and BIB on the backup", Duration::from_secs(5), || repl_b.lock().shadow_counts(s) == (1, 1));
+    wait("session hint on the backup", Duration::from_secs(5), || repl_b.lock().shadow.hint_count(ts) == 1);
+    let tcp_bibs = usize::from(ts == s);
+    wait("block and BIB on the backup", Duration::from_secs(5), || repl_b.lock().shadow_counts(s) == (1, 1 + tcp_bibs));
     wait("backup in sync", Duration::from_secs(5), || b.h().shared.repl.as_ref().unwrap().lock().slice_counts()[2] > 0);
     // NIST-006: the primary records its backup's replication state.
     wait("in_sync member state", Duration::from_secs(5), || {
@@ -450,6 +506,10 @@ fn join_replicate_takeover_rejoin_failback() {
     });
     // Same subscriber, same mapping on B (RFC 6146 §3.5.1.1).
     assert_eq!(b.send(client, 40000), Some((v4, port)));
+    // The server speaks first on the restored session (ADF, no SYN).
+    assert_eq!(b.tcp_in(tv4, tport, ACK), Some(40001), "restored TCP session survives the crash takeover");
+    assert!(b.nat.state().strict_tcp(ts), "in sync and hinted: strict pickup");
+    assert_eq!(b.tcp_out(client, 40002, ACK), None, "un-hinted non-SYN refused after a hinted adoption");
 
     // Rejoin A: standby, sync, failback by handover.
     drop(a);
@@ -477,6 +537,9 @@ fn join_replicate_takeover_rejoin_failback() {
     // B-2: after the handover both directions are protected again and no
     // block is held back.
     wait_protected(&[&a, &b]);
+    // Planned failback carried the (now ESTABLISHED on B) session back.
+    assert_eq!(a.nat.state().slice_state(ts), Some(SliceState::Active), "A's slice failed back");
+    assert_eq!(a.tcp_in(tv4, tport, ACK), Some(40001), "restored TCP session survives the failback");
 
     // Auto mode refuses the manual commands.
     assert!(b.h().command(Command::Takeover(0, false)).starts_with("error"));
@@ -694,11 +757,15 @@ fn non_owner_replication_is_refused() {
         b,
         &Msg::BlockAlloc { slice: s, seq: 2, sub: stranger, block: WireBlock { addr: v4, block: 3 }, wall_us: 1 }
     ));
-    assert!(znet.send(b, &Msg::SnapshotEnd { slice: s, seq: 3 }));
+    assert!(znet.send(b, &Msg::SnapshotEnd { slice: s, seq: 3, hints: false }));
     assert!(znet.send(b, &Msg::SubHome { sub: stranger, slice: s }));
+    // POAM-028: a session hint from a non-owner is refused the same way.
+    let hint = plat_cluster::WireHint { proto: 6, v4, port4: port, raddr: SERVER, rport: 443 };
+    assert!(znet.send(b, &Msg::SessHint { slice: s, seq: 4, hint }));
     let bnet = nodes[bi].h().shared.net.clone();
-    wait("forgeries refused", Duration::from_secs(5), || bnet.stats.rejected(RejectReason::NotAllowed) >= 4);
+    wait("forgeries refused", Duration::from_secs(5), || bnet.stats.rejected(RejectReason::NotAllowed) >= 5);
     assert!(synced(&repl_b), "shadow untouched");
+    assert_eq!(repl_b.lock().shadow.hint_count(s), 0, "no forged hint");
     assert_ne!(nodes[bi].nat.state().directory().unwrap().home_of(stranger).map(|h| h.node), Some(z));
     assert!(bnet.is_up(z), "a lagging view is not a reason to drop the link");
     assert!(nodes[bi].has(|e| matches!(e, Event::ClusterPeerRejected { rejected, .. }
@@ -2324,5 +2391,123 @@ fn release_and_adoption_interleave() {
     println!("release_and_adoption_interleave: steps {before:?} -> {after:?}, X active {}", x.active());
     for n in nodes.iter_mut().flatten() {
         n.stop();
+    }
+}
+
+/// Dials `port` as member 0 over mutual TLS, sends a `Hello` with
+/// `version`, and returns every message the member answers until it
+/// closes (or 5 s pass).
+fn raw_hello(pki: &Pki, port: u16, version: u16) -> Vec<Msg> {
+    use std::io::{Read, Write};
+
+    use plat_cluster::{Hello, PartitionScheme, codec};
+    let (l, s) = (Layout::new(2, false), ShortDir::new("r"));
+    let cfg = member_cfg(&l, 0, l.ports[0], pki, &s.0, "", None);
+    let tls = peer_configs(&cfg);
+    let name = plat_tls::peer_server_name(&format!("dns:{}", ident(1)), "127.0.0.1".parse().unwrap()).unwrap();
+    let conn = rustls::ClientConnection::new(tls.client.clone(), name).unwrap();
+    let sock = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut tls = rustls::StreamOwned::new(conn, sock);
+    let hello = Msg::Hello(Hello {
+        proto_version: version,
+        node_id: 0,
+        name: "plat-0".into(),
+        config_digest: [0; 32],
+        epoch: 0,
+        scheme: PartitionScheme::Slices,
+        owned: Vec::new(),
+    });
+    let mut out = Vec::new();
+    codec::encode(&hello, 64 << 10, &mut out).unwrap();
+    tls.write_all(&out).unwrap();
+    tls.flush().unwrap();
+    let (mut buf, mut got, mut chunk) = (Vec::new(), Vec::new(), [0u8; 4096]);
+    let end = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < end {
+        match tls.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+        while let Ok(Some((m, used))) = codec::decode(&buf, 64 << 10) {
+            buf.drain(..used);
+            got.push(m);
+        }
+    }
+    got
+}
+
+/// QA (CM-3, plan §8): protocol 2 has no negotiation. A peer whose `Hello`
+/// carries protocol 1 (a node not yet upgraded) or any other version is
+/// refused `version` (counted, answered with `HelloAck(version)`, audited)
+/// and never comes up.
+#[test]
+fn qa_hello_with_other_protocol_version_is_refused() {
+    let _serial = crate::test_pki::FIPS_HOOK.lock();
+    assert_eq!(plat_cluster::PROTO_VERSION, 2);
+    let pki = Pki::new();
+    let l = Layout::new(2, false);
+    let sb = ShortDir::new("b");
+    let b = Node::start(member_cfg(&l, 1, l.ports[1], &pki, &sb.0, "", None));
+    let mut want = 0;
+    for v in [1u16, 3, 0, u16::MAX] {
+        let got = raw_hello(&pki, l.ports[1], v);
+        want += 1;
+        assert!(
+            got.iter().any(|m| matches!(m, Msg::HelloAck(Some(RejectReason::Version)))),
+            "version {v}: answered {got:?}"
+        );
+        assert!(!got.iter().any(|m| matches!(m, Msg::HelloAck(None))), "version {v} accepted");
+        wait("version refusal counted", Duration::from_secs(5), || {
+            b.h().shared.net.stats.rejected(RejectReason::Version) >= want
+        });
+        assert!(!b.h().shared.net.is_up(0), "version {v}: the peer must not come up");
+    }
+    // Control: the same harness at protocol 2 passes the version check and
+    // is refused later, on the (zero) config digest.
+    let got = raw_hello(&pki, l.ports[1], plat_cluster::PROTO_VERSION);
+    assert!(got.iter().any(|m| matches!(m, Msg::HelloAck(Some(RejectReason::DigestMismatch)))), "{got:?}");
+    assert_eq!(b.h().shared.net.stats.rejected(RejectReason::Version), want);
+    wait("version refusal record", Duration::from_secs(10), || {
+        b.has(|e| {
+            matches!(e, Event::ClusterPeerRejected { rejected, .. }
+            if rejected.reason == PeerRejectReason::Version && rejected.claimed_id == Some(0))
+        })
+    });
+}
+
+/// QA (plan §8 `snapshot_end_hints_flag_follows_primary_config`): the
+/// `SnapshotEnd.hints` byte is the primary's own `session_hints`. With A
+/// `"off"` and B `"tcp"` (the setting is per node, not in the digest),
+/// B's shadow of A's slices is in sync but not hinted, and A's shadow of
+/// B's slices is in sync and hinted; A's slices are never strict on B.
+#[test]
+fn qa_snapshot_end_hints_flag_follows_primary_config() {
+    let _serial = crate::test_pki::FIPS_HOOK.lock();
+    let pki = Pki::new();
+    let l = Layout::new(2, true);
+    let (sa, sb, sw) = (ShortDir::new("a"), ShortDir::new("b"), ShortDir::new("w"));
+    let (wsink, _wev) = collector(4096);
+    let _w = super::witness::start(&witness_file(&l, &pki, &sw.0), wsink).unwrap();
+    let mut cfg_a = member_cfg(&l, 0, l.ports[0], &pki, &sa.0, "", None);
+    cfg_a.cluster.ha.as_mut().unwrap().session_hints = plat_common::config::SessionHints::Off;
+    let a = Node::start(cfg_a);
+    let b = Node::start(member_cfg(&l, 1, l.ports[1], &pki, &sb.0, "", None));
+    wait("16 slices served once", Duration::from_secs(15), || {
+        a.active() > 0 && b.active() > 0 && total_active(&[&a, &b]) == 16
+    });
+    let owned = |n: &Node| -> Vec<SliceId> {
+        (0..16).filter(|&s| n.nat.state().slice_state(s) == Some(SliceState::Active)).collect()
+    };
+    let (sa_, sb_) = (owned(&a), owned(&b));
+    let (repl_a, repl_b) = (a.h().shared.repl.clone().unwrap(), b.h().shared.repl.clone().unwrap());
+    wait("both shadows in sync", Duration::from_secs(15), || {
+        sa_.iter().all(|&s| repl_b.lock().shadow.in_sync(s)) && sb_.iter().all(|&s| repl_a.lock().shadow.in_sync(s))
+    });
+    for &s in &sa_ {
+        assert!(!repl_b.lock().shadow.hinted(s), "slice {s}: primary A has hints off");
+    }
+    for &s in &sb_ {
+        assert!(repl_a.lock().shadow.hinted(s), "slice {s}: primary B has hints on");
     }
 }

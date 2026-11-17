@@ -27,7 +27,10 @@ pub mod membership;
 pub mod slices;
 pub mod view;
 
-pub use codec::{CodecError, Hello, MAX_NAME_LEN, Msg, PROTO_VERSION, RejectReason, SnapRecord, WireBib, WireBlock};
+pub use codec::{
+    CodecError, Hello, MAX_NAME_LEN, Msg, PROTO_TCP, PROTO_VERSION, RejectReason, SnapRecord, WireBib, WireBlock,
+    WireHint,
+};
 pub use digest::{DigestInput, DigestMember, PartitionScheme, config_digest};
 pub use membership::{
     AcquireReason, Action, Membership, MembershipConfig, MembershipError, Persisted, ReleaseReason, Role,
