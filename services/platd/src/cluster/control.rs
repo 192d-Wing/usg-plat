@@ -329,32 +329,51 @@ fn shutdown_release(
     }
 }
 
+/// `plat_cluster_session_hints_enabled`: 0 off, 1 tcp, 2 tcp_udp.
+fn hints_mode(n: &plat_nat64::Nat64) -> u8 {
+    match (n.state().session_hints(), n.state().udp_hints()) {
+        (_, true) => 2,
+        (true, false) => 1,
+        (false, false) => 0,
+    }
+}
+
 /// Session-hint metrics (SI-4, POAM-028): `sent` on the primary, the rest
-/// on the backup's shadow.
-fn render_hints(o: &mut String, enabled: bool, st: &super::replicator::ReplStats, h: &plat_nat64::HintStats) {
+/// on the backup's shadow. `outside_slice`, `invalid` and `sess_orphan`
+/// are checked before the protocol is known and carry `proto="tcp"`'s
+/// historical series name without a proto split.
+fn render_hints(o: &mut String, mode: u8, st: &super::replicator::ReplStats, h: &plat_nat64::HintStats) {
     use std::fmt::Write as _;
     let l = |c: &AtomicU64| c.load(Ordering::Relaxed);
     let _ = write!(
         o,
         "# TYPE plat_cluster_session_hints_enabled gauge\nplat_cluster_session_hints_enabled {}\n\
          # TYPE plat_cluster_session_hints_total counter\n\
-         plat_cluster_session_hints_total{{result=\"sent\"}} {}\n\
-         plat_cluster_session_hints_total{{result=\"applied\"}} {}\n\
+         plat_cluster_session_hints_total{{proto=\"tcp\",result=\"sent\"}} {}\n\
+         plat_cluster_session_hints_total{{proto=\"tcp\",result=\"applied\"}} {}\n\
+         plat_cluster_session_hints_total{{proto=\"udp\",result=\"sent\"}} {}\n\
+         plat_cluster_session_hints_total{{proto=\"udp\",result=\"applied\"}} {}\n\
          # TYPE plat_cluster_session_hints_refused_total counter\n\
-         plat_cluster_session_hints_refused_total{{reason=\"no_bib\"}} {}\n\
+         plat_cluster_session_hints_refused_total{{proto=\"tcp\",reason=\"no_bib\"}} {}\n\
+         plat_cluster_session_hints_refused_total{{proto=\"udp\",reason=\"no_bib\"}} {}\n\
          plat_cluster_session_hints_refused_total{{reason=\"outside_slice\"}} {}\n\
          plat_cluster_session_hints_refused_total{{reason=\"invalid\"}} {}\n\
          plat_cluster_session_hints_refused_total{{reason=\"sess_orphan\"}} {}\n\
          # TYPE plat_cluster_session_hints_evicted_total counter\n\
-         plat_cluster_session_hints_evicted_total {}\n",
-        u8::from(enabled),
+         plat_cluster_session_hints_evicted_total{{proto=\"tcp\"}} {}\n\
+         plat_cluster_session_hints_evicted_total{{proto=\"udp\"}} {}\n",
+        mode,
         l(&st.hints_sent),
         l(&h.applied),
+        l(&st.udp_hints_sent),
+        l(&h.udp_applied),
         l(&h.no_bib),
+        l(&h.udp_no_bib),
         l(&h.outside_slice),
         l(&h.invalid),
         l(&h.sess_orphan),
         l(&h.evicted),
+        l(&h.udp_evicted),
     );
 }
 
@@ -368,11 +387,16 @@ struct AdoptMetrics {
     abandoned: [AtomicU64; 5],
     /// 1 while an adoption (or its abandon) is in progress.
     adopting: AtomicU64,
-    /// Hinted TCP sessions restored by completed adoptions.
-    restored: AtomicU64,
-    /// Hinted sessions not restored, by [`RESTORE_REFUSED_LABELS`].
-    restore_refused: [AtomicU64; 5],
+    /// Hinted sessions restored by completed adoptions, per
+    /// [`RESTORE_PROTOS`].
+    restored: [AtomicU64; 2],
+    /// Hinted sessions not restored, per [`RESTORE_PROTOS`] and
+    /// [`RESTORE_REFUSED_LABELS`].
+    restore_refused: [[AtomicU64; 5]; 2],
 }
+
+/// `proto` label of the restore metrics.
+const RESTORE_PROTOS: [&str; 2] = ["tcp", "udp"];
 
 /// `plat_cluster_session_restore_refused_total{reason}`.
 const RESTORE_REFUSED_LABELS: [&str; 5] = ["session_limit", "subscriber_limit", "policy", "duplicate", "aged"];
@@ -403,12 +427,14 @@ impl AdoptMetrics {
 
     /// Session restore counts of a completed adoption.
     fn done(&self, s: &plat_nat64::AdoptStats) {
-        self.restored.fetch_add(s.sessions_restored, Ordering::Relaxed);
-        let r = s.sessions_refused;
-        for (c, n) in
-            self.restore_refused.iter().zip([r.session_limit, r.subscriber_limit, r.policy, r.duplicate, r.aged])
+        let per = [(s.sessions_restored, s.sessions_refused), (s.udp_sessions_restored, s.udp_sessions_refused)];
+        for ((restored, refused), ((n, r), _)) in
+            self.restored.iter().zip(&self.restore_refused).zip(per.iter().zip(RESTORE_PROTOS))
         {
-            c.fetch_add(n, Ordering::Relaxed);
+            restored.fetch_add(*n, Ordering::Relaxed);
+            for (c, k) in refused.iter().zip([r.session_limit, r.subscriber_limit, r.policy, r.duplicate, r.aged]) {
+                c.fetch_add(k, Ordering::Relaxed);
+            }
         }
     }
 
@@ -429,18 +455,19 @@ impl AdoptMetrics {
             let _ =
                 writeln!(o, "plat_cluster_adoptions_abandoned_total{{reason=\"{l}\"}} {}", c.load(Ordering::Relaxed));
         }
-        let _ = write!(
-            o,
-            "# TYPE plat_cluster_sessions_restored_total counter\nplat_cluster_sessions_restored_total {}\n\
-             # TYPE plat_cluster_session_restore_refused_total counter\n",
-            self.restored.load(Ordering::Relaxed)
-        );
-        for (l, c) in RESTORE_REFUSED_LABELS.iter().zip(&self.restore_refused) {
-            let _ = writeln!(
-                o,
-                "plat_cluster_session_restore_refused_total{{reason=\"{l}\"}} {}",
-                c.load(Ordering::Relaxed)
-            );
+        o.push_str("# TYPE plat_cluster_sessions_restored_total counter\n");
+        for (p, c) in RESTORE_PROTOS.iter().zip(&self.restored) {
+            let _ = writeln!(o, "plat_cluster_sessions_restored_total{{proto=\"{p}\"}} {}", c.load(Ordering::Relaxed));
+        }
+        o.push_str("# TYPE plat_cluster_session_restore_refused_total counter\n");
+        for (p, refused) in RESTORE_PROTOS.iter().zip(&self.restore_refused) {
+            for (l, c) in RESTORE_REFUSED_LABELS.iter().zip(refused) {
+                let _ = writeln!(
+                    o,
+                    "plat_cluster_session_restore_refused_total{{proto=\"{p}\",reason=\"{l}\"}} {}",
+                    c.load(Ordering::Relaxed)
+                );
+            }
         }
     }
 }
@@ -634,7 +661,7 @@ impl Shared {
                 st.resync_total.load(Ordering::Relaxed),
                 st.ack_timeouts.load(Ordering::Relaxed)
             );
-            render_hints(o, self.nat.as_ref().is_some_and(|n| n.state().session_hints()), &st, sh.hint_stats());
+            render_hints(o, self.nat.as_ref().map_or(0, |n| hints_mode(n)), &st, sh.hint_stats());
         }
         if let Some(h) = &self.hub {
             let _ = write!(
@@ -649,6 +676,8 @@ impl Shared {
                  plat_cluster_repl_drains_truncated_total {}\n\
                  # TYPE plat_cluster_session_hints_superseded_total counter\n\
                  plat_cluster_session_hints_superseded_total {}\n\
+                 # TYPE plat_cluster_udp_hints_deferred_total counter\n\
+                 plat_cluster_udp_hints_deferred_total {}\n\
                  # TYPE plat_cluster_repl_lag_records gauge\n",
                 h.pushed_total(),
                 h.dropped_total(),
@@ -657,6 +686,7 @@ impl Shared {
                 self.repl.as_ref().map_or(0, |r| r.lock().stats.rx_gaps.load(Ordering::Relaxed)),
                 h.drains_truncated(),
                 h.hints_superseded(),
+                h.udp_hints_deferred(),
             );
             for v in self.voters.iter().filter(|v| v.id != self.me && !v.witness) {
                 let _ =
@@ -2315,5 +2345,48 @@ mod metric_tests {
         assert!(o.contains("# TYPE plat_cluster_release_oldest_age_seconds gauge\n"), "{o}");
         m.oldest_started_ms.store(u64::MAX, Ordering::Relaxed);
         assert_eq!(m.oldest_age(12_500), 0.0);
+    }
+
+    /// SI-4 (UDP hints, closes the TCP-run advisory "metric rendering
+    /// untested"): hint and restore series render with their `proto`
+    /// labels; the mode gauge is 0/1/2.
+    #[test]
+    fn metrics_render_hint_and_restore_series() {
+        let st = super::super::replicator::ReplStats::default();
+        st.hints_sent.store(3, Ordering::Relaxed);
+        st.udp_hints_sent.store(5, Ordering::Relaxed);
+        let h = plat_nat64::HintStats::default();
+        h.udp_applied.store(4, Ordering::Relaxed);
+        h.udp_no_bib.store(2, Ordering::Relaxed);
+        h.udp_evicted.store(1, Ordering::Relaxed);
+        let mut o = String::new();
+        super::render_hints(&mut o, 2, &st, &h);
+        for line in [
+            "plat_cluster_session_hints_enabled 2\n",
+            "plat_cluster_session_hints_total{proto=\"tcp\",result=\"sent\"} 3\n",
+            "plat_cluster_session_hints_total{proto=\"udp\",result=\"sent\"} 5\n",
+            "plat_cluster_session_hints_total{proto=\"udp\",result=\"applied\"} 4\n",
+            "plat_cluster_session_hints_refused_total{proto=\"tcp\",reason=\"no_bib\"} 0\n",
+            "plat_cluster_session_hints_refused_total{proto=\"udp\",reason=\"no_bib\"} 2\n",
+            "plat_cluster_session_hints_evicted_total{proto=\"udp\"} 1\n",
+        ] {
+            assert!(o.contains(line), "{line} in {o}");
+        }
+        let m = super::AdoptMetrics::default();
+        let mut a = plat_nat64::AdoptStats { sessions_restored: 2, udp_sessions_restored: 7, ..Default::default() };
+        a.udp_sessions_refused.aged = 3;
+        a.sessions_refused.policy = 1;
+        m.done(&a);
+        let mut o = String::new();
+        m.render(&mut o);
+        for line in [
+            "plat_cluster_sessions_restored_total{proto=\"tcp\"} 2\n",
+            "plat_cluster_sessions_restored_total{proto=\"udp\"} 7\n",
+            "plat_cluster_session_restore_refused_total{proto=\"udp\",reason=\"aged\"} 3\n",
+            "plat_cluster_session_restore_refused_total{proto=\"tcp\",reason=\"policy\"} 1\n",
+            "plat_cluster_session_restore_refused_total{proto=\"tcp\",reason=\"aged\"} 0\n",
+        ] {
+            assert!(o.contains(line), "{line} in {o}");
+        }
     }
 }

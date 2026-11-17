@@ -22,8 +22,8 @@ use crate::view::{MAX_MEMBERS, View};
 
 /// Peer protocol version carried in `Hello`.
 ///
-/// Version 2 adds TCP session hints (`SessHint`, `SnapRecord::Sess`,
-/// `SnapshotEnd.hints`). There is no negotiation: members of different
+/// Version 2 adds TCP and UDP session hints (`SessHint`, `SnapRecord::Sess`,
+/// `SnapshotEnd.hints`; the last covers TCP only). There is no negotiation: members of different
 /// versions refuse each other (`RejectReason::Version`), so an upgrade is a
 /// cluster-wide restart.
 ///
@@ -32,8 +32,11 @@ use crate::view::{MAX_MEMBERS, View};
 ///   protocol changes are refused, not interpreted
 pub const PROTO_VERSION: u16 = 2;
 
-/// IANA protocol number of TCP, the only protocol a session hint carries.
+/// IANA protocol number of TCP (session hints: ESTABLISHED sessions).
 pub const PROTO_TCP: u8 = 6;
+/// IANA protocol number of UDP (session hints: aged bidirectional sessions,
+/// `session_hints = "tcp_udp"`).
+pub const PROTO_UDP: u8 = 17;
 
 /// `u32 len` + `u8 type`.
 pub const HEADER_LEN: usize = 5;
@@ -159,12 +162,13 @@ pub enum SnapRecord {
         alloc_wall_us: u64,
     },
     Bib(WireBib),
-    /// An ESTABLISHED session of the preceding TCP `Bib` (session hint).
+    /// A hinted session of the preceding TCP or UDP `Bib` (session hint).
     Sess(WireHint),
 }
 
-/// One session hint: the IPv4 side of an ESTABLISHED TCP session on the
-/// BIB `(proto, v4, port4)`. Every field is non-zero and `proto` is TCP.
+/// One session hint: the IPv4 side of an ESTABLISHED TCP session or a
+/// hinted UDP session on the BIB `(proto, v4, port4)`. Every field is
+/// non-zero and `proto` is TCP or UDP.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WireHint {
     pub proto: u8,
@@ -281,13 +285,15 @@ pub enum Msg {
     },
     /// `hints`: the primary sent session hints for this slice (its
     /// `session_hints` is on), so the backup's copy carries every
-    /// ESTABLISHED TCP session the primary had.
+    /// ESTABLISHED TCP session the primary had (TCP strictness only; UDP
+    /// hints never make adoption stricter).
     SnapshotEnd {
         slice: SliceId,
         seq: u64,
         hints: bool,
     },
-    /// A TCP session of the slice reached ESTABLISHED on the primary.
+    /// A TCP session of the slice reached ESTABLISHED on the primary, or a
+    /// UDP session became (or stays) eligible for a hint.
     SessHint {
         slice: SliceId,
         seq: u64,
@@ -435,6 +441,57 @@ fn put_slice_seq(out: &mut Vec<u8>, slice: SliceId, seq: u64) {
     out.extend_from_slice(&seq.to_le_bytes());
 }
 
+/// Hello body; on `Err` the caller truncates `out` to the frame start.
+fn put_hello(out: &mut Vec<u8>, h: &Hello) -> Result<(), CodecError> {
+    if h.name.len() > MAX_NAME_LEN || !valid_name(h.name.as_bytes()) {
+        return Err(CodecError::Invalid("hello.name"));
+    }
+    if h.owned.len() > MAX_OWNED {
+        return Err(CodecError::Invalid("hello.owned"));
+    }
+    out.extend_from_slice(&h.proto_version.to_le_bytes());
+    out.extend_from_slice(&h.node_id.to_le_bytes());
+    out.push(h.name.len() as u8);
+    out.extend_from_slice(h.name.as_bytes());
+    out.extend_from_slice(&h.config_digest);
+    out.extend_from_slice(&h.epoch.to_le_bytes());
+    out.push(h.scheme.code());
+    out.extend_from_slice(&(h.owned.len() as u16).to_le_bytes());
+    for c in &h.owned {
+        out.extend_from_slice(&c.network().to_le_bytes());
+        out.push(c.prefix_len());
+    }
+    Ok(())
+}
+
+/// Snapshot chunk records (count + records); on `Err` the caller truncates
+/// `out` to the frame start.
+fn put_snap_records(out: &mut Vec<u8>, records: &[SnapRecord]) -> Result<(), CodecError> {
+    out.extend_from_slice(&(records.len() as u32).to_le_bytes());
+    for r in records {
+        match r {
+            SnapRecord::Block { sub, block, alloc_wall_us } => {
+                out.push(1);
+                out.extend_from_slice(&sub.to_le_bytes());
+                put_block(out, block);
+                out.extend_from_slice(&alloc_wall_us.to_le_bytes());
+            }
+            SnapRecord::Bib(b) => {
+                out.push(2);
+                put_bib(out, b);
+            }
+            SnapRecord::Sess(h) => {
+                if !valid_hint(h) {
+                    return Err(CodecError::Invalid("hint"));
+                }
+                out.push(3);
+                put_hint(out, h);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Append one frame for `msg` to `out`. Fails (leaving `out` unchanged)
 /// when the frame would exceed `max_frame` or a field is unencodable; the
 /// caller must then split the message (snapshot chunks) or drop it.
@@ -444,25 +501,9 @@ pub fn encode(msg: &Msg, max_frame: usize, out: &mut Vec<u8>) -> Result<(), Code
     out.push(msg.type_code());
     match msg {
         Msg::Hello(h) => {
-            if h.name.len() > MAX_NAME_LEN || !valid_name(h.name.as_bytes()) {
+            if let Err(e) = put_hello(out, h) {
                 out.truncate(start);
-                return Err(CodecError::Invalid("hello.name"));
-            }
-            if h.owned.len() > MAX_OWNED {
-                out.truncate(start);
-                return Err(CodecError::Invalid("hello.owned"));
-            }
-            out.extend_from_slice(&h.proto_version.to_le_bytes());
-            out.extend_from_slice(&h.node_id.to_le_bytes());
-            out.push(h.name.len() as u8);
-            out.extend_from_slice(h.name.as_bytes());
-            out.extend_from_slice(&h.config_digest);
-            out.extend_from_slice(&h.epoch.to_le_bytes());
-            out.push(h.scheme.code());
-            out.extend_from_slice(&(h.owned.len() as u16).to_le_bytes());
-            for c in &h.owned {
-                out.extend_from_slice(&c.network().to_le_bytes());
-                out.push(c.prefix_len());
+                return Err(e);
             }
         }
         Msg::HelloAck(r) => out.push(r.map_or(0, RejectReason::code)),
@@ -555,28 +596,9 @@ pub fn encode(msg: &Msg, max_frame: usize, out: &mut Vec<u8>) -> Result<(), Code
         Msg::SubGone { sub } => out.extend_from_slice(&sub.to_le_bytes()),
         Msg::SnapshotChunk { slice, seq, records } => {
             put_slice_seq(out, *slice, *seq);
-            out.extend_from_slice(&(records.len() as u32).to_le_bytes());
-            for r in records {
-                match r {
-                    SnapRecord::Block { sub, block, alloc_wall_us } => {
-                        out.push(1);
-                        out.extend_from_slice(&sub.to_le_bytes());
-                        put_block(out, block);
-                        out.extend_from_slice(&alloc_wall_us.to_le_bytes());
-                    }
-                    SnapRecord::Bib(b) => {
-                        out.push(2);
-                        put_bib(out, b);
-                    }
-                    SnapRecord::Sess(h) => {
-                        if !valid_hint(h) {
-                            out.truncate(start);
-                            return Err(CodecError::Invalid("hint"));
-                        }
-                        out.push(3);
-                        put_hint(out, h);
-                    }
-                }
+            if let Err(e) = put_snap_records(out, records) {
+                out.truncate(start);
+                return Err(e);
             }
         }
         Msg::HandoverFence { slice, epoch, final_seq } => {
@@ -612,10 +634,13 @@ fn valid_proto(p: u8) -> bool {
     matches!(p, 1 | 6 | 17)
 }
 
-/// A session hint names a TCP session with every address and port set
-/// (the IPv4 side of a real ESTABLISHED session never has a zero field).
+/// A session hint names a TCP or UDP session with every address and port
+/// set (the IPv4 side of a real session never has a zero field).
+///
+/// COMPLIANCE MAPPING:
+/// - NIST 800-53: SI-10 (Information Input Validation) - closed proto set
 fn valid_hint(h: &WireHint) -> bool {
-    h.proto == PROTO_TCP && h.v4 != 0 && h.port4 != 0 && h.raddr != 0 && h.rport != 0
+    matches!(h.proto, PROTO_TCP | PROTO_UDP) && h.v4 != 0 && h.port4 != 0 && h.raddr != 0 && h.rport != 0
 }
 
 /// Bounds-checked cursor over one payload.
@@ -1138,6 +1163,25 @@ mod tests {
         p
     }
 
+    /// QA: exhaustive proto boundary for `SessHint` and snapshot `Sess`
+    /// (tag 3): accepted iff proto is 6 or 17.
+    #[test]
+    fn qa_hint_proto_exhaustive() {
+        for proto in 0..=u8::MAX {
+            let ok = matches!(proto, 6 | 17);
+            let r = decode_payload(ty::SESS_HINT, &hint_payload(proto, 1, 2, 3, 4));
+            assert_eq!(r.is_ok(), ok, "SessHint proto {proto}: {r:?}");
+            let mut c = 0u16.to_le_bytes().to_vec();
+            c.extend_from_slice(&0u64.to_le_bytes());
+            c.extend_from_slice(&1u32.to_le_bytes());
+            c.push(3);
+            c.push(proto);
+            c.extend_from_slice(&[1; 12]);
+            let r = decode_payload(ty::SNAPSHOT_CHUNK, &c);
+            assert_eq!(r.is_ok(), ok, "Sess proto {proto}: {r:?}");
+        }
+    }
+
     #[test]
     fn session_hints_strict() {
         let ok = hint_payload(6, 1, 2, 3, 4);
@@ -1145,9 +1189,16 @@ mod tests {
             decode_payload(ty::SESS_HINT, &ok),
             Ok(Msg::SessHint { slice: 3, seq: 9, hint: WireHint { proto: 6, v4: 1, port4: 2, raddr: 3, rport: 4 } })
         );
+        let udp = hint_payload(17, 1, 2, 3, 4);
+        assert_eq!(
+            decode_payload(ty::SESS_HINT, &udp),
+            Ok(Msg::SessHint { slice: 3, seq: 9, hint: WireHint { proto: 17, v4: 1, port4: 2, raddr: 3, rport: 4 } })
+        );
         for bad in [
-            hint_payload(17, 1, 2, 3, 4),
+            hint_payload(0, 1, 2, 3, 4),
+            hint_payload(58, 1, 2, 3, 4),
             hint_payload(1, 1, 2, 3, 4),
+            hint_payload(17, 0, 2, 3, 4),
             hint_payload(6, 0, 2, 3, 4),
             hint_payload(6, 1, 0, 3, 4),
             hint_payload(6, 1, 2, 0, 4),
@@ -1159,7 +1210,7 @@ mod tests {
         long.push(0);
         assert_eq!(decode_payload(ty::SESS_HINT, &long), Err(CodecError::Trailing(1)));
         // Encode refuses what decode would refuse.
-        let bad = Msg::SessHint { slice: 0, seq: 0, hint: WireHint { proto: 17, v4: 1, port4: 1, raddr: 1, rport: 1 } };
+        let bad = Msg::SessHint { slice: 0, seq: 0, hint: WireHint { proto: 1, v4: 1, port4: 1, raddr: 1, rport: 1 } };
         let mut out = vec![7];
         assert_eq!(encode(&bad, MAX, &mut out), Err(CodecError::Invalid("hint")));
         assert_eq!(out, vec![7]);
@@ -1183,7 +1234,8 @@ mod tests {
         assert_eq!(decode_payload(ty::SNAPSHOT_END, &p), Err(CodecError::Truncated), "v1 SnapshotEnd refused");
         p.push(2);
         assert_eq!(decode_payload(ty::SNAPSHOT_END, &p), Err(CodecError::Invalid("snapshot_end.hints")));
-        // Unknown snapshot tag 4, and a Sess record with proto UDP.
+        // Unknown snapshot tag 4, a Sess record with proto ICMP, and one
+        // with proto UDP (accepted).
         let mut c = 0u16.to_le_bytes().to_vec();
         c.extend_from_slice(&0u64.to_le_bytes());
         c.extend_from_slice(&1u32.to_le_bytes());
@@ -1191,11 +1243,19 @@ mod tests {
         t4.push(4);
         t4.extend_from_slice(&[1; 13]);
         assert_eq!(decode_payload(ty::SNAPSHOT_CHUNK, &t4), Err(CodecError::Invalid("snapshot.record")));
+        let mut icmp = c.clone();
+        icmp.push(3);
+        icmp.push(1);
+        icmp.extend_from_slice(&[1; 12]);
+        assert_eq!(decode_payload(ty::SNAPSHOT_CHUNK, &icmp), Err(CodecError::Invalid("hint")));
         let mut udp = c.clone();
         udp.push(3);
         udp.push(17);
         udp.extend_from_slice(&[1; 12]);
-        assert_eq!(decode_payload(ty::SNAPSHOT_CHUNK, &udp), Err(CodecError::Invalid("hint")));
+        assert!(matches!(
+            decode_payload(ty::SNAPSHOT_CHUNK, &udp),
+            Ok(Msg::SnapshotChunk { records, .. }) if matches!(records[..], [SnapRecord::Sess(WireHint { proto: 17, .. })])
+        ));
     }
 
     // ---- QA: session-hint codec properties ----
@@ -1223,7 +1283,7 @@ mod tests {
 
         /// A `SnapshotChunk` of `Sess` records with arbitrary record bytes
         /// (tag 3 forced) never panics; it decodes only when every record is
-        /// a valid TCP hint with non-zero fields.
+        /// a valid TCP or UDP hint with non-zero fields.
         #[test]
         fn qa_sess_records_arbitrary_bytes(recs in proptest::collection::vec(any::<[u8; 13]>(), 1..20)) {
             let mut p = 1u16.to_le_bytes().to_vec();
@@ -1234,7 +1294,7 @@ mod tests {
                 p.extend_from_slice(r);
             }
             let valid = recs.iter().all(|r| {
-                r[0] == PROTO_TCP
+                (r[0] == PROTO_TCP || r[0] == PROTO_UDP)
                     && r[1..5] != [0; 4]
                     && r[5..7] != [0; 2]
                     && r[7..11] != [0; 4]
@@ -1247,14 +1307,15 @@ mod tests {
             }
         }
 
-        /// `SessHint` decodes iff proto is TCP and every field is non-zero;
+        /// `SessHint` decodes iff proto is TCP or UDP and every field is
+        /// non-zero;
         /// `SnapshotEnd.hints` accepts only 0 and 1.
         #[test]
         fn qa_sess_hint_and_end_byte_rules(
             proto in any::<u8>(), v4 in any::<u32>(), port4 in any::<u16>(),
             raddr in any::<u32>(), rport in any::<u16>(), end in any::<u8>(),
         ) {
-            let ok = proto == PROTO_TCP && v4 != 0 && port4 != 0 && raddr != 0 && rport != 0;
+            let ok = (proto == PROTO_TCP || proto == PROTO_UDP) && v4 != 0 && port4 != 0 && raddr != 0 && rport != 0;
             let got = decode_payload(ty::SESS_HINT, &hint_payload(proto, v4, port4, raddr, rport));
             if ok {
                 prop_assert_eq!(got, Ok(Msg::SessHint { slice: 3, seq: 9, hint: WireHint { proto, v4, port4, raddr, rport } }));

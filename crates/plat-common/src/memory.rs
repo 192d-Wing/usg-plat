@@ -350,6 +350,12 @@ mod tests {
             h.session_hints = crate::config::SessionHints::Off;
         }
         assert_eq!(required_bytes(&c_off, 3) - required_bytes(&no_ha, 3), 4 * 65536 * 64);
+        // UDP hints reuse the inline shadow hints: same memory as "tcp".
+        let mut c_udp = c.clone();
+        if let Some(h) = c_udp.cluster.ha.as_mut() {
+            h.session_hints = crate::config::SessionHints::TcpUdp;
+        }
+        assert_eq!(required_bytes(&c_udp, 3), required_bytes(&c, 3));
     }
 
     #[test]

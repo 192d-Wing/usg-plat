@@ -12,7 +12,8 @@
 //! - [`Shadow`]: the backup's copy of the slices it protects, turned into
 //!   an [`AdoptInput`] on takeover. With session hints it also keeps, per
 //!   TCP BIB, up to [`MAX_HINTS`] remotes the primary had an ESTABLISHED
-//!   session with (POAM-028).
+//!   session with, and with `session_hints = "tcp_udp"` per UDP BIB the
+//!   remotes of its hinted (aged, bidirectional) sessions (POAM-028).
 //!
 //! COMPLIANCE MAPPING:
 //! - NIST 800-53: SC-5 (Denial-of-Service Protection) - every ring, the
@@ -30,7 +31,7 @@ use ahash::RandomState;
 use crossbeam_utils::CachePadded;
 use parking_lot::Mutex;
 use plat_cluster::{
-    MAX_MEMBERS, MemberId, Msg, PROTO_TCP, SliceId, SliceMap, SnapRecord, WireBib, WireBlock, WireHint,
+    MAX_MEMBERS, MemberId, Msg, PROTO_TCP, PROTO_UDP, SliceId, SliceMap, SnapRecord, WireBib, WireBlock, WireHint,
 };
 use plat_packet::proto;
 
@@ -69,10 +70,12 @@ pub enum ReplRecord {
         sub: u128,
     },
     /// A TCP session on the BIB `(TCP, v4, port4)` reached ESTABLISHED
-    /// (once per connection; there is no delete record, a hint dies with
-    /// its BIB).
+    /// (once per connection), or a UDP session on `(UDP, v4, port4)` became
+    /// eligible or is re-hinted (at most once per `udp_secs`). There is no
+    /// delete record: a hint dies with its BIB. `proto` is TCP or UDP.
     SessHint {
         slice: SliceId,
+        proto: u8,
         v4: u32,
         port4: u16,
         raddr: u32,
@@ -104,8 +107,8 @@ impl ReplRecord {
             Self::BibDelete { slice, proto, v4, port4 } => Msg::BibDelete { slice, seq, proto, v4, port4 },
             Self::SubHome { sub, slice } => Msg::SubHome { sub, slice },
             Self::SubGone { sub } => Msg::SubGone { sub },
-            Self::SessHint { slice, v4, port4, raddr, rport } => {
-                Msg::SessHint { slice, seq, hint: WireHint { proto: PROTO_TCP, v4, port4, raddr, rport } }
+            Self::SessHint { slice, proto, v4, port4, raddr, rport } => {
+                Msg::SessHint { slice, seq, hint: WireHint { proto, v4, port4, raddr, rport } }
             }
         }
     }
@@ -122,10 +125,18 @@ impl ReplRecord {
             Msg::BibDelete { slice, seq, proto, v4, port4 } => (Self::BibDelete { slice, proto, v4, port4 }, seq),
             Msg::SubHome { sub, slice } => (Self::SubHome { sub, slice }, 0),
             Msg::SubGone { sub } => (Self::SubGone { sub }, 0),
-            // The codec refuses any protocol other than TCP.
-            Msg::SessHint { slice, seq, hint } => {
-                (Self::SessHint { slice, v4: hint.v4, port4: hint.port4, raddr: hint.raddr, rport: hint.rport }, seq)
-            }
+            // The codec refuses any protocol other than TCP and UDP.
+            Msg::SessHint { slice, seq, hint } => (
+                Self::SessHint {
+                    slice,
+                    proto: hint.proto,
+                    v4: hint.v4,
+                    port4: hint.port4,
+                    raddr: hint.raddr,
+                    rport: hint.rport,
+                },
+                seq,
+            ),
             _ => return None,
         })
     }
@@ -160,6 +171,10 @@ struct Ring {
     tail: CachePadded<AtomicU64>,
     /// Records refused on a full ring (producer-owned).
     dropped: CachePadded<AtomicU64>,
+    /// UDP hints deferred by the producer's bucket, and accepted by it
+    /// (producer-owned, written only on the cold UDP hint path).
+    udp_deferred: CachePadded<AtomicU64>,
+    udp_pushed: CachePadded<AtomicU64>,
     /// Serialises consumers (off path), so `drain` may be called from any
     /// thread without breaking the single-consumer contract.
     /// Padded (PERF-004): off the line of `slots`/`mask`, which the
@@ -240,8 +255,15 @@ impl ReplRecord {
                 put(1, lo(sub));
                 put(2, hi(sub));
             }
-            Self::SessHint { slice, v4, port4, raddr, rport } => {
-                put(0, T_HINT | u64::from(slice) << 8 | u64::from(port4) << 24 | u64::from(rport) << 40);
+            Self::SessHint { slice, proto, v4, port4, raddr, rport } => {
+                put(
+                    0,
+                    T_HINT
+                        | u64::from(slice) << 8
+                        | u64::from(port4) << 24
+                        | u64::from(rport) << 40
+                        | u64::from(proto) << 56,
+                );
                 put(1, u64::from(v4) | u64::from(raddr) << 32);
             }
         }
@@ -282,6 +304,7 @@ impl ReplRecord {
                 let w1 = g(1);
                 let h = Self::SessHint {
                     slice: (w0 >> 8) as u16,
+                    proto: (w0 >> 56) as u8,
                     v4: w1 as u32,
                     port4: (w0 >> 24) as u16,
                     raddr: (w1 >> 32) as u32,
@@ -293,7 +316,8 @@ impl ReplRecord {
                     | Self::SessHint { port4: 0, .. }
                     | Self::SessHint { raddr: 0, .. }
                     | Self::SessHint { rport: 0, .. } => return None,
-                    _ => h,
+                    Self::SessHint { proto: PROTO_TCP | PROTO_UDP, .. } => h,
+                    _ => return None,
                 }
             }
             _ => return None,
@@ -310,6 +334,8 @@ impl Ring {
             head: CachePadded::new(AtomicU64::new(0)),
             tail: CachePadded::new(AtomicU64::new(0)),
             dropped: CachePadded::new(AtomicU64::new(0)),
+            udp_deferred: CachePadded::new(AtomicU64::new(0)),
+            udp_pushed: CachePadded::new(AtomicU64::new(0)),
             consumer: CachePadded::new(Mutex::new(())),
         }
     }
@@ -389,8 +415,9 @@ pub struct ReplHub {
 struct DrainScratch {
     /// Hints of the batch with their drain position.
     hints: Vec<(usize, ReplRecord)>,
-    /// `(slice, v4, port4, position)` of every TCP `BibDelete` in the batch.
-    dels: Vec<(SliceId, u32, u16, usize)>,
+    /// `(slice, proto, v4, port4, position)` of every TCP or UDP
+    /// `BibDelete` in the batch.
+    dels: Vec<(SliceId, u8, u32, u16, usize)>,
     /// Per-ring tail read before the pops: the hint cut.
     cuts: Vec<u64>,
 }
@@ -405,13 +432,35 @@ pub struct ReplProducer {
     /// the type `!Sync`).
     head_cache: Cell<u64>,
     hub: Arc<ReplHub>,
+    /// UDP hint token bucket (owner thread only): tokens, the fraction of
+    /// a token carried over (thousandths), last refill (engine ms), and
+    /// the rate (`cluster.ha.udp_hints_per_sec`, also the burst).
+    udp_tokens: Cell<u32>,
+    udp_credit: Cell<u64>,
+    udp_refill_ms: Cell<u64>,
+    udp_rate: u32,
 }
+
+/// Default `cluster.ha.udp_hints_per_sec` ([`ReplHub::new`]).
+pub const DEFAULT_UDP_HINTS_PER_SEC: u32 = 2000;
 
 impl ReplHub {
     /// `producers` rings (workers plus one for the sweeper) of `entries`
     /// records each (rounded up to a power of two), preallocated; `slices`
-    /// sizes the dirty bitmap.
+    /// sizes the dirty bitmap. UDP hints use [`DEFAULT_UDP_HINTS_PER_SEC`].
     pub fn new(producers: usize, entries: usize, slices: usize) -> (Arc<Self>, Vec<ReplProducer>) {
+        Self::with_udp_hint_rate(producers, entries, slices, DEFAULT_UDP_HINTS_PER_SEC)
+    }
+
+    /// [`Self::new`] with `udp_hints_per_sec` UDP hints per second per
+    /// producer (burst one second; at least 1).
+    pub fn with_udp_hint_rate(
+        producers: usize,
+        entries: usize,
+        slices: usize,
+        udp_hints_per_sec: u32,
+    ) -> (Arc<Self>, Vec<ReplProducer>) {
+        let rate = udp_hints_per_sec.max(1);
         let rings: Vec<Arc<Ring>> = (0..producers).map(|_| Arc::new(Ring::new(entries))).collect();
         let hub = Arc::new(Self {
             rings: rings.clone(),
@@ -422,8 +471,18 @@ impl ReplHub {
             hints_superseded: AtomicU64::new(0),
             drains_truncated: AtomicU64::new(0),
         });
-        let prods =
-            rings.into_iter().map(|ring| ReplProducer { ring, head_cache: Cell::new(0), hub: hub.clone() }).collect();
+        let prods = rings
+            .into_iter()
+            .map(|ring| ReplProducer {
+                ring,
+                head_cache: Cell::new(0),
+                hub: hub.clone(),
+                udp_tokens: Cell::new(rate),
+                udp_credit: Cell::new(0),
+                udp_refill_ms: Cell::new(0),
+                udp_rate: rate,
+            })
+            .collect();
         (hub, prods)
     }
 
@@ -536,7 +595,9 @@ impl ReplHub {
                     hints.push((i, r));
                     continue;
                 }
-                ReplRecord::BibDelete { slice, proto: proto::TCP, v4, port4 } => dels.push((slice, v4, port4, i)),
+                ReplRecord::BibDelete { slice, proto: p @ (proto::TCP | proto::UDP), v4, port4 } => {
+                    dels.push((slice, p, v4, port4, i))
+                }
                 _ => {}
             }
             if let Some(slot) = out.get_mut(w) {
@@ -548,12 +609,13 @@ impl ReplHub {
         // Last delete position per BIB: the final element of each key run.
         dels.sort_unstable();
         for &(pos, h) in hints.iter() {
-            if let ReplRecord::SessHint { slice, v4, port4, .. } = h {
-                let end = dels.partition_point(|d| (d.0, d.1, d.2) <= (slice, v4, port4));
+            if let ReplRecord::SessHint { slice, proto: p, v4, port4, .. } = h {
+                let key = (slice, p, v4, port4);
+                let end = dels.partition_point(|d| (d.0, d.1, d.2, d.3) <= key);
                 let deleted_later = end
                     .checked_sub(1)
                     .and_then(|j| dels.get(j))
-                    .is_some_and(|d| (d.0, d.1, d.2) == (slice, v4, port4) && d.3 > pos);
+                    .is_some_and(|d| (d.0, d.1, d.2, d.3) == key && d.4 > pos);
                 if deleted_later {
                     self.hints_superseded.fetch_add(1, Ordering::Relaxed);
                 } else {
@@ -617,6 +679,18 @@ impl ReplHub {
     pub fn dropped_total(&self) -> u64 {
         self.rings.iter().map(|r| r.dropped.load(Ordering::Relaxed)).sum()
     }
+
+    /// UDP hints a producer's bucket deferred to a later packet
+    /// (`plat_cluster_udp_hints_deferred_total`).
+    pub fn udp_hints_deferred(&self) -> u64 {
+        self.rings.iter().map(|r| r.udp_deferred.load(Ordering::Relaxed)).sum()
+    }
+
+    /// UDP hints accepted by the buckets (queued, or lost on a full ring
+    /// and repaired by resync).
+    pub fn udp_hints_pushed(&self) -> u64 {
+        self.rings.iter().map(|r| r.udp_pushed.load(Ordering::Relaxed)).sum()
+    }
 }
 
 impl ReplProducer {
@@ -630,6 +704,58 @@ impl ReplProducer {
     #[inline]
     pub fn push(&self, rec: ReplRecord) -> bool {
         self.ring.push(&rec, &self.head_cache) || self.lost(rec)
+    }
+
+    /// Refills the UDP hint bucket to engine time `now_ms` and returns
+    /// whether it holds a token, counting a deferral when it does not.
+    /// Callers check this before building the hint, so an empty bucket
+    /// costs no lookup; [`Self::push_udp_hint`] then takes the token.
+    /// Fractions of a token carry over, so any rate is delivered exactly;
+    /// a clock that goes backwards adds nothing.
+    #[inline]
+    pub fn udp_hint_ready(&self, now_ms: u64) -> bool {
+        let last = self.udp_refill_ms.get();
+        if now_ms > last {
+            self.udp_refill_ms.set(now_ms);
+            let rate = u64::from(self.udp_rate);
+            let credit = self.udp_credit.get().saturating_add((now_ms - last).saturating_mul(rate));
+            let t = u64::from(self.udp_tokens.get()).saturating_add(credit / 1000);
+            if t >= rate {
+                self.udp_tokens.set(self.udp_rate);
+                self.udp_credit.set(0);
+            } else {
+                self.udp_tokens.set(t as u32);
+                self.udp_credit.set(credit % 1000);
+            }
+        }
+        if self.udp_tokens.get() == 0 {
+            let d = &self.ring.udp_deferred;
+            d.store(d.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+            return false;
+        }
+        true
+    }
+
+    /// Queues a UDP session hint if the producer's token bucket has a
+    /// token (refilled at `udp_hints_per_sec` from engine time `now_ms`).
+    /// Returns false when the bucket is empty (deferred, counted): the
+    /// caller keeps the hint pending and retries on a later packet. A hint
+    /// lost on a full ring counts as sent (the slice resyncs).
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: SC-5 - UDP churn cannot flood the ring or the peer
+    ///   channel: at most `udp_hints_per_sec` (plus one second of burst)
+    ///   hints per producer
+    pub fn push_udp_hint(&self, rec: ReplRecord, now_ms: u64) -> bool {
+        if !self.udp_hint_ready(now_ms) {
+            return false;
+        }
+        let t = self.udp_tokens.get();
+        self.udp_tokens.set(t - 1);
+        let p = &self.ring.udp_pushed;
+        p.store(p.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+        self.push(rec);
+        true
     }
 
     #[cold]
@@ -929,6 +1055,13 @@ pub struct HintStats {
     /// A fifth remote replaced a (possibly live) one: the BIB is marked
     /// hint-incomplete (`plat_cluster_session_hints_evicted_total`).
     pub evicted: AtomicU64,
+    /// UDP hints (`proto="udp"`): applied, and refused because their BIB
+    /// is not in the shadow (counted only, never a gap: UDP hints do not
+    /// govern strictness, and resyncing on UDP churn would amplify it).
+    pub udp_applied: AtomicU64,
+    pub udp_no_bib: AtomicU64,
+    /// A fifth UDP remote replaced the oldest (no strictness effect).
+    pub udp_evicted: AtomicU64,
 }
 
 /// What a new owner imports on takeover (from [`Shadow::take`]).
@@ -937,8 +1070,8 @@ pub struct AdoptInput {
     /// `(sub, block, original allocation time)`.
     pub blocks: Vec<(u128, WireBlock, u64)>,
     pub bibs: Vec<WireBib>,
-    /// Session hints of the TCP BIBs in `bibs` (the hint's BIB is
-    /// `(TCP, v4, port4)`); hints of other BIBs are ignored.
+    /// Session hints of the TCP and UDP BIBs in `bibs` (the hint's BIB is
+    /// `(hint.proto, v4, port4)`); hints of other BIBs are ignored.
     pub hints: Vec<WireHint>,
     /// When each of `hints` was learned (shadow clock, seconds; parallel
     /// to `hints`, a missing entry means `hint_now_s`).
@@ -1161,7 +1294,9 @@ impl Shadow {
         &self.hint_stats
     }
 
-    /// Adds one session hint to its shadow TCP BIB.
+    /// Adds one session hint to its shadow TCP or UDP BIB. A UDP hint
+    /// without its BIB is counted (`udp_no_bib`) and accepted: it never
+    /// marks the slice gapped (T3, no resync amplification by UDP churn).
     ///
     /// COMPLIANCE MAPPING:
     /// - NIST 800-53: SI-10 - zero fields and addresses outside the slice
@@ -1171,13 +1306,14 @@ impl Shadow {
     fn apply_hint(
         &self,
         slice: SliceId,
+        p: u8,
         v4: u32,
         port4: u16,
         remote: (u32, u16),
         now_ms: u64,
     ) -> Result<(), ShadowError> {
         let st = &self.hint_stats;
-        if v4 == 0 || port4 == 0 || remote.0 == 0 || remote.1 == 0 {
+        if v4 == 0 || port4 == 0 || remote.0 == 0 || remote.1 == 0 || !matches!(p, proto::TCP | proto::UDP) {
             st.invalid.fetch_add(1, Ordering::Relaxed);
             return Err(ShadowError::Invalid);
         }
@@ -1186,6 +1322,20 @@ impl Shadow {
             return Err(ShadowError::Range);
         }
         let mut g = self.slice(slice)?.lock();
+        if p == proto::UDP {
+            let Some(b) = g.bibs.get_mut(&(proto::UDP, v4, port4)) else {
+                drop(g);
+                st.udp_no_bib.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            };
+            let evicted = b.hints.get_or_insert_with(Hints::default).add(remote, hint_secs(now_ms));
+            drop(g);
+            if evicted {
+                st.udp_evicted.fetch_add(1, Ordering::Relaxed);
+            }
+            st.udp_applied.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
         let Some(b) = g.bibs.get_mut(&(proto::TCP, v4, port4)) else {
             // The slice copy now lacks an ESTABLISHED session: not hinted
             // until the next snapshot (the caller also marks it gapped).
@@ -1284,8 +1434,8 @@ impl Shadow {
                     self.bibs.fetch_sub(1, Ordering::Relaxed);
                 }
             }
-            ReplRecord::SessHint { slice, v4, port4, raddr, rport } => {
-                self.apply_hint(slice, v4, port4, (raddr, rport), now_ms)?
+            ReplRecord::SessHint { slice, proto: p, v4, port4, raddr, rport } => {
+                self.apply_hint(slice, p, v4, port4, (raddr, rport), now_ms)?
             }
             ReplRecord::SubHome { .. } | ReplRecord::SubGone { .. } => {}
         }
@@ -1350,11 +1500,11 @@ impl Shadow {
                     }
                 }
                 SnapRecord::Sess(h) => {
-                    if h.proto != PROTO_TCP {
+                    if h.proto != PROTO_TCP && h.proto != PROTO_UDP {
                         self.hint_stats.invalid.fetch_add(1, Ordering::Relaxed);
                         return Err(ShadowError::Proto);
                     }
-                    match self.apply_hint(slice, h.v4, h.port4, (h.raddr, h.rport), now_ms) {
+                    match self.apply_hint(slice, h.proto, h.v4, h.port4, (h.raddr, h.rport), now_ms) {
                         Err(ShadowError::NoBib) => {
                             // Counted as an orphan, not as a streamed no_bib.
                             self.hint_stats.no_bib.fetch_sub(1, Ordering::Relaxed);
@@ -1498,16 +1648,17 @@ impl Shadow {
         for x in s.bibs.into_values() {
             if let Some(h) = &x.hints {
                 for ((raddr, rport), t) in h.iter() {
-                    hints.push((WireHint { proto: PROTO_TCP, v4: x.bib.v4, port4: x.bib.port4, raddr, rport }, t));
+                    hints.push((WireHint { proto: x.bib.proto, v4: x.bib.v4, port4: x.bib.port4, raddr, rport }, t));
                 }
-                if h.lossy() {
+                // Lossy governs TCP pickup only.
+                if h.lossy() && x.bib.proto == proto::TCP {
                     hints_lossy.push((x.bib.v4, x.bib.port4));
                 }
             }
             bibs.push(x.bib);
         }
         bibs.sort_unstable_by_key(|b| (b.v4, b.port4, b.proto));
-        hints.sort_unstable_by_key(|(h, _)| (h.v4, h.port4, h.raddr, h.rport));
+        hints.sort_unstable_by_key(|(h, _)| (h.v4, h.port4, h.proto, h.raddr, h.rport));
         hints_lossy.sort_unstable();
         let (hints, hint_learned_s) = hints.into_iter().unzip();
         let mut reserved_unseen: Vec<_> = s.reserved.iter().map(|&(addr, block)| WireBlock { addr, block }).collect();
@@ -1560,7 +1711,7 @@ mod tests {
 
     #[test]
     fn ring_records_round_trip() {
-        let (hub, prods) = ReplHub::new(1, 8, 4);
+        let (hub, prods) = ReplHub::new(1, 16, 4);
         let bib = WireBib {
             sub: u128::MAX - 1,
             proto: 6,
@@ -1578,8 +1729,16 @@ mod tests {
             ReplRecord::BibDelete { slice: 3, proto: 17, v4: u32::MAX, port4: 65535 },
             ReplRecord::SubHome { sub: u128::MAX, slice: 4095 },
             ReplRecord::SubGone { sub: 1 << 127 },
-            ReplRecord::SessHint { slice: 4095, v4: u32::MAX, port4: 65535, raddr: u32::MAX - 1, rport: 65534 },
-            ReplRecord::SessHint { slice: 0, v4: 1, port4: 1, raddr: 1, rport: 1 },
+            ReplRecord::SessHint {
+                slice: 4095,
+                proto: 6,
+                v4: u32::MAX,
+                port4: 65535,
+                raddr: u32::MAX - 1,
+                rport: 65534,
+            },
+            ReplRecord::SessHint { slice: 0, proto: 6, v4: 1, port4: 1, raddr: 1, rport: 1 },
+            ReplRecord::SessHint { slice: 4095, proto: 17, v4: u32::MAX, port4: 65535, raddr: 7, rport: 65535 },
         ];
         for _ in 0..3 {
             for r in &recs {
@@ -1589,9 +1748,10 @@ mod tests {
             assert_eq!(hub.drain(100, &mut out), recs.len());
             assert_eq!(out, recs, "wraps the ring");
         }
-        assert_eq!(hub.pushed_total(), 24);
-        let h = recs[7];
-        assert_eq!(ReplRecord::from_msg(&h.to_msg(5)), Some((h, 5)));
+        assert_eq!(hub.pushed_total(), 27);
+        for h in [recs[7], recs[8]] {
+            assert_eq!(ReplRecord::from_msg(&h.to_msg(5)), Some((h, 5)));
+        }
     }
 
     #[test]
@@ -1659,7 +1819,7 @@ mod tests {
     }
 
     fn hint(port4: u16, raddr: u32, rport: u16) -> ReplRecord {
-        ReplRecord::SessHint { slice: 0, v4: 0x0a00_0000, port4, raddr, rport }
+        ReplRecord::SessHint { slice: 0, proto: 6, v4: 0x0a00_0000, port4, raddr, rport }
     }
 
     /// SEC-002: a fifth remote evicts the oldest, is counted and leaves the
@@ -1822,7 +1982,7 @@ mod tests {
         // UDP BIB with the same port: still no TCP BIB.
         sh.apply(&ReplRecord::BibCreate { slice: 0, bib: WireBib { proto: 17, ..tcp_bib(1100) } }, 0).unwrap();
         assert_eq!(sh.apply(&hint(1100, 1, 443), 0), Err(ShadowError::NoBib));
-        let out = ReplRecord::SessHint { slice: 1, v4: 0x0a00_0000, port4: 1100, raddr: 1, rport: 1 };
+        let out = ReplRecord::SessHint { slice: 1, proto: 6, v4: 0x0a00_0000, port4: 1100, raddr: 1, rport: 1 };
         assert_eq!(sh.apply(&out, 0), Err(ShadowError::Range));
         assert_eq!(sh.apply(&hint(1100, 0, 443), 0), Err(ShadowError::Invalid));
         let st = sh.hint_stats();
@@ -1873,9 +2033,139 @@ mod tests {
     #[test]
     fn ring_refuses_zero_hint_fields() {
         let (hub, prods) = ReplHub::new(1, 8, 4);
-        assert!(prods[0].push(ReplRecord::SessHint { slice: 0, v4: 1, port4: 1, raddr: 0, rport: 1 }));
+        assert!(prods[0].push(ReplRecord::SessHint { slice: 0, proto: 6, v4: 1, port4: 1, raddr: 0, rport: 1 }));
         let mut out = Vec::new();
         assert_eq!(hub.drain(10, &mut out), 1);
         assert!(out.is_empty(), "decoded as nothing");
+    }
+
+    /// SI-10: a ring hint whose proto (bits 56..63) is not TCP or UDP
+    /// decodes as nothing.
+    #[test]
+    fn ring_refuses_bad_hint_proto() {
+        let (hub, prods) = ReplHub::new(1, 8, 4);
+        for p in [0, 1, 58, 255] {
+            assert!(prods[0].push(ReplRecord::SessHint { slice: 0, proto: p, v4: 1, port4: 1, raddr: 1, rport: 1 }));
+        }
+        let mut out = Vec::new();
+        assert_eq!(hub.drain(10, &mut out), 4);
+        assert!(out.is_empty());
+    }
+
+    /// SC-5: the UDP hint bucket starts full (one second of burst), defers
+    /// when empty (counted, nothing queued) and refills at the rate.
+    #[test]
+    fn udp_hint_bucket_rate_burst_refill() {
+        let (hub, prods) = ReplHub::with_udp_hint_rate(1, 64, 4, 3);
+        let h = ReplRecord::SessHint { slice: 0, proto: 17, v4: 1, port4: 1, raddr: 1, rport: 1 };
+        let t0 = 10_000;
+        assert!((0..3).all(|_| prods[0].push_udp_hint(h, t0)));
+        assert!(!prods[0].push_udp_hint(h, t0));
+        assert!(!prods[0].push_udp_hint(h, t0 + 300), "0.9 tokens");
+        assert!(prods[0].push_udp_hint(h, t0 + 340), "one token after 1/3 s");
+        assert!(!prods[0].push_udp_hint(h, t0 + 340));
+        // Long idle: capped at the burst.
+        assert!((0..3).all(|_| prods[0].push_udp_hint(h, t0 + 60_000)));
+        assert!(!prods[0].push_udp_hint(h, t0 + 60_000));
+        assert_eq!((hub.udp_hints_pushed(), hub.udp_hints_deferred()), (7, 4));
+        let mut out = Vec::new();
+        assert_eq!(hub.drain(100, &mut out), 7);
+        // Rate 0 is raised to 1.
+        let (_, prods) = ReplHub::with_udp_hint_rate(1, 8, 4, 0);
+        assert!(prods[0].push_udp_hint(h, t0));
+        assert!(!prods[0].push_udp_hint(h, t0));
+    }
+
+    /// QA, SC-5: bucket boundaries. Burst is exactly one second of tokens
+    /// (at 1/s and at the 100 000/s cap), a refill below one token adds
+    /// nothing, exactly 1000/rate ms adds one, and a clock that goes
+    /// backwards adds nothing.
+    #[test]
+    fn qa_udp_hint_bucket_boundaries() {
+        let h = ReplRecord::SessHint { slice: 0, proto: 17, v4: 1, port4: 1, raddr: 1, rport: 1 };
+        for rate in [1u32, 1000, 100_000] {
+            let (hub, prods) = ReplHub::with_udp_hint_rate(1, 1024, 4, rate);
+            let p = &prods[0];
+            let t0 = 50_000;
+            let mut n = 0u64;
+            while p.push_udp_hint(h, t0) {
+                n += 1;
+                assert!(n <= u64::from(rate), "rate {rate}: burst above one second");
+            }
+            assert_eq!(n, u64::from(rate), "rate {rate}: burst is one second of tokens");
+            let step = 1000 / u64::from(rate);
+            if step > 1 {
+                assert!(!p.push_udp_hint(h, t0 + step - 1), "rate {rate}: below one token");
+            }
+            assert!(p.push_udp_hint(h, t0 + step.max(1)), "rate {rate}: one token after {step} ms");
+            if rate <= 1000 {
+                assert!(!p.push_udp_hint(h, t0 + step - 1), "rate {rate}: clock went backwards");
+            }
+            assert_eq!(hub.udp_hints_pushed(), u64::from(rate) + 1);
+            assert!(hub.udp_hints_deferred() >= 1);
+        }
+    }
+
+    /// QA, SC-5: sustained rate over 10 s of one call per ms never exceeds
+    /// burst + rate x elapsed (fractional remainders are not created out of
+    /// thin air).
+    #[test]
+    fn qa_udp_hint_bucket_sustained_rate() {
+        let h = ReplRecord::SessHint { slice: 0, proto: 17, v4: 1, port4: 1, raddr: 1, rport: 1 };
+        for rate in [3u32, 7, 333, 2000] {
+            let (_hub, prods) = ReplHub::with_udp_hint_rate(1, 1 << 16, 4, rate);
+            let t0 = 1_000;
+            let mut sent = 0u64;
+            for ms in 0..10_000u64 {
+                for _ in 0..4 {
+                    sent += u64::from(prods[0].push_udp_hint(h, t0 + ms));
+                }
+            }
+            let cap = u64::from(rate) * 11;
+            assert!(sent <= cap, "rate {rate}: {sent} > {cap}");
+        }
+    }
+
+    /// QA-2: a rate that does not divide 1000 is delivered in full with
+    /// frequent calls (fractions of a token carry over).
+    #[test]
+    fn qa_udp_hint_bucket_delivers_configured_rate() {
+        let h = ReplRecord::SessHint { slice: 0, proto: 17, v4: 1, port4: 1, raddr: 1, rport: 1 };
+        for rate in [333u32, 999] {
+            let (_hub, prods) = ReplHub::with_udp_hint_rate(1, 1 << 16, 4, rate);
+            let mut sent = 0u64;
+            // Two calls per ms: more demand than the rate, so the bucket
+            // (not the caller) sets the pace (one call per ms caps 999/s
+            // at 1000 calls/s).
+            for ms in 0..10_000u64 {
+                for _ in 0..2 {
+                    sent += u64::from(prods[0].push_udp_hint(h, 1_000 + ms));
+                }
+            }
+            // One second of burst plus 10 s at the rate (last ms excluded).
+            let want = u64::from(rate) * 11;
+            assert!(sent * 100 >= want * 95, "rate {rate}: {sent} of {want}");
+            assert!(sent <= want, "rate {rate}: {sent} > {want}");
+        }
+    }
+
+    /// A UDP hint drained before a delete of its UDP BIB in the same batch
+    /// is superseded; a TCP delete of the same `(v4, port4)` does not touch
+    /// it.
+    #[test]
+    fn drain_supersedes_udp_hint_by_udp_delete_only() {
+        let (hub, prods) = ReplHub::new(1, 16, 4);
+        let h = ReplRecord::SessHint { slice: 0, proto: 17, v4: 1, port4: 1, raddr: 1, rport: 1 };
+        assert!(prods[0].push(h));
+        assert!(prods[0].push(ReplRecord::BibDelete { slice: 0, proto: 6, v4: 1, port4: 1 }));
+        let mut out = Vec::new();
+        hub.drain(100, &mut out);
+        assert_eq!(out.last(), Some(&h));
+        assert!(prods[0].push(h));
+        assert!(prods[0].push(ReplRecord::BibDelete { slice: 0, proto: 17, v4: 1, port4: 1 }));
+        out.clear();
+        hub.drain(100, &mut out);
+        assert!(!out.contains(&h));
+        assert_eq!(hub.hints_superseded(), 1);
     }
 }

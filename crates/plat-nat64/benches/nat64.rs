@@ -454,15 +454,26 @@ fn ha_fixture() -> (Fx, Arc<ReplHub>) {
 
 /// `ha_fixture` with config edits and a reserve-ahead budget in blocks.
 fn ha_fixture_with(edits: &[(&str, &str)], reserve_ahead: u16) -> (Fx, Arc<ReplHub>) {
-    ha_fixture_full(edits, reserve_ahead, false)
+    ha_fixture_full(edits, reserve_ahead, (false, false))
 }
 
 /// `ha_fixture` with `cluster.ha.session_hints` on (`hints`) or off.
 fn ha_fixture_hints(hints: bool) -> (Fx, Arc<ReplHub>) {
-    ha_fixture_full(&[], 8, hints)
+    ha_fixture_full(&[], 8, (hints, false))
 }
 
-fn ha_fixture_full(edits: &[(&str, &str)], reserve_ahead: u16, hints: bool) -> (Fx, Arc<ReplHub>) {
+/// `ha_fixture` with `cluster.ha.session_hints = "tcp_udp"`.
+fn ha_fixture_udp() -> (Fx, Arc<ReplHub>) {
+    ha_fixture_full(&[], 8, (true, true))
+}
+
+/// `hints = (TCP, UDP)`: `"off"`, `"tcp"` or `"tcp_udp"`.
+fn ha_fixture_full(edits: &[(&str, &str)], reserve_ahead: u16, hints: (bool, bool)) -> (Fx, Arc<ReplHub>) {
+    ha_fixture_rate(edits, reserve_ahead, hints, plat_nat64::repl::DEFAULT_UDP_HINTS_PER_SEC)
+}
+
+/// [`ha_fixture_full`] with `udp_hints_per_sec = rate`.
+fn ha_fixture_rate(edits: &[(&str, &str)], reserve_ahead: u16, hints: (bool, bool), rate: u32) -> (Fx, Arc<ReplHub>) {
     let cfg = config(edits);
     let setup = ClusterSetup {
         slices: SliceMap::new(&cfg.nat64.pool, 32).unwrap(),
@@ -470,7 +481,8 @@ fn ha_fixture_full(edits: &[(&str, &str)], reserve_ahead: u16, hints: bool) -> (
         steering: SteeringMode::Drop,
         directory: Arc::new(Directory::new(cfg.nat64.table_shards, cfg.nat64.max_subscribers)),
         tcp_adopt_secs: 300,
-        session_hints: hints,
+        session_hints: hints.0,
+        udp_hints: hints.1.then_some(2),
         quarantine_secs: 600,
         reserve_ahead,
     };
@@ -481,7 +493,7 @@ fn ha_fixture_full(edits: &[(&str, &str)], reserve_ahead: u16, hints: bool) -> (
         let m = AdoptMeta { epoch: 1, prev_owner: None, reason: AcquireReason::Startup };
         nat.state().adopt_slice(s, &AdoptInput::default(), m).unwrap();
     }
-    let (hub, mut prods) = ReplHub::new(1, 65_536, 4);
+    let (hub, mut prods) = ReplHub::with_udp_hint_rate(1, 65_536, 4, rate);
     let ctx = WorkerCtx::new(Arc::new(Counters::default()), 1).with_repl(prods.remove(0));
     (Fx { nat, clock, rx, ctx }, hub)
 }
@@ -518,6 +530,64 @@ fn bench_flows(c: &mut Criterion) {
             black_box(fx.nat.process(&mut buf, HEADROOM, pkt.len(), &mut fx.ctx));
         })
     });
+
+    // POAM-028 (UDP hints): steady-state UDP both ways in "off", "tcp" and
+    // "tcp_udp" (the session hinted first): one byte test, plus one 16-bit
+    // compare once hinted.
+    for (tag, mode) in [("off", (false, false)), ("tcp", (true, false)), ("tcp_udp", (true, true))] {
+        let (mut fx, _hub) = ha_fixture_full(&[], 8, mode);
+        let s = sub(1, 1);
+        let out = udp6(s, 5001, 0xc633_6407, 443, &[0u8; 512]);
+        let o = run(&mut fx, &out).unwrap();
+        let (v4, p4) = (plat_packet::be32(&o, 12), plat_packet::be16(&o, 20));
+        let back = udp4(0xc633_6407, 443, v4, p4, &[0u8; 512]);
+        run(&mut fx, &back).unwrap();
+        fx.clock.advance(Duration::from_millis(3_100));
+        run(&mut fx, &out).unwrap();
+        g.bench_function(format!("udp_existing_session_both_ways_{tag}"), |b| {
+            b.iter(|| {
+                for p in [&out, &back] {
+                    buf[HEADROOM..HEADROOM + p.len()].copy_from_slice(p);
+                    black_box(fx.nat.process(&mut buf, HEADROOM, p.len(), &mut fx.ctx));
+                }
+            })
+        });
+    }
+    // PERF-001: an eligible flow whose hint the empty bucket defers (rate
+    // 1, its one token spent on another flow, clock frozen): every packet
+    // retries, and must cost only the token check, not a slice lookup.
+    {
+        let (mut fx, hub) = ha_fixture_rate(&[], 8, (true, true), 1);
+        let s = sub(1, 1);
+        let mut flows = Vec::new();
+        for port in [5001u16, 5002] {
+            let out = udp6(s, port, 0xc633_6407, 443, &[0u8; 512]);
+            let o = run(&mut fx, &out).unwrap();
+            let (v4, p4) = (plat_packet::be32(&o, 12), plat_packet::be16(&o, 20));
+            let back = udp4(0xc633_6407, 443, v4, p4, &[0u8; 512]);
+            run(&mut fx, &back).unwrap();
+            flows.push((out, back));
+        }
+        fx.clock.advance(Duration::from_millis(3_100));
+        for (out, _) in &flows {
+            run(&mut fx, out).unwrap();
+        }
+        assert_eq!((hub.udp_hints_pushed(), hub.udp_hints_deferred()), (1, 1));
+        let (out, back) = &flows[1];
+        g.bench_function("udp_existing_session_both_ways_tcp_udp_deferred", |b| {
+            b.iter(|| {
+                for p in [out, back] {
+                    buf[HEADROOM..HEADROOM + p.len()].copy_from_slice(p);
+                    black_box(fx.nat.process(&mut buf, HEADROOM, p.len(), &mut fx.ctx));
+                }
+            })
+        });
+        assert_eq!(hub.udp_hints_pushed(), 1, "still deferred");
+    }
+    // New UDP session (new BIB per packet) with "tcp" versus "tcp_udp":
+    // the creation writes the hint state (budget +20 ns per session).
+    g.bench_function("udp_session_create_tcp", |b| b.iter_custom(|n| timed_flows(n, &pkts, || ha_fixture_hints(true))));
+    g.bench_function("udp_session_create_with_hints", |b| b.iter_custom(|n| timed_flows(n, &pkts, ha_fixture_udp)));
 
     // POAM-028: steady-state established TCP, both directions (the
     // `refresh` path that now reports a first establish), hints on.

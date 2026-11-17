@@ -28,8 +28,8 @@ pub mod slices;
 pub mod view;
 
 pub use codec::{
-    CodecError, Hello, MAX_NAME_LEN, Msg, PROTO_TCP, PROTO_VERSION, RejectReason, SnapRecord, WireBib, WireBlock,
-    WireHint,
+    CodecError, Hello, MAX_NAME_LEN, Msg, PROTO_TCP, PROTO_UDP, PROTO_VERSION, RejectReason, SnapRecord, WireBib,
+    WireBlock, WireHint,
 };
 pub use digest::{DigestInput, DigestMember, PartitionScheme, config_digest};
 pub use membership::{

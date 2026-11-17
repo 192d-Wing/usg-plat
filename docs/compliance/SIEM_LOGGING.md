@@ -34,6 +34,13 @@ rate-limited `nat_resource_limit` record (`subscriber_session_limit` or
 BIB, and the record may appear before the slice's `cluster_slice_acquire`
 completes its `nat_port_block_adopt` series.
 
+Branch `feat/udp-hints` (unreleased, on top of `feat/session-hints`, HA UDP
+session hints, POAM-028 (a)) also changes Prometheus metrics only: a `proto`
+label on five hint/restore series, one new counter and a third gauge value
+(see "Metrics and health"). No record type or field changes; the schema
+stays 8. The label change is on series introduced by the unreleased
+`feat/session-hints`, so no released dashboard depends on the old names.
+
 Branch `feat/protocol-completeness` (unreleased) adds drop reasons, counters
 and one gauge but changes no record type or field name, so the schema stays
 7. New `plat.counter.name` values can appear in `dataplane_counter` records
@@ -1016,28 +1023,44 @@ for `nat_port_block_release` (same address and range), `service_stop`,
   the view wait then gets no time (takeover falls back to lease expiry,
   POAM-030 behaviour) and releases queued later go straight to
   `release_all` (SEC-005);
-  session hints (POAM-028, `feat/session-hints`, unreleased; metrics only,
-  schema stays 8): gauge `plat_cluster_session_hints_enabled` (1 when
-  `cluster.ha.session_hints = "tcp"`), counters
-  `plat_cluster_session_hints_total{result}` (`sent`: hints batched to
-  backups by this node as primary; `applied`: hints stored in this node's
-  shadow as backup),
-  `plat_cluster_session_hints_refused_total{reason}` (`no_bib`: the hint's
-  BIB was not in the shadow, the slice is marked gapped and resyncs;
-  `outside_slice`; `invalid`; `sess_orphan`: a snapshot `Sess` record
-  without its `Bib`), `plat_cluster_session_hints_evicted_total` (a fifth
-  remote on one BIB replaced the oldest; that BIB adopts lenient),
+  session hints (POAM-028, `feat/session-hints` and `feat/udp-hints`,
+  unreleased; metrics only, schema stays 8): gauge
+  `plat_cluster_session_hints_enabled` (0 `session_hints = "off"`, 1
+  `"tcp"`, 2 `"tcp_udp"`), counters
+  `plat_cluster_session_hints_total{proto,result}` (`proto` `tcp` or `udp`;
+  `sent`: hints batched to backups by this node as primary; `applied`:
+  hints stored in this node's shadow as backup),
+  `plat_cluster_session_hints_refused_total{proto,reason}` (`no_bib`, split
+  by `proto`: the hint's BIB was not in the shadow; a TCP `no_bib` marks the
+  slice gapped and it resyncs, a UDP `no_bib` is only counted) and
+  `plat_cluster_session_hints_refused_total{reason}` without `proto` for
+  `outside_slice`, `invalid` and `sess_orphan` (a snapshot `Sess` record
+  without its `Bib`), which are checked before the protocol is trusted,
+  `plat_cluster_session_hints_evicted_total{proto}` (a fifth remote on one
+  BIB replaced the oldest; for `tcp` that BIB adopts lenient, `udp`
+  evictions never change TCP strictness),
   `plat_cluster_session_hints_superseded_total` (a hint dropped because
   its BIB was deleted later in the same drain),
+  `plat_cluster_udp_hints_deferred_total` (UDP hints a worker could not
+  send because its per-worker `cluster.ha.udp_hints_per_sec` bucket was
+  empty; the flow retries on a later packet),
   `plat_cluster_repl_drains_truncated_total` (replicator pumps whose last
   of 8 drain rounds was still cut at its limit; the residual that can
-  produce `no_bib`), `plat_cluster_sessions_restored_total` (sessions
-  restored by completed adoptions) and
-  `plat_cluster_session_restore_refused_total{reason}` (`session_limit`,
-  `subscriber_limit`, `policy`: remote refused by the destination policy,
-  `duplicate`, `aged`: hint older than TCP_EST). Runbook: a rising
-  `no_bib` together with `repl_drains_truncated_total` means hint bursts
-  exceed the pump; affected slices fall back to un-hinted pickup until
+  produce `no_bib`), `plat_cluster_sessions_restored_total{proto}`
+  (sessions restored by completed adoptions) and
+  `plat_cluster_session_restore_refused_total{proto,reason}`
+  (`session_limit`, `subscriber_limit`, `policy`: remote refused by the
+  destination policy, `duplicate`, `aged`: for `tcp` a hint older than
+  TCP_EST, for `udp` a hint whose age leaves no time of `udp_secs`).
+  Runbook: a rising `no_bib` together with `repl_drains_truncated_total`
+  means hint bursts exceed the pump; affected slices fall back to
+  un-hinted pickup until their resync. A rising
+  `plat_cluster_udp_hints_deferred_total` means UDP flows are not being
+  hinted (and, with `[xdp]`, stay on the slow path); the bucket is per
+  worker and shared by all subscribers, so one subscriber with many
+  long-lived bidirectional flows can defer other subscribers' hints
+  (POAM-028, SEC-001). Alert on a sustained non-zero rate and correlate
+  with per-subscriber session counts.
   their resync. The `slice acquired` journal line gains `sessions`;
   and the per-worker
   `plat_cluster_steer_missteered_total`, `plat_cluster_reserve_starved_total`,

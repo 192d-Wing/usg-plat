@@ -60,6 +60,7 @@ fn node_full(extra: &[(&str, &str)], ring: usize, steering: SteeringMode, id: u1
         directory: dir.clone(),
         tcp_adopt_secs: 300,
         session_hints: hints,
+        udp_hints: None,
         quarantine_secs: 600,
         reserve_ahead: 2,
     };
@@ -675,6 +676,7 @@ fn paired_subscribers_under_connection_load_get_reserved_blocks() {
         directory: Arc::new(Directory::new(16, 1000)),
         tcp_adopt_secs: 300,
         session_hints: false,
+        udp_hints: None,
         quarantine_secs: 600,
         reserve_ahead: 1,
     };
@@ -1577,7 +1579,7 @@ fn hint_emitted_once_on_establish() {
     }
     let h = hints_of(&drain(&a));
     let slice = (v4 & 3) as u16;
-    assert_eq!(h, vec![ReplRecord::SessHint { slice, v4, port4: p4, raddr: SERVER, rport: 443 }]);
+    assert_eq!(h, vec![ReplRecord::SessHint { slice, proto: 6, v4, port4: p4, raddr: SERVER, rport: 443 }]);
     // RST then ACK: TRANS → ESTABLISHED, no new hint (T3).
     run(&mut a.fx, &tcp4(SERVER, 443, v4, p4, RST | ACK)).unwrap();
     run(&mut a.fx, &tcp6(s, 4000, SERVER, 443, ACK)).unwrap();
@@ -1762,6 +1764,7 @@ fn restore_checks_destination_policy() {
         directory: Arc::new(Directory::new(16, 1000)),
         tcp_adopt_secs: 300,
         session_hints: true,
+        udp_hints: None,
         quarantine_secs: 600,
         reserve_ahead: 2,
     };
@@ -1961,8 +1964,18 @@ fn chunked_restore_matches_single_shot() {
             one.apply(&ReplRecord::BibCreate { slice: s, bib: *b }, 0).unwrap();
         }
         for h in &input.hints {
-            one.apply(&ReplRecord::SessHint { slice: s, v4: h.v4, port4: h.port4, raddr: h.raddr, rport: h.rport }, 0)
-                .unwrap();
+            one.apply(
+                &ReplRecord::SessHint {
+                    slice: s,
+                    proto: h.proto,
+                    v4: h.v4,
+                    port4: h.port4,
+                    raddr: h.raddr,
+                    rport: h.rport,
+                },
+                0,
+            )
+            .unwrap();
         }
         for x in &input.blocks {
             one.apply(&ReplRecord::BlockAlloc { slice: s, sub: x.0, block: x.1, wall_us: x.2 }, 0).unwrap();
@@ -2290,19 +2303,46 @@ fn env_or(name: &str, d: usize) -> usize {
 /// (drain rounds per pump, default 8 like platd; 1: one round). Asserts
 /// only that nothing panics, nothing is lost silently and every hint is
 /// either applied or refused `NoBib`.
-#[test]
-fn qa_no_bib_race_rate_with_8_workers() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::mpsc;
-    const W: usize = 8;
-    let conns = env_or("QA_RACE_CONNS", 2000);
-    let ring = env_or("QA_RACE_RING", 65_536);
-    let pause = Duration::from_micros(env_or("QA_RACE_DRAIN_US", 0) as u64);
-    let gap = Duration::from_micros(env_or("QA_RACE_GAP_US", 0) as u64);
-    let hints_on = env_or("QA_RACE_HINTS", 1) != 0;
-    let rtt = Duration::from_micros(env_or("QA_RACE_RTT_US", 0) as u64);
-    // Drain rounds per pump while a round is cut (platd `DRAIN_ROUNDS`).
-    let rounds = env_or("QA_RACE_ROUNDS", 8);
+/// Workers in the Q1 race harness.
+const RACE_W: usize = 8;
+
+/// Q1 harness knobs (`QA_RACE_*`, see the test doc).
+#[derive(Clone, Copy)]
+struct RaceParams {
+    conns: usize,
+    ring: usize,
+    pause: Duration,
+    gap: Duration,
+    hints_on: bool,
+    rtt: Duration,
+    rounds: usize,
+}
+
+impl RaceParams {
+    fn from_env() -> Self {
+        Self {
+            conns: env_or("QA_RACE_CONNS", 2000),
+            ring: env_or("QA_RACE_RING", 65_536),
+            pause: Duration::from_micros(env_or("QA_RACE_DRAIN_US", 0) as u64),
+            gap: Duration::from_micros(env_or("QA_RACE_GAP_US", 0) as u64),
+            hints_on: env_or("QA_RACE_HINTS", 1) != 0,
+            rtt: Duration::from_micros(env_or("QA_RACE_RTT_US", 0) as u64),
+            // Drain rounds per pump while a round is cut (platd `DRAIN_ROUNDS`).
+            rounds: env_or("QA_RACE_ROUNDS", 8),
+        }
+    }
+}
+
+/// A SYN/ACK due at `.0` for the translated tuple of its SYN (`None`: the
+/// SYN was dropped); a `None` message closes the channel.
+type RaceMsg = (std::time::Instant, Option<Option<(u32, u16)>>);
+
+/// Drainer result: hints, `NoBib` refusals, other refusals, non-empty drains.
+type DrainStats = (u64, u64, u64, u64);
+
+/// Cluster engine with slices 0..4 Active, a hinted shadow of them and a
+/// thread draining the audit channel (ends once the engine is dropped).
+fn race_setup(p: &RaceParams) -> (Arc<Nat64>, Arc<Shadow>, std::thread::JoinHandle<()>) {
     let cfg = config(&[("max_sessions = 4000000", "max_sessions = 4000000")]);
     let setup = ClusterSetup {
         slices: SliceMap::new(&cfg.nat64.pool, 32).unwrap(),
@@ -2310,13 +2350,13 @@ fn qa_no_bib_race_rate_with_8_workers() {
         steering: SteeringMode::Drop,
         directory: Arc::new(Directory::new(16, 1000)),
         tcp_adopt_secs: 300,
-        session_hints: hints_on,
+        session_hints: p.hints_on,
+        udp_hints: None,
         quarantine_secs: 600,
         reserve_ahead: 2,
     };
     let (sink, rx) = AuditSink::bounded(1 << 20);
     let nat = Arc::new(Nat64::new_cluster(&cfg, setup, sink, Clock::new()).unwrap());
-    let (hub, prods) = ReplHub::new(W + 1, ring, 4);
     for s in 0..4 {
         nat.state()
             .adopt_slice(
@@ -2340,36 +2380,145 @@ fn qa_no_bib_race_rate_with_8_workers() {
         shadow.snapshot_end_hinted(s, true).unwrap();
     }
     let audit_drain = std::thread::spawn(move || while rx.recv().is_ok() {});
-    let done = Arc::new(AtomicBool::new(false));
-    let drainer = {
-        let (hub, shadow, done) = (hub.clone(), shadow.clone(), done.clone());
-        std::thread::spawn(move || {
-            let (mut buf, mut hints, mut no_bib, mut other, mut drains) = (Vec::new(), 0u64, 0u64, 0u64, 0u64);
-            loop {
-                let fin = done.load(Ordering::Acquire);
-                buf.clear();
-                let n = hub.drain_rounds(4096, rounds, &mut buf);
-                drains += u64::from(n > 0);
-                for r in &buf {
-                    let h = matches!(r, ReplRecord::SessHint { .. });
-                    hints += u64::from(h);
-                    match shadow.apply(r, 0) {
-                        Ok(()) => {}
-                        Err(plat_nat64::ShadowError::NoBib) if h => no_bib += 1,
-                        Err(_) => other += 1,
-                    }
-                }
-                if n == 0 && fin {
-                    return (hints, no_bib, other, drains);
-                }
-                if !pause.is_zero() {
-                    std::thread::sleep(pause);
+    (nat, shadow, audit_drain)
+}
+
+/// Replicator stand-in: drains the hub into the shadow until `done` and empty.
+fn spawn_race_drainer(
+    hub: Arc<ReplHub>,
+    shadow: Arc<Shadow>,
+    done: Arc<std::sync::atomic::AtomicBool>,
+    p: RaceParams,
+) -> std::thread::JoinHandle<DrainStats> {
+    use std::sync::atomic::Ordering;
+    std::thread::spawn(move || {
+        let (mut buf, mut hints, mut no_bib, mut other, mut drains) = (Vec::new(), 0u64, 0u64, 0u64, 0u64);
+        loop {
+            let fin = done.load(Ordering::Acquire);
+            buf.clear();
+            let n = hub.drain_rounds(4096, p.rounds, &mut buf);
+            drains += u64::from(n > 0);
+            for r in &buf {
+                let h = matches!(r, ReplRecord::SessHint { .. });
+                hints += u64::from(h);
+                match shadow.apply(r, 0) {
+                    Ok(()) => {}
+                    Err(plat_nat64::ShadowError::NoBib) if h => no_bib += 1,
+                    Err(_) => other += 1,
                 }
             }
-        })
+            if n == 0 && fin {
+                return (hints, no_bib, other, drains);
+            }
+            if !p.pause.is_zero() {
+                std::thread::sleep(p.pause);
+            }
+        }
+    })
+}
+
+/// One race worker: sends its SYNs (to `next` for the SYN/ACK) and answers
+/// the previous worker's SYN/ACKs one emulated RTT after their SYN.
+/// Returns (answered, SYN drops, counters).
+fn race_worker(
+    i: usize,
+    nat: &Nat64,
+    prod: ReplProducer,
+    inbox: &std::sync::mpsc::Receiver<RaceMsg>,
+    next: &std::sync::mpsc::Sender<RaceMsg>,
+    p: &RaceParams,
+) -> (usize, usize, Arc<Counters>) {
+    let mut ctx = nat.new_worker(Arc::new(Counters::default()), i as u16 + 1).with_repl(prod);
+    let mut buf = vec![0u8; plat_xlat::HEADROOM + 2048];
+    let mut go = |pkt: &[u8], ctx: &mut WorkerCtx| {
+        buf[plat_xlat::HEADROOM..plat_xlat::HEADROOM + pkt.len()].copy_from_slice(pkt);
+        match nat.process(&mut buf, plat_xlat::HEADROOM, pkt.len(), ctx) {
+            plat_nat64::Verdict::Forward { start, len } => Some(tuple4(&buf[start..start + len])),
+            _ => None,
+        }
     };
-    let (txs, rxs): (Vec<_>, Vec<_>) =
-        (0..W).map(|_| mpsc::channel::<(std::time::Instant, Option<Option<(u32, u16)>>)>()).unzip();
+    let (mut sent, mut answered, mut open, mut syn_drops) = (0usize, 0usize, true, 0usize);
+    let mut pending = std::collections::VecDeque::new();
+    while open || sent < p.conns || !pending.is_empty() {
+        if sent < p.conns {
+            let s = sub((i * 40 + sent % 40) as u16, 1);
+            let port = 1024 + (sent / 40) as u16;
+            let r = go(&tcp6(s, port, SERVER, 443, SYN), &mut ctx);
+            syn_drops += usize::from(r.is_none());
+            let _ = next.send((std::time::Instant::now() + p.rtt, Some(r)));
+            sent += 1;
+            spin_for(p.gap);
+            if sent == p.conns {
+                let _ = next.send((std::time::Instant::now(), None));
+            }
+        }
+        open = race_recv(inbox, &mut pending) && open;
+        let now = std::time::Instant::now();
+        while pending.front().is_some_and(|q: &(std::time::Instant, _)| q.0 <= now) {
+            if let Some((_, Some((v4, p4)))) = pending.pop_front() {
+                answered += usize::from(go(&tcp4(SERVER, 443, v4, p4, SYN | ACK), &mut ctx).is_some());
+            }
+        }
+        if sent >= p.conns {
+            std::thread::yield_now();
+        }
+    }
+    (answered, syn_drops, ctx.counters.clone())
+}
+
+/// Busy-wait `d` (a sleep is far too coarse for SYN gaps).
+fn spin_for(d: Duration) {
+    if d.is_zero() {
+        return;
+    }
+    let t = std::time::Instant::now();
+    while t.elapsed() < d {
+        std::hint::spin_loop();
+    }
+}
+
+/// Move queued SYN/ACKs into `pending`; false once the sender closed.
+fn race_recv(
+    inbox: &std::sync::mpsc::Receiver<RaceMsg>,
+    pending: &mut std::collections::VecDeque<(std::time::Instant, Option<(u32, u16)>)>,
+) -> bool {
+    use std::sync::mpsc::TryRecvError;
+    loop {
+        match inbox.try_recv() {
+            Ok((_, None)) | Err(TryRecvError::Disconnected) => return false,
+            Ok((due, Some(m))) => pending.push_back((due, m)),
+            Err(TryRecvError::Empty) => return true,
+        }
+    }
+}
+
+/// Q1 measurement harness (plan §1.7, §8): 8 workers open TCP connections
+/// at full speed; each SYN is handled by one worker (its `BibCreate` goes
+/// to that worker's ring) and the SYN/ACK by the next worker (the hint goes
+/// to another ring), as with RSS on the two address families. A drainer
+/// thread empties the hub like the replicator (batch 4096, round-robin)
+/// and applies to a shadow, counting `NoBib` refusals. Prints the rate.
+///
+/// Scale with `QA_RACE_CONNS` (per worker, default 2000), `QA_RACE_RING`
+/// (default 65536), `QA_RACE_DRAIN_US` (pause between drains, default 0)
+/// `QA_RACE_GAP_US` (per-worker pause between SYNs, default 0) and
+/// `QA_RACE_RTT_US` (delay from a SYN to its SYN/ACK, default 0) and
+/// `QA_RACE_HINTS` (0: hints off, the control run) and `QA_RACE_ROUNDS`
+/// (drain rounds per pump, default 8 like platd; 1: one round). Asserts
+/// only that nothing panics, nothing is lost silently and every hint is
+/// either applied or refused `NoBib`.
+#[test]
+fn qa_no_bib_race_rate_with_8_workers() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    const W: usize = RACE_W;
+    let p = RaceParams::from_env();
+    let RaceParams { conns, ring, pause, gap, hints_on, rtt, rounds } = p;
+    let (nat, shadow, audit_drain) = race_setup(&p);
+    let (hub, prods) = ReplHub::new(W + 1, ring, 4);
+    let done = Arc::new(AtomicBool::new(false));
+    let drainer = spawn_race_drainer(hub.clone(), shadow.clone(), done.clone(), p);
+    let (txs, rxs): (Vec<_>, Vec<_>) = (0..W).map(|_| mpsc::channel::<RaceMsg>()).unzip();
     let t0 = std::time::Instant::now();
     let workers: Vec<_> = prods
         .into_iter()
@@ -2379,60 +2528,7 @@ fn qa_no_bib_race_rate_with_8_workers() {
         .map(|(i, (prod, inbox))| {
             let nat = nat.clone();
             let next = txs[(i + 1) % W].clone();
-            std::thread::spawn(move || {
-                let mut ctx = nat.new_worker(Arc::new(Counters::default()), i as u16 + 1).with_repl(prod);
-                let mut buf = vec![0u8; plat_xlat::HEADROOM + 2048];
-                let mut go = |pkt: &[u8], ctx: &mut WorkerCtx| {
-                    buf[plat_xlat::HEADROOM..plat_xlat::HEADROOM + pkt.len()].copy_from_slice(pkt);
-                    match nat.process(&mut buf, plat_xlat::HEADROOM, pkt.len(), ctx) {
-                        plat_nat64::Verdict::Forward { start, len } => Some(tuple4(&buf[start..start + len])),
-                        _ => None,
-                    }
-                };
-                let (mut sent, mut answered, mut open, mut syn_drops) = (0usize, 0usize, true, 0usize);
-                let mut pending = std::collections::VecDeque::new();
-                while open || sent < conns || !pending.is_empty() {
-                    if sent < conns {
-                        let s = sub((i * 40 + sent % 40) as u16, 1);
-                        let port = 1024 + (sent / 40) as u16;
-                        let r = go(&tcp6(s, port, SERVER, 443, SYN), &mut ctx);
-                        syn_drops += usize::from(r.is_none());
-                        let _ = next.send((std::time::Instant::now() + rtt, Some(r)));
-                        sent += 1;
-                        if !gap.is_zero() {
-                            let t = std::time::Instant::now();
-                            while t.elapsed() < gap {
-                                std::hint::spin_loop();
-                            }
-                        }
-                        if sent == conns {
-                            let _ = next.send((std::time::Instant::now(), None));
-                        }
-                    }
-                    loop {
-                        match inbox.try_recv() {
-                            Ok((_, None)) | Err(mpsc::TryRecvError::Disconnected) => {
-                                open = false;
-                                break;
-                            }
-                            Ok((due, Some(m))) => pending.push_back((due, m)),
-                            Err(mpsc::TryRecvError::Empty) => break,
-                        }
-                    }
-                    // The SYN/ACKs of the previous worker's connections,
-                    // one emulated RTT after their SYN.
-                    let now = std::time::Instant::now();
-                    while pending.front().is_some_and(|p: &(std::time::Instant, _)| p.0 <= now) {
-                        if let Some((_, Some((v4, p4)))) = pending.pop_front() {
-                            answered += usize::from(go(&tcp4(SERVER, 443, v4, p4, SYN | ACK), &mut ctx).is_some());
-                        }
-                    }
-                    if sent >= conns {
-                        std::thread::yield_now();
-                    }
-                }
-                (answered, syn_drops, ctx.counters.clone())
-            })
+            std::thread::spawn(move || race_worker(i, &nat, prod, &inbox, &next, &p))
         })
         .collect();
     drop(txs);
@@ -2480,4 +2576,745 @@ fn qa_no_bib_race_rate_with_8_workers() {
     }
     drop(nat);
     let _ = audit_drain.join();
+}
+
+// -------------------------------------------------- UDP session hints
+
+/// A node with `cluster.ha.session_hints = "tcp_udp"` (`udp_hint_after_secs`
+/// 2) and `rate` UDP hints per second per producer.
+fn node_udp(extra: &[(&str, &str)], id: u16, rate: u32) -> Node {
+    let cfg = config(extra);
+    let slices = SliceMap::new(&cfg.nat64.pool, 32).unwrap();
+    let dir = Arc::new(Directory::new(16, 1000));
+    let setup = ClusterSetup {
+        slices,
+        self_id: id,
+        steering: SteeringMode::Drop,
+        directory: dir.clone(),
+        tcp_adopt_secs: 300,
+        session_hints: true,
+        udp_hints: Some(2),
+        quarantine_secs: 600,
+        reserve_ahead: 2,
+    };
+    let clock = Clock::new();
+    let (sink, rx) = AuditSink::bounded(4096);
+    let nat = Nat64::new_cluster(&cfg, setup, sink, clock.clone()).unwrap();
+    let (hub, mut prods) = ReplHub::with_udp_hint_rate(2, 1024, 4, rate);
+    let sweeper = prods.pop().unwrap();
+    let worker = prods.pop().unwrap();
+    let ctx = WorkerCtx::new(Arc::new(Counters::default()), 1).with_repl(worker);
+    Node { fx: Fx { nat, clock, rx, ctx }, hub, sweeper, dir, cfg }
+}
+
+/// One UDP exchange from subscriber `n` port `port` to `SERVER:dport`
+/// (outbound then the reply); returns the IPv4 side of the mapping.
+fn udp_exchange(a: &mut Node, n: u16, port: u16, dport: u16) -> (u32, u16) {
+    let o = run(&mut a.fx, &udp6(sub(n, 1), port, SERVER, dport, b"q")).unwrap();
+    let (v4, p4) = tuple4(&o);
+    run(&mut a.fx, &udp4(SERVER, dport, v4, p4, b"r")).unwrap();
+    (v4, p4)
+}
+
+fn udp_hint(v4: u32, p4: u16, dport: u16) -> ReplRecord {
+    ReplRecord::SessHint { slice: (v4 & 3) as u16, proto: proto::UDP, v4, port4: p4, raddr: SERVER, rport: dport }
+}
+
+/// SC-5, CP-10: a UDP hint needs traffic both ways and a packet at least
+/// `udp_hint_after_secs` after creation; it is sent exactly once, never
+/// per packet, then re-sent once per `udp_secs` (300 s here) of traffic.
+#[test]
+fn udp_hint_after_bidirectional_and_age() {
+    let mut a = node_udp(&[], 0, 2000);
+    start_all(&a);
+    let _ = drain(&a);
+    let (v4, p4) = udp_exchange(&mut a, 1, 5000, 443);
+    let s = sub(1, 1);
+    a.fx.clock.advance(Duration::from_millis(1_000));
+    run(&mut a.fx, &udp6(s, 5000, SERVER, 443, b"x")).unwrap();
+    assert!(hints_of(&drain(&a)).is_empty(), "younger than 2 s");
+    a.fx.clock.advance(Duration::from_millis(2_100));
+    run(&mut a.fx, &udp4(SERVER, 443, v4, p4, b"y")).unwrap();
+    assert_eq!(hints_of(&drain(&a)), vec![udp_hint(v4, p4, 443)]);
+    for _ in 0..10 {
+        run(&mut a.fx, &udp6(s, 5000, SERVER, 443, b"x")).unwrap();
+        run(&mut a.fx, &udp4(SERVER, 443, v4, p4, b"y")).unwrap();
+    }
+    assert!(hints_of(&drain(&a)).is_empty(), "once, not per packet");
+    // Re-hint: once per udp_secs of traffic.
+    for _ in 0..2 {
+        a.fx.clock.advance(Duration::from_secs(150));
+        run(&mut a.fx, &udp6(s, 5000, SERVER, 443, b"x")).unwrap();
+    }
+    assert_eq!(hints_of(&drain(&a)), vec![udp_hint(v4, p4, 443)]);
+    run(&mut a.fx, &udp6(s, 5000, SERVER, 443, b"x")).unwrap();
+    assert!(hints_of(&drain(&a)).is_empty());
+    // The hinted session is exported in the snapshot, right after its BIB.
+    let (recs, _) = a.fx.nat.state().export_slice((v4 & 3) as u16, ExportCursor::default(), 1 << 20);
+    let i = recs.iter().position(|r| matches!(r, SnapRecord::Bib(b) if b.v4 == v4 && b.port4 == p4)).unwrap();
+    assert_eq!(
+        recs.get(i + 1),
+        Some(&SnapRecord::Sess(plat_cluster::WireHint { proto: 17, v4, port4: p4, raddr: SERVER, rport: 443 }))
+    );
+}
+
+/// T2: one-way flows and one-shot exchanges (DNS) never hint, and are not
+/// exported.
+#[test]
+fn dns_like_and_one_way_flows_never_hint() {
+    let mut a = node_udp(&[], 0, 2000);
+    start_all(&a);
+    let _ = drain(&a);
+    let s = sub(1, 1);
+    // DNS: query, reply, silence.
+    let (v4, _) = udp_exchange(&mut a, 1, 5000, 53);
+    // One way only, for 10 s.
+    for _ in 0..10 {
+        run(&mut a.fx, &udp6(s, 5001, SERVER, 9999, b"x")).unwrap();
+        a.fx.clock.advance(Duration::from_secs(1));
+    }
+    assert!(hints_of(&drain(&a)).is_empty());
+    let (recs, _) = a.fx.nat.state().export_slice((v4 & 3) as u16, ExportCursor::default(), 1 << 20);
+    assert!(!recs.iter().any(|r| matches!(r, SnapRecord::Sess(_))));
+    a.fx.clock.advance(Duration::from_secs(400));
+    a.fx.nat.state().sweep_with(Some(&a.sweeper));
+    assert!(hints_of(&drain(&a)).is_empty());
+}
+
+/// SC-5: the per-producer bucket bounds UDP hints; an empty bucket defers
+/// (counted) and the session's next packet retries.
+#[test]
+fn udp_hint_rate_bounded_and_deferred() {
+    let mut a = node_udp(&[], 0, 1);
+    start_all(&a);
+    let _ = drain(&a);
+    let f1 = udp_exchange(&mut a, 1, 5000, 443);
+    let f2 = udp_exchange(&mut a, 1, 5001, 443);
+    a.fx.clock.advance(Duration::from_millis(3_100));
+    run(&mut a.fx, &udp4(SERVER, 443, f1.0, f1.1, b"y")).unwrap();
+    run(&mut a.fx, &udp4(SERVER, 443, f2.0, f2.1, b"y")).unwrap();
+    assert_eq!(hints_of(&drain(&a)), vec![udp_hint(f1.0, f1.1, 443)]);
+    assert_eq!(a.hub.udp_hints_deferred(), 1);
+    run(&mut a.fx, &udp4(SERVER, 443, f2.0, f2.1, b"y")).unwrap();
+    assert!(hints_of(&drain(&a)).is_empty(), "still no token");
+    assert_eq!(a.hub.udp_hints_deferred(), 2);
+    a.fx.clock.advance(Duration::from_millis(1_000));
+    run(&mut a.fx, &udp4(SERVER, 443, f2.0, f2.1, b"y")).unwrap();
+    assert_eq!(hints_of(&drain(&a)), vec![udp_hint(f2.0, f2.1, 443)]);
+    assert_eq!(a.hub.udp_hints_pushed(), 2);
+    // TCP hints do not use the bucket.
+    let _ = establish(&mut a, 2, 4000);
+    assert_eq!(hints_of(&drain(&a)).len(), 1);
+}
+
+/// `"off"` and `"tcp"` modes: an eligible UDP flow sends nothing and
+/// exports nothing (unchanged behaviour).
+#[test]
+fn off_and_tcp_modes_send_no_udp_hints() {
+    for hints in [false, true] {
+        let mut a = node_h(&[], 0, hints);
+        start_all(&a);
+        let _ = drain(&a);
+        let (v4, p4) = udp_exchange(&mut a, 1, 5000, 443);
+        a.fx.clock.advance(Duration::from_secs(3));
+        run(&mut a.fx, &udp4(SERVER, 443, v4, p4, b"y")).unwrap();
+        a.fx.clock.advance(Duration::from_secs(301));
+        run(&mut a.fx, &udp6(sub(1, 1), 5000, SERVER, 443, b"x")).unwrap();
+        assert!(hints_of(&drain(&a)).is_empty(), "hints {hints}");
+        let (recs, _) = a.fx.nat.state().export_slice((v4 & 3) as u16, ExportCursor::default(), 1 << 20);
+        assert!(!recs.iter().any(|r| matches!(r, SnapRecord::Sess(_))), "hints {hints}");
+        assert!(!a.fx.nat.state().udp_hints());
+    }
+}
+
+/// An eligible UDP flow on `a` (subscriber 1, port `port`, to
+/// `SERVER:dport`), hinted.
+fn hinted_udp(a: &mut Node, port: u16, dport: u16) -> (u32, u16) {
+    let (v4, p4) = udp_exchange(a, 1, port, dport);
+    a.fx.clock.advance(Duration::from_millis(3_100));
+    run(&mut a.fx, &udp6(sub(1, 1), port, SERVER, dport, b"x")).unwrap();
+    (v4, p4)
+}
+
+/// CP-10, SC-7(5): after a takeover the hinted UDP remote is delivered
+/// inbound-first under ADF and APDF; an un-hinted remote stays filtered.
+/// Under EIF nothing is restored (inbound-first passes anyway).
+#[test]
+fn udp_inbound_first_accepted_after_takeover() {
+    for filtering in ["address_dependent", "address_port_dependent", "endpoint_independent"] {
+        let f = ("filtering = \"address_dependent\"", &*format!("filtering = \"{filtering}\""));
+        let mut a = node_udp(&[f], 0, 2000);
+        start_all(&a);
+        let (v4, p4) = hinted_udp(&mut a, 5000, 443);
+        let shadow = stream_shadow(&a, false);
+        let slice = (v4 & 3) as u16;
+        let mut b = node_udp(&[f], 1, 2000);
+        let input = shadow.take(slice, 0);
+        assert_eq!(input.hints.len(), 1);
+        let st = b.fx.nat.state().adopt_slice(slice, &input, meta(AcquireReason::Takeover)).unwrap();
+        let eif = filtering == "endpoint_independent";
+        assert_eq!(st.udp_sessions_restored, u64::from(!eif), "{filtering}");
+        assert_eq!((st.sessions_restored, st.udp_sessions_refused.total()), (0, 0));
+        assert!(!b.fx.nat.state().strict_tcp(slice), "UDP never makes TCP strict");
+        let _ = events(&b.fx);
+        let o = run(&mut b.fx, &udp4(SERVER, 443, v4, p4, b"first")).unwrap();
+        assert_eq!(be16(&o, 42), 5000, "{filtering}: delivered to the subscriber port");
+        let other = run(&mut b.fx, &udp4(SERVER + 9, 443, v4, p4, b"x"));
+        if eif {
+            assert!(other.is_ok());
+        } else {
+            assert_eq!(other.unwrap_err(), DropReason::Filtered, "{filtering}: un-hinted remote");
+        }
+    }
+}
+
+/// Without `"tcp_udp"` on the adopter, UDP hints are not restored.
+#[test]
+fn tcp_mode_adopter_ignores_udp_hints() {
+    let mut a = node_udp(&[], 0, 2000);
+    start_all(&a);
+    let (v4, p4) = hinted_udp(&mut a, 5000, 443);
+    let shadow = stream_shadow(&a, true);
+    let slice = (v4 & 3) as u16;
+    let mut b = node_h(&[], 1, true);
+    let st = b.fx.nat.state().adopt_slice(slice, &shadow.take(slice, 0), meta(AcquireReason::Takeover)).unwrap();
+    assert_eq!((st.udp_sessions_restored, st.sessions_restored), (0, 0));
+    let _ = events(&b.fx);
+    assert_eq!(run(&mut b.fx, &udp4(SERVER, 443, v4, p4, b"x")).unwrap_err(), DropReason::Filtered);
+}
+
+/// RFC 4787 REQ-6: a restored UDP session is refreshed by packets from
+/// either side; it stays unconfirmed (not exported) until the IPv4 side
+/// speaks, then is an ordinary hinted session.
+#[test]
+fn restored_udp_refreshed_by_either_side() {
+    let mut a = node_udp(&[], 0, 2000);
+    start_all(&a);
+    let f1 = hinted_udp(&mut a, 5000, 443);
+    let f2 = hinted_udp(&mut a, 5000, 444);
+    assert_eq!(f1, f2, "same BIB, two remotes");
+    let shadow = stream_shadow(&a, false);
+    let mut b = node_udp(&[], 1, 2000);
+    adopt_from(&b, &shadow);
+    let _ = drain(&b);
+    let _ = events(&b.fx);
+    assert_eq!(b.fx.nat.state().session_count(), 2);
+    b.fx.clock.advance(Duration::from_secs(200));
+    run(&mut b.fx, &udp6(sub(1, 1), 5000, SERVER, 443, b"x")).unwrap();
+    run(&mut b.fx, &udp4(SERVER, 444, f2.0, f2.1, b"y")).unwrap();
+    // A confirmed restore is already hinted: no new record.
+    assert!(hints_of(&drain(&b)).is_empty());
+    b.fx.clock.advance(Duration::from_secs(101));
+    let st = b.fx.nat.state();
+    st.sweep();
+    let k = Key4 { proto: proto::UDP, addr: f1.0, port: f1.1 };
+    assert!(st.has_session(k, (SERVER, 443)), "refreshed by the IPv6 side");
+    assert!(st.has_session(k, (SERVER, 444)), "confirmed by the IPv4 side");
+    // Only the confirmed session is exported as a hint for the next backup.
+    let (recs, _) = st.export_slice((f1.0 & 3) as u16, ExportCursor::default(), 1 << 20);
+    let sess: Vec<_> = recs.iter().filter(|r| matches!(r, SnapRecord::Sess(_))).collect();
+    assert_eq!(
+        sess,
+        vec![&SnapRecord::Sess(plat_cluster::WireHint { proto: 17, v4: f2.0, port4: f2.1, raddr: SERVER, rport: 444 })]
+    );
+}
+
+/// RFC-001, RFC 4787 REQ-6: one restored session per BIB, outbound-only
+/// keepalives well past `udp_secs` after the takeover: the BIB and its
+/// `(v4, port4)` stay the same.
+#[test]
+fn restored_udp_outbound_only_keeps_mapping() {
+    let mut a = node_udp(&[], 0, 2000);
+    start_all(&a);
+    let f = hinted_udp(&mut a, 5000, 443);
+    let shadow = stream_shadow(&a, false);
+    let mut b = node_udp(&[], 1, 2000);
+    adopt_from(&b, &shadow);
+    let _ = drain(&b);
+    let _ = events(&b.fx);
+    assert_eq!(b.fx.nat.state().session_count(), 1);
+    // 25 s keepalives for 3 × udp_secs (300 s), sweeping as we go.
+    for _ in 0..36 {
+        b.fx.clock.advance(Duration::from_secs(25));
+        let o = run(&mut b.fx, &udp6(sub(1, 1), 5000, SERVER, 443, b"k")).unwrap();
+        assert_eq!(tuple4(&o), f, "mapping unchanged");
+        b.fx.nat.state().sweep();
+    }
+    assert_eq!(b.fx.nat.state().session_count(), 1);
+}
+
+/// RFC-002, SC-10: a restored UDP session lives what is left of
+/// `udp_secs` (300 s) after its hint; a hint `udp_secs` old is refused.
+#[test]
+fn restored_udp_aged_hint_refused() {
+    let mut a = node_udp(&[], 0, 2000);
+    start_all(&a);
+    let (v4, p4) = hinted_udp(&mut a, 5000, 443);
+    let recs = drain(&a);
+    let shadow_of = || {
+        let sh = shadow_for(&a);
+        for r in &recs {
+            sh.apply(r, 0).unwrap();
+        }
+        sh
+    };
+    let slice = (v4 & 3) as u16;
+    let b = node_udp(&[], 1, 2000);
+    // Learned at shadow time 0, taken 300 s later.
+    let shadow = shadow_of();
+    let st = b.fx.nat.state().adopt_slice(slice, &shadow.take(slice, 300_000), meta(AcquireReason::Takeover)).unwrap();
+    assert_eq!((st.udp_sessions_restored, st.udp_sessions_refused.aged), (0, 1));
+    let shadow = shadow_of();
+    let b = node_udp(&[], 1, 2000);
+    let st = b.fx.nat.state().adopt_slice(slice, &shadow.take(slice, 290_000), meta(AcquireReason::Takeover)).unwrap();
+    assert_eq!(st.udp_sessions_restored, 1);
+    let k = Key4 { proto: proto::UDP, addr: v4, port: p4 };
+    b.fx.clock.advance(Duration::from_secs(9));
+    b.fx.nat.state().sweep();
+    assert!(b.fx.nat.state().has_session(k, (SERVER, 443)), "10 s left");
+    b.fx.clock.advance(Duration::from_secs(2));
+    b.fx.nat.state().sweep();
+    assert!(!b.fx.nat.state().has_session(k, (SERVER, 443)), "expired with the old owner's session");
+}
+
+/// SC-5: UDP restore passes the node session cap (the BIB is still
+/// imported).
+#[test]
+fn udp_restore_respects_session_caps() {
+    let mut a = node_udp(&[], 0, 2000);
+    start_all(&a);
+    let (v4, _) = hinted_udp(&mut a, 5000, 443);
+    let _ = hinted_udp(&mut a, 5000, 444);
+    let slice = (v4 & 3) as u16;
+    let shadow = stream_shadow(&a, false);
+    let b = node_udp(&[("max_sessions = 4000000", "max_sessions = 1")], 1, 2000);
+    let st = b.fx.nat.state().adopt_slice(slice, &shadow.take(slice, 0), meta(AcquireReason::Takeover)).unwrap();
+    assert_eq!((st.udp_sessions_restored, st.udp_sessions_refused.session_limit), (1, 1));
+    assert_eq!((st.bibs_adopted, b.fx.nat.state().session_count()), (1, 1));
+}
+
+/// SC-7: a restored UDP remote passes the outbound destination policy
+/// (SERVER is TEST-NET-2, denied by the strict config).
+#[test]
+fn udp_restore_checks_destination_policy() {
+    let mut a = node_udp(&[], 0, 2000);
+    start_all(&a);
+    let (v4, _) = hinted_udp(&mut a, 5000, 443);
+    let slice = (v4 & 3) as u16;
+    let shadow = stream_shadow(&a, false);
+    let cfg = config_strict(&[]);
+    let setup = ClusterSetup {
+        slices: SliceMap::new(&cfg.nat64.pool, 32).unwrap(),
+        self_id: 1,
+        steering: SteeringMode::Drop,
+        directory: Arc::new(Directory::new(16, 1000)),
+        tcp_adopt_secs: 300,
+        session_hints: true,
+        udp_hints: Some(2),
+        quarantine_secs: 600,
+        reserve_ahead: 2,
+    };
+    let (sink, _rx) = AuditSink::bounded(4096);
+    let nat = Nat64::new_cluster(&cfg, setup, sink, Clock::new()).unwrap();
+    let st = nat.state().adopt_slice(slice, &shadow.take(slice, 0), meta(AcquireReason::Takeover)).unwrap();
+    assert_eq!((st.udp_sessions_restored, st.udp_sessions_refused.policy), (0, 1));
+}
+
+/// A duplicate UDP hint refreshes its learned time in the shadow; a fifth
+/// remote evicts the oldest (counted `udp_evicted`, no TCP lossy mark).
+#[test]
+fn udp_shadow_dup_and_eviction() {
+    let a = node_udp(&[], 0, 2000);
+    let shadow = shadow_for(&a);
+    let (v4, p4) = (POOL_BASE + 1, 1100);
+    let bib = plat_cluster::WireBib {
+        sub: sub(1, 0),
+        proto: proto::UDP,
+        v6: sub(1, 1),
+        port6: 5000,
+        v4,
+        port4: p4,
+        created_wall_us: 1,
+    };
+    shadow.apply(&ReplRecord::BibCreate { slice: 1, bib }, 0).unwrap();
+    for (i, d) in [443u16, 443, 444, 445, 446, 447].iter().enumerate() {
+        shadow.apply(&udp_hint(v4, p4, *d), i as u64 * 1000).unwrap();
+    }
+    let hs = shadow.hint_stats();
+    assert_eq!(hs.udp_applied.load(std::sync::atomic::Ordering::Relaxed), 6);
+    assert_eq!(hs.udp_evicted.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(hs.evicted.load(std::sync::atomic::Ordering::Relaxed), 0);
+    let input = shadow.take(1, 0);
+    assert_eq!(input.hints.len(), 4);
+    assert!(input.hints.iter().all(|h| h.proto == proto::UDP));
+    assert!(input.hints_lossy.is_empty(), "lossy governs TCP pickup only");
+}
+
+/// T3: a UDP hint without its BIB is counted and never gaps the slice, so
+/// UDP churn cannot cause resyncs or change TCP strictness.
+#[test]
+fn udp_hints_never_change_tcp_strictness() {
+    let mut a = node_udp(&[], 0, 2000);
+    start_all(&a);
+    let _ = drain(&a);
+    let (v4, p4) = hinted_udp(&mut a, 5000, 443);
+    let slice = (v4 & 3) as u16;
+    let shadow = shadow_for(&a);
+    shadow.snapshot_end_hinted(slice, true).unwrap();
+    for r in hints_of(&drain(&a)) {
+        assert_eq!(shadow.apply(&r, 0), Ok(()));
+    }
+    assert!(shadow.hinted(slice));
+    assert_eq!(shadow.hint_stats().udp_no_bib.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(shadow.hint_stats().no_bib.load(std::sync::atomic::Ordering::Relaxed), 0);
+    let _ = p4;
+}
+
+/// Snapshot round trip: the hinted live UDP sessions exported by the
+/// primary are exactly the ones the adopter restores.
+#[test]
+fn udp_snapshot_hints_round_trip() {
+    let mut a = node_udp(&[], 0, 2000);
+    start_all(&a);
+    let f = hinted_udp(&mut a, 5000, 443);
+    // A second, one-shot flow on the same BIB: not exported.
+    run(&mut a.fx, &udp6(sub(1, 1), 5000, SERVER, 53, b"q")).unwrap();
+    let slice = (f.0 & 3) as u16;
+    let shadow = shadow_for(&a);
+    let (recs, _) = a.fx.nat.state().export_slice(slice, ExportCursor::default(), 1 << 20);
+    shadow.snapshot_records(slice, &recs).unwrap();
+    shadow.snapshot_end_hinted(slice, true).unwrap();
+    assert_eq!(shadow.hint_count(slice), 1);
+    let mut b = node_udp(&[("filtering = \"address_dependent\"", "filtering = \"address_port_dependent\"")], 1, 2000);
+    let st = b.fx.nat.state().adopt_slice(slice, &shadow.take(slice, 0), meta(AcquireReason::Takeover)).unwrap();
+    assert_eq!(st.udp_sessions_restored, 1);
+    let _ = events(&b.fx);
+    assert!(run(&mut b.fx, &udp4(SERVER, 443, f.0, f.1, b"x")).is_ok());
+    assert_eq!(run(&mut b.fx, &udp4(SERVER, 53, f.0, f.1, b"x")).unwrap_err(), DropReason::Filtered);
+}
+
+/// SC-24: an abandoned adoption frees the restored UDP sessions and
+/// returns their hints to the shadow.
+#[test]
+fn abandon_after_udp_restore_frees_sessions() {
+    let mut a = node_udp(&[], 0, 2000);
+    start_all(&a);
+    let (v4, _) = hinted_udp(&mut a, 5000, 443);
+    let slice = (v4 & 3) as u16;
+    let shadow = stream_shadow(&a, false);
+    let b = node_udp(&[], 1, 2000);
+    let st = b.fx.nat.state();
+    let mut ad = st
+        .adopt_begin(slice, plat_nat64::AdoptSource::Detached(shadow.detach(slice, 0)), meta(AcquireReason::Takeover))
+        .unwrap();
+    step_until(&b, &mut ad, |b| b.fx.nat.state().session_count() == 1);
+    assert_eq!(st.slice_state(slice), Some(SliceState::Adopting));
+    st.adopt_abandon_all(&mut ad, None);
+    assert_eq!(st.session_count(), 0);
+    assert_eq!(shadow.hint_count(slice), 1);
+}
+
+/// NIST-001, SC-10: an abandoned adoption returns an unconfirmed UDP
+/// restore with its original age, so adopt, abandon, adopt cannot keep a
+/// silent remote young: 301 s after the hint it is refused as aged.
+#[test]
+fn abandon_keeps_age_of_unconfirmed_udp_restore() {
+    let mut a = node_udp(&[], 0, 2000);
+    start_all(&a);
+    let (v4, _) = hinted_udp(&mut a, 5000, 443);
+    let slice = (v4 & 3) as u16;
+    let shadow = stream_shadow(&a, false);
+    let b = node_udp(&[], 1, 2000);
+    let st = b.fx.nat.state();
+    let mut ad = st
+        .adopt_begin(slice, plat_nat64::AdoptSource::Detached(shadow.detach(slice, 0)), meta(AcquireReason::Takeover))
+        .unwrap();
+    step_until(&b, &mut ad, |b| b.fx.nat.state().session_count() == 1);
+    b.fx.clock.advance(Duration::from_secs(200));
+    st.adopt_abandon_all(&mut ad, None);
+    assert_eq!(shadow.hint_count(slice), 1);
+    let c = node_udp(&[], 2, 2000);
+    let r = c.fx.nat.state().adopt_slice(slice, &shadow.take(slice, 301_000), meta(AcquireReason::Takeover)).unwrap();
+    assert_eq!((r.udp_sessions_restored, r.udp_sessions_refused.aged), (0, 1), "age kept across the abandon");
+}
+
+/// NIST-003, SC-5: a chunked (multi-step) UDP restore that hits the node
+/// session cap part way refuses the rest as `session_limit`, keeps every
+/// BIB, and queues one `Limit{GlobalSessions}` record.
+#[test]
+fn chunked_udp_restore_hits_global_session_cap() {
+    let mut a = node_udp(&[], 0, 100_000);
+    start_all(&a);
+    let mut slice = None;
+    for port in 5000..5040u16 {
+        let (v4, _) = udp_exchange(&mut a, 1, port, 443);
+        let _ = udp_exchange(&mut a, 1, port, 444);
+        if slice.is_none() {
+            slice = Some((v4 & 3) as u16);
+        }
+    }
+    a.fx.clock.advance(Duration::from_millis(3_100));
+    for port in 5000..5040u16 {
+        for d in [443u16, 444] {
+            run(&mut a.fx, &udp6(sub(1, 1), port, SERVER, d, b"x")).unwrap();
+        }
+    }
+    let shadow = stream_shadow(&a, false);
+    let b = node_udp(&[("max_sessions = 4000000", "max_sessions = 25")], 1, 2000);
+    let st = b.fx.nat.state();
+    let mut total = (0u64, 0u64, 0u64);
+    for s in 0..4u16 {
+        let det = shadow.detach(s, 0);
+        let mut ad = st.adopt_begin(s, plat_nat64::AdoptSource::Detached(det), meta(AcquireReason::Takeover)).unwrap();
+        let mut steps = 0;
+        let r = loop {
+            steps += 1;
+            assert!(steps < 100_000);
+            match st.adopt_step(&mut ad, past()) {
+                Ok(plat_nat64::Step::More) => continue,
+                Ok(plat_nat64::Step::Done(r)) => break r,
+                other => panic!("{other:?}"),
+            }
+        };
+        total.0 += r.udp_sessions_restored;
+        total.1 += r.udp_sessions_refused.session_limit;
+        total.2 += r.bibs_adopted;
+    }
+    let _ = slice;
+    assert_eq!(total, (25, 80 - 25, 40));
+    assert_eq!(st.session_count(), 25);
+    let limits = events(&b.fx)
+        .iter()
+        .filter(|e| matches!(e, plat_audit::Event::Limit { kind: plat_audit::LimitKind::GlobalSessions, .. }))
+        .count();
+    assert_eq!(limits, 1);
+}
+
+/// NIST-003: `mark_s` wraps every 65 536 units (about 67 109 s); a flow
+/// created just before the wrap hints after it, on time, and re-hints
+/// once per `udp_secs` across it.
+#[test]
+fn udp_hint_across_mark_s_wrap() {
+    let mut a = node_udp(&[], 0, 100_000);
+    start_all(&a);
+    let _ = drain(&a);
+    let wrap = 65_536u64 * 1024;
+    let now = a.fx.clock.now_ms();
+    a.fx.clock.advance(Duration::from_millis(wrap - 1_500 - now));
+    let f = udp_exchange(&mut a, 1, 5000, 443);
+    a.fx.clock.advance(Duration::from_millis(1_000));
+    run(&mut a.fx, &udp6(sub(1, 1), 5000, SERVER, 443, b"x")).unwrap();
+    assert!(hints_of(&drain(&a)).is_empty(), "1 s old, before the wrap");
+    a.fx.clock.advance(Duration::from_millis(2_100));
+    assert!(a.fx.clock.now_ms() > wrap);
+    run(&mut a.fx, &udp6(sub(1, 1), 5000, SERVER, 443, b"x")).unwrap();
+    assert_eq!(hints_of(&drain(&a)), vec![udp_hint(f.0, f.1, 443)], "hinted after the wrap");
+    a.fx.clock.advance(Duration::from_secs(100));
+    run(&mut a.fx, &udp4(SERVER, 443, f.0, f.1, b"y")).unwrap();
+    assert!(hints_of(&drain(&a)).is_empty(), "no re-hint before udp_secs");
+    a.fx.clock.advance(Duration::from_secs(200));
+    run(&mut a.fx, &udp4(SERVER, 443, f.0, f.1, b"y")).unwrap();
+    assert_eq!(hints_of(&drain(&a)).len(), 1, "re-hinted after udp_secs");
+}
+
+// ------------------------------------------- QA: UDP session hints (gaps)
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 16, ..ProptestConfig::default() })]
+
+    /// CP-10, SC-7(5): export/import round trip, snapshot and streamed
+    /// paths. The UDP sessions restored on the adopter are exactly the
+    /// hinted live remotes of the primary (at most 4 per BIB); one-shot
+    /// remotes on the same BIBs stay filtered under APDF.
+    #[test]
+    fn qa_udp_export_import_round_trip(
+        flows in prop::collection::vec((1u16..4, 5000u16..5003, 0u16..6, any::<bool>()), 1..24),
+        budget in 1usize..8,
+    ) {
+        let apdf = ("filtering = \"address_dependent\"", "filtering = \"address_port_dependent\"");
+        let mut flows = flows;
+        flows.sort_unstable();
+        flows.dedup_by_key(|f| (f.0, f.1, f.2));
+        let mut a = node_udp(&[apdf], 0, 100_000);
+        start_all(&a);
+        let _ = drain(&a);
+        // (bib (v4, p4), dport, hinted)
+        let mut made = Vec::new();
+        for &(n, port, d, h) in &flows {
+            let k4 = udp_exchange(&mut a, n, port, 1000 + d);
+            made.push((k4, 1000 + d, h));
+        }
+        a.fx.clock.advance(Duration::from_millis(3_100));
+        for &(n, port, d, h) in &flows {
+            if h {
+                run(&mut a.fx, &udp6(sub(n, 1), port, SERVER, 1000 + d, b"x")).unwrap();
+            }
+        }
+        let mut per_bib: std::collections::BTreeMap<(u32, u16), usize> = Default::default();
+        for &(k4, _, h) in &made {
+            if h {
+                *per_bib.entry(k4).or_default() += 1;
+            }
+        }
+        let want: u64 = per_bib.values().map(|&c| c.min(4) as u64).sum();
+
+        // Snapshot path.
+        let snap = shadow_for(&a);
+        for s in 0..4 {
+            snap.snapshot_begin(s).unwrap();
+            let mut cur = Some(ExportCursor::default());
+            while let Some(c) = cur {
+                let (recs, next) = a.fx.nat.state().export_slice(s, c, budget);
+                snap.snapshot_records(s, &recs).unwrap();
+                cur = next;
+            }
+            snap.snapshot_end_hinted(s, true).unwrap();
+        }
+        let streamed = stream_shadow(&a, true);
+        for shadow in [snap, streamed] {
+            let mut b = node_udp(&[apdf], 1, 2000);
+            let mut restored = 0;
+            for s in 0..4 {
+                let input = shadow.take(s, 0);
+                let st = b.fx.nat.state().adopt_slice(s, &input, meta(AcquireReason::Takeover)).unwrap();
+                restored += st.udp_sessions_restored;
+                prop_assert_eq!(st.udp_sessions_refused.total(), 0);
+                prop_assert!(!b.fx.nat.state().strict_tcp(s) || st.sessions_restored == 0);
+            }
+            prop_assert_eq!(restored, want);
+            prop_assert_eq!(b.fx.nat.state().session_count(), want);
+            let _ = events(&b.fx);
+            let mut delivered: std::collections::BTreeMap<(u32, u16), usize> = Default::default();
+            for &(k4, d, h) in &made {
+                let ok = run(&mut b.fx, &udp4(SERVER, d, k4.0, k4.1, b"in")).is_ok();
+                if !h {
+                    prop_assert!(!ok, "one-shot remote {} on {:?} must stay filtered", d, k4);
+                } else if per_bib[&k4] <= 4 {
+                    prop_assert!(ok, "hinted remote {} on {:?} must be restored", d, k4);
+                }
+                if ok {
+                    *delivered.entry(k4).or_default() += 1;
+                }
+            }
+            for (k4, c) in &per_bib {
+                prop_assert_eq!(delivered.get(k4).copied().unwrap_or(0), (*c).min(4));
+            }
+        }
+    }
+}
+
+/// `mark_s` is kept in 1.024 s units: probes every 16 ms from creation,
+/// at several alignments to the unit boundary, find when the hint first
+/// fires. It never fires before `udp_hint_after_secs` (2 s) and at most
+/// two units after creation plus the rounded-up age.
+#[test]
+fn qa_udp_hint_age_quantised_within_one_unit() {
+    let mut a = node_udp(&[], 0, 100_000);
+    start_all(&a);
+    let _ = drain(&a);
+    for (i, off) in [0u64, 1, 511, 1000, 1023].into_iter().enumerate() {
+        // Align: next multiple of 1024 ms, plus `off`.
+        let now = a.fx.clock.now_ms();
+        let t = (now / 1024 + 1) * 1024 + off;
+        a.fx.clock.advance(Duration::from_millis(t - now));
+        let port = 6000 + i as u16;
+        let _ = udp_exchange(&mut a, 1, port, 443);
+        let mut e = 0u64;
+        loop {
+            a.fx.clock.advance(Duration::from_millis(16));
+            e += 16;
+            run(&mut a.fx, &udp6(sub(1, 1), port, SERVER, 443, b"x")).unwrap();
+            if !hints_of(&drain(&a)).is_empty() {
+                break;
+            }
+            assert!(e < 10_000, "no hint after 10 s (off {off})");
+        }
+        assert!(e <= 3 * 1_024 + 16, "off {off}: hint {e} ms after creation");
+        assert!(e >= 2_000, "off {off}: hint {e} ms after creation");
+    }
+}
+
+/// QA-1: a session created at 1023 ms into a unit does not hint 1025 ms
+/// later with `udp_hint_after_secs = 2` (nor 1999 ms later); it does by
+/// 3072 ms.
+#[test]
+fn qa_udp_hint_never_before_after_secs() {
+    let mut a = node_udp(&[], 0, 100_000);
+    start_all(&a);
+    let _ = drain(&a);
+    let now = a.fx.clock.now_ms();
+    let t = (now / 1024 + 1) * 1024 + 1023;
+    a.fx.clock.advance(Duration::from_millis(t - now));
+    let _ = udp_exchange(&mut a, 1, 5000, 443);
+    a.fx.clock.advance(Duration::from_millis(1_025));
+    run(&mut a.fx, &udp6(sub(1, 1), 5000, SERVER, 443, b"x")).unwrap();
+    assert!(hints_of(&drain(&a)).is_empty(), "hinted 1025 ms after creation with after_secs = 2");
+    a.fx.clock.advance(Duration::from_millis(974));
+    run(&mut a.fx, &udp6(sub(1, 1), 5000, SERVER, 443, b"x")).unwrap();
+    assert!(hints_of(&drain(&a)).is_empty(), "hinted 1999 ms after creation");
+    a.fx.clock.advance(Duration::from_millis(1_073));
+    run(&mut a.fx, &udp6(sub(1, 1), 5000, SERVER, 443, b"x")).unwrap();
+    assert_eq!(hints_of(&drain(&a)).len(), 1, "hinted by 3072 ms");
+}
+
+/// A UDP BIB and a TCP BIB sharing `(v4, port4)`: a UDP hint (and UDP
+/// evictions) never loosen TCP strictness on the TCP BIB. Under strict
+/// TCP, a TCP segment from the UDP-hinted remote is refused while the
+/// UDP datagram from it is delivered; the real TCP hint still works.
+#[test]
+fn qa_udp_hint_cannot_loosen_tcp_on_same_v4_port() {
+    let mut a = node_udp(&[], 0, 2000);
+    start_all(&a);
+    let _ = drain(&a);
+    let (v4, p4) = establish(&mut a, 1, 4000);
+    let slice = (v4 & 3) as u16;
+    let recs = drain(&a);
+    let shadow = shadow_for(&a);
+    for r in &recs {
+        shadow.apply(r, 0).unwrap();
+    }
+    // Same subscriber, same block, same (v4, port4), proto UDP.
+    let bib = plat_cluster::WireBib {
+        sub: sub(1, 0),
+        proto: proto::UDP,
+        v6: sub(1, 1),
+        port6: 6000,
+        v4,
+        port4: p4,
+        created_wall_us: 1,
+    };
+    shadow.apply(&ReplRecord::BibCreate { slice, bib }, 0).unwrap();
+    // Five UDP remotes: one eviction on the UDP set.
+    for d in 80u16..85 {
+        let h = ReplRecord::SessHint { slice, proto: proto::UDP, v4, port4: p4, raddr: SERVER + 1, rport: d };
+        shadow.apply(&h, 0).unwrap();
+    }
+    shadow.snapshot_end_hinted(slice, true).unwrap();
+    let hs = shadow.hint_stats();
+    assert_eq!(hs.udp_evicted.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(hs.evicted.load(std::sync::atomic::Ordering::Relaxed), 0);
+    let input = shadow.take(slice, 0);
+    assert!(input.hints_lossy.is_empty(), "UDP eviction must not mark the TCP BIB lossy");
+    assert_eq!(input.hints.iter().filter(|h| h.proto == proto::TCP).count(), 1);
+    let mut b = node_udp(&[("filtering = \"address_dependent\"", "filtering = \"address_port_dependent\"")], 1, 2000);
+    let st = b.fx.nat.state().adopt_slice(slice, &input, meta(AcquireReason::Takeover)).unwrap();
+    assert_eq!((st.sessions_restored, st.udp_sessions_restored), (1, 4));
+    assert!(b.fx.nat.state().strict_tcp(slice));
+    let _ = events(&b.fx);
+    assert!(run(&mut b.fx, &udp4(SERVER + 1, 84, v4, p4, b"u")).is_ok(), "UDP hint restored");
+    assert!(run(&mut b.fx, &tcp4(SERVER + 1, 84, v4, p4, ACK)).is_err(), "UDP hint must not admit TCP");
+    assert!(run(&mut b.fx, &tcp4(SERVER + 1, 80, v4, p4, ACK)).is_err(), "evicted UDP remote must not admit TCP");
+    assert!(run(&mut b.fx, &tcp4(SERVER, 443, v4, p4, ACK)).is_ok(), "the TCP hint is restored");
+    // A UDP hint keyed to a (v4, port4) that only has a TCP BIB is a UDP
+    // no_bib: counted, the TCP hint set is not touched, no gap.
+    let shadow = shadow_for(&a);
+    for r in &recs {
+        shadow.apply(r, 0).unwrap();
+    }
+    shadow.snapshot_end_hinted(slice, true).unwrap();
+    let h = ReplRecord::SessHint { slice, proto: proto::UDP, v4, port4: p4, raddr: SERVER + 2, rport: 9 };
+    assert_eq!(shadow.apply(&h, 0), Ok(()));
+    assert_eq!(shadow.hint_stats().udp_no_bib.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert!(shadow.hinted(slice));
+    assert_eq!(shadow.hint_count(slice), 1);
 }

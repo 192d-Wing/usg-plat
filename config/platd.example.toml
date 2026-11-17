@@ -32,9 +32,13 @@ node_count = 1
 # tcp_adopt_secs = 300          # TCP pickup window / restored-session lifetime after
 #                               # takeover; tcp_transitory_secs..=3600 with hints on,
 #                               # 0..=3600 with session_hints = "off"
-# session_hints = "tcp"         # "tcp" | "off": replicate ESTABLISHED TCP sessions to
-#                               # backups (per node, not in the digest; UDP not covered).
-#                               # Peer protocol 2: upgrade every member together.
+# session_hints = "tcp"         # "tcp" | "tcp_udp" | "off": replicate ESTABLISHED TCP
+#                               # sessions (and, with "tcp_udp", aged bidirectional UDP
+#                               # sessions incl. QUIC) to backups (per node, not in the
+#                               # digest). Peer protocol 2: upgrade every member together.
+# udp_hint_after_secs = 2       # 1..=60: UDP hint only after traffic both ways and a
+#                               # packet this old (one-shot DNS never hints); "tcp_udp" only
+# udp_hints_per_sec = 2000      # 1..=100000 UDP hints per second per worker (burst 1 s)
 # takeover_quarantine_secs = 600
 # failback_delay_secs = 60      # 0 = manual failback
 # state_dir = "/var/lib/plat/cluster"

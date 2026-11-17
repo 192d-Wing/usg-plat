@@ -46,6 +46,7 @@ fn cluster_fx(q: usize) -> Fx {
         directory: Arc::new(Directory::new(16, 1000)),
         tcp_adopt_secs: 300,
         session_hints: false,
+        udp_hints: None,
         quarantine_secs: 600,
         reserve_ahead: 2,
     };

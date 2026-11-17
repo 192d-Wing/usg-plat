@@ -71,7 +71,7 @@ hardened audit trail, FIPS TLS and clustered high availability.
 |---|---|---|
 | Scale-out | Fixed IPv4 pool slices per node, BGP announce/withdraw hooks (FRR examples) | Run several separate instances |
 | State sync | Primary and backup per slice; port blocks and BIB replicated over mutual TLS; leases, a witness node, self-fencing | `joold`: active/active session sync over Netlink and TCP, documented as best-effort |
-| Gaps | Established TCP sessions are replicated as hints and restored after takeover (unreleased, in-process tests only); UDP sessions are not, and un-hinted TCP is picked up (POAM-028 Partial); takeover takes about 6.2 s against a 5 s target; not yet tested against a real BGP/BFD peer | No fencing or split-brain protection |
+| Gaps | Established TCP sessions are replicated as hints and restored after takeover (unreleased, in-process tests only); UDP sessions only with the opt-in `session_hints = "tcp_udp"` (unreleased, in-process tests only), and un-hinted TCP is picked up (POAM-028 Partial); takeover takes about 6.2 s against a 5 s target; not yet tested against a real BGP/BFD peer | No fencing or split-brain protection |
 
 ## Summary
 

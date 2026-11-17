@@ -364,6 +364,15 @@ fn ha_numeric_edges() {
         ("tcp_adopt_secs = 240", "tcp_adopt_secs = 239", "tcp_adopt_secs"),
         ("tcp_adopt_secs = 240", "tcp_adopt_secs = 0", "tcp_transitory_secs"),
         ("tcp_adopt_secs = 3600", "tcp_adopt_secs = 3601", "tcp_adopt_secs"),
+        ("udp_hint_after_secs = 1", "udp_hint_after_secs = 0", "udp_hint_after_secs"),
+        ("udp_hint_after_secs = 60", "udp_hint_after_secs = 61", "udp_hint_after_secs"),
+        ("udp_hints_per_sec = 1", "udp_hints_per_sec = 0", "udp_hints_per_sec"),
+        ("udp_hints_per_sec = 100000", "udp_hints_per_sec = 100001", "udp_hints_per_sec"),
+        (
+            "session_hints = \"tcp_udp\"\ntcp_adopt_secs = 240",
+            "session_hints = \"tcp_udp\"\ntcp_adopt_secs = 239",
+            "tcp_adopt_secs",
+        ),
         // Longest of udp 300 / tcp_trans 240 / icmp 60 in the example.
         ("takeover_quarantine_secs = 300", "takeover_quarantine_secs = 299", "takeover_quarantine_secs"),
         ("takeover_quarantine_secs = 86400", "takeover_quarantine_secs = 86401", "takeover_quarantine_secs"),
@@ -682,7 +691,15 @@ fn ha_session_hints_values() {
     let h = ha(2, "session_hints = \"off\"").unwrap();
     assert_eq!(h.cluster.ha_active().unwrap().session_hints, SessionHints::Off);
     assert!(!h.cluster.ha_active().unwrap().hints_on());
-    for bad in ["\"tcp_udp\"", "\"udp\"", "\"TCP\"", "\"\"", "1", "true"] {
+    assert!(!h.cluster.ha_active().unwrap().udp_hints_on());
+    let h = ha(2, "").unwrap();
+    assert!(!h.cluster.ha_active().unwrap().udp_hints_on(), "default tcp has no UDP hints");
+    let h = ha(2, "session_hints = \"tcp_udp\"").unwrap();
+    let a = h.cluster.ha_active().unwrap();
+    assert_eq!(a.session_hints, SessionHints::TcpUdp);
+    assert!(a.hints_on() && a.udp_hints_on());
+    assert_eq!((a.udp_hint_after_secs, a.udp_hints_per_sec), (2, 2000), "defaults");
+    for bad in ["\"tcpudp\"", "\"tcp-udp\"", "\"TcpUdp\"", "\"udp\"", "\"TCP\"", "\"\"", "1", "true"] {
         assert!(
             matches!(ha(2, &format!("session_hints = {bad}")), Err(ConfigError::Parse(_))),
             "session_hints = {bad} must not parse"
@@ -723,4 +740,25 @@ fn qa_tcp_adopt_secs_follows_tcp_transitory_secs() {
     // Unknown keys next to session_hints are still refused.
     assert!(matches!(ha(2, "session_hint = \"tcp\""), Err(ConfigError::Parse(_))));
     assert!(matches!(ha(2, "session_hints = [\"tcp\"]"), Err(ConfigError::Parse(_))));
+}
+
+/// QA: the UDP hint keys are validated in every mode (also `"off"` and
+/// the default `"tcp"`), wrong types are parse errors, and the
+/// `< timeouts.udp_secs` bound holds at the RFC 6146 minimum (120 s),
+/// where it is implied by the `..=60` range.
+#[test]
+fn qa_udp_hint_keys_bounds_every_mode() {
+    for mode in ["off", "tcp", "tcp_udp"] {
+        let m = format!("session_hints = \"{mode}\"\ntcp_adopt_secs = 300\n");
+        ha_valid(2, &format!("{m}udp_hint_after_secs = 60\nudp_hints_per_sec = 100000"));
+        ha_invalid(2, &format!("{m}udp_hint_after_secs = 0"), "udp_hint_after_secs");
+        ha_invalid(2, &format!("{m}udp_hint_after_secs = 4294967295"), "udp_hint_after_secs");
+        ha_invalid(2, &format!("{m}udp_hints_per_sec = 0"), "udp_hints_per_sec");
+        ha_invalid(2, &format!("{m}udp_hints_per_sec = 4294967295"), "udp_hints_per_sec");
+    }
+    for bad in ["udp_hint_after_secs = -1", "udp_hints_per_sec = 1.5", "udp_hint_after_secs = \"2\""] {
+        assert!(matches!(ha(2, bad), Err(ConfigError::Parse(_))), "{bad}");
+    }
+    let s = ha_section(2, "session_hints = \"tcp_udp\"\nudp_hint_after_secs = 60", "");
+    valid(&[(NC, &s), ("udp_secs = 300", "udp_secs = 120")]);
 }
