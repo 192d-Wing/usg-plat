@@ -70,7 +70,7 @@ rustls = { version = "=0.23.46", default-features = false, features = ["fips", "
 rustls-pki-types = { version = "1.15", features = ["std"] }
 aws-lc-rs = { version = "1.19", default-features = false, features = ["fips", "alloc"] }
 zeroize = "1.9"
-x509-cert = "0.2.5"
+x509-cert = "0.3.0"
 der = { version = "0.7", features = ["alloc", "oid"] }
 # RFC 6960 OCSP DER types (no builder: requests and checks use aws-lc-rs).
 x509-ocsp = { version = "0.2.1", default-features = false }
