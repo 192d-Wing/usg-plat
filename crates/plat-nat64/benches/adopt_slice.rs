@@ -48,7 +48,8 @@ use std::hint::black_box;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use criterion::measurement::WallTime;
+use criterion::{BenchmarkGroup, Criterion, Throughput, criterion_group, criterion_main};
 use crossbeam_channel::Receiver;
 use plat_audit::{AcquireReason, AuditSink, Event};
 use plat_cluster::{SliceMap, SnapRecord, WireBib, WireBlock, WireHint};
@@ -307,6 +308,79 @@ fn adopt_once(n: &Node, input: &AdoptInput, epoch: u64) -> Duration {
     d
 }
 
+/// The unhinted adopt, detached-adopt and release benches for one case.
+fn bench_case(g: &mut BenchmarkGroup<'_, WallTime>, n: &Node, id: &str, blocks: u64, bibs: u64) {
+    g.throughput(Throughput::Elements(blocks + bibs));
+
+    fill(n, blocks, bibs);
+    let input = take(n);
+    let mut epoch = 1u64;
+    g.bench_function(format!("adopt/{id}"), |b| {
+        b.iter_custom(|iters| {
+            (0..iters)
+                .map(|_| {
+                    epoch += 1;
+                    adopt_once(n, &input, epoch)
+                })
+                .sum()
+        })
+    });
+    drop(input);
+
+    // What platd runs: detach, then 5 ms steps from the maps.
+    let mut longest = (Duration::ZERO, "");
+    let mut steps = Vec::new();
+    g.bench_function(format!("adopt_detached/{id}"), |b| {
+        b.iter_custom(|iters| {
+            (0..iters)
+                .map(|_| {
+                    fill(n, blocks, bibs);
+                    epoch += 1;
+                    let t = Instant::now();
+                    let d = n.shadow.detach(SLICE, n.nat.state().now_ms());
+                    let detach = t.elapsed();
+                    let (stats, took, l) =
+                        adopt_stepped(n, AdoptSource::Detached(d), epoch, ADOPT_STEP_BUDGET, &mut steps);
+                    if l.0 > longest.0 {
+                        longest = l;
+                    }
+                    check(n, stats, blocks, bibs);
+                    detach + took
+                })
+                .sum()
+        })
+    });
+    print_steps("adopt_step_5ms", id, &mut steps, longest, ADOPT_STEP_BUDGET);
+
+    // POAM-048: the release of the adopted slice, 5 ms steps.
+    let mut longest = (Duration::ZERO, "");
+    let mut steps = Vec::new();
+    g.bench_function(format!("release/{id}"), |b| {
+        b.iter_custom(|iters| {
+            (0..iters)
+                .map(|_| {
+                    fill(n, blocks, bibs);
+                    epoch += 1;
+                    let d = n.shadow.detach(SLICE, n.nat.state().now_ms());
+                    let (stats, _, _) =
+                        adopt_stepped(n, AdoptSource::Detached(d), epoch, Duration::from_secs(3600), &mut Vec::new());
+                    assert_eq!(stats.bibs_adopted, bibs);
+                    let _ = n.rx.try_iter().count();
+                    let (rel, took, l) = release_stepped(n, RELEASE_STEP_BUDGET, &mut steps);
+                    assert_eq!((rel.bibs_removed, rel.blocks_released), (bibs, blocks));
+                    assert_eq!(n.nat.state().slice_state(SLICE), Some(SliceState::Inactive));
+                    let _ = n.rx.try_iter().count();
+                    if l.0 > longest.0 {
+                        longest = l;
+                    }
+                    took
+                })
+                .sum()
+        })
+    });
+    print_steps("release_step_5ms", id, &mut steps, longest, RELEASE_STEP_BUDGET);
+}
+
 fn bench(c: &mut Criterion) {
     let cfg = config();
     let default_len = cfg.cluster.slice_prefix_len;
@@ -327,81 +401,7 @@ fn bench(c: &mut Criterion) {
             cases.insert(0, ("vm", VM_BLOCKS, VM_BLOCKS * 10));
         }
         for (name, blocks, bibs) in cases {
-            let id = format!("slice{slice_len}_{tag}/{name}_{blocks}blk_{bibs}bib");
-            g.throughput(Throughput::Elements(blocks + bibs));
-
-            fill(&n, blocks, bibs);
-            let input = take(&n);
-            let mut epoch = 1u64;
-            g.bench_function(format!("adopt/{id}"), |b| {
-                b.iter_custom(|iters| {
-                    (0..iters)
-                        .map(|_| {
-                            epoch += 1;
-                            adopt_once(&n, &input, epoch)
-                        })
-                        .sum()
-                })
-            });
-            drop(input);
-
-            // What platd runs: detach, then 5 ms steps from the maps.
-            let mut longest = (Duration::ZERO, "");
-            let mut steps = Vec::new();
-            g.bench_function(format!("adopt_detached/{id}"), |b| {
-                b.iter_custom(|iters| {
-                    (0..iters)
-                        .map(|_| {
-                            fill(&n, blocks, bibs);
-                            epoch += 1;
-                            let t = Instant::now();
-                            let d = n.shadow.detach(SLICE, n.nat.state().now_ms());
-                            let detach = t.elapsed();
-                            let (stats, took, l) =
-                                adopt_stepped(&n, AdoptSource::Detached(d), epoch, ADOPT_STEP_BUDGET, &mut steps);
-                            if l.0 > longest.0 {
-                                longest = l;
-                            }
-                            check(&n, stats, blocks, bibs);
-                            detach + took
-                        })
-                        .sum()
-                })
-            });
-            print_steps("adopt_step_5ms", &id, &mut steps, longest, ADOPT_STEP_BUDGET);
-
-            // POAM-048: the release of the adopted slice, 5 ms steps.
-            let mut longest = (Duration::ZERO, "");
-            let mut steps = Vec::new();
-            g.bench_function(format!("release/{id}"), |b| {
-                b.iter_custom(|iters| {
-                    (0..iters)
-                        .map(|_| {
-                            fill(&n, blocks, bibs);
-                            epoch += 1;
-                            let d = n.shadow.detach(SLICE, n.nat.state().now_ms());
-                            let (stats, _, _) = adopt_stepped(
-                                &n,
-                                AdoptSource::Detached(d),
-                                epoch,
-                                Duration::from_secs(3600),
-                                &mut Vec::new(),
-                            );
-                            assert_eq!(stats.bibs_adopted, bibs);
-                            let _ = n.rx.try_iter().count();
-                            let (rel, took, l) = release_stepped(&n, RELEASE_STEP_BUDGET, &mut steps);
-                            assert_eq!((rel.bibs_removed, rel.blocks_released), (bibs, blocks));
-                            assert_eq!(n.nat.state().slice_state(SLICE), Some(SliceState::Inactive));
-                            let _ = n.rx.try_iter().count();
-                            if l.0 > longest.0 {
-                                longest = l;
-                            }
-                            took
-                        })
-                        .sum()
-                })
-            });
-            print_steps("release_step_5ms", &id, &mut steps, longest, RELEASE_STEP_BUDGET);
+            bench_case(&mut g, &n, &format!("slice{slice_len}_{tag}/{name}_{blocks}blk_{bibs}bib"), blocks, bibs);
         }
 
         // POAM-028: the largest case again with one hint per TCP BIB.

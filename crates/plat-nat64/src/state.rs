@@ -3145,39 +3145,7 @@ impl State {
                             port4: k4.port,
                             created_wall_us: b.created_wall_us,
                         }));
-                        if hints && k4.proto == proto::TCP {
-                            let est = b.sessions.iter().filter(|(r, x)| {
-                                x.tcp == Some(TcpState::Established) && r.0 != 0 && r.1 != 0 && k4.port != 0
-                            });
-                            for (r, _) in est.take(crate::repl::MAX_HINTS) {
-                                out.push(SnapRecord::Sess(WireHint {
-                                    proto: proto::TCP,
-                                    v4: k4.addr,
-                                    port4: k4.port,
-                                    raddr: r.0,
-                                    rport: r.1,
-                                }));
-                            }
-                        } else if udp_hints && k4.proto == proto::UDP {
-                            // Hinted (eligible) sessions only: one-shot and
-                            // unconfirmed restored flows are not exported.
-                            let hinted = b.sessions.iter().filter(|(r, x)| {
-                                x.uf == U_LIVE
-                                    && (x.expires_ms > now || x.slot != NO_SLOT)
-                                    && r.0 != 0
-                                    && r.1 != 0
-                                    && k4.port != 0
-                            });
-                            for (r, _) in hinted.take(crate::repl::MAX_HINTS) {
-                                out.push(SnapRecord::Sess(WireHint {
-                                    proto: proto::UDP,
-                                    v4: k4.addr,
-                                    port4: k4.port,
-                                    raddr: r.0,
-                                    rport: r.1,
-                                }));
-                            }
-                        }
+                        export_bib_hints(k4, b, hints, udp_hints, now, &mut out);
                     }
                     cur.shard += 1;
                 }
@@ -3271,6 +3239,33 @@ impl State {
                 false
             }
         }
+    }
+}
+
+/// Appends the `Sess` records exported after one BIB in a slice snapshot:
+/// up to [`crate::repl::MAX_HINTS`] ESTABLISHED TCP sessions (hints on), or
+/// up to as many hinted live UDP sessions (`"tcp_udp"`; one-shot and
+/// unconfirmed restored flows are not exported).
+fn export_bib_hints(k4: &Key4, b: &Bib, hints: bool, udp_hints: bool, now: u64, out: &mut Vec<SnapRecord>) {
+    if k4.port == 0 {
+        return;
+    }
+    let tcp = hints && k4.proto == proto::TCP;
+    let udp = udp_hints && k4.proto == proto::UDP;
+    if !tcp && !udp {
+        return;
+    }
+    let pick = b.sessions.iter().filter(|(r, x)| {
+        r.0 != 0
+            && r.1 != 0
+            && if tcp {
+                x.tcp == Some(TcpState::Established)
+            } else {
+                x.uf == U_LIVE && (x.expires_ms > now || x.slot != NO_SLOT)
+            }
+    });
+    for (r, _) in pick.take(crate::repl::MAX_HINTS) {
+        out.push(SnapRecord::Sess(WireHint { proto: k4.proto, v4: k4.addr, port4: k4.port, raddr: r.0, rport: r.1 }));
     }
 }
 
