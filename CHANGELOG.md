@@ -4,6 +4,14 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 
 ## [Unreleased]
 
+### Fixed
+- Port-block pool (SC-5): with several workers, a block allocation could
+  fail as `port_exhausted` (no reserve-starved or paired-exhausted count)
+  while free blocks remained, because another worker had popped the only
+  round-robin queue entry for an address or slice and not yet pushed it
+  back. The queue walk is now serialised (`Pool::scan`, lock order
+  `scan` → address/slice → `avail`), in legacy and sliced mode.
+
 ### Changed
 - Cluster HA (CP-10, SC-5, SC-7, POAM-028 (a) Partial): UDP session hints,
   opt-in. New value `cluster.ha.session_hints = "tcp_udp"` (default stays
