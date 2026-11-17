@@ -4,6 +4,14 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 
 ## [Unreleased]
 
+### Fixed
+- Port-block pool (SC-5): with several workers, a block allocation could
+  fail as `port_exhausted` (no reserve-starved or paired-exhausted count)
+  while free blocks remained, because another worker had popped the only
+  round-robin queue entry for an address or slice and not yet pushed it
+  back. The queue walk is now serialised (`Pool::scan`, lock order
+  `scan` → address/slice → `avail`), in legacy and sliced mode.
+
 ### Changed
 - Cluster HA (CP-10, SC-24, AU-12, POAM-048): releasing an Active slice
   (handover, lease lost, reassignment) is now a resumable cursor stepped on

@@ -103,7 +103,7 @@ struct Run {
 /// Allocation is O(1) amortised: `avail` is a round-robin queue of address
 /// indices (legacy) or slice ids (sliced) that have free blocks, so an
 /// allocation never scans addresses, and an exhausted pool is detected from
-/// one atomic load. Lock order is `free[i]` / slice → `avail`; `avail` is
+/// one atomic load. Lock order is `scan` → `free[i]` / slice → `avail`; `avail` is
 /// never held while taking a per-address or per-slice lock.
 ///
 /// COMPLIANCE MAPPING:
@@ -125,6 +125,15 @@ pub struct Pool {
     /// allocation/release and must not share a line with `runs`, which
     /// `index` reads on every packet.
     avail: CachePadded<Mutex<VecDeque<u32>>>,
+    /// Serialises the round-robin queue walk of [`Pool::alloc_block`]
+    /// (legacy and sliced). A walker pops an entry, locks its address or
+    /// slice, and pushes it back; without this lock a concurrent walker
+    /// could find the queue empty in that window and report `Exhausted`
+    /// with free blocks left (one entry per address or slice, so a small
+    /// pool under several workers hit it). Lock order: `scan` →
+    /// `free[i]` / slice → `avail`. Taken only on block allocation (not
+    /// per packet), never by release, relist or the prefer path.
+    scan: CachePadded<Mutex<()>>,
     port_min: u16,
     block_size: u16,
     blocks_per_addr: u16,
@@ -309,6 +318,7 @@ impl Pool {
             sliced: None,
             free,
             avail: CachePadded::new(Mutex::new(avail)),
+            scan: CachePadded::new(Mutex::new(())),
             port_min,
             block_size,
             blocks_per_addr,
@@ -382,6 +392,7 @@ impl Pool {
             })),
             free: Vec::new(),
             avail: CachePadded::new(Mutex::new(VecDeque::new())),
+            scan: CachePadded::new(Mutex::new(())),
             port_min,
             block_size,
             blocks_per_addr: bpa,
@@ -705,6 +716,13 @@ impl Pool {
         }
         // Each iteration either allocates or removes one stale entry, so the
         // loop is bounded by the queue length and amortised O(1).
+        //
+        // COMPLIANCE MAPPING:
+        // - NIST 800-53: SC-5 - a pool with free blocks is never reported
+        //   exhausted because another worker holds the popped queue entry
+        //   (walk serialised by `scan`, regression
+        //   `concurrent_walk_never_sees_an_empty_queue`).
+        let _walk = self.scan.lock();
         loop {
             let idx = self.avail.lock().pop_front().ok_or(AllocFail::Exhausted)?;
             if let Some(b) = self.take(idx, true) {
@@ -754,6 +772,9 @@ impl Pool {
             return Err(s.fail(starved));
         }
         // Bounded by the queue length (each slice is listed at most once).
+        // Serialised (see `Pool::scan`, SC-5): a concurrent walker never
+        // sees the queue empty while another holds a popped slice.
+        let _walk = self.scan.lock();
         loop {
             let Some(id) = s.avail.lock().pop_front() else {
                 return Err(s.fail(starved));
@@ -1177,6 +1198,57 @@ mod tests {
         // A never-used block (refused record) returns at once.
         p.unalloc(a);
         assert_eq!(p.free_blocks(), 1);
+    }
+
+    /// Runs two queue-path allocations while the first is parked inside
+    /// its walk (entry popped, `hold` keeps its address/slice locked): the
+    /// second must not fail. Before the `scan` lock it returned
+    /// `Exhausted` with free blocks left (8-worker harness, ~1 in 7 runs).
+    fn race_two_walkers<'a, G>(p: &'a Arc<Pool>, hold: impl FnOnce(&'a Pool) -> G, queue_empty: fn(&Pool) -> bool) {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        let guard = hold(p);
+        let (tx, rx) = mpsc::channel();
+        let spawn = |tx: mpsc::Sender<_>| {
+            let p = p.clone();
+            std::thread::spawn(move || tx.send(p.alloc_block(None, false)).unwrap())
+        };
+        let a = spawn(tx.clone());
+        // Deterministic: A has popped the only entry and waits on `hold`.
+        let t = Instant::now();
+        while !queue_empty(p) {
+            assert!(t.elapsed() < Duration::from_secs(10), "walker A never popped the entry");
+            std::thread::yield_now();
+        }
+        let b = spawn(tx);
+        // B either waits for A (fixed) or answers at once (the bug).
+        if let Ok(r) = rx.recv_timeout(Duration::from_millis(300)) {
+            assert!(r.is_ok(), "second walker failed while the first held the entry: {r:?}");
+        }
+        drop(guard);
+        a.join().unwrap();
+        b.join().unwrap();
+        let rest: Vec<_> = rx.try_iter().collect();
+        assert!(rest.iter().all(Result::is_ok), "{rest:?}");
+        assert_eq!(p.free_blocks(), 0);
+    }
+
+    #[test]
+    fn concurrent_walk_never_sees_an_empty_queue() {
+        // Legacy: one address, two blocks.
+        let p = Arc::new(Pool::new(vec![1], 1024, 1024 + 2 * 64 - 1, 64));
+        race_two_walkers(&p, |p| p.free[0].lock(), |p| p.avail.lock().is_empty());
+        // Sliced: one Active slice (two addresses, four blocks); drain two
+        // so exactly two remain for the two walkers.
+        let p = sliced();
+        p.set_slice_state(1, SliceState::Active);
+        p.alloc(None, false).unwrap();
+        p.alloc(None, false).unwrap();
+        race_two_walkers(
+            &Arc::new(p),
+            |p| p.sliced.as_ref().unwrap().slices[1].lock(),
+            |p| p.sliced.as_ref().unwrap().avail.lock().is_empty(),
+        );
     }
 
     fn sliced() -> Pool {
