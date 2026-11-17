@@ -454,6 +454,15 @@ fn ha_fixture() -> (Fx, Arc<ReplHub>) {
 
 /// `ha_fixture` with config edits and a reserve-ahead budget in blocks.
 fn ha_fixture_with(edits: &[(&str, &str)], reserve_ahead: u16) -> (Fx, Arc<ReplHub>) {
+    ha_fixture_full(edits, reserve_ahead, false)
+}
+
+/// `ha_fixture` with `cluster.ha.session_hints` on (`hints`) or off.
+fn ha_fixture_hints(hints: bool) -> (Fx, Arc<ReplHub>) {
+    ha_fixture_full(&[], 8, hints)
+}
+
+fn ha_fixture_full(edits: &[(&str, &str)], reserve_ahead: u16, hints: bool) -> (Fx, Arc<ReplHub>) {
     let cfg = config(edits);
     let setup = ClusterSetup {
         slices: SliceMap::new(&cfg.nat64.pool, 32).unwrap(),
@@ -461,6 +470,7 @@ fn ha_fixture_with(edits: &[(&str, &str)], reserve_ahead: u16) -> (Fx, Arc<ReplH
         steering: SteeringMode::Drop,
         directory: Arc::new(Directory::new(cfg.nat64.table_shards, cfg.nat64.max_subscribers)),
         tcp_adopt_secs: 300,
+        session_hints: hints,
         quarantine_secs: 600,
         reserve_ahead,
     };
@@ -508,7 +518,64 @@ fn bench_flows(c: &mut Criterion) {
             black_box(fx.nat.process(&mut buf, HEADROOM, pkt.len(), &mut fx.ctx));
         })
     });
+
+    // POAM-028: steady-state established TCP, both directions (the
+    // `refresh` path that now reports a first establish), hints on.
+    for hints in [false, true] {
+        let (mut fx, _hub) = ha_fixture_hints(hints);
+        let s = sub(1, 1);
+        let o = run(&mut fx, &tcp6(s, 6000, 0xc633_6407, 443, 0x02)).unwrap();
+        let (v4, p4) = (plat_packet::be32(&o, 12), plat_packet::be16(&o, 20));
+        run(&mut fx, &tcp4(0xc633_6407, 443, v4, p4, 0x12)).unwrap();
+        let out = tcp6(s, 6000, 0xc633_6407, 443, 0x10);
+        let back = tcp4(0xc633_6407, 443, v4, p4, 0x10);
+        let tag = if hints { "hints" } else { "nohints" };
+        g.bench_function(format!("tcp_existing_session_both_ways_{tag}"), |b| {
+            b.iter(|| {
+                for p in [&out, &back] {
+                    buf[HEADROOM..HEADROOM + p.len()].copy_from_slice(p);
+                    black_box(fx.nat.process(&mut buf, HEADROOM, p.len(), &mut fx.ctx));
+                }
+            })
+        });
+        // The establishing packet (V4 SYN+ACK on a V6 INIT session): one
+        // hint push per iteration with hints on.
+        g.bench_function(format!("tcp_establish_{tag}"), |b| b.iter_custom(|n| timed_establish(n, hints)));
+    }
     g.finish();
+}
+
+/// Sessions per engine in [`timed_establish`] (under the per-subscriber
+/// session cap and the ring size).
+const EST_CHUNK: usize = 2000;
+
+/// Times only the IPv4 SYN+ACK that makes each new session ESTABLISHED
+/// (one BIB, one remote port per session); SYNs and setup untimed.
+fn timed_establish(iters: u64, hints: bool) -> Duration {
+    let mut buf = vec![0u8; HEADROOM + 2048];
+    let mut total = Duration::ZERO;
+    let mut left = iters as usize;
+    let s = sub(1, 1);
+    while left > 0 {
+        let n = left.min(EST_CHUNK);
+        let (mut fx, hub) = ha_fixture_hints(hints);
+        let mut acks = Vec::with_capacity(n);
+        for i in 0..n {
+            let o = run(&mut fx, &tcp6(s, 6000, 0xc633_6407, 1000 + i as u16, 0x02)).unwrap();
+            let (v4, p4) = (plat_packet::be32(&o, 12), plat_packet::be16(&o, 20));
+            acks.push(tcp4(0xc633_6407, 1000 + i as u16, v4, p4, 0x12));
+        }
+        let start = Instant::now();
+        for p in &acks {
+            buf[HEADROOM..HEADROOM + p.len()].copy_from_slice(p);
+            black_box(fx.nat.process(&mut buf, HEADROOM, p.len(), &mut fx.ctx));
+        }
+        total += start.elapsed();
+        assert_eq!(hub.dropped_total(), 0);
+        drop((fx, hub));
+        left -= n;
+    }
+    total
 }
 
 /// Audit queue for the layout benches: well above the block records one

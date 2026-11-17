@@ -27,6 +27,10 @@
 //!   `RELEASE_STEP_BUDGET` until done; the adoption before it is untimed.
 //!   The longest step is printed (`release_step_5ms`).
 //!
+//! - `adopt_detached_hinted` (POAM-028): `adopt_detached` with
+//!   `session_hints` on and one ESTABLISHED session hint per TCP BIB (a
+//!   third of the BIBs), restored as `Pickup` sessions during the import.
+//!
 //! Each case reports the time of one adoption; the throughput line is
 //! records (blocks + BIBs) per second. A `blocks_only` case next to a full
 //! one separates the per-block cost (subscriber insert and one
@@ -44,7 +48,7 @@ use std::time::{Duration, Instant};
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use crossbeam_channel::Receiver;
 use plat_audit::{AcquireReason, AuditSink, Event};
-use plat_cluster::{SliceMap, SnapRecord, WireBib, WireBlock};
+use plat_cluster::{SliceMap, SnapRecord, WireBib, WireBlock, WireHint};
 use plat_common::config::SteeringMode;
 use plat_common::{Clock, Config};
 use plat_nat64::{
@@ -83,6 +87,10 @@ struct Node {
 }
 
 fn node(cfg: &Config, slice_len: u8) -> Node {
+    node_h(cfg, slice_len, false)
+}
+
+fn node_h(cfg: &Config, slice_len: u8, hints: bool) -> Node {
     let n = &cfg.nat64;
     let slices = SliceMap::new(&n.pool, slice_len).unwrap();
     let cidr = slices.cidr(SLICE).unwrap();
@@ -92,6 +100,7 @@ fn node(cfg: &Config, slice_len: u8) -> Node {
         steering: SteeringMode::Drop,
         directory: Arc::new(Directory::new(16, 1000)),
         tcp_adopt_secs: 300,
+        session_hints: hints,
         quarantine_secs: 600,
         reserve_ahead: 2,
     };
@@ -131,6 +140,12 @@ fn sub(i: u64) -> u128 {
 /// and `bibs` BIBs spread evenly over them, through the snapshot path a
 /// backup uses.
 fn fill(n: &Node, blocks: u64, bibs: u64) {
+    fill_h(n, blocks, bibs, false)
+}
+
+/// [`fill`] with one session hint (remote 198.51.100.7:443) after every
+/// TCP BIB when `hints`; the snapshot ends hinted.
+fn fill_h(n: &Node, blocks: u64, bibs: u64, hints: bool) {
     assert!(blocks <= n.slice_blocks && bibs <= n.slice_bibs, "case exceeds the slice");
     let per_block = bibs.checked_div(blocks).unwrap_or(0);
     let extra = bibs.checked_rem(blocks).unwrap_or(0);
@@ -146,19 +161,23 @@ fn fill(n: &Node, blocks: u64, bibs: u64) {
         recs.push(SnapRecord::Block { sub: s, block: WireBlock { addr, block }, alloc_wall_us: 1 });
         for j in 0..per_block + u64::from(i < extra) {
             let port = lo + (j / PROTOS.len() as u64) as u16;
+            let proto = PROTOS[(j % PROTOS.len() as u64) as usize];
             recs.push(SnapRecord::Bib(WireBib {
                 sub: s,
-                proto: PROTOS[(j % PROTOS.len() as u64) as usize],
+                proto,
                 v6: s | 1,
                 port6: port,
                 v4: addr,
                 port4: port,
                 created_wall_us: 1,
             }));
+            if hints && proto == proto::TCP {
+                recs.push(SnapRecord::Sess(WireHint { proto, v4: addr, port4: port, raddr: 0xc633_6407, rport: 443 }));
+            }
         }
         n.shadow.snapshot_records(SLICE, &recs).unwrap();
     }
-    n.shadow.snapshot_end(SLICE).unwrap();
+    n.shadow.snapshot_end_hinted(SLICE, hints).unwrap();
     assert_eq!(n.shadow.counts(SLICE), (blocks as usize, bibs as usize));
 }
 
@@ -362,6 +381,39 @@ fn bench(c: &mut Criterion) {
             });
             print_steps("release_step_5ms", &id, &mut steps, longest, RELEASE_STEP_BUDGET);
         }
+
+        // POAM-028: the largest case again with one hint per TCP BIB.
+        let n = node_h(&cfg, slice_len, true);
+        let (blocks, bibs) = (max_blocks, max_bibs);
+        let id = format!("slice{slice_len}_{tag}/max_{blocks}blk_{bibs}bib");
+        let tcp = bibs.div_ceil(PROTOS.len() as u64);
+        g.throughput(Throughput::Elements(blocks + bibs + tcp));
+        let mut longest = (Duration::ZERO, "");
+        let mut steps = Vec::new();
+        let mut epoch = 1u64;
+        g.bench_function(format!("adopt_detached_hinted/{id}"), |b| {
+            b.iter_custom(|iters| {
+                (0..iters)
+                    .map(|_| {
+                        fill_h(&n, blocks, bibs, true);
+                        epoch += 1;
+                        let t = Instant::now();
+                        let d = n.shadow.detach(SLICE, n.nat.state().now_ms());
+                        let detach = t.elapsed();
+                        let (stats, took, l) =
+                            adopt_stepped(&n, AdoptSource::Detached(d), epoch, ADOPT_STEP_BUDGET, &mut steps);
+                        if l.0 > longest.0 {
+                            longest = l;
+                        }
+                        assert_eq!(stats.sessions_restored, n.nat.state().session_count());
+                        assert!(stats.sessions_restored > 0 && stats.sessions_refused.total() == 0);
+                        check(&n, stats, blocks, bibs);
+                        detach + took
+                    })
+                    .sum()
+            })
+        });
+        print_steps("adopt_step_5ms_hinted", &id, &mut steps, longest, ADOPT_STEP_BUDGET);
     }
     g.finish();
 }

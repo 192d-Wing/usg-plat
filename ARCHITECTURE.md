@@ -487,8 +487,13 @@ flowchart LR
   push block, BIB and directory records into bounded per-worker SPSC rings
   (no lock, allocation or syscall; a full ring drops, counts and marks the
   slice dirty). `plat-repl` sends a snapshot then the stream to the slice's
-  backup; the backup is **in sync** after the snapshot end is acked. Sessions
-  are not replicated.
+  backup; the backup is **in sync** after the snapshot end is acked. UDP
+  and ICMP sessions are not replicated; with
+  `cluster.ha.session_hints = "tcp"` (default) the primary sends one
+  session hint per TCP connection when it first becomes ESTABLISHED (peer
+  `SessHint`, snapshot `Sess` records; at most 4 remotes per BIB in the
+  shadow). The peer protocol is version 2 and refuses version 1, so an
+  upgrade needs a cluster-wide restart.
 - **Block reservation**: while an in-sync backup exists, the primary hands
   out only blocks the backup has acked in a `Reserve` (top-up off the packet
   path, `reserve_ahead_blocks`), so no block is used that the backup cannot
@@ -497,9 +502,14 @@ flowchart LR
   `cluster_slice_acquire` and one `nat_port_block_adopt` per block, imports
   blocks and BIBs, rebuilds the free list (unknown reserved blocks held for
   `takeover_quarantine_secs`, recent releases finish their cool-down) and
-  only then sets the slice Active and runs the announce hook. Adopted TCP
-  BIBs accept a pickup on the transitory timer for `tcp_adopt_secs`
-  (POAM-028).
+  only then sets the slice Active and runs the announce hook. Hinted TCP
+  sessions are restored during the chunked import in state `Pickup` on the
+  `tcp_adopt_secs` window, so they accept inbound-first segments and reach
+  TCP_EST when the IPv4 side speaks. After an in-sync, hinted adoption the
+  slice is strict: a segment without a session creates one only with FIN
+  or on a BIB whose hints were incomplete. Otherwise adopted TCP BIBs
+  accept an outbound pickup on the transitory timer for `tcp_adopt_secs`
+  (POAM-028 Partial; UDP has no hints).
 - **Handover** (failback, growth, graceful shutdown): the old owner fences,
   flushes, logs release(`handover`) records, runs the withdraw hook and sends
   `HandoverFence`; the new owner adopts. A view moves every affected slice at

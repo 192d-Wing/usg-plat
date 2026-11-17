@@ -308,9 +308,15 @@ pub struct HaConfig {
     /// Clock-rate drift margin applied to leases (plus 200 ms).
     #[serde(default = "d_drift")]
     pub drift_margin_pct: u8,
-    /// TCP pickup window on adopted BIBs after takeover (0 disables).
+    /// TCP pickup window on adopted BIBs after takeover, and the lifetime
+    /// of a restored (hinted) session until its IPv4 side speaks. 0
+    /// disables the window; only valid with `session_hints = "off"`.
     #[serde(default = "d_tcp_adopt")]
     pub tcp_adopt_secs: u32,
+    /// Session hints replicated to backups so ESTABLISHED TCP sessions
+    /// survive a takeover. Per node, not in the config digest.
+    #[serde(default)]
+    pub session_hints: SessionHints,
     /// Hold-back for reserved-but-unlogged blocks after takeover.
     #[serde(default = "d_quarantine")]
     pub takeover_quarantine_secs: u32,
@@ -414,6 +420,30 @@ pub struct ClusterTlsConfig {
     /// Replaces `[tls.revocation]` for peer chains.
     #[serde(default)]
     pub revocation: Option<RevocationConfig>,
+}
+
+/// `cluster.ha.session_hints`: which sessions the slice primary replicates
+/// as hints to its backups (POAM-028).
+///
+/// COMPLIANCE MAPPING:
+/// - NIST 800-53: CP-10 (System Recovery and Reconstitution) - established
+///   TCP sessions are restored on adoption
+/// - NIST 800-53: CM-6 (Configuration Settings) - closed set of values
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionHints {
+    /// No hints: adoption keeps the un-hinted TCP pickup window.
+    Off,
+    /// ESTABLISHED TCP sessions (default). UDP is not covered (POAM-028).
+    #[default]
+    Tcp,
+}
+
+impl HaConfig {
+    /// Whether this node sends and restores TCP session hints.
+    pub fn hints_on(&self) -> bool {
+        self.session_hints != SessionHints::Off
+    }
 }
 
 /// What to do with a new subscriber homed on another node.
@@ -2279,6 +2309,16 @@ impl Config {
             return invalid("cluster.ha.tcp_adopt_secs must be 0..=3600");
         }
         let to = &self.timeouts;
+        // COMPLIANCE MAPPING:
+        // - NIST 800-53: CM-6 (Configuration Settings)
+        // - RFC 6146 §3.5.2.2 - a restored session never lives shorter than
+        //   TCP_TRANS (the RFC's minimum for an unconfirmed TCP session)
+        if h.hints_on() && h.tcp_adopt_secs < to.tcp_transitory_secs {
+            return invalid(
+                "cluster.ha.tcp_adopt_secs must be >= timeouts.tcp_transitory_secs \
+                 when session_hints = \"tcp\" (or set session_hints = \"off\")",
+            );
+        }
         let longest = to.udp_secs.max(to.tcp_transitory_secs).max(to.icmp_secs);
         if h.takeover_quarantine_secs < longest || h.takeover_quarantine_secs > MAX_TIMEOUT_SECS {
             return invalid(format!(

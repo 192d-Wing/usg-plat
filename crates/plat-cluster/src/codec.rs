@@ -21,7 +21,19 @@ use crate::slices::{MemberId, SliceId};
 use crate::view::{MAX_MEMBERS, View};
 
 /// Peer protocol version carried in `Hello`.
-pub const PROTO_VERSION: u16 = 1;
+///
+/// Version 2 adds TCP session hints (`SessHint`, `SnapRecord::Sess`,
+/// `SnapshotEnd.hints`). There is no negotiation: members of different
+/// versions refuse each other (`RejectReason::Version`), so an upgrade is a
+/// cluster-wide restart.
+///
+/// COMPLIANCE MAPPING:
+/// - NIST 800-53: CM-3 (Configuration Change Control) - incompatible peer
+///   protocol changes are refused, not interpreted
+pub const PROTO_VERSION: u16 = 2;
+
+/// IANA protocol number of TCP, the only protocol a session hint carries.
+pub const PROTO_TCP: u8 = 6;
 
 /// `u32 len` + `u8 type`.
 pub const HEADER_LEN: usize = 5;
@@ -141,8 +153,25 @@ pub struct WireBib {
 /// One snapshot record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapRecord {
-    Block { sub: u128, block: WireBlock, alloc_wall_us: u64 },
+    Block {
+        sub: u128,
+        block: WireBlock,
+        alloc_wall_us: u64,
+    },
     Bib(WireBib),
+    /// An ESTABLISHED session of the preceding TCP `Bib` (session hint).
+    Sess(WireHint),
+}
+
+/// One session hint: the IPv4 side of an ESTABLISHED TCP session on the
+/// BIB `(proto, v4, port4)`. Every field is non-zero and `proto` is TCP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WireHint {
+    pub proto: u8,
+    pub v4: u32,
+    pub port4: u16,
+    pub raddr: u32,
+    pub rport: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -250,9 +279,19 @@ pub enum Msg {
         seq: u64,
         records: Vec<SnapRecord>,
     },
+    /// `hints`: the primary sent session hints for this slice (its
+    /// `session_hints` is on), so the backup's copy carries every
+    /// ESTABLISHED TCP session the primary had.
     SnapshotEnd {
         slice: SliceId,
         seq: u64,
+        hints: bool,
+    },
+    /// A TCP session of the slice reached ESTABLISHED on the primary.
+    SessHint {
+        slice: SliceId,
+        seq: u64,
+        hint: WireHint,
     },
     /// Backup to primary: the backup's copy of `slice` has a gap at
     /// record `seq` (lost or refused input); send a new snapshot.
@@ -298,6 +337,7 @@ mod ty {
     pub const SNAPSHOT_CHUNK: u8 = 25;
     pub const SNAPSHOT_END: u8 = 26;
     pub const RESYNC: u8 = 27;
+    pub const SESS_HINT: u8 = 28;
     pub const HANDOVER_FENCE: u8 = 32;
     pub const HANDOVER_DONE: u8 = 33;
     pub const SYNC_STATUS: u8 = 34;
@@ -329,6 +369,7 @@ impl Msg {
             Msg::HandoverFence { .. } => ty::HANDOVER_FENCE,
             Msg::HandoverDone { .. } => ty::HANDOVER_DONE,
             Msg::Resync { .. } => ty::RESYNC,
+            Msg::SessHint { .. } => ty::SESS_HINT,
             Msg::SyncStatus { .. } => ty::SYNC_STATUS,
         }
     }
@@ -379,6 +420,14 @@ fn put_bib(out: &mut Vec<u8>, b: &WireBib) {
     out.extend_from_slice(&b.v4.to_le_bytes());
     out.extend_from_slice(&b.port4.to_le_bytes());
     out.extend_from_slice(&b.created_wall_us.to_le_bytes());
+}
+
+fn put_hint(out: &mut Vec<u8>, h: &WireHint) {
+    out.push(h.proto);
+    out.extend_from_slice(&h.v4.to_le_bytes());
+    out.extend_from_slice(&h.port4.to_le_bytes());
+    out.extend_from_slice(&h.raddr.to_le_bytes());
+    out.extend_from_slice(&h.rport.to_le_bytes());
 }
 
 fn put_slice_seq(out: &mut Vec<u8>, slice: SliceId, seq: u64) {
@@ -463,10 +512,21 @@ pub fn encode(msg: &Msg, max_frame: usize, out: &mut Vec<u8>) -> Result<(), Code
                 put_block(out, b);
             }
         }
-        Msg::Ack { slice, seq }
-        | Msg::SnapshotBegin { slice, seq }
-        | Msg::SnapshotEnd { slice, seq }
-        | Msg::Resync { slice, seq } => put_slice_seq(out, *slice, *seq),
+        Msg::Ack { slice, seq } | Msg::SnapshotBegin { slice, seq } | Msg::Resync { slice, seq } => {
+            put_slice_seq(out, *slice, *seq)
+        }
+        Msg::SnapshotEnd { slice, seq, hints } => {
+            put_slice_seq(out, *slice, *seq);
+            out.push(u8::from(*hints));
+        }
+        Msg::SessHint { slice, seq, hint } => {
+            if !valid_hint(hint) {
+                out.truncate(start);
+                return Err(CodecError::Invalid("hint"));
+            }
+            put_slice_seq(out, *slice, *seq);
+            put_hint(out, hint);
+        }
         Msg::BlockAlloc { slice, seq, sub, block, wall_us } => {
             put_slice_seq(out, *slice, *seq);
             out.extend_from_slice(&sub.to_le_bytes());
@@ -508,6 +568,14 @@ pub fn encode(msg: &Msg, max_frame: usize, out: &mut Vec<u8>) -> Result<(), Code
                         out.push(2);
                         put_bib(out, b);
                     }
+                    SnapRecord::Sess(h) => {
+                        if !valid_hint(h) {
+                            out.truncate(start);
+                            return Err(CodecError::Invalid("hint"));
+                        }
+                        out.push(3);
+                        put_hint(out, h);
+                    }
                 }
             }
         }
@@ -542,6 +610,12 @@ fn valid_name(b: &[u8]) -> bool {
 
 fn valid_proto(p: u8) -> bool {
     matches!(p, 1 | 6 | 17)
+}
+
+/// A session hint names a TCP session with every address and port set
+/// (the IPv4 side of a real ESTABLISHED session never has a zero field).
+fn valid_hint(h: &WireHint) -> bool {
+    h.proto == PROTO_TCP && h.v4 != 0 && h.port4 != 0 && h.raddr != 0 && h.rport != 0
 }
 
 /// Bounds-checked cursor over one payload.
@@ -617,6 +691,12 @@ impl<'a> Rd<'a> {
             port4: self.u16()?,
             created_wall_us: self.u64()?,
         })
+    }
+
+    fn hint(&mut self) -> Result<WireHint, CodecError> {
+        let h =
+            WireHint { proto: self.u8()?, v4: self.u32()?, port4: self.u16()?, raddr: self.u32()?, rport: self.u16()? };
+        if valid_hint(&h) { Ok(h) } else { Err(CodecError::Invalid("hint")) }
     }
 
     fn members(&mut self) -> Result<Vec<MemberId>, CodecError> {
@@ -759,13 +839,14 @@ pub fn decode_payload(t: u8, payload: &[u8]) -> Result<Msg, CodecError> {
         ty::SNAPSHOT_CHUNK => {
             let (slice, seq) = r.slice_seq()?;
             let n = r.u32()? as usize;
-            // Smallest record: tag + Block (1 + 16 + 6 + 8).
-            let n = r.count(n, 31)?;
+            // Smallest record: tag + Sess (1 + 1 + 4 + 2 + 4 + 2).
+            let n = r.count(n, 14)?;
             let mut records = Vec::with_capacity(n);
             for _ in 0..n {
                 records.push(match r.u8()? {
                     1 => SnapRecord::Block { sub: r.u128()?, block: r.block()?, alloc_wall_us: r.u64()? },
                     2 => SnapRecord::Bib(r.bib()?),
+                    3 => SnapRecord::Sess(r.hint()?),
                     _ => return Err(CodecError::Invalid("snapshot.record")),
                 });
             }
@@ -773,7 +854,11 @@ pub fn decode_payload(t: u8, payload: &[u8]) -> Result<Msg, CodecError> {
         }
         ty::SNAPSHOT_END => {
             let (slice, seq) = r.slice_seq()?;
-            Msg::SnapshotEnd { slice, seq }
+            Msg::SnapshotEnd { slice, seq, hints: r.bool("snapshot_end.hints")? }
+        }
+        ty::SESS_HINT => {
+            let (slice, seq) = r.slice_seq()?;
+            Msg::SessHint { slice, seq, hint: r.hint()? }
         }
         ty::RESYNC => {
             let (slice, seq) = r.slice_seq()?;
@@ -849,6 +934,16 @@ mod tests {
             })
     }
 
+    fn arb_hint() -> impl Strategy<Value = WireHint> {
+        (1u32.., 1u16.., 1u32.., 1u16..).prop_map(|(v4, port4, raddr, rport)| WireHint {
+            proto: PROTO_TCP,
+            v4,
+            port4,
+            raddr,
+            rport,
+        })
+    }
+
     fn arb_msg() -> impl Strategy<Value = Msg> {
         let hello = (
             any::<u16>(),
@@ -895,6 +990,7 @@ mod tests {
                 alloc_wall_us
             }),
             arb_bib().prop_map(SnapRecord::Bib),
+            arb_hint().prop_map(SnapRecord::Sess),
         ];
         prop_oneof![
             hello,
@@ -922,7 +1018,12 @@ mod tests {
             (any::<u16>(), any::<u64>()).prop_map(|(slice, seq)| Msg::SnapshotBegin { slice, seq }),
             (any::<u16>(), any::<u64>(), proptest::collection::vec(rec, 0..30))
                 .prop_map(|(slice, seq, records)| Msg::SnapshotChunk { slice, seq, records }),
-            (any::<u16>(), any::<u64>()).prop_map(|(slice, seq)| Msg::SnapshotEnd { slice, seq }),
+            (any::<u16>(), any::<u64>(), any::<bool>()).prop_map(|(slice, seq, hints)| Msg::SnapshotEnd {
+                slice,
+                seq,
+                hints
+            }),
+            (any::<u16>(), any::<u64>(), arb_hint()).prop_map(|(slice, seq, hint)| Msg::SessHint { slice, seq, hint }),
             (any::<u16>(), any::<u64>(), any::<u64>()).prop_map(|(slice, epoch, final_seq)| Msg::HandoverFence {
                 slice,
                 epoch,
@@ -1024,5 +1125,150 @@ mod tests {
         p.extend_from_slice(&0u16.to_le_bytes());
         p.extend_from_slice(&[1, 3, 0, 1, 3, 0]);
         assert_eq!(decode_payload(ty::VIEW_PROPOSE, &p), Err(CodecError::Invalid("view.standby")));
+    }
+
+    fn hint_payload(proto: u8, v4: u32, port4: u16, raddr: u32, rport: u16) -> Vec<u8> {
+        let mut p = 3u16.to_le_bytes().to_vec();
+        p.extend_from_slice(&9u64.to_le_bytes());
+        p.push(proto);
+        p.extend_from_slice(&v4.to_le_bytes());
+        p.extend_from_slice(&port4.to_le_bytes());
+        p.extend_from_slice(&raddr.to_le_bytes());
+        p.extend_from_slice(&rport.to_le_bytes());
+        p
+    }
+
+    #[test]
+    fn session_hints_strict() {
+        let ok = hint_payload(6, 1, 2, 3, 4);
+        assert_eq!(
+            decode_payload(ty::SESS_HINT, &ok),
+            Ok(Msg::SessHint { slice: 3, seq: 9, hint: WireHint { proto: 6, v4: 1, port4: 2, raddr: 3, rport: 4 } })
+        );
+        for bad in [
+            hint_payload(17, 1, 2, 3, 4),
+            hint_payload(1, 1, 2, 3, 4),
+            hint_payload(6, 0, 2, 3, 4),
+            hint_payload(6, 1, 0, 3, 4),
+            hint_payload(6, 1, 2, 0, 4),
+            hint_payload(6, 1, 2, 3, 0),
+        ] {
+            assert_eq!(decode_payload(ty::SESS_HINT, &bad), Err(CodecError::Invalid("hint")));
+        }
+        let mut long = ok.clone();
+        long.push(0);
+        assert_eq!(decode_payload(ty::SESS_HINT, &long), Err(CodecError::Trailing(1)));
+        // Encode refuses what decode would refuse.
+        let bad = Msg::SessHint { slice: 0, seq: 0, hint: WireHint { proto: 17, v4: 1, port4: 1, raddr: 1, rport: 1 } };
+        let mut out = vec![7];
+        assert_eq!(encode(&bad, MAX, &mut out), Err(CodecError::Invalid("hint")));
+        assert_eq!(out, vec![7]);
+        let bad = Msg::SnapshotChunk {
+            slice: 0,
+            seq: 0,
+            records: vec![SnapRecord::Sess(WireHint { proto: 6, v4: 1, port4: 1, raddr: 0, rport: 1 })],
+        };
+        assert_eq!(encode(&bad, MAX, &mut out), Err(CodecError::Invalid("hint")));
+        // A replication message, not control traffic.
+        assert!(
+            !Msg::SessHint { slice: 0, seq: 0, hint: WireHint { proto: 6, v4: 1, port4: 1, raddr: 1, rport: 1 } }
+                .is_control()
+        );
+    }
+
+    #[test]
+    fn snapshot_end_hints_byte_and_record_tags_strict() {
+        let mut p = 0u16.to_le_bytes().to_vec();
+        p.extend_from_slice(&0u64.to_le_bytes());
+        assert_eq!(decode_payload(ty::SNAPSHOT_END, &p), Err(CodecError::Truncated), "v1 SnapshotEnd refused");
+        p.push(2);
+        assert_eq!(decode_payload(ty::SNAPSHOT_END, &p), Err(CodecError::Invalid("snapshot_end.hints")));
+        // Unknown snapshot tag 4, and a Sess record with proto UDP.
+        let mut c = 0u16.to_le_bytes().to_vec();
+        c.extend_from_slice(&0u64.to_le_bytes());
+        c.extend_from_slice(&1u32.to_le_bytes());
+        let mut t4 = c.clone();
+        t4.push(4);
+        t4.extend_from_slice(&[1; 13]);
+        assert_eq!(decode_payload(ty::SNAPSHOT_CHUNK, &t4), Err(CodecError::Invalid("snapshot.record")));
+        let mut udp = c.clone();
+        udp.push(3);
+        udp.push(17);
+        udp.extend_from_slice(&[1; 12]);
+        assert_eq!(decode_payload(ty::SNAPSHOT_CHUNK, &udp), Err(CodecError::Invalid("hint")));
+    }
+
+    // ---- QA: session-hint codec properties ----
+
+    /// Re-encodes `m` and returns its payload (after the frame header).
+    fn payload_of(m: &Msg) -> Vec<u8> {
+        let mut out = Vec::new();
+        encode(m, MAX, &mut out).unwrap();
+        out.split_off(HEADER_LEN)
+    }
+
+    proptest! {
+        /// SI-10: arbitrary payloads of the three new wire shapes never
+        /// panic, and whatever decodes is canonical (re-encodes to the same
+        /// bytes), so the strict decoder has exactly one encoding per value.
+        #[test]
+        fn qa_hint_shapes_arbitrary_payload_never_panic_and_canonical(
+            t in prop_oneof![Just(ty::SESS_HINT), Just(ty::SNAPSHOT_END), Just(ty::SNAPSHOT_CHUNK)],
+            b in proptest::collection::vec(any::<u8>(), 0..256),
+        ) {
+            if let Ok(m) = decode_payload(t, &b) {
+                prop_assert_eq!(payload_of(&m), b);
+            }
+        }
+
+        /// A `SnapshotChunk` of `Sess` records with arbitrary record bytes
+        /// (tag 3 forced) never panics; it decodes only when every record is
+        /// a valid TCP hint with non-zero fields.
+        #[test]
+        fn qa_sess_records_arbitrary_bytes(recs in proptest::collection::vec(any::<[u8; 13]>(), 1..20)) {
+            let mut p = 1u16.to_le_bytes().to_vec();
+            p.extend_from_slice(&5u64.to_le_bytes());
+            p.extend_from_slice(&(recs.len() as u32).to_le_bytes());
+            for r in &recs {
+                p.push(3);
+                p.extend_from_slice(r);
+            }
+            let valid = recs.iter().all(|r| {
+                r[0] == PROTO_TCP
+                    && r[1..5] != [0; 4]
+                    && r[5..7] != [0; 2]
+                    && r[7..11] != [0; 4]
+                    && r[11..13] != [0; 2]
+            });
+            let got = decode_payload(ty::SNAPSHOT_CHUNK, &p);
+            prop_assert_eq!(got.is_ok(), valid, "{:?}", got);
+            if let Ok(m) = got {
+                prop_assert_eq!(payload_of(&m), p);
+            }
+        }
+
+        /// `SessHint` decodes iff proto is TCP and every field is non-zero;
+        /// `SnapshotEnd.hints` accepts only 0 and 1.
+        #[test]
+        fn qa_sess_hint_and_end_byte_rules(
+            proto in any::<u8>(), v4 in any::<u32>(), port4 in any::<u16>(),
+            raddr in any::<u32>(), rport in any::<u16>(), end in any::<u8>(),
+        ) {
+            let ok = proto == PROTO_TCP && v4 != 0 && port4 != 0 && raddr != 0 && rport != 0;
+            let got = decode_payload(ty::SESS_HINT, &hint_payload(proto, v4, port4, raddr, rport));
+            if ok {
+                prop_assert_eq!(got, Ok(Msg::SessHint { slice: 3, seq: 9, hint: WireHint { proto, v4, port4, raddr, rport } }));
+            } else {
+                prop_assert_eq!(got, Err(CodecError::Invalid("hint")));
+            }
+            let mut e = 2u16.to_le_bytes().to_vec();
+            e.extend_from_slice(&7u64.to_le_bytes());
+            e.push(end);
+            let got = decode_payload(ty::SNAPSHOT_END, &e);
+            match end {
+                0 | 1 => prop_assert_eq!(got, Ok(Msg::SnapshotEnd { slice: 2, seq: 7, hints: end == 1 })),
+                _ => prop_assert_eq!(got, Err(CodecError::Invalid("snapshot_end.hints"))),
+            }
+        }
     }
 }

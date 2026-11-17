@@ -329,6 +329,35 @@ fn shutdown_release(
     }
 }
 
+/// Session-hint metrics (SI-4, POAM-028): `sent` on the primary, the rest
+/// on the backup's shadow.
+fn render_hints(o: &mut String, enabled: bool, st: &super::replicator::ReplStats, h: &plat_nat64::HintStats) {
+    use std::fmt::Write as _;
+    let l = |c: &AtomicU64| c.load(Ordering::Relaxed);
+    let _ = write!(
+        o,
+        "# TYPE plat_cluster_session_hints_enabled gauge\nplat_cluster_session_hints_enabled {}\n\
+         # TYPE plat_cluster_session_hints_total counter\n\
+         plat_cluster_session_hints_total{{result=\"sent\"}} {}\n\
+         plat_cluster_session_hints_total{{result=\"applied\"}} {}\n\
+         # TYPE plat_cluster_session_hints_refused_total counter\n\
+         plat_cluster_session_hints_refused_total{{reason=\"no_bib\"}} {}\n\
+         plat_cluster_session_hints_refused_total{{reason=\"outside_slice\"}} {}\n\
+         plat_cluster_session_hints_refused_total{{reason=\"invalid\"}} {}\n\
+         plat_cluster_session_hints_refused_total{{reason=\"sess_orphan\"}} {}\n\
+         # TYPE plat_cluster_session_hints_evicted_total counter\n\
+         plat_cluster_session_hints_evicted_total {}\n",
+        u8::from(enabled),
+        l(&st.hints_sent),
+        l(&h.applied),
+        l(&h.no_bib),
+        l(&h.outside_slice),
+        l(&h.invalid),
+        l(&h.sess_orphan),
+        l(&h.evicted),
+    );
+}
+
 /// Chunked adoption on the control thread (SI-4, POAM-047).
 #[derive(Debug, Default)]
 struct AdoptMetrics {
@@ -339,7 +368,14 @@ struct AdoptMetrics {
     abandoned: [AtomicU64; 5],
     /// 1 while an adoption (or its abandon) is in progress.
     adopting: AtomicU64,
+    /// Hinted TCP sessions restored by completed adoptions.
+    restored: AtomicU64,
+    /// Hinted sessions not restored, by [`RESTORE_REFUSED_LABELS`].
+    restore_refused: [AtomicU64; 5],
 }
+
+/// `plat_cluster_session_restore_refused_total{reason}`.
+const RESTORE_REFUSED_LABELS: [&str; 5] = ["session_limit", "subscriber_limit", "policy", "duplicate", "aged"];
 
 /// Notes one step of `d` in a windowed maximum (`max_ns` since `since_ms`).
 fn note_step(max_ns: &AtomicU64, since_ms: &AtomicU64, d: Duration) {
@@ -365,6 +401,17 @@ impl AdoptMetrics {
         note_step(&self.step_max_ns, &self.max_since_ms, d);
     }
 
+    /// Session restore counts of a completed adoption.
+    fn done(&self, s: &plat_nat64::AdoptStats) {
+        self.restored.fetch_add(s.sessions_restored, Ordering::Relaxed);
+        let r = s.sessions_refused;
+        for (c, n) in
+            self.restore_refused.iter().zip([r.session_limit, r.subscriber_limit, r.policy, r.duplicate, r.aged])
+        {
+            c.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
     fn render(&self, o: &mut String) {
         use std::fmt::Write as _;
         let max = step_max(&self.step_max_ns, &self.max_since_ms);
@@ -381,6 +428,19 @@ impl AdoptMetrics {
         for (l, c) in ABANDON_LABELS.iter().zip(&self.abandoned) {
             let _ =
                 writeln!(o, "plat_cluster_adoptions_abandoned_total{{reason=\"{l}\"}} {}", c.load(Ordering::Relaxed));
+        }
+        let _ = write!(
+            o,
+            "# TYPE plat_cluster_sessions_restored_total counter\nplat_cluster_sessions_restored_total {}\n\
+             # TYPE plat_cluster_session_restore_refused_total counter\n",
+            self.restored.load(Ordering::Relaxed)
+        );
+        for (l, c) in RESTORE_REFUSED_LABELS.iter().zip(&self.restore_refused) {
+            let _ = writeln!(
+                o,
+                "plat_cluster_session_restore_refused_total{{reason=\"{l}\"}} {}",
+                c.load(Ordering::Relaxed)
+            );
         }
     }
 }
@@ -563,7 +623,10 @@ impl Shared {
             for (name, v) in ["active", "fenced", "backup_in_sync", "backup_syncing", "unprotected"].iter().zip(c) {
                 let _ = writeln!(o, "plat_cluster_slices{{state=\"{name}\"}} {v}");
             }
-            let st = r.lock().stats.clone();
+            let (st, sh) = {
+                let g = r.lock();
+                (g.stats.clone(), g.shadow.clone())
+            };
             let _ = write!(
                 o,
                 "# TYPE plat_cluster_resync_total counter\nplat_cluster_resync_total {}\n\
@@ -571,6 +634,7 @@ impl Shared {
                 st.resync_total.load(Ordering::Relaxed),
                 st.ack_timeouts.load(Ordering::Relaxed)
             );
+            render_hints(o, self.nat.as_ref().is_some_and(|n| n.state().session_hints()), &st, sh.hint_stats());
         }
         if let Some(h) = &self.hub {
             let _ = write!(
@@ -581,12 +645,18 @@ impl Shared {
                  plat_cluster_repl_dropped_total{{reason=\"peer_queue\"}} {}\n\
                  plat_cluster_repl_dropped_total{{reason=\"link\"}} {}\n\
                  plat_cluster_repl_dropped_total{{reason=\"gap\"}} {}\n\
+                 # TYPE plat_cluster_repl_drains_truncated_total counter\n\
+                 plat_cluster_repl_drains_truncated_total {}\n\
+                 # TYPE plat_cluster_session_hints_superseded_total counter\n\
+                 plat_cluster_session_hints_superseded_total {}\n\
                  # TYPE plat_cluster_repl_lag_records gauge\n",
                 h.pushed_total(),
                 h.dropped_total(),
                 self.net.stats.queue_dropped.load(Ordering::Relaxed),
                 self.net.stats.link_dropped.load(Ordering::Relaxed),
-                self.repl.as_ref().map_or(0, |r| r.lock().stats.rx_gaps.load(Ordering::Relaxed))
+                self.repl.as_ref().map_or(0, |r| r.lock().stats.rx_gaps.load(Ordering::Relaxed)),
+                h.drains_truncated(),
+                h.hints_superseded(),
             );
             for v in self.voters.iter().filter(|v| v.id != self.me && !v.witness) {
                 let _ =
@@ -1093,8 +1163,10 @@ impl Ctl {
                         blocks = s.blocks_adopted,
                         bibs = s.bibs_adopted,
                         held = s.blocks_held,
+                        sessions = s.sessions_restored,
                         "slice acquired"
                     );
+                    self.sh.adopt.done(&s);
                     self.finish(&j);
                     ended = true;
                     None

@@ -5,6 +5,41 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 ## [Unreleased]
 
 ### Changed
+- **BREAKING (cluster HA):** peer protocol `PROTO_VERSION` 2. A version-2
+  node refuses version-1 peers (`HelloAck(Version)`, `cluster_peer_rejected`
+  reason `version`); there is no version negotiation and mixed versions do
+  not form a cluster. Upgrade procedure: stop `platd` on every member (and
+  `platd witness`), upgrade every node, then start them; a cluster-wide
+  restart loses every node's in-memory BIBs and sessions.
+- **BREAKING (config):** with `[cluster.ha] enabled = true` and session
+  hints on, `cluster.ha.tcp_adopt_secs` must be at least
+  `timeouts.tcp_transitory_secs` (default 240) and at most 3600; `0` is
+  refused. A config with `tcp_adopt_secs = 0` (or below the transitory
+  timeout) must set `session_hints = "off"` or raise the value.
+- Cluster HA (CP-10, SC-5, SC-7, POAM-028 Partial): TCP session hints. New
+  `cluster.ha.session_hints = "off" | "tcp"` (default `"tcp"`; per node, not
+  in the config digest). The slice owner replicates one hint per TCP
+  connection when it first becomes ESTABLISHED, and snapshots carry the
+  ESTABLISHED sessions (at most 4 remotes per BIB). On takeover the new
+  owner restores them, checked against the destination policy and session
+  caps, in state `Pickup` on the `tcp_adopt_secs` window: established flows
+  accept inbound-first segments and reach TCP_EST when the IPv4 side speaks.
+  After an in-sync, hinted adoption, un-hinted TCP state creation is
+  refused except for FIN and BIBs whose hints were incomplete. A FIN pickup
+  stays on the transitory timer until the IPv4 side speaks (`PickupFin`).
+  UDP is not hinted. `"off"` behaves as before. The memory requirement adds
+  `SHADOW_HINT_BYTES` (112 B) per `nat64.max_sessions` with HA and hints on.
+  New metrics `plat_cluster_session_hints_enabled`,
+  `plat_cluster_session_hints_total{result}`,
+  `plat_cluster_session_hints_refused_total{reason}`,
+  `plat_cluster_session_hints_evicted_total`,
+  `plat_cluster_session_hints_superseded_total`,
+  `plat_cluster_repl_drains_truncated_total`,
+  `plat_cluster_sessions_restored_total`,
+  `plat_cluster_session_restore_refused_total{reason}`. No audit field or
+  record (`LOG_SCHEMA_VERSION` stays 8). Hinted adoption is about 19 %
+  slower (host measurement). In-process tests only; VM flows not re-run.
+
 - Cluster HA (CP-10, SC-24, AU-12, POAM-048): releasing an Active slice
   (handover, lease lost, reassignment) is now a resumable cursor stepped on
   the cluster ctl thread with a 5 ms budget, alternating with adoption

@@ -18,7 +18,7 @@ if ms=$(wait_until 60000 metric_gt "$A" 'plat_cluster_slices{state="backup_in_sy
 else
     fail "A never reached backup_in_sync"
 fi
-traffic_start $((FAILBACK_SECS + 45))
+PUSH_FLOWS=50 IDLE_FLOWS=20 traffic_start $((FAILBACK_SECS + 45))
 if ms=$(wait_until $(((FAILBACK_SECS + 40) * 1000)) slices_eq "$A" "$a_slices"); then
     pass "A failed back to $a_slices slices after $ms ms"
 else
@@ -26,6 +26,7 @@ else
 fi
 traffic_wait 180
 check_flows 100 1000
+check_pushed 95
 new=$(vm "$B" "$AUDIT_CAT | tail -n +$((mark + 1))")
 h=$(printf '%s\n' "$new" | grep -cF '"plat.release_reason":"handover"' || true)
 if [ "$h" -gt 0 ]; then pass "$h release(handover) records on B"; else fail "no release(handover) records on B"; fi

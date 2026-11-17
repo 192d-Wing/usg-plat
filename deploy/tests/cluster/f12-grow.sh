@@ -18,7 +18,7 @@ vm "$B" "rm -rf /var/lib/plat/cluster/*; install -d -m 0750 /var/lib/plat-audit-
     [ -e /var/log/plat/nat64-audit.jsonl ] && mv /var/log/plat/nat64-audit.jsonl /var/lib/plat-audit-archive/nat64-audit.jsonl.\$(date +%s%6N); true"
 ma=$(audit_mark "$A")
 t_start=$(iso_now "$B")
-traffic_start $((FAILBACK_SECS + 60))
+PUSH_FLOWS=50 IDLE_FLOWS=20 traffic_start $((FAILBACK_SECS + 60))
 sleep 5
 platd_start "$B"
 if ms=$(wait_until $(((FAILBACK_SECS + 50) * 1000)) rebalanced_to "$B" 6); then
@@ -28,6 +28,7 @@ else
 fi
 traffic_wait 240
 check_flows 95 -
+check_pushed 95
 # In-flight handovers: +1 at A's release(handover), -1 at B's acquire(handover).
 {
     vm "$A" "$AUDIT_CAT | tail -n +$((ma + 1))" | grep -F '"event.action":"cluster_slice_release"' |

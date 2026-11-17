@@ -26,6 +26,15 @@ pub const SESSION_BYTES: u64 = 800;
 pub const AUDIT_SLOT_BYTES: u64 = 64;
 /// Bytes per replication ring slot (`plat_nat64::repl::REPL_SLOT_BYTES`).
 pub const REPL_SLOT_BYTES: u64 = 64;
+/// Shadow bytes per backed-up BIB added by session hints (HA with
+/// `session_hints = "tcp"`): the inline hints grow every shadow map bucket
+/// by 48 B (`plat_nat64::repl::SHADOW_BIB_HINT_BYTES`, hinted or not, no
+/// allocation), times 2.29 for the worst-case hash table occupancy (7/8
+/// load, power-of-two buckets just after a resize), rounded up. One shadow
+/// holds the slices of every peer, capped at `max_sessions` BIBs in total
+/// (including a slice detached for adoption), so `max_sessions` bounds the
+/// entries however many peers it backs up.
+pub const SHADOW_HINT_BYTES: u64 = 112;
 /// Fixed headroom: binary, thread stacks, TLS, logger buffers, allocator slack.
 pub const HEADROOM_BYTES: u64 = 256 << 20;
 /// Bytes per table shard header (a cache-line-padded mutex, map header and
@@ -100,6 +109,7 @@ pub fn worker_count(cfg: &Config) -> usize {
 /// `max_sessions × 800 + queue_capacity × 64
 ///  + workers × fragment memory per worker
 ///  + (workers + 1) × repl_ring_entries × 64 (HA only)
+///  + max_sessions × 112 (HA with session hints on)
 ///  + held-SYN worst case (`Nat64Config::held_syn_memory`)
 ///  + [`xdp_user_bytes`] (`[xdp]` only)
 ///  + shard headers + 256 MiB`,
@@ -115,12 +125,18 @@ pub fn required_bytes(cfg: &Config, workers: usize) -> u64 {
     let ring = cfg.cluster.ha_active().map_or(0, |h| {
         (w + 1).saturating_mul(u64::from(h.repl_ring_entries).next_power_of_two()).saturating_mul(REPL_SLOT_BYTES)
     });
+    let hints = cfg
+        .cluster
+        .ha_active()
+        .filter(|h| h.hints_on())
+        .map_or(0, |_| cfg.nat64.max_sessions.saturating_mul(SHADOW_HINT_BYTES));
     cfg.nat64
         .max_sessions
         .saturating_mul(SESSION_BYTES)
         .saturating_add((cfg.audit.queue_capacity as u64).saturating_mul(AUDIT_SLOT_BYTES))
         .saturating_add(w.saturating_mul(cfg.translation.fragments.memory_per_worker()))
         .saturating_add(ring)
+        .saturating_add(hints)
         .saturating_add(cfg.nat64.held_syn_memory())
         .saturating_add(xdp_user_bytes(cfg))
         .saturating_add(shard_header_bytes(cfg.nat64.table_shards))
@@ -326,7 +342,14 @@ mod tests {
         let mut off = c.clone();
         off.cluster.ha = Some(ha);
         assert_eq!(required_bytes(&off, 3), required_bytes(&no_ha, 3));
-        assert_eq!(required_bytes(&c, 3) - required_bytes(&no_ha, 3), 4 * 65536 * 64);
+        let hints = c.nat64.max_sessions * SHADOW_HINT_BYTES;
+        assert_eq!(required_bytes(&c, 3) - required_bytes(&no_ha, 3), 4 * 65536 * 64 + hints);
+        // Hints off: ring memory only.
+        let mut c_off = c.clone();
+        if let Some(h) = c_off.cluster.ha.as_mut() {
+            h.session_hints = crate::config::SessionHints::Off;
+        }
+        assert_eq!(required_bytes(&c_off, 3) - required_bytes(&no_ha, 3), 4 * 65536 * 64);
     }
 
     #[test]
