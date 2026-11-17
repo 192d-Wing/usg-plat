@@ -25,7 +25,8 @@
 //! audited without touching the shadow. Subscribers and BIB addresses
 //! must lie in `translation.client_prefixes`.
 //!
-//! Session hints (`cluster.ha.session_hints = "tcp"`, POAM-028): the rings
+//! Session hints (`cluster.ha.session_hints = "tcp"` or `"tcp_udp"`,
+//! POAM-028; a UDP hint without its BIB never gaps the slice): the rings
 //! carry one `SessHint` per TCP connection that reached ESTABLISHED, sent
 //! as slice records; snapshots carry `Sess` records after each TCP BIB, and
 //! `SnapshotEnd.hints` tells the backup whether this primary sends hints.
@@ -166,9 +167,12 @@ pub struct ReplStats {
     pub rx_gaps: AtomicU64,
     /// Primary side: awaited acks given up ([`ACK_TIMEOUT`]).
     pub ack_timeouts: AtomicU64,
-    /// Primary side: session hints queued to a peer
-    /// (`plat_cluster_session_hints_total{result="sent"}`).
+    /// Primary side: TCP session hints queued to a peer
+    /// (`plat_cluster_session_hints_total{proto="tcp",result="sent"}`).
     pub hints_sent: AtomicU64,
+    /// Primary side: UDP session hints queued to a peer
+    /// (`plat_cluster_session_hints_total{proto="udp",result="sent"}`).
+    pub udp_hints_sent: AtomicU64,
 }
 
 pub struct Replicator {
@@ -463,8 +467,14 @@ impl Replicator {
                         continue; // the snapshot will carry it
                     }
                     let seq = self.next_seq(s);
-                    if matches!(r, ReplRecord::SessHint { .. }) {
-                        self.stats.hints_sent.fetch_add(1, Ordering::Relaxed);
+                    match r {
+                        ReplRecord::SessHint { proto: plat_cluster::PROTO_UDP, .. } => {
+                            self.stats.udp_hints_sent.fetch_add(1, Ordering::Relaxed);
+                        }
+                        ReplRecord::SessHint { .. } => {
+                            self.stats.hints_sent.fetch_add(1, Ordering::Relaxed);
+                        }
+                        _ => {}
                     }
                     self.batch_slice(t, s, &r.to_msg(seq));
                 }

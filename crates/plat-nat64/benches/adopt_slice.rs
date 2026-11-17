@@ -31,6 +31,9 @@
 //!   `session_hints` on and one ESTABLISHED session hint per TCP BIB (a
 //!   third of the BIBs), restored as `Pickup` sessions during the import.
 //!
+//! - `adopt_detached_hinted_udp` (QA, POAM-028 (a)): the same with
+//!   `session_hints = "tcp_udp"` and 4 UDP hints per UDP BIB.
+//!
 //! Each case reports the time of one adoption; the throughput line is
 //! records (blocks + BIBs) per second. A `blocks_only` case next to a full
 //! one separates the per-block cost (subscriber insert and one
@@ -91,6 +94,12 @@ fn node(cfg: &Config, slice_len: u8) -> Node {
 }
 
 fn node_h(cfg: &Config, slice_len: u8, hints: bool) -> Node {
+    node_hu(cfg, slice_len, hints, false)
+}
+
+/// [`node_h`] with `session_hints = "tcp_udp"` when `udp` (UDP hints
+/// restored; the example filtering is address-dependent).
+fn node_hu(cfg: &Config, slice_len: u8, hints: bool, udp: bool) -> Node {
     let n = &cfg.nat64;
     let slices = SliceMap::new(&n.pool, slice_len).unwrap();
     let cidr = slices.cidr(SLICE).unwrap();
@@ -101,6 +110,7 @@ fn node_h(cfg: &Config, slice_len: u8, hints: bool) -> Node {
         directory: Arc::new(Directory::new(16, 1000)),
         tcp_adopt_secs: 300,
         session_hints: hints,
+        udp_hints: udp.then_some(2),
         quarantine_secs: 600,
         reserve_ahead: 2,
     };
@@ -146,6 +156,12 @@ fn fill(n: &Node, blocks: u64, bibs: u64) {
 /// [`fill`] with one session hint (remote 198.51.100.7:443) after every
 /// TCP BIB when `hints`; the snapshot ends hinted.
 fn fill_h(n: &Node, blocks: u64, bibs: u64, hints: bool) {
+    fill_hu(n, blocks, bibs, hints, 0)
+}
+
+/// [`fill_h`] plus `udp_remotes` (≤ 4) UDP session hints after every UDP
+/// BIB (remotes 198.51.100.7:443, :444, ...).
+fn fill_hu(n: &Node, blocks: u64, bibs: u64, hints: bool, udp_remotes: u16) {
     assert!(blocks <= n.slice_blocks && bibs <= n.slice_bibs, "case exceeds the slice");
     let per_block = bibs.checked_div(blocks).unwrap_or(0);
     let extra = bibs.checked_rem(blocks).unwrap_or(0);
@@ -173,6 +189,12 @@ fn fill_h(n: &Node, blocks: u64, bibs: u64, hints: bool) {
             }));
             if hints && proto == proto::TCP {
                 recs.push(SnapRecord::Sess(WireHint { proto, v4: addr, port4: port, raddr: 0xc633_6407, rport: 443 }));
+            }
+            if proto == proto::UDP {
+                for r in 0..udp_remotes {
+                    let h = WireHint { proto, v4: addr, port4: port, raddr: 0xc633_6407, rport: 443 + r };
+                    recs.push(SnapRecord::Sess(h));
+                }
             }
         }
         n.shadow.snapshot_records(SLICE, &recs).unwrap();
@@ -414,6 +436,64 @@ fn bench(c: &mut Criterion) {
             })
         });
         print_steps("adopt_step_5ms_hinted", &id, &mut steps, longest, ADOPT_STEP_BUDGET);
+
+        // QA, POAM-028 (a): UDP-heavy hinted mix (`tcp_udp`): one TCP hint
+        // per TCP BIB and 4 UDP hints per UDP BIB; restores past
+        // `max_sessions` are refused (`session_limit`) and counted.
+        let n = node_hu(&cfg, slice_len, true, true);
+        let udp = bibs / PROTOS.len() as u64;
+        g.throughput(Throughput::Elements(blocks + bibs + tcp + 4 * udp));
+        let mut longest = (Duration::ZERO, "");
+        let mut steps = Vec::new();
+        let mut last = (0u64, 0u64, 0u64);
+        let mut extra: Vec<String> = Vec::new();
+        g.bench_function(format!("adopt_detached_hinted_udp/{id}"), |b| {
+            b.iter_custom(|iters| {
+                (0..iters)
+                    .map(|_| {
+                        fill_hu(&n, blocks, bibs, true, 4);
+                        epoch += 1;
+                        let t = Instant::now();
+                        let d = n.shadow.detach(SLICE, n.nat.state().now_ms());
+                        let detach = t.elapsed();
+                        let (stats, took, l) =
+                            adopt_stepped(&n, AdoptSource::Detached(d), epoch, ADOPT_STEP_BUDGET, &mut steps);
+                        if l.0 > longest.0 {
+                            longest = l;
+                        }
+                        assert!(stats.udp_sessions_restored > 0);
+                        assert_eq!(
+                            stats.sessions_restored + stats.udp_sessions_restored,
+                            n.nat.state().session_count()
+                        );
+                        last =
+                            (stats.sessions_restored, stats.udp_sessions_restored, stats.udp_sessions_refused.total());
+                        // The session cap is hit mid-restore: besides the
+                        // acquire and adopt records the engine may queue
+                        // another record. Count adopt records only.
+                        let evs: Vec<Event> = n.rx.try_iter().collect();
+                        let adopts = evs.iter().filter(|e| matches!(e, Event::PortBlockAdopt { .. })).count();
+                        assert_eq!(adopts as u64, blocks);
+                        for e in &evs {
+                            if !matches!(e, Event::PortBlockAdopt { .. } | Event::ClusterSliceAcquire { .. }) {
+                                extra.push(format!("{e:?}").chars().take(160).collect::<String>());
+                            }
+                        }
+                        assert_eq!(stats.bibs_adopted, bibs);
+                        assert_eq!(n.nat.state().release_slice(SLICE, None).bibs_removed, bibs);
+                        let _ = n.rx.try_iter().count();
+                        detach + took
+                    })
+                    .sum()
+            })
+        });
+        println!(
+            "adopt_detached_hinted_udp/{id}: tcp restored {}, udp restored {}, udp refused {}",
+            last.0, last.1, last.2
+        );
+        extra.dedup();
+        println!("adopt_detached_hinted_udp: other audit records: {:?}", &extra[..extra.len().min(3)]);
+        print_steps("adopt_step_5ms_hinted_udp", &id, &mut steps, longest, ADOPT_STEP_BUDGET);
     }
     g.finish();
 }

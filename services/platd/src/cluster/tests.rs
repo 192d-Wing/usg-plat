@@ -216,6 +216,8 @@ fn collector(cap: usize) -> (AuditSink, Events) {
 
 struct Node {
     nat: Arc<Nat64>,
+    /// The engine clock (not ticked: tests advance it).
+    clock: Clock,
     ctx: WorkerCtx,
     handle: Option<ClusterHandle>,
     events: Events,
@@ -228,12 +230,13 @@ impl Node {
     }
 
     fn start_with(cfg: Config, sink: AuditSink, events: Events) -> Self {
-        let (nat, repl) = crate::run::build_engine(&cfg, 1, &sink, &Clock::new()).unwrap();
+        let clock = Clock::new();
+        let (nat, repl) = crate::run::build_engine(&cfg, 1, &sink, &clock).unwrap();
         let nat = Arc::new(nat);
         let (hub, mut prods): (Arc<ReplHub>, Vec<ReplProducer>) = repl.unwrap();
         let ctx = WorkerCtx::new(Arc::new(Counters::default()), 1).with_repl(prods.remove(0));
         let handle = super::start(&cfg, nat.clone(), hub, sink, peer_configs(&cfg)).unwrap();
-        Self { nat, ctx, handle: Some(handle), events }
+        Self { nat, clock, ctx, handle: Some(handle), events }
     }
 
     fn h(&self) -> &ClusterHandle {
@@ -341,6 +344,19 @@ fn udp6(src: u128, sport: u16, payload: &[u8]) -> Vec<u8> {
     p[48..].copy_from_slice(payload);
     let c = ck::finish(ck::pseudo_v6(src, dst, proto::UDP, l as u32) + ck::sum(&p[40..]));
     put16(&mut p, 46, ck::udp_nonzero(c));
+    p
+}
+
+/// A UDP datagram from `SERVER:5353` to `(dst, dport)`.
+fn udp4(dst: u32, dport: u16) -> Vec<u8> {
+    let mut p = vec![0u8; 29];
+    write_v4_header(&mut p, 0, 29, 0, true, false, 0, 64, proto::UDP, SERVER, dst);
+    put16(&mut p, 20, 5353);
+    put16(&mut p, 22, dport);
+    put16(&mut p, 24, 9);
+    p[28] = b'r';
+    let c = ck::finish(ck::pseudo_v4(SERVER, dst, proto::UDP, 9) + ck::sum(&p[20..]));
+    put16(&mut p, 26, ck::udp_nonzero(c));
     p
 }
 
@@ -2510,4 +2526,118 @@ fn qa_snapshot_end_hints_flag_follows_primary_config() {
     for &s in &sb_ {
         assert!(repl_a.lock().shadow.hinted(s), "slice {s}: primary B has hints on");
     }
+}
+
+/// POAM-028 (a), CP-10: with `session_hints = "tcp_udp"` and ADF, an aged
+/// bidirectional UDP flow (QUIC-like) of A is hinted to B, and after A
+/// crashes B delivers the server's next datagram inbound-first (no
+/// packet from the client after the takeover).
+#[test]
+fn udp_hint_keeps_inbound_first_across_takeover() {
+    use plat_common::config::{Filtering, SessionHints};
+    let _serial = crate::test_pki::FIPS_HOOK.lock();
+    let pki = Pki::new();
+    let l = Layout::new(2, true);
+    let (sa, sb, sw) = (ShortDir::new("a"), ShortDir::new("b"), ShortDir::new("w"));
+    let (wsink, _wev) = collector(4096);
+    let _w = super::witness::start(&witness_file(&l, &pki, &sw.0), wsink).unwrap();
+    let cfg = |id: u16, st: &Path| {
+        let mut c = member_cfg(&l, id, l.ports[usize::from(id)], &pki, st, "", None);
+        c.nat64.filtering = Filtering::AddressDependent;
+        c.cluster.ha.as_mut().unwrap().session_hints = SessionHints::TcpUdp;
+        c
+    };
+    let mut a = Node::start(cfg(0, &sa.0));
+    let mut b = Node::start(cfg(1, &sb.0));
+    wait("16 slices served once", Duration::from_secs(15), || {
+        a.active() > 0 && b.active() > 0 && total_active(&[&a, &b]) == 16
+    });
+    let mut mapped = None;
+    for i in 0..64u128 {
+        let client = 0x2001_0db8_0100_0000_0000_0000_0000_0000 | (i << 72) | 1;
+        if let Some(m) = a.send(client, 40000) {
+            mapped = Some((client, m));
+            break;
+        }
+    }
+    let (client, (v4, port)) = mapped.expect("A translates for its own slices");
+    let s = a.nat.state().slice_map().unwrap().slice_of(v4).unwrap();
+    let inbound = |n: &mut Node| {
+        let pkt = udp4(v4, port);
+        let mut buf = vec![0u8; HEADROOM + 2048];
+        buf[HEADROOM..HEADROOM + pkt.len()].copy_from_slice(&pkt);
+        matches!(n.nat.process(&mut buf, HEADROOM, pkt.len(), &mut n.ctx), Verdict::Forward { .. })
+    };
+    assert!(inbound(&mut a), "the reply passes ADF on A");
+    a.clock.advance(Duration::from_millis(3_100));
+    assert!(a.send(client, 40000).is_some());
+    let repl_b = b.h().shared.repl.clone().unwrap();
+    wait("UDP hint on the backup", Duration::from_secs(5), || repl_b.lock().shadow.hint_count(s) == 1);
+    wait("backup in sync", Duration::from_secs(5), || repl_b.lock().shadow.in_sync(s));
+    a.kill();
+    wait("takeover by B", Duration::from_secs(6), || b.active() == 16);
+    assert!(inbound(&mut b), "the server speaks first after the takeover");
+}
+
+/// QA, CP-10, SC-7(5): planned-failback variant of
+/// `udp_hint_keeps_inbound_first_across_takeover`. After the crash
+/// takeover B confirms the restored UDP session (the server's datagram);
+/// A rejoins, syncs from B, fails back by planned handover and then
+/// delivers the server's next datagram inbound-first, still with no
+/// packet from the client since the crash.
+#[test]
+fn qa_udp_hint_keeps_inbound_first_across_planned_failback() {
+    use plat_common::config::{Filtering, SessionHints};
+    let _serial = crate::test_pki::FIPS_HOOK.lock();
+    let pki = Pki::new();
+    let l = Layout::new(2, true);
+    let (sa, sb, sw) = (ShortDir::new("a"), ShortDir::new("b"), ShortDir::new("w"));
+    let (wsink, _wev) = collector(4096);
+    let _w = super::witness::start(&witness_file(&l, &pki, &sw.0), wsink).unwrap();
+    let cfg = |id: u16, st: &Path| {
+        let mut c = member_cfg(&l, id, l.ports[usize::from(id)], &pki, st, "", None);
+        c.nat64.filtering = Filtering::AddressDependent;
+        c.cluster.ha.as_mut().unwrap().session_hints = SessionHints::TcpUdp;
+        c
+    };
+    let mut a = Node::start(cfg(0, &sa.0));
+    let mut b = Node::start(cfg(1, &sb.0));
+    wait("16 slices served once", Duration::from_secs(15), || {
+        a.active() > 0 && b.active() > 0 && total_active(&[&a, &b]) == 16
+    });
+    let mut mapped = None;
+    for i in 0..64u128 {
+        let client = 0x2001_0db8_0100_0000_0000_0000_0000_0000 | (i << 72) | 1;
+        if let Some(m) = a.send(client, 40000) {
+            mapped = Some((client, m));
+            break;
+        }
+    }
+    let (client, (v4, port)) = mapped.expect("A translates for its own slices");
+    let s = a.nat.state().slice_map().unwrap().slice_of(v4).unwrap();
+    let inbound = |n: &mut Node| {
+        let pkt = udp4(v4, port);
+        let mut buf = vec![0u8; HEADROOM + 2048];
+        buf[HEADROOM..HEADROOM + pkt.len()].copy_from_slice(&pkt);
+        matches!(n.nat.process(&mut buf, HEADROOM, pkt.len(), &mut n.ctx), Verdict::Forward { .. })
+    };
+    assert!(inbound(&mut a), "the reply passes ADF on A");
+    a.clock.advance(Duration::from_millis(3_100));
+    assert!(a.send(client, 40000).is_some());
+    let repl_b = b.h().shared.repl.clone().unwrap();
+    wait("UDP hint on the backup", Duration::from_secs(5), || repl_b.lock().shadow.hint_count(s) == 1);
+    wait("backup in sync", Duration::from_secs(5), || repl_b.lock().shadow.in_sync(s));
+    a.kill();
+    wait("takeover by B", Duration::from_secs(6), || b.active() == 16);
+    assert!(inbound(&mut b), "the server speaks first after the takeover");
+    drop(a);
+    let mut a = Node::start(cfg(0, &sa.0));
+    wait("failback to A", Duration::from_secs(20), || a.active() > 0 && total_active(&[&a, &b]) == 16);
+    wait("failback record", Duration::from_secs(5), || {
+        a.has(|e| matches!(e, Event::ClusterSliceAcquire { acquire, .. } if acquire.reason == AuditAcquire::Failback))
+    });
+    wait("slice back on A", Duration::from_secs(10), || a.nat.state().slice_state(s) == Some(SliceState::Active));
+    assert!(inbound(&mut a), "the server speaks first after the planned failback");
+    // B no longer serves the slice.
+    assert!(!inbound(&mut b), "B released the slice");
 }

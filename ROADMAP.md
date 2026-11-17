@@ -13,7 +13,7 @@ into work and does not replace that register.
 | Stateful NAT64 / 464XLAT PLAT (RFC 6146, 7915, 6052) | Implemented: TUN data path, run-to-completion workers, fragments and reassembly (POAM-001), ICMP error generation (POAM-002), TCP simultaneous open (POAM-008), port blocks with cool-down and per-subscriber / per-aggregate limits |
 | Attribution logging (AU-*) | Implemented: schema 8, JSON/CEF, syslog UDP/TCP/TLS 1.3, SHA-256 chained files with `verify-log`; chain is unkeyed (POAM-003) |
 | FIPS / TLS (SC-8, SC-13, IA-*) | Implemented: aws-lc-rs FIPS, TLS 1.3 only, mTLS management, OCSP/CRL revocation; CMVP certificate for AWS-LC-FIPS 4.x pending (POAM-026) |
-| Cluster scale-out and HA (CP-10) | Partial (POAM-007): slices, replication, leases, witness, takeover; three-VM runs with an FRR BGP/BFD edge (LINUX_VERIFICATION L19–L23) PASS (round 6, 2026-10-29): `kill -9` takeover 3.8 s and VM loss 3.4 s with 200/200 TCP flows, leader crash max 4.5 s over 27 trials (≤ 5 s target; old election; the new election's simulated bound excludes adoption time and has no VM trials yet); sessions not replicated (POAM-028) |
+| Cluster scale-out and HA (CP-10) | Partial (POAM-007): slices, replication, leases, witness, takeover; three-VM runs with an FRR BGP/BFD edge (LINUX_VERIFICATION L19–L23) PASS (round 6, 2026-10-29): `kill -9` takeover 3.8 s and VM loss 3.4 s with 200/200 TCP flows, leader crash max 4.5 s over 27 trials (≤ 5 s target; old election; the new election's simulated bound excludes adoption time and has no VM trials yet); sessions replicated only as hints: TCP by default, UDP opt-in (`"tcp_udp"`), unreleased and in-process only (POAM-028 Partial) |
 | Host hardening (AC-6, SC-7, SC-39) | Implemented: capability-free `platd`, nftables forward policy with `plat-fwguard`; verified on one Ubuntu 24.04 VM |
 | XDP fast path (POAM-016) | Phase 1 code-complete (PRs #23–#28): established UDP in eBPF, `platd` as slow path, loader and systemd units, schema 8 records, `[xdp]` off by default, kernel ≥ 6.6. CI checks are required on `main` on x86_64 and aarch64 (#29). Speed-up not measured |
 | Releases and install-time verification (SI-7, SR-4, SR-11, CM-14) | Implemented, Partial (POAM-044): `v*` tags signed with cosign keyless and build provenance (v0.2.1 onwards, `scripts/verify-release.sh`); apt/dnf repository at https://192d-wing.github.io/usg-plat-packages/ and an offline tarball per tag; install-time gate `usg-plat-verify` (v0.4.0 onwards; apt hook + dnf4 plugin, `platd` depends on it). Packages install on EL9, Debian 12 and Ubuntu 22.04/24.04 (glibc floor 2.34). Live installs through the gate: L35 (v0.4.0, fixed in v0.4.1), L36 (v0.4.1) PASS; L37 offline mirror PARTIAL (apt fixed in v0.4.2, live re-run open). arm64 containers only |
@@ -43,7 +43,8 @@ Ordered by value for the effort, with what each needs.
    closed, `feat/chunked-release`). Left:
    VM trials of the new election on a three-data-member bed (WU-A5), and
    the session residuals of POAM-028 (Partial: TCP session hints on
-   `feat/session-hints`, unreleased; UDP hints and VM re-run of F1/F5/F12
+   `feat/session-hints`, UDP hints opt-in `"tcp_udp"` on `feat/udp-hints`,
+   both unreleased; VM re-run of F1/F5/F12 and the UDP push/DNS flows
    left).
 
 Done since the last update:
@@ -121,8 +122,12 @@ Done since the last update:
   Linux/glibc (up to 47 ms single frees on the macOS host); avoid one
   `bib4` scan per released slice.
 - POAM-007 (2): VM trials of the new election (WU-A5).
-- POAM-028 (Partial): TCP session hints done in-process (`feat/session-hints`);
-  left: UDP/QUIC hints (`"tcp_udp"`), held SYNs, restored sessions on the
+- POAM-028 (Partial): TCP session hints done in-process (`feat/session-hints`),
+  UDP/QUIC hints opt-in `"tcp_udp"` done in-process (`feat/udp-hints`);
+  left: a per-subscriber share of the UDP hint bucket (SEC-001), VM runs of
+  `flows.py --udp-push-flows`/`--dns-qps` (and wiring them into the runner),
+  XDP level 2–4 checks of the deferred mirror install, held SYNs,
+  restored sessions on the
   `tcp_adopt_secs` window instead of TCP_EST, truncated-drain gap, VM
   re-run of F1/F5/F12, Linux `perf stat` of the legacy bench.
 - POAM-029 to POAM-033: subscriber-home directory, leader-coordinated

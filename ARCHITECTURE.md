@@ -487,12 +487,18 @@ flowchart LR
   push block, BIB and directory records into bounded per-worker SPSC rings
   (no lock, allocation or syscall; a full ring drops, counts and marks the
   slice dirty). `plat-repl` sends a snapshot then the stream to the slice's
-  backup; the backup is **in sync** after the snapshot end is acked. UDP
-  and ICMP sessions are not replicated; with
+  backup; the backup is **in sync** after the snapshot end is acked. ICMP
+  sessions are not replicated; with
   `cluster.ha.session_hints = "tcp"` (default) the primary sends one
   session hint per TCP connection when it first becomes ESTABLISHED (peer
   `SessHint`, snapshot `Sess` records; at most 4 remotes per BIB in the
-  shadow). The peer protocol is version 2 and refuses version 1, so an
+  shadow). With the opt-in `"tcp_udp"` it also sends one hint per UDP
+  session once the session has seen both directions and is
+  `udp_hint_after_secs` old, re-sent once per `udp_secs` (by the worker, or
+  by the sweeper for XDP-mirrored flows), through a per-worker token bucket
+  (`udp_hints_per_sec`); same messages with proto 17, same shadow entries.
+  In that mode a new UDP flow is installed in the XDP fast path only after
+  its hint is sent. The peer protocol is version 2 and refuses version 1, so an
   upgrade needs a cluster-wide restart.
 - **Block reservation**: while an in-sync backup exists, the primary hands
   out only blocks the backup has acked in a `Reserve` (top-up off the packet
@@ -509,7 +515,10 @@ flowchart LR
   slice is strict: a segment without a session creates one only with FIN
   or on a BIB whose hints were incomplete. Otherwise adopted TCP BIBs
   accept an outbound pickup on the transitory timer for `tcp_adopt_secs`
-  (POAM-028 Partial; UDP has no hints).
+  (POAM-028 Partial). With `"tcp_udp"` on the adopter (and ADF/APDF),
+  hinted UDP sessions are restored too, living `udp_secs` minus the hint's
+  age and refreshed by either side; they are exported onward and mirrored
+  only after the IPv4 side speaks. A `"tcp"` adopter restores no UDP.
 - **Handover** (failback, growth, graceful shutdown): the old owner fences,
   flushes, logs release(`handover`) records, runs the withdraw hook and sends
   `HandoverFence`; the new owner adopts. A view moves every affected slice at

@@ -14,6 +14,14 @@ client:  from netns `cli`, through the translators to the server's NAT64 address
   - <idle-flows> idle-then-push TCP flows: silent in both directions for
     <idle-secs> after the handshake (across the takeover), then the server
     (port + 2) pushes as above
+  - <udp-push-flows> server-speaks-first UDP flows (QUIC-like, POAM-028 UDP
+    hints with session_hints = "tcp_udp"): each client socket sends one
+    datagram every 100 ms for <udp-warm-secs> (so the flow is bidirectional
+    and older than udp_hint_after_secs), then only listens; the server
+    (UDP port + 1) pushes one datagram every 100 ms to every peer it heard
+  - <dns-qps> one-shot UDP exchanges per second (DNS-like churn): each from
+    a new socket (new source port) to the UDP echo port; these must never
+    be hinted
   Source addresses rotate over <sources> subscriber /64s (2001:db8:100:<n>::10),
   so subscribers spread over both nodes by the edge ECMP hash.
 syslog:  UDP syslog sink appending each message's JSON payload to a file
@@ -53,8 +61,21 @@ def server(args):
     us.bind((args.bind, args.port))
     us.setblocking(False)
     sel.register(us, selectors.EVENT_READ, "udp")
+    # UDP push: peer -> monotonic time of the next datagram.
+    up = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    up.bind((args.bind, args.port + 1))
+    up.setblocking(False)
+    sel.register(up, selectors.EVENT_READ, "udp_push")
+    upeers = {}
     while True:
         t = time.monotonic()
+        for peer, due in list(upeers.items()):
+            if t >= due:
+                try:
+                    up.sendto(b"upush\x00\x00\x00", peer)
+                except OSError:
+                    pass
+                upeers[peer] = t + PROBE_MS / 1000
         for c, due in list(pushed.items()):
             if t < due:
                 continue
@@ -97,6 +118,12 @@ def server(args):
                 try:
                     d, peer = us.recvfrom(2048)
                     us.sendto(d, peer)
+                except OSError:
+                    pass
+            elif key.data == "udp_push":
+                try:
+                    _, peer = up.recvfrom(2048)
+                    upeers.setdefault(peer, time.monotonic())
                 except OSError:
                     pass
             else:
@@ -158,8 +185,24 @@ def client(args):
     us.connect((args.target, args.port))
     us.setblocking(False)
     sel.register(us, selectors.EVENT_READ, "udp")
+    # UDP push flows: socket -> stats; the client sends only while warming.
+    uflows = {}
+    for i in range(args.udp_push_flows):
+        u = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        u.bind((src(i, args.sources), 0))
+        u.connect((args.target, args.port + 1))
+        u.setblocking(False)
+        uflows[u] = {"last": 0.0, "gap": 0.0, "seen": False}
+        sel.register(u, selectors.EVENT_READ, "udp_push")
+    dns = {}
+    dns_ok = dns_fail = 0
+    dns_idx = 0
 
     start = now()
+    next_dns = start
+    next_uwarm = start
+    for f in uflows.values():
+        f["last"] = start + args.udp_warm_secs
     # The connect phase can last up to its 5 s deadline: measure gaps from
     # here, not from each flow's own connect time.
     for f in flows.values():
@@ -189,6 +232,33 @@ def client(args):
                     except OSError:
                         f["alive"] = False
             next_probe = t + PROBE_MS / 1000
+        if uflows and t >= next_uwarm and t < start + args.udp_warm_secs:
+            for u in uflows:
+                try:
+                    u.send(b"uwarm\x00\x00\x00")
+                except OSError:
+                    pass
+            next_uwarm = t + PROBE_MS / 1000
+        if args.dns_qps and t >= next_dns:
+            q = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+            try:
+                q.bind((src(dns_idx, args.sources), 0))
+                q.connect((args.target, args.port))
+                q.setblocking(False)
+                q.send(b"dnsq")
+                dns[q] = t + 1.0
+                sel.register(q, selectors.EVENT_READ, "dns")
+            except OSError:
+                q.close()
+                dns_fail += 1
+            dns_idx += 1
+            next_dns = t + 1 / args.dns_qps
+        for q, dl in list(dns.items()):
+            if t >= dl:
+                sel.unregister(q)
+                q.close()
+                del dns[q]
+                dns_fail += 1
         if args.udp_pps and t >= next_udp:
             try:
                 us.send(struct.pack("!Q", seq))
@@ -232,6 +302,28 @@ def client(args):
                     new_fail += 1
                 s.close()
                 continue
+            if key.data == "dns":
+                sel.unregister(s)
+                dns.pop(s, None)
+                try:
+                    s.recv(64)
+                    dns_ok += 1
+                except OSError:
+                    dns_fail += 1
+                s.close()
+                continue
+            if key.data == "udp_push":
+                f = uflows[s]
+                try:
+                    while s.recv(64):
+                        t2 = now()
+                        if f["seen"]:
+                            f["gap"] = max(f["gap"], t2 - f["last"])
+                        f["last"] = t2
+                        f["seen"] = True
+                except OSError:
+                    pass
+                continue
             if key.data == "udp":
                 try:
                     while us.recv(64):
@@ -266,6 +358,10 @@ def client(args):
             if t - f["last"] > 10 or (f["kind"] != "echo" and not f["seen"]):
                 f["alive"] = False
 
+    for f in uflows.values():
+        f["gap"] = max(f["gap"], t - f["last"])
+        f["alive"] = f["seen"] and t - f["last"] <= 10
+
     def of(kind):
         return [f for f in flows.values() if f["kind"] == kind]
 
@@ -290,6 +386,11 @@ def client(args):
         "udp_max_gap_ms": int(udp_gap * 1000),
         "new_ok": new_ok,
         "new_fail": new_fail,
+        "udp_push_flows": len(uflows),
+        "udp_push_survived": sum(1 for f in uflows.values() if f["alive"]),
+        "udp_push_max_gap_ms": int(max((f["gap"] for f in uflows.values() if f["alive"]), default=0) * 1000),
+        "dns_ok": dns_ok,
+        "dns_fail": dns_fail,
     }
     with open(args.out + ".tmp", "w") as fh:
         json.dump(out, fh)
@@ -321,6 +422,9 @@ def main():
     p.add_argument("--push-flows", type=int, default=0)
     p.add_argument("--idle-flows", type=int, default=0)
     p.add_argument("--idle-secs", type=float, default=20)
+    p.add_argument("--udp-push-flows", type=int, default=0)
+    p.add_argument("--udp-warm-secs", type=float, default=3)
+    p.add_argument("--dns-qps", type=float, default=0)
     p.add_argument("--out", default="/run/plat-flows.json")
     a = p.parse_args()
     {"server": server, "client": client, "syslog": syslog}[a.mode](a)

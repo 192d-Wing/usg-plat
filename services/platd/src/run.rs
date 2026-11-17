@@ -208,7 +208,8 @@ pub(crate) fn build_engine(cfg: &Config, workers: usize, sink: &AuditSink, clock
     let slices = setup.slices.len();
     let nat = Nat64::new_cluster(cfg, setup, sink.clone(), clock.clone())?;
     if let Some(h) = cfg.cluster.ha_active() {
-        let (hub, prods) = ReplHub::new(workers + 1, h.repl_ring_entries as usize, slices);
+        let (hub, prods) =
+            ReplHub::with_udp_hint_rate(workers + 1, h.repl_ring_entries as usize, slices, h.udp_hints_per_sec);
         return Ok((nat, Some((hub, prods))));
     }
     // Static slices: adopt this node's primaries at once (AU-12: each with

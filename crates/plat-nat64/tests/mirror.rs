@@ -360,6 +360,7 @@ fn cluster_fx(q: usize) -> (Fx, Config) {
         directory: Arc::new(Directory::new(16, 1000)),
         tcp_adopt_secs: 300,
         session_hints: false,
+        udp_hints: None,
         quarantine_secs: 600,
         reserve_ahead: 2,
     };
@@ -572,4 +573,86 @@ fn concurrent_slice_churn_keeps_the_invariants() {
     for (_, rec) in m.live() {
         assert!(rec.entry.generation <= m.slice(rec.entry.slice).unwrap().1);
     }
+}
+
+// ---------------------------------------------------------------------
+// UDP session hints (`session_hints = "tcp_udp"`, decision Q3).
+
+/// A cluster fixture with UDP hints, a worker ring and the sweeper's.
+fn udp_hint_fx() -> (Fx, Arc<ModelMirror>, Arc<plat_nat64::ReplHub>, plat_nat64::ReplProducer) {
+    let cfg = config(&[]);
+    let setup = ClusterSetup {
+        slices: SliceMap::new(&cfg.nat64.pool, 32).unwrap(),
+        self_id: 0,
+        steering: SteeringMode::Drop,
+        directory: Arc::new(Directory::new(16, 1000)),
+        tcp_adopt_secs: 300,
+        session_hints: true,
+        udp_hints: Some(2),
+        quarantine_secs: 600,
+        reserve_ahead: 2,
+    };
+    let clock = Clock::new();
+    let (sink, rx) = AuditSink::bounded(1 << 16);
+    let nat = Nat64::new_cluster(&cfg, setup, sink, clock.clone()).unwrap();
+    let (hub, mut prods) = plat_nat64::ReplHub::new(2, 1024, 4);
+    let sweeper = prods.pop().unwrap();
+    let ctx = nat.new_worker(Arc::new(Counters::default()), 1).with_repl(prods.pop().unwrap());
+    let mut fx = Fx { nat, clock, rx, ctx };
+    let m = checked_model(&fx.rx, 256);
+    fx.nat.set_mirror(m.clone());
+    fx.clock.advance(Duration::from_secs(1));
+    for s in 0..4 {
+        fx.nat.state().adopt_slice(s, &AdoptInput::default(), startup(1)).unwrap();
+    }
+    (fx, m, hub, sweeper)
+}
+
+fn udp_hints_in(hub: &plat_nat64::ReplHub) -> usize {
+    let mut v = Vec::new();
+    while hub.drain(1024, &mut v) > 0 {}
+    v.iter().filter(|r| matches!(r, plat_nat64::ReplRecord::SessHint { proto: proto::UDP, .. })).count()
+}
+
+/// Q3: with `"tcp_udp"` a UDP flow is mirrored only once it has hinted;
+/// a one-shot flow never is. Without UDP hints the install is immediate
+/// (unchanged, `fencing_stops_the_mirror_at_once...`).
+#[test]
+fn tcp_udp_defers_mirror_install_until_the_hint() {
+    let (mut fx, m, hub, _) = udp_hint_fx();
+    let s = sub(1, 1);
+    let out = run(&mut fx, &udp6(s, 1000, SERVER, 443, b"x")).unwrap();
+    let (v4, p4) = (be32(&out, 12), be16(&out, 20));
+    run(&mut fx, &udp4(SERVER, 443, v4, p4, b"y")).unwrap();
+    run(&mut fx, &udp6(s, 1001, SERVER, 53, b"q")).unwrap();
+    assert!(m.is_empty(), "no install before the hint");
+    fx.clock.advance(Duration::from_millis(3_100));
+    run(&mut fx, &udp6(s, 1000, SERVER, 443, b"x")).unwrap();
+    assert_eq!(udp_hints_in(&hub), 1);
+    assert_eq!(m.len(), 1, "installed with the hint");
+    assert_i1(&fx.nat, &m);
+}
+
+/// A mirrored, hinted flow bypasses the slow path: the sweeper re-hints
+/// it after the seen read-back, once per `udp_secs`.
+#[test]
+fn sweeper_rehints_mirrored_udp_flow() {
+    let (mut fx, m, hub, sweeper) = udp_hint_fx();
+    let s = sub(1, 1);
+    let out = run(&mut fx, &udp6(s, 1000, SERVER, 443, b"x")).unwrap();
+    let (v4, p4) = (be32(&out, 12), be16(&out, 20));
+    run(&mut fx, &udp4(SERVER, 443, v4, p4, b"y")).unwrap();
+    fx.clock.advance(Duration::from_millis(3_100));
+    run(&mut fx, &udp6(s, 1000, SERVER, 443, b"x")).unwrap();
+    assert_eq!(udp_hints_in(&hub), 1);
+    let (slot, _) = m.live()[0];
+    // Fast-path traffic only, past the slow-path expiry.
+    fx.clock.advance(Duration::from_millis(UDP_MS - 1_000));
+    m.touch(slot, fx.nat.state().now_ms());
+    fx.clock.advance(Duration::from_millis(2_000));
+    fx.nat.state().sweep_with(Some(&sweeper));
+    assert!(fx.nat.state().has_session(Key4 { proto: proto::UDP, addr: v4, port: p4 }, (SERVER, 443)));
+    assert_eq!(udp_hints_in(&hub), 1, "re-hinted by the sweeper");
+    fx.nat.state().sweep_with(Some(&sweeper));
+    assert_eq!(udp_hints_in(&hub), 0);
 }

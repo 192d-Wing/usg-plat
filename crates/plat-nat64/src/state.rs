@@ -83,6 +83,14 @@ pub struct Mapped {
 pub struct Session {
     pub expires_ms: u64,
     pub tcp: Option<TcpState>,
+    /// UDP session-hint state ([`U_PEND`], [`U_V6`], [`U_V4`],
+    /// [`U_RESTORED`], [`U_LIVE`]); always 0 unless
+    /// `cluster.ha.session_hints = "tcp_udp"` (and for TCP and ICMP).
+    pub uf: u8,
+    /// Coarse time (wrapping, units of 1.024 s, [`udp_mark_s`]) of the
+    /// session's creation while [`U_PEND`], then of its last hint (or
+    /// restore).
+    pub mark_s: u16,
     /// Session mirror slot ([`NO_SLOT`]: not mirrored; always so without a
     /// mirror).
     pub slot: u32,
@@ -90,14 +98,48 @@ pub struct Session {
 
 impl Session {
     pub(crate) fn new(expires_ms: u64, tcp: Option<TcpState>) -> Self {
-        Self { expires_ms, tcp, slot: NO_SLOT }
+        Self { expires_ms, tcp, uf: 0, mark_s: 0, slot: NO_SLOT }
+    }
+
+    /// A session with UDP hint state `uf` marked at `mark_s`.
+    pub(crate) fn with_hint(expires_ms: u64, tcp: Option<TcpState>, uf: u8, mark_s: u16) -> Self {
+        Self { expires_ms, tcp, uf, mark_s, slot: NO_SLOT }
     }
 }
 
 // A session exists per flow (up to `nat64.max_sessions`): the mirror slot
-// fits in the padding after the one-byte `Option<TcpState>` (plan §4.4).
+// and the UDP hint state fit in the padding after the one-byte
+// `Option<TcpState>` (plan §4.4, UDP hints §1.4).
 const _: () = assert!(size_of::<Option<TcpState>>() == 1);
 const _: () = assert!(size_of::<Session>() == 16);
+
+/// [`Session::uf`]: the UDP hint is not sent yet.
+pub(crate) const U_PEND: u8 = 1;
+/// [`Session::uf`] while [`U_PEND`]: a packet from the IPv6 side was seen.
+pub(crate) const U_V6: u8 = 2;
+/// [`Session::uf`] while [`U_PEND`]: a packet from the IPv4 side was seen.
+pub(crate) const U_V4: u8 = 4;
+/// [`Session::uf`]: restored on adoption from a hint, the IPv4 side has not
+/// spoken yet (refreshed by either side, but neither exported nor mirrored).
+pub(crate) const U_RESTORED: u8 = 8;
+/// [`Session::uf`]: hinted; re-hinted once per `timeouts.udp_secs`.
+pub(crate) const U_LIVE: u8 = 16;
+
+/// Coarse wrapping time of an engine time in units of 1.024 s (a shift,
+/// not a division, on the per-packet path), as kept in
+/// [`Session::mark_s`]. A wrap (about 67 000 s) only delays a hint.
+#[inline(always)]
+pub(crate) fn udp_mark_s(now_ms: u64) -> u16 {
+    (now_ms >> 10) as u16
+}
+
+/// Seconds as [`udp_mark_s`] units, rounded up (`up`) or down, capped to
+/// the `u16` range.
+fn udp_units(secs: u32, up: bool) -> u16 {
+    let ms = u64::from(secs) * 1000;
+    let u = if up { ms.div_ceil(1024) } else { ms / 1024 };
+    u.min(u64::from(u16::MAX)) as u16
+}
 
 #[derive(Debug)]
 pub struct Bib {
@@ -376,6 +418,10 @@ pub struct ClusterSetup {
     /// `cluster.ha.session_hints != "off"`: ESTABLISHED TCP sessions are
     /// replicated as hints and restored on adoption.
     pub session_hints: bool,
+    /// `cluster.ha.session_hints = "tcp_udp"`: `Some(udp_hint_after_secs)`;
+    /// aged bidirectional UDP sessions are replicated as hints and
+    /// restored on adoption (under ADF/APDF). `None`: no UDP hints.
+    pub udp_hints: Option<u32>,
     /// `cluster.ha.takeover_quarantine_secs`.
     pub quarantine_secs: u32,
     /// `cluster.ha.reserve_ahead_blocks`.
@@ -401,6 +447,7 @@ impl ClusterSetup {
             directory: Arc::new(Directory::new(cfg.nat64.table_shards, cfg.nat64.max_subscribers)),
             tcp_adopt_secs: ha.map_or(0, |h| h.tcp_adopt_secs),
             session_hints: ha.is_some_and(|h| h.hints_on()),
+            udp_hints: ha.filter(|h| h.udp_hints_on()).map(|h| h.udp_hint_after_secs),
             quarantine_secs: ha.map_or(600, |h| h.takeover_quarantine_secs),
             reserve_ahead: ha.map_or(8, |h| h.reserve_ahead_blocks),
         })
@@ -439,6 +486,8 @@ struct ClusterCtx {
     tcp_adopt_ms: u64,
     /// See [`ClusterSetup::session_hints`].
     pub(super) session_hints: bool,
+    /// See [`ClusterSetup::udp_hints`].
+    pub(super) udp_hints: bool,
     /// Per slice: after an in-sync, hinted adoption no TCP session is
     /// picked up without a SYN (RFC 6146 §3.5.2.2). Written by the control
     /// plane (Activate, adoption and release begin), read relaxed by
@@ -560,6 +609,15 @@ pub struct State {
     held: Option<Box<HeldCtx>>,
     /// Session mirror (fast-path index); `None` without one.
     mirror: Option<Box<MirrorCtx>>,
+    /// [`Session::uf`] of a new UDP session: [`U_PEND`] with
+    /// `session_hints = "tcp_udp"`, else 0 (no per-packet hint work).
+    udp_hint_init: u8,
+    /// `cluster.ha.udp_hint_after_secs` in [`udp_mark_s`] units, rounded
+    /// up plus one (both marks truncate): never earlier than configured.
+    udp_after_s: u16,
+    /// Re-hint interval: `timeouts.udp_secs` in [`udp_mark_s`] units
+    /// (rounded down: never later), capped to the `mark_s` range.
+    udp_rehint_s: u16,
 }
 
 /// The attached session mirror and what the engine needs to build its keys.
@@ -788,6 +846,7 @@ impl State {
             directory: setup.directory,
             tcp_adopt_ms: u64::from(setup.tcp_adopt_secs) * 1000,
             session_hints: setup.session_hints,
+            udp_hints: setup.udp_hints.is_some(),
             strict_tcp: (0..n_slices).map(|_| std::sync::atomic::AtomicBool::new(false)).collect(),
             restore_dst: RestoreDst {
                 deny_non_global: wkp || !t.allow_non_global_destinations,
@@ -798,7 +857,14 @@ impl State {
             adopt_stash: parking_lot::Mutex::new(Map::with_hasher(RandomState::new())),
             releasing: (0..n_slices).map(|_| std::sync::atomic::AtomicBool::new(false)).collect(),
         };
-        Ok(Self::build(cfg, pool, Some(Box::new(ctx)), audit, clock))
+        let mut st = Self::build(cfg, pool, Some(Box::new(ctx)), audit, clock);
+        if let Some(after) = setup.udp_hints {
+            st.udp_hint_init = U_PEND;
+            // One unit more than rounded up: both marks truncate, so a
+            // hint is never earlier than `udp_hint_after_secs`.
+            st.udp_after_s = udp_units(after.max(1), true).saturating_add(1);
+        }
+        Ok(st)
     }
 
     fn build(cfg: &Config, pool: Pool, cluster: Option<Box<ClusterCtx>>, audit: AuditSink, clock: Clock) -> Self {
@@ -847,6 +913,9 @@ impl State {
             cluster,
             held: HeldCtx::from_config(n),
             mirror: None,
+            udp_hint_init: 0,
+            udp_after_s: 2,
+            udp_rehint_s: udp_units(t.udp_secs, false),
         }
     }
 
@@ -1572,7 +1641,146 @@ impl State {
             return;
         }
         let Some(slice) = self.pool.index(k4.addr).and_then(|i| self.pool.slice_of_idx(i)) else { return };
-        tx.push(ReplRecord::SessHint { slice, v4: k4.addr, port4: k4.port, raddr: remote.0, rport: remote.1 });
+        tx.push(ReplRecord::SessHint {
+            slice,
+            proto: proto::TCP,
+            v4: k4.addr,
+            port4: k4.port,
+            raddr: remote.0,
+            rport: remote.1,
+        });
+    }
+
+    /// [`Session::uf`] of a new session created by a packet from `side`
+    /// (`U_V6` or `U_V4`): pending for UDP with `session_hints =
+    /// "tcp_udp"`, 0 otherwise (one byte test, no cluster load).
+    #[inline(always)]
+    fn udp_init(&self, p: u8, side: u8) -> u8 {
+        if self.udp_hint_init != 0 && p == proto::UDP { self.udp_hint_init | side } else { 0 }
+    }
+
+    /// UDP hint step of a live session with [`Session::uf`] != 0 (only with
+    /// `session_hints = "tcp_udp"`), under the caller's `bib4` shard.
+    /// Returns whether the packet may refresh the session (always true
+    /// today; kept so the call sites stay one short-circuit). A hinted
+    /// session costs one 16-bit compare per packet.
+    #[inline]
+    fn udp_note(
+        &self,
+        repl: Option<&ReplProducer>,
+        k4: Key4,
+        remote: (u32, u16),
+        s: &mut Session,
+        side: Side,
+        now: u64,
+    ) -> bool {
+        if s.uf == U_LIVE && udp_mark_s(now).wrapping_sub(s.mark_s) < self.udp_rehint_s {
+            return true;
+        }
+        self.udp_note_cold(repl, k4, remote, s, side, now)
+    }
+
+    /// Eligibility, restore confirmation and re-hint of [`Self::udp_note`]
+    /// (cold: the first packets of a flow, then once per `udp_secs`).
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: CP-10, SC-5(2) - aged bidirectional UDP flows (QUIC,
+    ///   RTP, VPN) are replicated so they survive a takeover (POAM-028)
+    /// - NIST 800-53: SC-5 - a hint is sent once a flow carried traffic both
+    ///   ways and is `udp_hint_after_secs` old (one-shot DNS exchanges never
+    ///   qualify), re-sent at most once per `udp_secs`, never per packet,
+    ///   and within the producer's `udp_hints_per_sec` bucket (an empty
+    ///   bucket defers to the session's next packet)
+    /// - NIST 800-53: SC-7(5) - a restored session admits its remote, but
+    ///   only an IPv4-side packet confirms it (exported, mirrored)
+    /// - RFC 4787 REQ-6, RFC 6146 §3.5.1 - IPv6-side packets refresh a
+    ///   restored session as any other, so outbound-only traffic keeps the
+    ///   mapping
+    #[cold]
+    #[inline(never)]
+    fn udp_note_cold(
+        &self,
+        repl: Option<&ReplProducer>,
+        k4: Key4,
+        remote: (u32, u16),
+        s: &mut Session,
+        side: Side,
+        now: u64,
+    ) -> bool {
+        let now_s = udp_mark_s(now);
+        if s.uf & U_RESTORED != 0 {
+            // An IPv6-side packet refreshes it as it would have created it
+            // (RFC 4787 REQ-6): the mapping stays put while the subscriber
+            // keeps sending, but the session stays unconfirmed (not
+            // exported, not mirrored) until the IPv4 side speaks.
+            if side == Side::V4 {
+                // Confirmed: an ordinary, already hinted session from now on.
+                s.uf = U_LIVE;
+                s.mark_s = now_s;
+            }
+            return true;
+        }
+        if s.uf & U_PEND != 0 {
+            s.uf |= if side == Side::V6 { U_V6 } else { U_V4 };
+            if s.uf & (U_V6 | U_V4) != U_V6 | U_V4 || now_s.wrapping_sub(s.mark_s) < self.udp_after_s {
+                return true;
+            }
+        }
+        if self.udp_hint(repl, k4, remote, now) {
+            s.uf = U_LIVE;
+            s.mark_s = now_s;
+        }
+        true
+    }
+
+    /// The sweeper's re-hint of a hinted, mirrored UDP session (its packets
+    /// bypass the slow path, so [`Self::udp_note`] never sees them).
+    #[cold]
+    #[inline(never)]
+    fn udp_rehint_mirrored(
+        &self,
+        repl: Option<&ReplProducer>,
+        k4: Key4,
+        remote: (u32, u16),
+        s: &mut Session,
+        now: u64,
+    ) {
+        let now_s = udp_mark_s(now);
+        if now_s.wrapping_sub(s.mark_s) >= self.udp_rehint_s && self.udp_hint(repl, k4, remote, now) {
+            s.mark_s = now_s;
+        }
+    }
+
+    /// Queues one UDP session hint through `repl`'s bucket. Returns false
+    /// only when the bucket deferred it (retry on a later packet); true
+    /// when it was queued, lost on a full ring (counted, slice resynced) or
+    /// cannot be expressed (no ring, no slice, a zero field), so the
+    /// session stops retrying.
+    fn udp_hint(&self, repl: Option<&ReplProducer>, k4: Key4, remote: (u32, u16), now: u64) -> bool {
+        let Some(tx) = repl else { return true };
+        // Token first: an empty bucket costs no slice lookup (PERF-001).
+        if !tx.udp_hint_ready(now) {
+            return false;
+        }
+        if remote.0 == 0 || remote.1 == 0 || k4.port == 0 || k4.proto != proto::UDP {
+            return true;
+        }
+        let Some(slice) = self.pool.index(k4.addr).and_then(|i| self.pool.slice_of_idx(i)) else { return true };
+        let rec = ReplRecord::SessHint {
+            slice,
+            proto: proto::UDP,
+            v4: k4.addr,
+            port4: k4.port,
+            raddr: remote.0,
+            rport: remote.1,
+        };
+        tx.push_udp_hint(rec, now)
+    }
+
+    /// Whether this node replicates and restores UDP session hints
+    /// (`session_hints = "tcp_udp"`).
+    pub fn udp_hints(&self) -> bool {
+        self.cluster.as_ref().is_some_and(|c| c.udp_hints)
     }
 
     /// Strict TCP state creation for slice `s` (see `ClusterCtx`).
@@ -1692,10 +1900,12 @@ impl State {
         let bib = g.get_mut(&k4).ok_or(DropReason::NoBinding)?;
         if let Some(s) = bib.sessions.get_mut(&remote) {
             if self.live(s, now) {
-                if self.refresh(k4.proto, s, Side::V6, flags, now, due) {
+                if (s.uf == 0 || self.udp_note(repl, k4, remote, s, Side::V6, now))
+                    && self.refresh(k4.proto, s, Side::V6, flags, now, due)
+                {
                     self.hint(repl, k4, remote);
                 }
-                if mirror && s.slot == NO_SLOT {
+                if mirror && s.slot == NO_SLOT && s.uf & (U_PEND | U_RESTORED) == 0 {
                     self.mirror_install(k4, bib, remote, true);
                 }
                 return Ok(());
@@ -1719,14 +1929,16 @@ impl State {
             (None, self.timeout(k4.proto, None))
         };
         self.admit_session(bib)?;
-        bib.insert_session(remote, Session::new(now + life, tcp));
+        let uf = self.udp_init(k4.proto, U_V6);
+        bib.insert_session(remote, Session::with_hint(now + life, tcp, uf, udp_mark_s(now)));
         lower_due(due, now + life);
         counters.inc(Counter::SessionCreated);
         // Simultaneous open completes at creation.
         if tcp == Some(TcpState::Established) {
             self.hint(repl, k4, remote);
         }
-        if mirror {
+        // Q3: with UDP hints a flow mirrors only once it has hinted.
+        if mirror && uf == 0 {
             self.mirror_install(k4, bib, remote, false);
         }
         Ok(())
@@ -1758,8 +1970,9 @@ impl State {
     // only a FIN segment, or any segment on a BIB whose hints were
     // incomplete (evicted, or older than TCP_EST). It runs on the
     // transitory timer (state Pickup, or PickupFin for a FIN, SEC-004) and becomes
-    // ESTABLISHED only on a packet from the IPv4 side (RFC-002). UDP has no
-    // hints: inbound-first UDP/QUIC under ADF still stalls after takeover.
+    // ESTABLISHED only on a packet from the IPv4 side (RFC-002). UDP is
+    // hinted only with `session_hints = "tcp_udp"` (opt-in): otherwise
+    // inbound-first UDP/QUIC under ADF still stalls after takeover.
     #[cold]
     #[inline(never)]
     fn pickup(&self, k4: Key4, bib: &Bib, flags: u8, now: u64) -> Result<TcpState, DropReason> {
@@ -1834,10 +2047,12 @@ impl State {
         let bib = g.get_mut(&k4).ok_or(DropReason::NoBinding)?;
         if let Some(s) = bib.sessions.get_mut(&remote) {
             if self.live(s, now) {
-                if self.refresh(k4.proto, s, Side::V4, flags, now, due) {
+                if (s.uf == 0 || self.udp_note(repl, k4, remote, s, Side::V4, now))
+                    && self.refresh(k4.proto, s, Side::V4, flags, now, due)
+                {
                     self.hint(repl, k4, remote);
                 }
-                if mirror && s.slot == NO_SLOT {
+                if mirror && s.slot == NO_SLOT && s.uf & (U_PEND | U_RESTORED) == 0 {
                     self.mirror_install(k4, bib, remote, true);
                 }
                 return Ok(Some(bib.k6));
@@ -1871,10 +2086,11 @@ impl State {
         };
         self.admit_session(bib)?;
         let expires = now + self.timeout(k4.proto, tcp);
-        bib.insert_session(remote, Session::new(expires, tcp));
+        let uf = self.udp_init(k4.proto, U_V4);
+        bib.insert_session(remote, Session::with_hint(expires, tcp, uf, udp_mark_s(now)));
         lower_due(due, expires);
         counters.inc(Counter::SessionCreated);
-        if mirror {
+        if mirror && uf == 0 {
             self.mirror_install(k4, bib, remote, false);
         }
         Ok(Some(bib.k6))
@@ -2278,7 +2494,7 @@ impl State {
                 n += 1;
                 h.add(SWEEP_ENTRY_COST + bib.sessions.len());
                 let r0 = st.mirror_retired;
-                next = next.min(self.sweep_bib(*k4, bib, now, st, dead, spill));
+                next = next.min(self.sweep_bib(*k4, bib, (now, repl), st, dead, spill));
                 h.charge(SWEEP_RETIRE_COST * (st.mirror_retired - r0) as usize);
             }
             lower_due(due, next);
@@ -2308,7 +2524,7 @@ impl State {
                     let Some(bib) = g.get_mut(k4) else { continue };
                     h.add(SWEEP_ENTRY_COST + bib.sessions.len());
                     let r0 = st.mirror_retired;
-                    next = next.min(self.sweep_bib(*k4, bib, now, st, dead, spill));
+                    next = next.min(self.sweep_bib(*k4, bib, (now, repl), st, dead, spill));
                     h.charge(SWEEP_RETIRE_COST * (st.mirror_retired - r0) as usize);
                 }
                 lower_due(due, next);
@@ -2327,15 +2543,17 @@ impl State {
     /// `dead`).
     /// An emptied held-SYN array is pushed to `spill` (dropped by the
     /// caller after the shard guard; the Vec keeps its capacity).
+    /// `at = (now, the sweeper's ring)` (re-hints of mirrored UDP flows).
     fn sweep_bib(
         &self,
         k4: Key4,
         bib: &mut Bib,
-        now: u64,
+        at: (u64, Option<&ReplProducer>),
         st: &mut SweepStats,
         dead: &mut Vec<(Key4, Key6)>,
         spill: &mut Vec<HeldBox>,
     ) -> u64 {
+        let (now, repl) = at;
         let held_next = if bib.held.is_some() {
             let mut one = None;
             let next = self.expire_held(k4, bib, now, false, true, &mut one);
@@ -2344,7 +2562,7 @@ impl State {
         } else {
             u64::MAX
         };
-        self.sweep_bib_sessions(k4, bib, now, st, dead).min(held_next)
+        self.sweep_bib_sessions(k4, bib, now, st, dead, repl).min(held_next)
     }
 
     /// The session part of [`State::sweep_bib`]. Held SYNs do not keep a
@@ -2356,6 +2574,7 @@ impl State {
         now: u64,
         st: &mut SweepStats,
         dead: &mut Vec<(Key4, Key6)>,
+        repl: Option<&ReplProducer>,
     ) -> u64 {
         let before = bib.sessions.len();
         let mut next = u64::MAX;
@@ -2367,6 +2586,11 @@ impl State {
             // (plan §5); without a mirror `slot` is always NO_SLOT.
             let keep = self.live(s, now);
             if keep {
+                // A mirrored UDP flow is not seen by the slow path: its
+                // re-hint comes from here, after the seen read-back.
+                if s.uf == U_LIVE && s.slot != NO_SLOT {
+                    self.udp_rehint_mirrored(repl, k4, remote, s, now);
+                }
                 next = next.min(s.expires_ms);
             } else {
                 forget_remote(remotes, remote.0);
@@ -2683,6 +2907,12 @@ pub struct AdoptStats {
     pub sessions_restored: u64,
     /// Hinted sessions not restored, by reason.
     pub sessions_refused: RestoreRefused,
+    /// Hinted UDP sessions restored (`session_hints = "tcp_udp"`, metrics
+    /// only: `plat_cluster_sessions_restored_total{proto="udp"}`).
+    pub udp_sessions_restored: u64,
+    /// Hinted UDP sessions not restored, by reason (`aged`: older than
+    /// `2 × udp_secs + 10 s`).
+    pub udp_sessions_refused: RestoreRefused,
 }
 
 /// Why a hinted session was not restored
@@ -2868,7 +3098,9 @@ impl State {
     /// BIB followed by up to [`crate::repl::MAX_HINTS`] `Sess` records of its
     /// ESTABLISHED sessions when session hints are on (FIN states and
     /// `Pickup` are not exported, so an unconfirmed or closing flow is not
-    /// revived on a third node). Walks
+    /// revived on a third node); with `"tcp_udp"` each UDP BIB is followed
+    /// by up to [`crate::repl::MAX_HINTS`] of its hinted live sessions
+    /// (not one-shot flows, not unconfirmed restores). Walks
     /// whole shards (one lock at a time) until at least `budget` records
     /// are collected; returns the cursor to resume from, or `None` when
     /// done. Concurrent changes reach the backup through the rings, which
@@ -2883,6 +3115,8 @@ impl State {
         let mut cur = cursor;
         let Some(c) = self.cluster.as_deref() else { return (out, None) };
         let hints = c.session_hints;
+        let udp_hints = c.udp_hints;
+        let now = self.clock.now_ms();
         loop {
             if out.len() >= budget.max(1) {
                 return (out, Some(cur));
@@ -2918,6 +3152,25 @@ impl State {
                             for (r, _) in est.take(crate::repl::MAX_HINTS) {
                                 out.push(SnapRecord::Sess(WireHint {
                                     proto: proto::TCP,
+                                    v4: k4.addr,
+                                    port4: k4.port,
+                                    raddr: r.0,
+                                    rport: r.1,
+                                }));
+                            }
+                        } else if udp_hints && k4.proto == proto::UDP {
+                            // Hinted (eligible) sessions only: one-shot and
+                            // unconfirmed restored flows are not exported.
+                            let hinted = b.sessions.iter().filter(|(r, x)| {
+                                x.uf == U_LIVE
+                                    && (x.expires_ms > now || x.slot != NO_SLOT)
+                                    && r.0 != 0
+                                    && r.1 != 0
+                                    && k4.port != 0
+                            });
+                            for (r, _) in hinted.take(crate::repl::MAX_HINTS) {
+                                out.push(SnapRecord::Sess(WireHint {
+                                    proto: proto::UDP,
                                     v4: k4.addr,
                                     port4: k4.port,
                                     raddr: r.0,

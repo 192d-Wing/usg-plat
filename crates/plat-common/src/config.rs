@@ -317,6 +317,15 @@ pub struct HaConfig {
     /// survive a takeover. Per node, not in the config digest.
     #[serde(default)]
     pub session_hints: SessionHints,
+    /// `session_hints = "tcp_udp"`: a UDP session is hinted once it has
+    /// carried traffic both ways and a packet arrives at least this many
+    /// seconds after its creation (one-shot flows such as DNS never hint).
+    #[serde(default = "d_udp_hint_after")]
+    pub udp_hint_after_secs: u32,
+    /// `session_hints = "tcp_udp"`: UDP hints (initial and refresh) per
+    /// second per producer (worker or sweeper); burst one second.
+    #[serde(default = "d_udp_hints_rate")]
+    pub udp_hints_per_sec: u32,
     /// Hold-back for reserved-but-unlogged blocks after takeover.
     #[serde(default = "d_quarantine")]
     pub takeover_quarantine_secs: u32,
@@ -358,6 +367,12 @@ fn d_drift() -> u8 {
 }
 fn d_tcp_adopt() -> u32 {
     300
+}
+fn d_udp_hint_after() -> u32 {
+    2
+}
+fn d_udp_hints_rate() -> u32 {
+    2000
 }
 fn d_quarantine() -> u32 {
     600
@@ -430,19 +445,27 @@ pub struct ClusterTlsConfig {
 ///   TCP sessions are restored on adoption
 /// - NIST 800-53: CM-6 (Configuration Settings) - closed set of values
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum SessionHints {
     /// No hints: adoption keeps the un-hinted TCP pickup window.
     Off,
     /// ESTABLISHED TCP sessions (default). UDP is not covered (POAM-028).
     #[default]
     Tcp,
+    /// ESTABLISHED TCP sessions plus aged bidirectional UDP sessions
+    /// (`udp_hint_after_secs`, rate `udp_hints_per_sec`).
+    TcpUdp,
 }
 
 impl HaConfig {
     /// Whether this node sends and restores TCP session hints.
     pub fn hints_on(&self) -> bool {
         self.session_hints != SessionHints::Off
+    }
+
+    /// Whether this node also sends and restores UDP session hints.
+    pub fn udp_hints_on(&self) -> bool {
+        self.session_hints == SessionHints::TcpUdp
     }
 }
 
@@ -2318,6 +2341,16 @@ impl Config {
                 "cluster.ha.tcp_adopt_secs must be >= timeouts.tcp_transitory_secs \
                  when session_hints = \"tcp\" (or set session_hints = \"off\")",
             );
+        }
+        // COMPLIANCE MAPPING:
+        // - NIST 800-53: CM-6 (Configuration Settings), SC-5 (Denial-of-Service
+        //   Protection) - UDP hint eligibility and rate are bounded
+        // - RFC 4787 REQ-5 - the eligibility age is shorter than the UDP timeout
+        if !(1..=60).contains(&h.udp_hint_after_secs) || h.udp_hint_after_secs >= to.udp_secs {
+            return invalid("cluster.ha.udp_hint_after_secs must be 1..=60 and < timeouts.udp_secs");
+        }
+        if !(1..=100_000).contains(&h.udp_hints_per_sec) {
+            return invalid("cluster.ha.udp_hints_per_sec must be 1..=100000");
         }
         let longest = to.udp_secs.max(to.tcp_transitory_secs).max(to.icmp_secs);
         if h.takeover_quarantine_secs < longest || h.takeover_quarantine_secs > MAX_TIMEOUT_SECS {

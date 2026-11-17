@@ -63,7 +63,7 @@ use super::{
 use crate::pool::{BlockRef, SliceState};
 use crate::repl::{AdoptInput, Detached, Hints, MAX_HINTS, ShadowBib, ShadowCharge, ShadowHome, hint_secs};
 use crate::shard::{Map, lower_due};
-use crate::state::{ADOPT_LOOSE, Session};
+use crate::state::{ADOPT_LOOSE, Session, U_LIVE, U_RESTORED, udp_mark_s};
 use crate::tcp::TcpState;
 
 /// Wall time one [`State::adopt_step`] aims for. A constant, not
@@ -475,7 +475,7 @@ impl State {
                 let mut hints: Map<(u8, u32, u16), Hints> = Map::with_hasher(self.hasher.clone());
                 for (j, h) in i.hints.iter().enumerate() {
                     let t = i.hint_learned_s.get(j).copied().unwrap_or(i.hint_now_s);
-                    hints.entry((proto::TCP, h.v4, h.port4)).or_default().add((h.raddr, h.rport), t);
+                    hints.entry((h.proto, h.v4, h.port4)).or_default().add((h.raddr, h.rport), t);
                 }
                 for &(v4, port4) in &i.hints_lossy {
                     hints.entry((proto::TCP, v4, port4)).or_default().mark_lossy();
@@ -615,9 +615,10 @@ impl State {
         // leftovers are not the shadow's).
         if a.home.is_some() && !stale {
             walk.collect = Some(Map::with_hasher(self.hasher.clone()));
-            // POAM: POAM-028 the restored sessions do not keep their
+            // POAM: POAM-028 the restored TCP sessions do not keep their
             // hint's learned time: they go back stamped with the shadow's
-            // now, so an abandon restarts their TCP_EST age cap.
+            // now, so an abandon restarts their TCP_EST age cap. Unconfirmed
+            // UDP restores keep their age (`remove_slice_bib`).
             let (shadow_s, begin_ms) = a.hint_ref;
             walk.collect_learned_s = shadow_s.saturating_add(hint_secs(self.clock.now_ms().saturating_sub(begin_ms)));
         }
@@ -708,7 +709,7 @@ impl State {
                 }
                 Phase::ImportBlocks => self.import_blocks(a, b),
                 Phase::Reserve => self.reserve_tables(a, b),
-                Phase::ImportBibs => self.import_bibs(a, b, c.tcp_adopt_ms, c.session_hints),
+                Phase::ImportBibs => self.import_bibs(a, b, c.tcp_adopt_ms, (c.session_hints, c.udp_hints)),
                 Phase::Log => self.adopt_log(a, b, c.slices.cidr(s).ok_or(AdoptError::BadSlice)?)?,
                 Phase::Activate => {
                     let in_use: Vec<BlockRef> = a.adopted.iter().filter(|x| x.imported).map(|x| x.r).collect();
@@ -948,9 +949,14 @@ impl State {
     /// then inserted under `bib6 → bib4` (released), then the port marked
     /// under `subs`. A `k6` or `k4` already present (a duplicate in the
     /// input, or local state) is rejected: first wins.
-    fn import_bibs(&self, a: &mut Adoption, b: &mut Budget, tcp_adopt_ms: u64, hints_on: bool) {
+    /// `hints_on = (TCP, UDP)`: this node restores TCP (with a hinted
+    /// shadow) and UDP session hints. UDP hints are restored whatever the
+    /// shadow's TCP `hinted` state, and not under endpoint-independent
+    /// filtering (inbound-first UDP passes there without a session).
+    fn import_bibs(&self, a: &mut Adoption, b: &mut Budget, tcp_adopt_ms: u64, hints_on: (bool, bool)) {
         let s = a.slice;
-        let restore = a.hinted && hints_on;
+        let restore = a.hinted && hints_on.0;
+        let restore_udp = hints_on.1 && self.filtering != Filtering::EndpointIndependent;
         let (shadow_s, begin_ms) = a.hint_ref;
         while !b.out() {
             let Some(ShadowBib { bib: w, hints }) = a.bibs.as_mut().and_then(BibSrc::next) else {
@@ -992,7 +998,11 @@ impl State {
             // The low bit is the hint-incomplete flag, set below.
             let until =
                 (now + if k4.proto == proto::TCP { tcp_adopt_ms } else { self.timeout(k4.proto, None) }) & !ADOPT_LOOSE;
-            let hints = hints.filter(|_| restore && k4.proto == proto::TCP);
+            let hints = hints.filter(|_| match k4.proto {
+                proto::TCP => restore,
+                proto::UDP => restore_udp,
+                _ => false,
+            });
             // Shadow-clock "now" for the hints' ages.
             let hint_now_s = shadow_s.saturating_add(hint_secs(now.saturating_sub(begin_ms)));
             let inserted = {
@@ -1019,7 +1029,9 @@ impl State {
                     );
                     g6.insert(k6, Mapped { k4, idx });
                     if let (Some(h), Some(bib)) = (hints.as_ref(), g4.get_mut(&k4)) {
-                        if !self.restore_sessions(bib, h, (until, hint_now_s), &mut a.stats) {
+                        if k4.proto == proto::UDP {
+                            self.restore_udp_sessions(bib, h, (now, hint_now_s), &mut a.stats);
+                        } else if !self.restore_sessions(bib, h, (until, hint_now_s), &mut a.stats) {
                             bib.adopt_until_ms |= ADOPT_LOOSE;
                         }
                         b.spend(HINT_IMPORT_COST * h.len());
@@ -1066,7 +1078,7 @@ impl State {
     ///   by a SYN on the previous owner, not on this node
     // POAM: POAM-028 restored sessions run on the pickup window
     // (`tcp_adopt_secs`), not TCP_EST, until the IPv4 side confirms them;
-    // UDP sessions and held SYNs are not replicated.
+    // Held SYNs are not replicated; UDP sessions only with "tcp_udp".
     fn restore_sessions(&self, bib: &mut Bib, h: &Hints, at: (u64, u32), st: &mut AdoptStats) -> bool {
         let (until, now_s) = at;
         let max_age_s = self.to.tcp_est / 1000;
@@ -1095,6 +1107,66 @@ impl State {
             }
         }
         complete
+    }
+
+    /// Restores the hinted sessions of one imported UDP BIB, under the
+    /// `bib4` shard lock the import holds, each living `timeouts.udp_secs`
+    /// from `now` and marked [`U_RESTORED`]: IPv6-side packets do not
+    /// extend it, the first IPv4-side packet makes it an ordinary session.
+    /// The slice is not Active yet, so none is used before the adoption's
+    /// records are queued. `at = (now ms, shadow now s)`.
+    ///
+    /// A hint older than `2 × udp_secs + 10 s` is not restored: a live flow
+    /// is re-hinted at least once per `udp_secs` of traffic, so an older
+    /// hint names a flow that ended.
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: CP-10, SC-5(2) - aged bidirectional UDP flows (QUIC,
+    ///   RTP, VPN) keep inbound-first delivery across a takeover under
+    ///   ADF/APDF (POAM-028)
+    /// - NIST 800-53: SC-7, SC-7(5) - each remote passes the outbound
+    ///   destination policy; ADF/APDF then admit exactly the restored
+    ///   remotes, which the subscriber exchanged traffic with
+    /// - NIST 800-53: SC-5 - node and per-subscriber session caps apply
+    /// - NIST 800-53: SC-10 - a restored session lives `udp_secs` minus
+    ///   the hint's age unless refreshed; a hint `udp_secs` old or older
+    ///   is refused (aged)
+    /// - RFC 6146 §3.5.1, RFC 4787 REQ-5/REQ-6 - never longer than the
+    ///   session it stands for; refreshed by packets from either side
+    // POAM: POAM-028 UDP flows younger than `udp_hint_after_secs`, hints
+    // deferred by the bucket, evicted (over 4 remotes per BIB) or lost
+    // are not restored: inbound-first UDP on them is filtered under
+    // ADF/APDF until the subscriber speaks (outbound always works).
+    fn restore_udp_sessions(&self, bib: &mut Bib, h: &Hints, at: (u64, u32), st: &mut AdoptStats) {
+        let (now, now_s) = at;
+        for (remote, learned_s) in h.iter().take(MAX_HINTS) {
+            let r = &mut st.udp_sessions_refused;
+            // The session lived at least `udp_secs` past its hint on the
+            // old owner: restore only what is left of that (RFC-002), so a
+            // restore never outlives the session it stands for.
+            let age_ms = u64::from(now_s.saturating_sub(learned_s)) * 1000;
+            let Some(life) = self.to.udp.checked_sub(age_ms).filter(|l| *l > 0) else {
+                r.aged += 1;
+                continue;
+            };
+            if bib.sessions.contains_key(&remote) {
+                r.duplicate += 1;
+                continue;
+            }
+            if !self.restore_dest_ok(remote) {
+                r.policy += 1;
+                continue;
+            }
+            match self.admit_session(bib) {
+                Ok(()) => {
+                    let s = Session::with_hint(now + life, None, U_RESTORED, udp_mark_s(now));
+                    bib.insert_session(remote, s);
+                    st.udp_sessions_restored += 1;
+                }
+                Err(plat_common::DropReason::SubscriberLimit) => r.subscriber_limit += 1,
+                Err(_) => r.session_limit += 1,
+            }
+        }
     }
 
     /// Queues `cluster_slice_acquire`, then one `nat_port_block_adopt` per
@@ -1397,6 +1469,24 @@ impl State {
         }
         let mut kept: Option<Hints> = None;
         if let Some(t) = hints
+            && k4.proto == proto::UDP
+        {
+            // Restored or hinted UDP sessions go back as hints. An
+            // unconfirmed restore keeps its age (NIST-001): its learned
+            // time is when it was last refreshed, `udp_secs` before it
+            // expires, so a flapping slice cannot keep it young.
+            let (now, udp) = (self.clock.now_ms(), self.to.udp);
+            for (remote, x) in bib.sessions.iter() {
+                if x.uf & U_LIVE != 0 {
+                    kept.get_or_insert_with(Hints::default).add(*remote, t);
+                } else if x.uf & U_RESTORED != 0 {
+                    let ago = udp.saturating_sub(x.expires_ms.saturating_sub(now));
+                    kept.get_or_insert_with(Hints::default)
+                        .add(*remote, t.saturating_sub(u32::try_from(ago.div_ceil(1000)).unwrap_or(u32::MAX)));
+                }
+            }
+        }
+        if let Some(t) = hints
             && k4.proto == proto::TCP
         {
             for (remote, x) in bib.sessions.iter() {
@@ -1472,6 +1562,7 @@ mod tests {
             directory: Arc::new(Directory::new(16, 1000)),
             tcp_adopt_secs: 300,
             session_hints: false,
+            udp_hints: None,
             quarantine_secs: 600,
             reserve_ahead: 2,
         };

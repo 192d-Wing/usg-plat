@@ -5,6 +5,29 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 ## [Unreleased]
 
 ### Changed
+- Cluster HA (CP-10, SC-5, SC-7, POAM-028 (a) Partial): UDP session hints,
+  opt-in. New value `cluster.ha.session_hints = "tcp_udp"` (default stays
+  `"tcp"`; `"off"` and `"tcp"` unchanged) and keys
+  `cluster.ha.udp_hint_after_secs` (1..=60, default 2, below
+  `timeouts.udp_secs`) and `cluster.ha.udp_hints_per_sec` (1..=100000,
+  default 2000 per worker), validated in every mode. A UDP session (QUIC
+  included) is hinted once it has seen both directions and is at least
+  `udp_hint_after_secs` old, then once per `udp_secs`; never per packet,
+  rate-limited per worker. On takeover an adopter running `"tcp_udp"` under
+  ADF/APDF restores them for `udp_secs` minus the hint's age, so
+  inbound-first UDP keeps flowing and outbound keeps its IPv4 port; either
+  side refreshes a restored session. A `"tcp"` adopter restores no UDP.
+  With `[xdp]`, a UDP flow is mirrored to the fast path only after its hint
+  (about 2–3 s on the slow path). Same peer messages with proto 17;
+  `PROTO_VERSION` stays 2; no memory change. Metrics: `proto` label on
+  `plat_cluster_session_hints_total`, `_refused_total` (`no_bib`),
+  `_evicted_total`, `plat_cluster_sessions_restored_total` and
+  `plat_cluster_session_restore_refused_total`; new
+  `plat_cluster_udp_hints_deferred_total`;
+  `plat_cluster_session_hints_enabled` is 2 for `"tcp_udp"`. No audit
+  change (`LOG_SCHEMA_VERSION` stays 8). In-process tests only; the new VM
+  flows (`flows.py --udp-push-flows`, `--dns-qps`) were not run. The hint
+  bucket is shared by all subscribers on a worker (POAM-028).
 - **BREAKING (cluster HA):** peer protocol `PROTO_VERSION` 2. A version-2
   node refuses version-1 peers (`HelloAck(Version)`, `cluster_peer_rejected`
   reason `version`); there is no version negotiation and mixed versions do
@@ -27,7 +50,8 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
   After an in-sync, hinted adoption, un-hinted TCP state creation is
   refused except for FIN and BIBs whose hints were incomplete. A FIN pickup
   stays on the transitory timer until the IPv4 side speaks (`PickupFin`).
-  UDP is not hinted. `"off"` behaves as before. The memory requirement adds
+  UDP is not hinted with `"tcp"` (see `"tcp_udp"` above). `"off"` behaves
+  as before. The memory requirement adds
   `SHADOW_HINT_BYTES` (112 B) per `nat64.max_sessions` with HA and hints on.
   New metrics `plat_cluster_session_hints_enabled`,
   `plat_cluster_session_hints_total{result}`,
