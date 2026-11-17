@@ -362,16 +362,22 @@ impl Ring {
     /// Pops up to `max` records. A session hint at or past `hint_cut` (a
     /// tail read before this call) stops the pop and stays queued, with
     /// everything after it ([`ReplHub::drain`]).
-    fn pop_into(&self, max: usize, out: &mut Vec<ReplRecord>, hint_cut: u64) -> usize {
+    /// Pops up to `max` records; a hint at or above `hint_cut` stops the
+    /// ring. Returns the records taken and whether that hint stopped it
+    /// (records behind it, possibly a `BibCreate` whose hint on another
+    /// ring was taken, are left: the drain counts this as a cut round).
+    fn pop_into(&self, max: usize, out: &mut Vec<ReplRecord>, hint_cut: u64) -> (usize, bool) {
         let _c = self.consumer.lock();
         let h = self.head.load(Ordering::Relaxed);
         let t = self.tail.load(Ordering::Acquire);
         let n = (t.wrapping_sub(h)).min(max as u64);
         let mut taken = 0;
+        let mut blocked = false;
         while taken < n {
             let at = h.wrapping_add(taken);
             let r = self.slots.get((at & self.mask) as usize).and_then(|s| ReplRecord::decode(&s.0));
             if matches!(r, Some(ReplRecord::SessHint { .. })) && at.wrapping_sub(hint_cut) < 1 << 63 {
+                blocked = true;
                 break;
             }
             if let Some(r) = r {
@@ -380,7 +386,7 @@ impl Ring {
             taken += 1;
         }
         self.head.store(h.wrapping_add(taken), Ordering::Release);
-        taken as usize
+        (taken as usize, blocked)
     }
 
     fn len(&self) -> usize {
@@ -554,8 +560,11 @@ impl ReplHub {
             }
             if let Some(r) = self.rings.get((start + i) % n) {
                 let cap = share.min(max - got);
-                let k = r.pop_into(cap, out, cuts.get((start + i) % n).copied().unwrap_or(0));
-                cut |= k == cap;
+                let (k, blocked) = r.pop_into(cap, out, cuts.get((start + i) % n).copied().unwrap_or(0));
+                // A ring stopped at a hint above its cut leaves the records
+                // behind it (a `BibCreate` among them may belong to a hint
+                // already taken from another ring): repeat the round.
+                cut |= k == cap || blocked;
                 got += k;
             }
         }
@@ -576,8 +585,8 @@ impl ReplHub {
     /// [`Self::hints_superseded`]). A hint drained after the delete (a
     /// re-created BIB) is kept. With the tail cut of [`Self::drain_rings`]
     /// the batch holds every `BibCreate` of its hints, except one left in
-    /// its ring because the share or `max` stopped that ring
-    /// ([`Self::drains_truncated`]); that hint is refused `no_bib` and the
+    /// its ring because the share, `max` or a hint above the ring's cut
+    /// stopped that ring in every round ([`Self::drains_truncated`]); that hint is refused `no_bib` and the
     /// slice resyncs (`mark_gap`, POAM-028).
     fn hints_last(&self, out: &mut Vec<ReplRecord>, from: usize, scratch: &mut DrainScratch) {
         let Some(batch) = out.get(from..) else { return };
@@ -1893,12 +1902,36 @@ mod tests {
         // Pushed after the consumer read its cut (tail 1).
         assert!(prods[0].push(hint(1100, 5, 6)) && prods[0].push(ReplRecord::SubGone { sub: 3 }));
         let mut out = Vec::new();
-        assert_eq!(ring.pop_into(8, &mut out, 1), 2, "non-hints past the cut are taken");
+        assert_eq!(ring.pop_into(8, &mut out, 1), (2, true), "non-hints before the blocking hint are taken");
         assert_eq!(out, vec![create, ReplRecord::SubGone { sub: 2 }]);
         assert_eq!(ring.len(), 2, "the hint and its successor wait for the next drain");
         out.clear();
-        assert_eq!(ring.pop_into(8, &mut out, 4), 2);
+        assert_eq!(ring.pop_into(8, &mut out, 4), (2, false));
         assert_eq!(out, vec![hint(1100, 5, 6), ReplRecord::SubGone { sub: 3 }]);
+    }
+
+    /// CI flake on Linux (qa_no_bib_race_rate_with_8_workers): ring 0 holds a
+    /// hint pushed after the cuts were read, then the `BibCreate` of a hint
+    /// already queued below its cut on ring 1. The blocked ring must make
+    /// the drain repeat the round, so the BIB is in the batch before its hint.
+    #[test]
+    fn ring_blocked_by_late_hint_repeats_round_for_bib_behind_it() {
+        let (hub, prods) = ReplHub::new(2, 16, 4);
+        let ring0 = &prods[0].ring;
+        assert!(prods[0].push(hint(1200, 9, 9)));
+        let create = ReplRecord::BibCreate { slice: 0, bib: tcp_bib(1201) };
+        assert!(prods[0].push(create));
+        let mut out = Vec::new();
+        // Cut 0 on ring 0: the late hint blocks the ring before the BIB.
+        assert_eq!(ring0.pop_into(8, &mut out, 0), (0, true));
+        assert!(out.is_empty());
+        // Through the hub, a later round (fresh cuts) takes both.
+        assert!(prods[1].push(hint(1201, 5, 6)));
+        assert_eq!(hub.drain_rounds(16, 8, &mut out), 3);
+        let bib_at = out.iter().position(|r| *r == create).unwrap();
+        let hint_at = out.iter().position(|r| *r == hint(1201, 5, 6)).unwrap();
+        assert!(bib_at < hint_at, "BIB before its hint");
+        assert_eq!(hub.drains_truncated(), 0);
     }
 
     #[test]

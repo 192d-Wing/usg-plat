@@ -7,6 +7,13 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 ## [0.5.0] - 2026-11-17
 
 ### Fixed
+- Cluster HA (CP-10, POAM-028): a replication drain could send a session
+  hint before its `BibCreate` without counting the drain as truncated.
+  A ring stopped at a hint pushed after the drain read its cut left the
+  records behind it, including a `BibCreate` whose hint had already been
+  taken from another ring. The drain now repeats the round in that case
+  (`ReplHub::drain_rounds`), so the backup no longer refuses such a hint
+  `no_bib` or resyncs the slice.
 - Port-block pool (SC-5): with several workers, a block allocation could
   fail as `port_exhausted` (no reserve-starved or paired-exhausted count)
   while free blocks remained, because another worker had popped the only
