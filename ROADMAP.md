@@ -1,7 +1,7 @@
 # Roadmap
 
-Status as of 2026-11-10. The latest release is
-[v0.4.2](https://github.com/192d-Wing/usg-plat/releases/tag/v0.4.2)
+Status as of 2026-11-17. The latest release is
+[v0.5.0](https://github.com/192d-Wing/usg-plat/releases/tag/v0.5.0)
 (signed, see `CHANGELOG.md`). Gaps are tracked as POA&M items in
 [`docs/compliance/POAM.md`](docs/compliance/POAM.md); this file groups them
 into work and does not replace that register.
