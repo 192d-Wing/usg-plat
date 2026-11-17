@@ -435,6 +435,57 @@ fn put_slice_seq(out: &mut Vec<u8>, slice: SliceId, seq: u64) {
     out.extend_from_slice(&seq.to_le_bytes());
 }
 
+/// Hello body; on `Err` the caller truncates `out` to the frame start.
+fn put_hello(out: &mut Vec<u8>, h: &Hello) -> Result<(), CodecError> {
+    if h.name.len() > MAX_NAME_LEN || !valid_name(h.name.as_bytes()) {
+        return Err(CodecError::Invalid("hello.name"));
+    }
+    if h.owned.len() > MAX_OWNED {
+        return Err(CodecError::Invalid("hello.owned"));
+    }
+    out.extend_from_slice(&h.proto_version.to_le_bytes());
+    out.extend_from_slice(&h.node_id.to_le_bytes());
+    out.push(h.name.len() as u8);
+    out.extend_from_slice(h.name.as_bytes());
+    out.extend_from_slice(&h.config_digest);
+    out.extend_from_slice(&h.epoch.to_le_bytes());
+    out.push(h.scheme.code());
+    out.extend_from_slice(&(h.owned.len() as u16).to_le_bytes());
+    for c in &h.owned {
+        out.extend_from_slice(&c.network().to_le_bytes());
+        out.push(c.prefix_len());
+    }
+    Ok(())
+}
+
+/// Snapshot chunk records (count + records); on `Err` the caller truncates
+/// `out` to the frame start.
+fn put_snap_records(out: &mut Vec<u8>, records: &[SnapRecord]) -> Result<(), CodecError> {
+    out.extend_from_slice(&(records.len() as u32).to_le_bytes());
+    for r in records {
+        match r {
+            SnapRecord::Block { sub, block, alloc_wall_us } => {
+                out.push(1);
+                out.extend_from_slice(&sub.to_le_bytes());
+                put_block(out, block);
+                out.extend_from_slice(&alloc_wall_us.to_le_bytes());
+            }
+            SnapRecord::Bib(b) => {
+                out.push(2);
+                put_bib(out, b);
+            }
+            SnapRecord::Sess(h) => {
+                if !valid_hint(h) {
+                    return Err(CodecError::Invalid("hint"));
+                }
+                out.push(3);
+                put_hint(out, h);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Append one frame for `msg` to `out`. Fails (leaving `out` unchanged)
 /// when the frame would exceed `max_frame` or a field is unencodable; the
 /// caller must then split the message (snapshot chunks) or drop it.
@@ -444,25 +495,9 @@ pub fn encode(msg: &Msg, max_frame: usize, out: &mut Vec<u8>) -> Result<(), Code
     out.push(msg.type_code());
     match msg {
         Msg::Hello(h) => {
-            if h.name.len() > MAX_NAME_LEN || !valid_name(h.name.as_bytes()) {
+            if let Err(e) = put_hello(out, h) {
                 out.truncate(start);
-                return Err(CodecError::Invalid("hello.name"));
-            }
-            if h.owned.len() > MAX_OWNED {
-                out.truncate(start);
-                return Err(CodecError::Invalid("hello.owned"));
-            }
-            out.extend_from_slice(&h.proto_version.to_le_bytes());
-            out.extend_from_slice(&h.node_id.to_le_bytes());
-            out.push(h.name.len() as u8);
-            out.extend_from_slice(h.name.as_bytes());
-            out.extend_from_slice(&h.config_digest);
-            out.extend_from_slice(&h.epoch.to_le_bytes());
-            out.push(h.scheme.code());
-            out.extend_from_slice(&(h.owned.len() as u16).to_le_bytes());
-            for c in &h.owned {
-                out.extend_from_slice(&c.network().to_le_bytes());
-                out.push(c.prefix_len());
+                return Err(e);
             }
         }
         Msg::HelloAck(r) => out.push(r.map_or(0, RejectReason::code)),
@@ -555,28 +590,9 @@ pub fn encode(msg: &Msg, max_frame: usize, out: &mut Vec<u8>) -> Result<(), Code
         Msg::SubGone { sub } => out.extend_from_slice(&sub.to_le_bytes()),
         Msg::SnapshotChunk { slice, seq, records } => {
             put_slice_seq(out, *slice, *seq);
-            out.extend_from_slice(&(records.len() as u32).to_le_bytes());
-            for r in records {
-                match r {
-                    SnapRecord::Block { sub, block, alloc_wall_us } => {
-                        out.push(1);
-                        out.extend_from_slice(&sub.to_le_bytes());
-                        put_block(out, block);
-                        out.extend_from_slice(&alloc_wall_us.to_le_bytes());
-                    }
-                    SnapRecord::Bib(b) => {
-                        out.push(2);
-                        put_bib(out, b);
-                    }
-                    SnapRecord::Sess(h) => {
-                        if !valid_hint(h) {
-                            out.truncate(start);
-                            return Err(CodecError::Invalid("hint"));
-                        }
-                        out.push(3);
-                        put_hint(out, h);
-                    }
-                }
+            if let Err(e) = put_snap_records(out, records) {
+                out.truncate(start);
+                return Err(e);
             }
         }
         Msg::HandoverFence { slice, epoch, final_seq } => {

@@ -210,12 +210,13 @@ check_flows() {
 # only through restored session hints (ADF/APDF refuse the server's first
 # packet otherwise), so this is the session-hints acceptance check.
 check_pushed() {
+    min_pct=$1
     for k in push idle; do
         total=$(flows_field ${k}_flows)
         [ "${total:-0}" -gt 0 ] || continue
         alive=$(flows_field ${k}_survived)
         pct=$((alive * 100 / total))
-        if [ "$pct" -ge "$1" ]; then pass "$k flows $alive/$total ($pct% >= $1%)"; else fail "$k flows $alive/$total ($pct% < $1%)"; fi
+        if [ "$pct" -ge "$min_pct" ]; then pass "$k flows $alive/$total ($pct% >= $min_pct%)"; else fail "$k flows $alive/$total ($pct% < $min_pct%)"; fi
     done
 }
 

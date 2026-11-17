@@ -2290,19 +2290,46 @@ fn env_or(name: &str, d: usize) -> usize {
 /// (drain rounds per pump, default 8 like platd; 1: one round). Asserts
 /// only that nothing panics, nothing is lost silently and every hint is
 /// either applied or refused `NoBib`.
-#[test]
-fn qa_no_bib_race_rate_with_8_workers() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::mpsc;
-    const W: usize = 8;
-    let conns = env_or("QA_RACE_CONNS", 2000);
-    let ring = env_or("QA_RACE_RING", 65_536);
-    let pause = Duration::from_micros(env_or("QA_RACE_DRAIN_US", 0) as u64);
-    let gap = Duration::from_micros(env_or("QA_RACE_GAP_US", 0) as u64);
-    let hints_on = env_or("QA_RACE_HINTS", 1) != 0;
-    let rtt = Duration::from_micros(env_or("QA_RACE_RTT_US", 0) as u64);
-    // Drain rounds per pump while a round is cut (platd `DRAIN_ROUNDS`).
-    let rounds = env_or("QA_RACE_ROUNDS", 8);
+/// Workers in the Q1 race harness.
+const RACE_W: usize = 8;
+
+/// Q1 harness knobs (`QA_RACE_*`, see the test doc).
+#[derive(Clone, Copy)]
+struct RaceParams {
+    conns: usize,
+    ring: usize,
+    pause: Duration,
+    gap: Duration,
+    hints_on: bool,
+    rtt: Duration,
+    rounds: usize,
+}
+
+impl RaceParams {
+    fn from_env() -> Self {
+        Self {
+            conns: env_or("QA_RACE_CONNS", 2000),
+            ring: env_or("QA_RACE_RING", 65_536),
+            pause: Duration::from_micros(env_or("QA_RACE_DRAIN_US", 0) as u64),
+            gap: Duration::from_micros(env_or("QA_RACE_GAP_US", 0) as u64),
+            hints_on: env_or("QA_RACE_HINTS", 1) != 0,
+            rtt: Duration::from_micros(env_or("QA_RACE_RTT_US", 0) as u64),
+            // Drain rounds per pump while a round is cut (platd `DRAIN_ROUNDS`).
+            rounds: env_or("QA_RACE_ROUNDS", 8),
+        }
+    }
+}
+
+/// A SYN/ACK due at `.0` for the translated tuple of its SYN (`None`: the
+/// SYN was dropped); a `None` message closes the channel.
+type RaceMsg = (std::time::Instant, Option<Option<(u32, u16)>>);
+
+/// Drainer result: hints, `NoBib` refusals, other refusals, non-empty drains.
+type DrainStats = (u64, u64, u64, u64);
+
+/// Cluster engine with slices 0..4 Active, a hinted shadow of them and a
+/// thread draining the audit channel (ends once the engine is dropped).
+fn race_setup(p: &RaceParams) -> (Arc<Nat64>, Arc<Shadow>, std::thread::JoinHandle<()>) {
     let cfg = config(&[("max_sessions = 4000000", "max_sessions = 4000000")]);
     let setup = ClusterSetup {
         slices: SliceMap::new(&cfg.nat64.pool, 32).unwrap(),
@@ -2310,13 +2337,12 @@ fn qa_no_bib_race_rate_with_8_workers() {
         steering: SteeringMode::Drop,
         directory: Arc::new(Directory::new(16, 1000)),
         tcp_adopt_secs: 300,
-        session_hints: hints_on,
+        session_hints: p.hints_on,
         quarantine_secs: 600,
         reserve_ahead: 2,
     };
     let (sink, rx) = AuditSink::bounded(1 << 20);
     let nat = Arc::new(Nat64::new_cluster(&cfg, setup, sink, Clock::new()).unwrap());
-    let (hub, prods) = ReplHub::new(W + 1, ring, 4);
     for s in 0..4 {
         nat.state()
             .adopt_slice(
@@ -2340,36 +2366,145 @@ fn qa_no_bib_race_rate_with_8_workers() {
         shadow.snapshot_end_hinted(s, true).unwrap();
     }
     let audit_drain = std::thread::spawn(move || while rx.recv().is_ok() {});
-    let done = Arc::new(AtomicBool::new(false));
-    let drainer = {
-        let (hub, shadow, done) = (hub.clone(), shadow.clone(), done.clone());
-        std::thread::spawn(move || {
-            let (mut buf, mut hints, mut no_bib, mut other, mut drains) = (Vec::new(), 0u64, 0u64, 0u64, 0u64);
-            loop {
-                let fin = done.load(Ordering::Acquire);
-                buf.clear();
-                let n = hub.drain_rounds(4096, rounds, &mut buf);
-                drains += u64::from(n > 0);
-                for r in &buf {
-                    let h = matches!(r, ReplRecord::SessHint { .. });
-                    hints += u64::from(h);
-                    match shadow.apply(r, 0) {
-                        Ok(()) => {}
-                        Err(plat_nat64::ShadowError::NoBib) if h => no_bib += 1,
-                        Err(_) => other += 1,
-                    }
-                }
-                if n == 0 && fin {
-                    return (hints, no_bib, other, drains);
-                }
-                if !pause.is_zero() {
-                    std::thread::sleep(pause);
+    (nat, shadow, audit_drain)
+}
+
+/// Replicator stand-in: drains the hub into the shadow until `done` and empty.
+fn spawn_race_drainer(
+    hub: Arc<ReplHub>,
+    shadow: Arc<Shadow>,
+    done: Arc<std::sync::atomic::AtomicBool>,
+    p: RaceParams,
+) -> std::thread::JoinHandle<DrainStats> {
+    use std::sync::atomic::Ordering;
+    std::thread::spawn(move || {
+        let (mut buf, mut hints, mut no_bib, mut other, mut drains) = (Vec::new(), 0u64, 0u64, 0u64, 0u64);
+        loop {
+            let fin = done.load(Ordering::Acquire);
+            buf.clear();
+            let n = hub.drain_rounds(4096, p.rounds, &mut buf);
+            drains += u64::from(n > 0);
+            for r in &buf {
+                let h = matches!(r, ReplRecord::SessHint { .. });
+                hints += u64::from(h);
+                match shadow.apply(r, 0) {
+                    Ok(()) => {}
+                    Err(plat_nat64::ShadowError::NoBib) if h => no_bib += 1,
+                    Err(_) => other += 1,
                 }
             }
-        })
+            if n == 0 && fin {
+                return (hints, no_bib, other, drains);
+            }
+            if !p.pause.is_zero() {
+                std::thread::sleep(p.pause);
+            }
+        }
+    })
+}
+
+/// One race worker: sends its SYNs (to `next` for the SYN/ACK) and answers
+/// the previous worker's SYN/ACKs one emulated RTT after their SYN.
+/// Returns (answered, SYN drops, counters).
+fn race_worker(
+    i: usize,
+    nat: &Nat64,
+    prod: ReplProducer,
+    inbox: &std::sync::mpsc::Receiver<RaceMsg>,
+    next: &std::sync::mpsc::Sender<RaceMsg>,
+    p: &RaceParams,
+) -> (usize, usize, Arc<Counters>) {
+    let mut ctx = nat.new_worker(Arc::new(Counters::default()), i as u16 + 1).with_repl(prod);
+    let mut buf = vec![0u8; plat_xlat::HEADROOM + 2048];
+    let mut go = |pkt: &[u8], ctx: &mut WorkerCtx| {
+        buf[plat_xlat::HEADROOM..plat_xlat::HEADROOM + pkt.len()].copy_from_slice(pkt);
+        match nat.process(&mut buf, plat_xlat::HEADROOM, pkt.len(), ctx) {
+            plat_nat64::Verdict::Forward { start, len } => Some(tuple4(&buf[start..start + len])),
+            _ => None,
+        }
     };
-    let (txs, rxs): (Vec<_>, Vec<_>) =
-        (0..W).map(|_| mpsc::channel::<(std::time::Instant, Option<Option<(u32, u16)>>)>()).unzip();
+    let (mut sent, mut answered, mut open, mut syn_drops) = (0usize, 0usize, true, 0usize);
+    let mut pending = std::collections::VecDeque::new();
+    while open || sent < p.conns || !pending.is_empty() {
+        if sent < p.conns {
+            let s = sub((i * 40 + sent % 40) as u16, 1);
+            let port = 1024 + (sent / 40) as u16;
+            let r = go(&tcp6(s, port, SERVER, 443, SYN), &mut ctx);
+            syn_drops += usize::from(r.is_none());
+            let _ = next.send((std::time::Instant::now() + p.rtt, Some(r)));
+            sent += 1;
+            spin_for(p.gap);
+            if sent == p.conns {
+                let _ = next.send((std::time::Instant::now(), None));
+            }
+        }
+        open = race_recv(inbox, &mut pending) && open;
+        let now = std::time::Instant::now();
+        while pending.front().is_some_and(|q: &(std::time::Instant, _)| q.0 <= now) {
+            if let Some((_, Some((v4, p4)))) = pending.pop_front() {
+                answered += usize::from(go(&tcp4(SERVER, 443, v4, p4, SYN | ACK), &mut ctx).is_some());
+            }
+        }
+        if sent >= p.conns {
+            std::thread::yield_now();
+        }
+    }
+    (answered, syn_drops, ctx.counters.clone())
+}
+
+/// Busy-wait `d` (a sleep is far too coarse for SYN gaps).
+fn spin_for(d: Duration) {
+    if d.is_zero() {
+        return;
+    }
+    let t = std::time::Instant::now();
+    while t.elapsed() < d {
+        std::hint::spin_loop();
+    }
+}
+
+/// Move queued SYN/ACKs into `pending`; false once the sender closed.
+fn race_recv(
+    inbox: &std::sync::mpsc::Receiver<RaceMsg>,
+    pending: &mut std::collections::VecDeque<(std::time::Instant, Option<(u32, u16)>)>,
+) -> bool {
+    use std::sync::mpsc::TryRecvError;
+    loop {
+        match inbox.try_recv() {
+            Ok((_, None)) | Err(TryRecvError::Disconnected) => return false,
+            Ok((due, Some(m))) => pending.push_back((due, m)),
+            Err(TryRecvError::Empty) => return true,
+        }
+    }
+}
+
+/// Q1 measurement harness (plan §1.7, §8): 8 workers open TCP connections
+/// at full speed; each SYN is handled by one worker (its `BibCreate` goes
+/// to that worker's ring) and the SYN/ACK by the next worker (the hint goes
+/// to another ring), as with RSS on the two address families. A drainer
+/// thread empties the hub like the replicator (batch 4096, round-robin)
+/// and applies to a shadow, counting `NoBib` refusals. Prints the rate.
+///
+/// Scale with `QA_RACE_CONNS` (per worker, default 2000), `QA_RACE_RING`
+/// (default 65536), `QA_RACE_DRAIN_US` (pause between drains, default 0)
+/// `QA_RACE_GAP_US` (per-worker pause between SYNs, default 0) and
+/// `QA_RACE_RTT_US` (delay from a SYN to its SYN/ACK, default 0) and
+/// `QA_RACE_HINTS` (0: hints off, the control run) and `QA_RACE_ROUNDS`
+/// (drain rounds per pump, default 8 like platd; 1: one round). Asserts
+/// only that nothing panics, nothing is lost silently and every hint is
+/// either applied or refused `NoBib`.
+#[test]
+fn qa_no_bib_race_rate_with_8_workers() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    const W: usize = RACE_W;
+    let p = RaceParams::from_env();
+    let RaceParams { conns, ring, pause, gap, hints_on, rtt, rounds } = p;
+    let (nat, shadow, audit_drain) = race_setup(&p);
+    let (hub, prods) = ReplHub::new(W + 1, ring, 4);
+    let done = Arc::new(AtomicBool::new(false));
+    let drainer = spawn_race_drainer(hub.clone(), shadow.clone(), done.clone(), p);
+    let (txs, rxs): (Vec<_>, Vec<_>) = (0..W).map(|_| mpsc::channel::<RaceMsg>()).unzip();
     let t0 = std::time::Instant::now();
     let workers: Vec<_> = prods
         .into_iter()
@@ -2379,60 +2514,7 @@ fn qa_no_bib_race_rate_with_8_workers() {
         .map(|(i, (prod, inbox))| {
             let nat = nat.clone();
             let next = txs[(i + 1) % W].clone();
-            std::thread::spawn(move || {
-                let mut ctx = nat.new_worker(Arc::new(Counters::default()), i as u16 + 1).with_repl(prod);
-                let mut buf = vec![0u8; plat_xlat::HEADROOM + 2048];
-                let mut go = |pkt: &[u8], ctx: &mut WorkerCtx| {
-                    buf[plat_xlat::HEADROOM..plat_xlat::HEADROOM + pkt.len()].copy_from_slice(pkt);
-                    match nat.process(&mut buf, plat_xlat::HEADROOM, pkt.len(), ctx) {
-                        plat_nat64::Verdict::Forward { start, len } => Some(tuple4(&buf[start..start + len])),
-                        _ => None,
-                    }
-                };
-                let (mut sent, mut answered, mut open, mut syn_drops) = (0usize, 0usize, true, 0usize);
-                let mut pending = std::collections::VecDeque::new();
-                while open || sent < conns || !pending.is_empty() {
-                    if sent < conns {
-                        let s = sub((i * 40 + sent % 40) as u16, 1);
-                        let port = 1024 + (sent / 40) as u16;
-                        let r = go(&tcp6(s, port, SERVER, 443, SYN), &mut ctx);
-                        syn_drops += usize::from(r.is_none());
-                        let _ = next.send((std::time::Instant::now() + rtt, Some(r)));
-                        sent += 1;
-                        if !gap.is_zero() {
-                            let t = std::time::Instant::now();
-                            while t.elapsed() < gap {
-                                std::hint::spin_loop();
-                            }
-                        }
-                        if sent == conns {
-                            let _ = next.send((std::time::Instant::now(), None));
-                        }
-                    }
-                    loop {
-                        match inbox.try_recv() {
-                            Ok((_, None)) | Err(mpsc::TryRecvError::Disconnected) => {
-                                open = false;
-                                break;
-                            }
-                            Ok((due, Some(m))) => pending.push_back((due, m)),
-                            Err(mpsc::TryRecvError::Empty) => break,
-                        }
-                    }
-                    // The SYN/ACKs of the previous worker's connections,
-                    // one emulated RTT after their SYN.
-                    let now = std::time::Instant::now();
-                    while pending.front().is_some_and(|p: &(std::time::Instant, _)| p.0 <= now) {
-                        if let Some((_, Some((v4, p4)))) = pending.pop_front() {
-                            answered += usize::from(go(&tcp4(SERVER, 443, v4, p4, SYN | ACK), &mut ctx).is_some());
-                        }
-                    }
-                    if sent >= conns {
-                        std::thread::yield_now();
-                    }
-                }
-                (answered, syn_drops, ctx.counters.clone())
-            })
+            std::thread::spawn(move || race_worker(i, &nat, prod, &inbox, &next, &p))
         })
         .collect();
     drop(txs);

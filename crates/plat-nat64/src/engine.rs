@@ -578,6 +578,15 @@ impl Nat64 {
         crate::state::non_global_foreign_v4(a, &self.cluster_pool)
     }
 
+    /// Inbound source check (see the COMPLIANCE MAPPING in `inbound_v4`):
+    /// never-translatable sources, and with non-global destinations denied,
+    /// non-global foreign sources (ICMP errors excepted per prefix kind).
+    #[inline]
+    fn src_refused_v4(&self, src: u32, is_err: bool) -> bool {
+        let icmp_exempt = if self.prefix.is_wkp() { is_err && self.wkp_non_global_icmp } else { is_err };
+        is_never_translatable_v4(src) || (self.deny_non_global_dst && !icmp_exempt && self.non_global_foreign(src))
+    }
+
     /// IPv6 → IPv4 (outbound from the CLAT side).
     #[inline(never)]
     fn outbound_v6<M: Mode>(&self, buf: &mut [u8], start: usize, len: usize, ctx: &mut WorkerCtx) -> R {
@@ -1029,11 +1038,7 @@ impl Nat64 {
         //   `translation.wkp_non_global_icmp_errors` deviation switch.
         // - RFC 6146 §3.8 - the cluster pool is exempt, so hairpinned
         //   packets (source = a pool address) pass.
-        let src_refused = is_never_translatable_v4(h.src)
-            || (self.deny_non_global_dst
-                && self.non_global_foreign(h.src)
-                && if self.prefix.is_wkp() { !(is_err && self.wkp_non_global_icmp) } else { !is_err });
-        if src_refused {
+        if self.src_refused_v4(h.src, is_err) {
             return Err(DropReason::SrcNotAllowed);
         }
         // COMPLIANCE MAPPING:
