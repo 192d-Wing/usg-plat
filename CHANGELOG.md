@@ -4,6 +4,14 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 
 ## [Unreleased]
 
+### Fixed
+- Port-block pool (SC-5): with several workers, a block allocation could
+  fail as `port_exhausted` (no reserve-starved or paired-exhausted count)
+  while free blocks remained, because another worker had popped the only
+  round-robin queue entry for an address or slice and not yet pushed it
+  back. The queue walk is now serialised (`Pool::scan`, lock order
+  `scan` → address/slice → `avail`), in legacy and sliced mode.
+
 ### Changed
 - **BREAKING (cluster HA):** peer protocol `PROTO_VERSION` 2. A version-2
   node refuses version-1 peers (`HelloAck(Version)`, `cluster_peer_rejected`
