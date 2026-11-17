@@ -4,6 +4,8 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and S
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-17
+
 ### Fixed
 - Port-block pool (SC-5): with several workers, a block allocation could
   fail as `port_exhausted` (no reserve-starved or paired-exhausted count)
