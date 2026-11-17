@@ -26,6 +26,10 @@ pub enum TcpState {
     /// Picked up on an adopted BIB after a takeover (POAM-028): runs on the
     /// transitory timer until the IPv4 side confirms the connection.
     Pickup,
+    /// Picked up from an IPv6 FIN (SEC-004): V6 FIN RCV that stays on the
+    /// transitory timer until the IPv4 side speaks, so IPv6 packets alone
+    /// never move it to TCP_EST.
+    PickupFin,
 }
 
 pub const FIN: u8 = 0x01;
@@ -55,10 +59,20 @@ pub fn initial(side: Side, flags: u8) -> Option<TcpState> {
 }
 
 /// State of a session picked up from a non-SYN, non-RST outbound segment
-/// on an adopted BIB (RFC-002 / SEC-8): a FIN maps to V6 FIN RCV, anything
-/// else to [`TcpState::Pickup`]. Both start on the transitory timer.
+/// on an adopted BIB (RFC-002 / SEC-8): a FIN maps to
+/// [`TcpState::PickupFin`] (V6 FIN RCV, SEC-004), anything else to
+/// [`TcpState::Pickup`]. Both start on the transitory timer.
 pub fn pickup(flags: u8) -> TcpState {
-    if flags & FIN != 0 { TcpState::V6FinRcv } else { TcpState::Pickup }
+    if flags & FIN != 0 { TcpState::PickupFin } else { TcpState::Pickup }
+}
+
+/// A transition that makes a connection ESTABLISHED for the first time
+/// (from V6 INIT, V4 INIT or Pickup): the one point a session hint is
+/// emitted (POAM-028). TRANS → ESTABLISHED (an ACK after a RST) and the
+/// FIN states never count, so a remote cannot mint hints by looping RST
+/// and ACK.
+pub fn first_established(from: TcpState, to: TcpState) -> bool {
+    to == TcpState::Established && matches!(from, TcpState::V6Init | TcpState::V4Init | TcpState::Pickup)
 }
 
 /// Advances the state machine for one packet.
@@ -73,7 +87,7 @@ pub fn step(s: TcpState, side: Side, flags: u8) -> (TcpState, Timer) {
         return match s {
             // INIT and BOTH FIN RCV already run on the transitory timer;
             // TRANS keeps its deadline (repeated RSTs never refresh it).
-            V6Init | V4Init | BothFinRcv | Trans | Pickup => (s, Timer::Keep),
+            V6Init | V4Init | BothFinRcv | Trans | Pickup | PickupFin => (s, Timer::Keep),
             _ => (Trans, Timer::Transitory),
         };
     }
@@ -96,8 +110,14 @@ pub fn step(s: TcpState, side: Side, flags: u8) -> (TcpState, Timer) {
         // connection is live; the IPv6 side alone never extends it.
         (Pickup, Side::V4) if fin => (V4FinRcv, Timer::Established),
         (Pickup, Side::V4) => (Established, Timer::Established),
-        (Pickup, Side::V6) if fin => (V6FinRcv, Timer::Transitory),
+        (Pickup, Side::V6) if fin => (PickupFin, Timer::Transitory),
         (Pickup, Side::V6) => (Pickup, Timer::Keep),
+        // SEC-004: a picked-up V6 FIN RCV becomes the ordinary state (same
+        // transition as V6 FIN RCV) only once the IPv4 side speaks; IPv6
+        // packets keep the transitory deadline.
+        (PickupFin, Side::V4) if fin => (BothFinRcv, Timer::Transitory),
+        (PickupFin, Side::V4) => (V6FinRcv, Timer::Established),
+        (PickupFin, Side::V6) => (PickupFin, Timer::Keep),
         (Trans, _) => (Established, Timer::Established),
     }
 }
@@ -105,6 +125,40 @@ pub fn step(s: TcpState, side: Side, flags: u8) -> (TcpState, Timer) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// POAM-028 / SC-5: only the first establish emits a session hint.
+    #[test]
+    fn trans_to_established_is_not_a_first_establish() {
+        use TcpState::*;
+        let (e, _) = step(V6Init, Side::V4, SYN | ACK);
+        assert!(first_established(V6Init, e));
+        assert!(first_established(V4Init, step(V4Init, Side::V6, SYN).0));
+        assert!(first_established(Pickup, step(Pickup, Side::V4, ACK).0));
+        let (t, _) = step(Established, Side::V4, RST);
+        assert_eq!(t, Trans);
+        let (back, _) = step(t, Side::V6, ACK);
+        assert_eq!(back, Established);
+        assert!(!first_established(t, back));
+        for s in [V6FinRcv, V4FinRcv, BothFinRcv, Established] {
+            assert!(!first_established(s, Established));
+        }
+    }
+
+    /// SEC-004: a FIN pickup is not extended by the IPv6 side alone.
+    #[test]
+    fn fin_pickup_waits_for_v4() {
+        use TcpState::*;
+        let s = pickup(FIN);
+        assert_eq!(s, PickupFin);
+        for f in [ACK, FIN | ACK, SYN, 0] {
+            assert_eq!(step(s, Side::V6, f), (PickupFin, Timer::Keep));
+        }
+        assert_eq!(step(s, Side::V6, RST), (PickupFin, Timer::Keep));
+        assert_eq!(step(Pickup, Side::V6, FIN), (PickupFin, Timer::Transitory));
+        assert_eq!(step(s, Side::V4, ACK), (V6FinRcv, Timer::Established));
+        assert_eq!(step(s, Side::V4, FIN | ACK), (BothFinRcv, Timer::Transitory));
+        assert!(!first_established(s, Established));
+    }
 
     #[test]
     fn handshake_and_close() {
@@ -135,9 +189,9 @@ mod tests {
     fn pickup_needs_the_v4_side() {
         use TcpState::*;
         assert_eq!(pickup(0x10), Pickup);
-        assert_eq!(pickup(FIN | 0x10), V6FinRcv);
+        assert_eq!(pickup(FIN | 0x10), PickupFin);
         assert_eq!(step(Pickup, Side::V6, 0x10), (Pickup, Timer::Keep));
-        assert_eq!(step(Pickup, Side::V6, FIN | 0x10), (V6FinRcv, Timer::Transitory));
+        assert_eq!(step(Pickup, Side::V6, FIN | 0x10), (PickupFin, Timer::Transitory));
         assert_eq!(step(Pickup, Side::V4, 0x10), (Established, Timer::Established));
         assert_eq!(step(Pickup, Side::V4, FIN | 0x10), (V4FinRcv, Timer::Established));
         assert_eq!(step(Pickup, Side::V4, RST), (Pickup, Timer::Keep));

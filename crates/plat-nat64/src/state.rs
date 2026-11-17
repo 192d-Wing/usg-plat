@@ -9,7 +9,7 @@ use ahash::RandomState;
 use crossbeam_utils::CachePadded;
 use parking_lot::MutexGuard;
 use plat_audit::{AcquireReason, AuditSink, BlockReleaseReason, Event, LimitKind, TryEmit};
-use plat_cluster::{MemberId, SliceId, SliceMap, SnapRecord, WireBib, WireBlock};
+use plat_cluster::{MemberId, SliceId, SliceMap, SnapRecord, WireBib, WireBlock, WireHint};
 use plat_common::config::{AuditMode, Config, Filtering, OverflowPolicy, SteeringMode};
 use plat_common::{Clock, Counter, Counters, DropReason, Ipv4Cidr, Ipv6Cidr};
 use plat_packet::proto;
@@ -24,7 +24,7 @@ use crate::tcp::{self, Side, TcpState, Timer};
 
 #[path = "adopt.rs"]
 mod adopt;
-pub use adopt::{ADOPT_BATCH, ADOPT_STEP_BUDGET, ADOPT_STEP_MAX_ITEMS, AdoptSource, Adoption, Step};
+pub use adopt::{ADOPT_BATCH, ADOPT_STEP_BUDGET, ADOPT_STEP_MAX_ITEMS, AdoptSource, Adoption, HINT_IMPORT_COST, Step};
 use adopt::{Budget, Emit, Walk};
 #[path = "release.rs"]
 mod release;
@@ -89,7 +89,7 @@ pub struct Session {
 }
 
 impl Session {
-    fn new(expires_ms: u64, tcp: Option<TcpState>) -> Self {
+    pub(crate) fn new(expires_ms: u64, tcp: Option<TcpState>) -> Self {
         Self { expires_ms, tcp, slot: NO_SLOT }
     }
 }
@@ -106,7 +106,7 @@ pub struct Bib {
     pub created_wall_us: u64,
     /// Adopted on takeover: kept without sessions until then, and (TCP) a
     /// non-SYN outbound segment may create a session before then. 0 for
-    /// every BIB created locally.
+    /// every BIB created locally. The low bit is [`ADOPT_LOOSE`].
     pub adopt_until_ms: u64,
     empty_since: Option<u64>,
     sub_sessions: Arc<AtomicU32>,
@@ -121,6 +121,12 @@ pub struct Bib {
     /// keep the BIB alive.
     held: HeldSlots,
 }
+
+/// Low bit of [`Bib::adopt_until_ms`] (a 1 ms shift of the window): the
+/// BIB was adopted with an incomplete hint set (a remote evicted, or a
+/// hint older than TCP_EST dropped), so pickup stays allowed on it under
+/// strict mode (SEC-002). Kept in the existing field: no BIB growth.
+pub(crate) const ADOPT_LOOSE: u64 = 1;
 
 // PERF-002: a BIB exists per binding (up to `nat64.max_bibs`); any growth
 // must be deliberate and reflected in `plat_common::memory`. The held-SYN
@@ -367,6 +373,9 @@ pub struct ClusterSetup {
     pub directory: Arc<Directory>,
     /// `cluster.ha.tcp_adopt_secs` (0 disables the TCP pickup window).
     pub tcp_adopt_secs: u32,
+    /// `cluster.ha.session_hints != "off"`: ESTABLISHED TCP sessions are
+    /// replicated as hints and restored on adoption.
+    pub session_hints: bool,
     /// `cluster.ha.takeover_quarantine_secs`.
     pub quarantine_secs: u32,
     /// `cluster.ha.reserve_ahead_blocks`.
@@ -391,6 +400,7 @@ impl ClusterSetup {
             steering: cfg.cluster.steering_mode(),
             directory: Arc::new(Directory::new(cfg.nat64.table_shards, cfg.nat64.max_subscribers)),
             tcp_adopt_secs: ha.map_or(0, |h| h.tcp_adopt_secs),
+            session_hints: ha.is_some_and(|h| h.hints_on()),
             quarantine_secs: ha.map_or(600, |h| h.takeover_quarantine_secs),
             reserve_ahead: ha.map_or(8, |h| h.reserve_ahead_blocks),
         })
@@ -427,6 +437,15 @@ struct ClusterCtx {
     steering: SteeringMode,
     directory: Arc<Directory>,
     tcp_adopt_ms: u64,
+    /// See [`ClusterSetup::session_hints`].
+    pub(super) session_hints: bool,
+    /// Per slice: after an in-sync, hinted adoption no TCP session is
+    /// picked up without a SYN (RFC 6146 §3.5.2.2). Written by the control
+    /// plane (Activate, adoption and release begin), read relaxed by
+    /// workers only on the cold pickup path.
+    strict_tcp: Box<[std::sync::atomic::AtomicBool]>,
+    /// Destination policy for restored sessions (the outbound path's).
+    restore_dst: RestoreDst,
     quarantine_ms: u64,
     /// Cursor of an [`State::adopt_slice`] refused part way
     /// (`AuditUnavailable`), per slice: the retry resumes it, so each
@@ -437,6 +456,51 @@ struct ClusterCtx {
     /// Per slice: a [`Release`] cursor is in progress (POAM-048). Written
     /// and read by the control plane only, never by a worker.
     releasing: Box<[std::sync::atomic::AtomicBool]>,
+}
+
+/// Side effects of a session update on the worker path
+/// ([`State::outbound_with`], [`State::inbound_with`]).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SessionOpts<'a> {
+    /// Mirror the session (the engine found the flow eligible).
+    pub mirror: bool,
+    /// This worker's replication ring (HA): session hints.
+    pub repl: Option<&'a ReplProducer>,
+}
+
+/// IPv4 destinations a subscriber may not reach: never-translatable space
+/// always, and non-global space outside the cluster pool when
+/// `deny_non_global`. The one predicate behind the engine's outbound check
+/// (`Nat64::dst_forbidden`) and the restore check
+/// ([`State::restore_dest_ok`]), so the two cannot drift (SEC-003).
+///
+/// COMPLIANCE MAPPING:
+/// - NIST 800-53: SC-7, SC-7(5) - outbound destination policy
+/// - RFC 6052 §3.1 - the WKP must not reach non-global IPv4 space
+#[inline]
+pub(crate) fn dst_forbidden_v4(a: u32, deny_non_global: bool, cluster_pool: &[Ipv4Cidr]) -> bool {
+    use plat_xlat::rfc6052::is_never_translatable_v4;
+    is_never_translatable_v4(a) || (deny_non_global && non_global_foreign_v4(a, cluster_pool))
+}
+
+/// Non-global IPv4 address (RFC 6890) outside the cluster pool. The pool
+/// test only runs for non-global addresses, so global traffic pays one
+/// table check.
+#[inline]
+pub(crate) fn non_global_foreign_v4(a: u32, cluster_pool: &[Ipv4Cidr]) -> bool {
+    plat_xlat::rfc6052::is_non_global_v4(a) && !cluster_pool.iter().any(|c| c.contains(a))
+}
+
+/// The engine's outbound destination policy ([`dst_forbidden_v4`]) with
+/// its inputs, applied to the remote of a restored session.
+#[derive(Debug)]
+struct RestoreDst {
+    /// Non-global IPv4 outside the cluster pool is refused.
+    deny_non_global: bool,
+    cluster_pool: Vec<Ipv4Cidr>,
+    /// Pool remotes are restored only with `translation.cross_node_hairpin`
+    /// (see [`State::restore_dest_ok`]).
+    cross_node_hairpin: bool,
 }
 
 #[derive(Debug)]
@@ -715,12 +779,21 @@ impl State {
         let n = &cfg.nat64;
         let pool = Pool::new_sliced(&setup.slices, n.port_min, n.port_max, n.port_block_size, setup.reserve_ahead)?;
         let n_slices = setup.slices.len();
+        let t = &cfg.translation;
+        let wkp = Prefix6052::new(t.nat64_prefix.network(), t.nat64_prefix.prefix_len()).is_none_or(|p| p.is_wkp());
         let ctx = ClusterCtx {
             self_id: setup.self_id,
             slices: setup.slices,
             steering: setup.steering,
             directory: setup.directory,
             tcp_adopt_ms: u64::from(setup.tcp_adopt_secs) * 1000,
+            session_hints: setup.session_hints,
+            strict_tcp: (0..n_slices).map(|_| std::sync::atomic::AtomicBool::new(false)).collect(),
+            restore_dst: RestoreDst {
+                deny_non_global: wkp || !t.allow_non_global_destinations,
+                cluster_pool: n.pool.clone(),
+                cross_node_hairpin: t.cross_node_hairpin,
+            },
             quarantine_ms: u64::from(setup.quarantine_secs) * 1000,
             adopt_stash: parking_lot::Mutex::new(Map::with_hasher(RandomState::new())),
             releasing: (0..n_slices).map(|_| std::sync::atomic::AtomicBool::new(false)).collect(),
@@ -1448,20 +1521,27 @@ impl State {
     /// A refresh only lowers the shard's due hint when a TCP transition
     /// shortens the lifetime (rare); a steady-state refresh never touches it
     /// (POAM-012).
+    ///
+    /// Returns true when the session first became ESTABLISHED (from V6
+    /// INIT, V4 INIT or Pickup): the caller then emits its session hint.
+    /// TRANS → ESTABLISHED does not count, so a remote looping RST and ACK
+    /// cannot flood the replication ring (SC-5).
     #[inline]
-    fn refresh(&self, p: u8, s: &mut Session, side: Side, flags: u8, now: u64, due: &AtomicU64) {
+    fn refresh(&self, p: u8, s: &mut Session, side: Side, flags: u8, now: u64, due: &AtomicU64) -> bool {
+        let mut est = false;
         let timer = match s.tcp {
             Some(st) => {
                 let (n, t) = tcp::step(st, side, flags);
                 if n != st {
                     s.tcp = Some(n);
+                    est = tcp::first_established(st, n);
                 }
                 t
             }
             None => Timer::Established,
         };
         let expires = match timer {
-            Timer::Keep => return,
+            Timer::Keep => return est,
             Timer::Transitory => now + self.to.tcp_trans,
             Timer::Established => now + self.timeout(p, s.tcp),
         };
@@ -1471,6 +1551,70 @@ impl State {
             }
             s.expires_ms = expires;
         }
+        est
+    }
+
+    /// Queues the session hint of a TCP session that just became
+    /// ESTABLISHED (cold: once per connection), under the `bib4` shard the
+    /// caller holds. No lock, no allocation: one SPSC push, dropped and
+    /// counted (slice resynced) when the ring is full.
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: CP-10 - the backup learns every established TCP
+    ///   session of the slice (POAM-028)
+    /// - NIST 800-53: SC-5 - at most one record per connection, never per
+    ///   packet; bounded ring
+    #[cold]
+    #[inline(never)]
+    fn hint(&self, repl: Option<&ReplProducer>, k4: Key4, remote: (u32, u16)) {
+        let (Some(tx), Some(c)) = (repl, self.cluster.as_deref()) else { return };
+        if !c.session_hints || k4.proto != proto::TCP || remote.0 == 0 || remote.1 == 0 || k4.port == 0 {
+            return;
+        }
+        let Some(slice) = self.pool.index(k4.addr).and_then(|i| self.pool.slice_of_idx(i)) else { return };
+        tx.push(ReplRecord::SessHint { slice, v4: k4.addr, port4: k4.port, raddr: remote.0, rport: remote.1 });
+    }
+
+    /// Strict TCP state creation for slice `s` (see `ClusterCtx`).
+    pub(super) fn set_strict_tcp(&self, s: SliceId, on: bool) {
+        if let Some(f) = self.cluster.as_ref().and_then(|c| c.strict_tcp.get(usize::from(s))) {
+            f.store(on, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether slice `s` refuses un-hinted TCP pickup (status, tests).
+    pub fn strict_tcp(&self, s: SliceId) -> bool {
+        self.cluster.as_ref().and_then(|c| c.strict_tcp.get(usize::from(s))).is_some_and(|f| f.load(Ordering::Relaxed))
+    }
+
+    /// Whether this node replicates and restores session hints.
+    pub fn session_hints(&self) -> bool {
+        self.cluster.as_ref().is_some_and(|c| c.session_hints)
+    }
+
+    /// The destination policy for the remote of a restored session
+    /// (SC-7): exactly the engine's outbound check ([`dst_forbidden_v4`],
+    /// the same function), plus one restore-only rule. A remote inside the
+    /// cluster pool is a hairpin peer. The outbound path accepts it (an
+    /// own-node hairpin loops back in-process, a cross-node one goes on the
+    /// wire), but its replies only arrive through the hairpin loop or, from
+    /// another node, with `cross_node_hairpin`. So a pool remote is restored
+    /// only with `cross_node_hairpin`. Own-node hairpin sessions are never
+    /// restored: the remote's slice may be owned elsewhere after the
+    /// takeover, and they are re-created by the next outbound SYN
+    /// (RFC-05 residual, POAM-028).
+    pub(super) fn restore_dest_ok(&self, remote: (u32, u16)) -> bool {
+        // SEC-006: without a cluster config there is no adoption and so no
+        // restore; refusing (fail closed) is correct, and the restore path
+        // is never reached from the legacy engine.
+        let Some(c) = self.cluster.as_deref() else { return false };
+        let d = &c.restore_dst;
+        let a = remote.0;
+        let in_pool = d.cluster_pool.iter().any(|p| p.contains(a));
+        !(a == 0
+            || remote.1 == 0
+            || dst_forbidden_v4(a, d.deny_non_global, &d.cluster_pool)
+            || (in_pool && !d.cross_node_hairpin))
     }
 
     /// Removes an expired session that the sweeper has not reached yet
@@ -1490,19 +1634,53 @@ impl State {
     /// BIB vanished concurrently; the caller retries once.
     #[inline]
     pub fn outbound(&self, k4: Key4, remote: (u32, u16), flags: u8, counters: &Counters) -> Result<(), DropReason> {
-        self.outbound_with(k4, remote, flags, false, counters)
+        self.outbound_with(k4, remote, flags, SessionOpts::default(), counters)
     }
 
     /// [`State::outbound`] that also mirrors the session when `mirror` (the
     /// engine found the flow eligible: UDP, remote outside the cluster
-    /// pool) and a mirror is attached.
+    /// pool) and a mirror is attached (`opts.mirror`). With `opts.repl`
+    /// (HA) a TCP session that becomes ESTABLISHED queues its session hint.
     #[inline]
     pub fn outbound_with(
         &self,
         k4: Key4,
         remote: (u32, u16),
         flags: u8,
+        opts: SessionOpts<'_>,
+        counters: &Counters,
+    ) -> Result<(), DropReason> {
+        self.outbound_core(k4, remote, flags, opts.mirror, opts.repl, counters)
+    }
+
+    /// [`State::outbound_with`] without a replication ring (the unsliced
+    /// engine): `mirror` by value as before session hints, and the hint
+    /// path folds away in this copy (PERF-001).
+    #[inline]
+    pub fn outbound_mirror(
+        &self,
+        k4: Key4,
+        remote: (u32, u16),
+        flags: u8,
         mirror: bool,
+        counters: &Counters,
+    ) -> Result<(), DropReason> {
+        self.outbound_core(k4, remote, flags, mirror, None, counters)
+    }
+
+    // PERF-001: `#[inline]`, not `inline(always)`. Forced, the body was
+    // inlined twice into `Nat64::outbound_v6` (first try and the
+    // NoBinding retry), and LLVM then outlined `refresh` and the shard
+    // `lock_due` as calls; main keeps one out-of-line copy with both
+    // inlined, which this restores.
+    #[inline]
+    fn outbound_core(
+        &self,
+        k4: Key4,
+        remote: (u32, u16),
+        flags: u8,
+        mirror: bool,
+        repl: Option<&ReplProducer>,
         counters: &Counters,
     ) -> Result<(), DropReason> {
         let now = self.clock.now_ms();
@@ -1514,7 +1692,9 @@ impl State {
         let bib = g.get_mut(&k4).ok_or(DropReason::NoBinding)?;
         if let Some(s) = bib.sessions.get_mut(&remote) {
             if self.live(s, now) {
-                self.refresh(k4.proto, s, Side::V6, flags, now, due);
+                if self.refresh(k4.proto, s, Side::V6, flags, now, due) {
+                    self.hint(repl, k4, remote);
+                }
                 if mirror && s.slot == NO_SLOT {
                     self.mirror_install(k4, bib, remote, true);
                 }
@@ -1533,7 +1713,7 @@ impl State {
                 }
                 Some(t) => (Some(t), self.timeout(k4.proto, Some(t))),
                 // A picked-up session starts on the transitory timer.
-                None => (Some(Self::pickup(bib, flags, now)?), self.to.tcp_trans),
+                None => (Some(self.pickup(k4, bib, flags, now)?), self.to.tcp_trans),
             }
         } else {
             (None, self.timeout(k4.proto, None))
@@ -1542,6 +1722,10 @@ impl State {
         bib.insert_session(remote, Session::new(now + life, tcp));
         lower_due(due, now + life);
         counters.inc(Counter::SessionCreated);
+        // Simultaneous open completes at creation.
+        if tcp == Some(TcpState::Established) {
+            self.hint(repl, k4, remote);
+        }
         if mirror {
             self.mirror_install(k4, bib, remote, false);
         }
@@ -1550,23 +1734,45 @@ impl State {
 
     /// A non-SYN outbound TCP segment without a session: only an adopted
     /// BIB inside its pickup window may create one (transitory until the
-    /// IPv4 side answers), so a
-    /// long-lived connection survives a takeover.
+    /// IPv4 side answers), so a long-lived connection survives a takeover.
+    /// Not after an in-sync adoption with session hints: there every
+    /// ESTABLISHED session of the old owner was restored, so an ACK-only
+    /// segment of any other flow is refused as RFC 6146 requires. Two
+    /// exceptions stay allowed under strict mode: a FIN (a flow that was
+    /// closing on the old owner, FIN RCV or TRANS, was not exported; it
+    /// gets PickupFin, V6 FIN RCV on the transitory timer until the IPv4
+    /// side speaks, RFC-03 / SEC-004), and any segment on
+    /// a BIB adopted hint-incomplete ([`ADOPT_LOOSE`]).
     ///
     /// COMPLIANCE MAPPING:
     /// - RFC 6146 §3.5.2.2 - documented deviation: only a SYN creates TCP
     ///   state, except on a BIB adopted from a failed slice owner during
-    ///   `cluster.ha.tcp_adopt_secs` (outbound only; RST never creates)
+    ///   `cluster.ha.tcp_adopt_secs` (outbound only; RST never creates),
+    ///   and only when the adoption was not in sync or not hinted, the
+    ///   segment carries FIN, or the BIB's hint set was incomplete
     /// - NIST 800-53: CP-10 - flow continuity across failover
-    // POAM: POAM-028 RFC 6146 §3.5.2.2 deviation: on an adopted BIB a
-    // non-SYN outbound TCP segment creates a session during the takeover
-    // pickup window (sessions are not replicated, decision Q2). It runs on
-    // the transitory timer (state Pickup, or V6 FIN RCV for a FIN) and
-    // becomes ESTABLISHED only on a packet from the IPv4 side (RFC-002).
+    // POAM: POAM-028 (Partial) RFC 6146 §3.5.2.2 deviation: after an
+    // adoption that was not in sync or not hinted (hints off on either
+    // node, or a hint lost), a non-SYN outbound TCP segment on an adopted
+    // BIB creates a session during the pickup window; after a strict one,
+    // only a FIN segment, or any segment on a BIB whose hints were
+    // incomplete (evicted, or older than TCP_EST). It runs on the
+    // transitory timer (state Pickup, or PickupFin for a FIN, SEC-004) and becomes
+    // ESTABLISHED only on a packet from the IPv4 side (RFC-002). UDP has no
+    // hints: inbound-first UDP/QUIC under ADF still stalls after takeover.
     #[cold]
     #[inline(never)]
-    fn pickup(bib: &Bib, flags: u8, now: u64) -> Result<TcpState, DropReason> {
-        if bib.adopt_until_ms > now && flags & tcp::RST == 0 {
+    fn pickup(&self, k4: Key4, bib: &Bib, flags: u8, now: u64) -> Result<TcpState, DropReason> {
+        let lenient = flags & tcp::FIN != 0 || bib.adopt_until_ms & ADOPT_LOOSE != 0;
+        if bib.adopt_until_ms > now
+            && flags & tcp::RST == 0
+            && (lenient
+                || !self
+                    .pool
+                    .index(k4.addr)
+                    .and_then(|i| self.pool.slice_of_idx(i))
+                    .is_some_and(|s| self.strict_tcp(s)))
+        {
             Ok(tcp::pickup(flags))
         } else {
             Err(DropReason::TcpNoState)
@@ -1589,10 +1795,10 @@ impl State {
         remote: (u32, u16),
         flags: u8,
         syn: Option<SynMeta>,
-        mirror: bool,
+        opts: SessionOpts<'_>,
         counters: &Counters,
     ) -> Result<Option<Key6>, DropReason> {
-        self.inbound_inner(k4, remote, flags, syn, mirror, counters)
+        self.inbound_inner(k4, remote, flags, syn, opts, counters)
     }
 
     /// [`State::inbound`] that may hold a refused SYN: with `syn` (an
@@ -1608,7 +1814,7 @@ impl State {
         syn: Option<SynMeta>,
         counters: &Counters,
     ) -> Result<Option<Key6>, DropReason> {
-        self.inbound_inner(k4, remote, flags, syn, false, counters)
+        self.inbound_inner(k4, remote, flags, syn, SessionOpts::default(), counters)
     }
 
     #[inline(always)]
@@ -1618,16 +1824,19 @@ impl State {
         remote: (u32, u16),
         flags: u8,
         syn: Option<SynMeta>,
-        mirror: bool,
+        opts: SessionOpts<'_>,
         counters: &Counters,
     ) -> Result<Option<Key6>, DropReason> {
+        let SessionOpts { mirror, repl } = opts;
         let now = self.clock.now_ms();
         let (mut g, due) = self.bib4.lock_due(&k4);
         hold_probe!();
         let bib = g.get_mut(&k4).ok_or(DropReason::NoBinding)?;
         if let Some(s) = bib.sessions.get_mut(&remote) {
             if self.live(s, now) {
-                self.refresh(k4.proto, s, Side::V4, flags, now, due);
+                if self.refresh(k4.proto, s, Side::V4, flags, now, due) {
+                    self.hint(repl, k4, remote);
+                }
                 if mirror && s.slot == NO_SLOT {
                     self.mirror_install(k4, bib, remote, true);
                 }
@@ -2469,6 +2678,32 @@ pub struct AdoptStats {
     pub rejected: u32,
     /// Stale local state of the slice released first.
     pub stale: ReleaseStats,
+    /// Hinted TCP sessions restored as `Pickup` (metrics only, no audit
+    /// field: `plat_cluster_sessions_restored_total`).
+    pub sessions_restored: u64,
+    /// Hinted sessions not restored, by reason.
+    pub sessions_refused: RestoreRefused,
+}
+
+/// Why a hinted session was not restored
+/// (`plat_cluster_session_restore_refused_total{reason}`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RestoreRefused {
+    pub session_limit: u64,
+    pub subscriber_limit: u64,
+    /// The remote fails the outbound destination policy.
+    pub policy: u64,
+    /// The BIB already had a session with the remote.
+    pub duplicate: u64,
+    /// The hint was learned more than TCP_EST ago (SEC-001): not restored,
+    /// and pickup stays allowed on its BIB.
+    pub aged: u64,
+}
+
+impl RestoreRefused {
+    pub fn total(&self) -> u64 {
+        self.session_limit + self.subscriber_limit + self.policy + self.duplicate + self.aged
+    }
 }
 
 /// Why [`State::adopt_slice`] did not activate the slice.
@@ -2629,7 +2864,11 @@ impl State {
         self.pool.set_reserve_required(s, on)
     }
 
-    /// Snapshot of slice `s` for a backup: port blocks, then BIBs. Walks
+    /// Snapshot of slice `s` for a backup: port blocks, then BIBs, each TCP
+    /// BIB followed by up to [`crate::repl::MAX_HINTS`] `Sess` records of its
+    /// ESTABLISHED sessions when session hints are on (FIN states and
+    /// `Pickup` are not exported, so an unconfirmed or closing flow is not
+    /// revived on a third node). Walks
     /// whole shards (one lock at a time) until at least `budget` records
     /// are collected; returns the cursor to resume from, or `None` when
     /// done. Concurrent changes reach the backup through the rings, which
@@ -2642,9 +2881,8 @@ impl State {
     ) -> (Vec<SnapRecord>, Option<ExportCursor>) {
         let mut out = Vec::new();
         let mut cur = cursor;
-        if self.cluster.is_none() {
-            return (out, None);
-        }
+        let Some(c) = self.cluster.as_deref() else { return (out, None) };
+        let hints = c.session_hints;
         loop {
             if out.len() >= budget.max(1) {
                 return (out, Some(cur));
@@ -2673,6 +2911,20 @@ impl State {
                             port4: k4.port,
                             created_wall_us: b.created_wall_us,
                         }));
+                        if hints && k4.proto == proto::TCP {
+                            let est = b.sessions.iter().filter(|(r, x)| {
+                                x.tcp == Some(TcpState::Established) && r.0 != 0 && r.1 != 0 && k4.port != 0
+                            });
+                            for (r, _) in est.take(crate::repl::MAX_HINTS) {
+                                out.push(SnapRecord::Sess(WireHint {
+                                    proto: proto::TCP,
+                                    v4: k4.addr,
+                                    port4: k4.port,
+                                    raddr: r.0,
+                                    rport: r.1,
+                                }));
+                            }
+                        }
                     }
                     cur.shard += 1;
                 }

@@ -7,6 +7,13 @@ client:  from netns `cli`, through the translators to the server's NAT64 address
     and expecting the echo; per-flow max gap and survival are recorded
   - a UDP stream with sequence numbers at <udp-pps>, echoed by the server
   - <cps> new short TCP connections per second (success / failure)
+  - <push-flows> server-speaks-first TCP flows (POAM-028 session hints): the
+    client never sends after the handshake; the server (port + 1) pushes one
+    8-byte probe every 100 ms, so after a takeover the new owner sees the
+    IPv4 side first (only a restored session passes ADF/APDF)
+  - <idle-flows> idle-then-push TCP flows: silent in both directions for
+    <idle-secs> after the handshake (across the takeover), then the server
+    (port + 2) pushes as above
   Source addresses rotate over <sources> subscriber /64s (2001:db8:100:<n>::10),
   so subscribers spread over both nodes by the edge ECMP hash.
 syslog:  UDP syslog sink appending each message's JSON payload to a file
@@ -26,23 +33,62 @@ import time
 PROBE_MS = 100
 
 
-def server(args):
-    sel = selectors.DefaultSelector()
+def listener(sel, args, port, kind):
     lt = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     lt.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    lt.bind((args.bind, args.port))
+    lt.bind((args.bind, port))
     lt.listen(4096)
     lt.setblocking(False)
-    sel.register(lt, selectors.EVENT_READ, "accept")
+    sel.register(lt, selectors.EVENT_READ, kind)
+
+
+def server(args):
+    sel = selectors.DefaultSelector()
+    listener(sel, args, args.port, "accept")
+    # Pushed flows: socket -> monotonic time of the next probe.
+    pushed = {}
+    listener(sel, args, args.port + 1, ("push", 0.0))
+    listener(sel, args, args.port + 2, ("push", float(args.idle_secs)))
     us = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     us.bind((args.bind, args.port))
     us.setblocking(False)
     sel.register(us, selectors.EVENT_READ, "udp")
     while True:
-        for key, _ in sel.select(1.0):
-            if key.data == "accept":
+        t = time.monotonic()
+        for c, due in list(pushed.items()):
+            if t < due:
+                continue
+            try:
+                c.send(b"push\x00\x00\x00\x00")
+                pushed[c] = t + PROBE_MS / 1000
+            except BlockingIOError:
+                pushed[c] = t + PROBE_MS / 1000
+            except OSError:
+                del pushed[c]
+                sel.unregister(c)
+                c.close()
+        for key, _ in sel.select(PROBE_MS / 2000):
+            if isinstance(key.data, tuple):
                 try:
-                    c, _ = lt.accept()
+                    c, _ = key.fileobj.accept()
+                except OSError:
+                    continue
+                c.setblocking(False)
+                pushed[c] = time.monotonic() + key.data[1]
+                sel.register(c, selectors.EVENT_READ, "pushed")
+            elif key.data == "pushed":
+                c = key.fileobj
+                try:
+                    d = c.recv(4096)
+                except OSError:
+                    d = b""
+                if not d:
+                    pushed.pop(c, None)
+                    sel.unregister(c)
+                    c.close()
+            elif key.data == "accept":
+                try:
+                    c, _ = key.fileobj.accept()
                 except OSError:
                     continue
                 c.setblocking(False)
@@ -81,25 +127,28 @@ def client(args):
     # timeout per flow made a blackholed run last up to flows * 5 s).
     pending = {}
     csel = selectors.DefaultSelector()
-    for i in range(args.flows):
+    kinds = [("echo", args.port)] * args.flows
+    kinds += [("push", args.port + 1)] * args.push_flows
+    kinds += [("idle", args.port + 2)] * args.idle_flows
+    for i, (kind, port) in enumerate(kinds):
         s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
         s.bind((src(i, args.sources), 0))
         s.setblocking(False)
-        if s.connect_ex((args.target, args.port)) not in (0, errno.EINPROGRESS):
+        if s.connect_ex((args.target, port)) not in (0, errno.EINPROGRESS):
             s.close()
             continue
-        pending[s] = True
+        pending[s] = kind
         csel.register(s, selectors.EVENT_WRITE)
     deadline = now() + 5
     while pending and now() < deadline:
         for key, _ in csel.select(max(0.0, deadline - now())):
             s = key.fileobj
             csel.unregister(s)
-            del pending[s]
+            kind = pending.pop(s)
             if s.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR) != 0:
                 s.close()
                 continue
-            flows[s] = {"last": now(), "gap": 0.0, "alive": True}
+            flows[s] = {"last": now(), "gap": 0.0, "alive": True, "kind": kind, "seen": False}
             sel.register(s, selectors.EVENT_READ, "tcp")
     for s in pending:
         s.close()
@@ -114,7 +163,8 @@ def client(args):
     # The connect phase can last up to its 5 s deadline: measure gaps from
     # here, not from each flow's own connect time.
     for f in flows.values():
-        f["last"] = start
+        # Idle flows are measured from the end of their silence.
+        f["last"] = start + (args.idle_secs if f["kind"] == "idle" else 0)
     end = start + args.duration
     next_probe = start
     next_udp = start
@@ -130,7 +180,8 @@ def client(args):
         t = now()
         if t >= next_probe:
             for s, f in flows.items():
-                if f["alive"]:
+                # Pushed flows never send after the handshake.
+                if f["alive"] and f["kind"] == "echo":
                     try:
                         s.send(b"probe\x00\x00\x00")
                     except BlockingIOError:
@@ -205,18 +256,35 @@ def client(args):
             t2 = now()
             f["gap"] = max(f["gap"], t2 - f["last"])
             f["last"] = t2
+            f["seen"] = True
     t = now()
     for f in flows.values():
         if f["alive"]:
             f["gap"] = max(f["gap"], t - f["last"])
-            # A flow that has not seen an echo for 10 s is counted as dead.
-            if t - f["last"] > 10:
+            # A flow that has not seen an echo (or a push) for 10 s, or a
+            # pushed flow that never received anything, is counted as dead.
+            if t - f["last"] > 10 or (f["kind"] != "echo" and not f["seen"]):
                 f["alive"] = False
+
+    def of(kind):
+        return [f for f in flows.values() if f["kind"] == kind]
+
+    def gap_ms(fs):
+        return int(max((f["gap"] for f in fs if f["alive"]), default=0) * 1000)
+
+    echo = of("echo")
     out = {
-        "tcp_flows": len(flows),
+        "tcp_flows": len(echo),
         "tcp_requested": args.flows,
-        "tcp_survived": sum(1 for f in flows.values() if f["alive"]),
-        "tcp_max_gap_ms": int(max((f["gap"] for f in flows.values() if f["alive"]), default=0) * 1000),
+        "tcp_survived": sum(1 for f in echo if f["alive"]),
+        "tcp_max_gap_ms": gap_ms(echo),
+        "push_flows": len(of("push")),
+        "push_requested": args.push_flows,
+        "push_survived": sum(1 for f in of("push") if f["alive"]),
+        "push_max_gap_ms": gap_ms(of("push")),
+        "idle_flows": len(of("idle")),
+        "idle_requested": args.idle_flows,
+        "idle_survived": sum(1 for f in of("idle") if f["alive"]),
         "udp_sent": seq,
         "udp_recv": udp_recv,
         "udp_max_gap_ms": int(udp_gap * 1000),
@@ -250,6 +318,9 @@ def main():
     p.add_argument("--udp-pps", type=float, default=200)
     p.add_argument("--cps", type=float, default=20)
     p.add_argument("--sources", type=int, default=8)
+    p.add_argument("--push-flows", type=int, default=0)
+    p.add_argument("--idle-flows", type=int, default=0)
+    p.add_argument("--idle-secs", type=float, default=20)
     p.add_argument("--out", default="/run/plat-flows.json")
     a = p.parse_args()
     {"server": server, "client": client, "syslog": syslog}[a.mode](a)

@@ -10,7 +10,9 @@
 //! - [`Directory`]: the cluster subscriber directory (`sub → home`), used to
 //!   detect mis-steered new subscribers.
 //! - [`Shadow`]: the backup's copy of the slices it protects, turned into
-//!   an [`AdoptInput`] on takeover.
+//!   an [`AdoptInput`] on takeover. With session hints it also keeps, per
+//!   TCP BIB, up to [`MAX_HINTS`] remotes the primary had an ESTABLISHED
+//!   session with (POAM-028).
 //!
 //! COMPLIANCE MAPPING:
 //! - NIST 800-53: SC-5 (Denial-of-Service Protection) - every ring, the
@@ -20,14 +22,16 @@
 //!   and BIB state survives the loss of the slice owner
 
 use std::cell::Cell;
-use std::collections::HashSet;
+use std::collections::{HashSet, hash_map};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use ahash::RandomState;
 use crossbeam_utils::CachePadded;
 use parking_lot::Mutex;
-use plat_cluster::{MAX_MEMBERS, MemberId, Msg, SliceId, SliceMap, SnapRecord, WireBib, WireBlock};
+use plat_cluster::{
+    MAX_MEMBERS, MemberId, Msg, PROTO_TCP, SliceId, SliceMap, SnapRecord, WireBib, WireBlock, WireHint,
+};
 use plat_packet::proto;
 
 use crate::shard::{Map, Sharded};
@@ -36,12 +40,44 @@ use crate::shard::{Map, Sharded};
 /// ring slot never owns heap memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplRecord {
-    BlockAlloc { slice: SliceId, sub: u128, block: WireBlock, wall_us: u64 },
-    BlockRelease { slice: SliceId, sub: u128, block: WireBlock },
-    BibCreate { slice: SliceId, bib: WireBib },
-    BibDelete { slice: SliceId, proto: u8, v4: u32, port4: u16 },
-    SubHome { sub: u128, slice: SliceId },
-    SubGone { sub: u128 },
+    BlockAlloc {
+        slice: SliceId,
+        sub: u128,
+        block: WireBlock,
+        wall_us: u64,
+    },
+    BlockRelease {
+        slice: SliceId,
+        sub: u128,
+        block: WireBlock,
+    },
+    BibCreate {
+        slice: SliceId,
+        bib: WireBib,
+    },
+    BibDelete {
+        slice: SliceId,
+        proto: u8,
+        v4: u32,
+        port4: u16,
+    },
+    SubHome {
+        sub: u128,
+        slice: SliceId,
+    },
+    SubGone {
+        sub: u128,
+    },
+    /// A TCP session on the BIB `(TCP, v4, port4)` reached ESTABLISHED
+    /// (once per connection; there is no delete record, a hint dies with
+    /// its BIB).
+    SessHint {
+        slice: SliceId,
+        v4: u32,
+        port4: u16,
+        raddr: u32,
+        rport: u16,
+    },
 }
 
 impl ReplRecord {
@@ -52,7 +88,8 @@ impl ReplRecord {
             Self::BlockAlloc { slice, .. }
             | Self::BlockRelease { slice, .. }
             | Self::BibCreate { slice, .. }
-            | Self::BibDelete { slice, .. } => Some(slice),
+            | Self::BibDelete { slice, .. }
+            | Self::SessHint { slice, .. } => Some(slice),
             Self::SubHome { .. } | Self::SubGone { .. } => None,
         }
     }
@@ -67,6 +104,9 @@ impl ReplRecord {
             Self::BibDelete { slice, proto, v4, port4 } => Msg::BibDelete { slice, seq, proto, v4, port4 },
             Self::SubHome { sub, slice } => Msg::SubHome { sub, slice },
             Self::SubGone { sub } => Msg::SubGone { sub },
+            Self::SessHint { slice, v4, port4, raddr, rport } => {
+                Msg::SessHint { slice, seq, hint: WireHint { proto: PROTO_TCP, v4, port4, raddr, rport } }
+            }
         }
     }
 
@@ -82,6 +122,10 @@ impl ReplRecord {
             Msg::BibDelete { slice, seq, proto, v4, port4 } => (Self::BibDelete { slice, proto, v4, port4 }, seq),
             Msg::SubHome { sub, slice } => (Self::SubHome { sub, slice }, 0),
             Msg::SubGone { sub } => (Self::SubGone { sub }, 0),
+            // The codec refuses any protocol other than TCP.
+            Msg::SessHint { slice, seq, hint } => {
+                (Self::SessHint { slice, v4: hint.v4, port4: hint.port4, raddr: hint.raddr, rport: hint.rport }, seq)
+            }
             _ => return None,
         })
     }
@@ -129,6 +173,7 @@ const T_BIB: u64 = 3;
 const T_BIBDEL: u64 = 4;
 const T_HOME: u64 = 5;
 const T_GONE: u64 = 6;
+const T_HINT: u64 = 7;
 
 fn lo(v: u128) -> u64 {
     v as u64
@@ -195,6 +240,10 @@ impl ReplRecord {
                 put(1, lo(sub));
                 put(2, hi(sub));
             }
+            Self::SessHint { slice, v4, port4, raddr, rport } => {
+                put(0, T_HINT | u64::from(slice) << 8 | u64::from(port4) << 24 | u64::from(rport) << 40);
+                put(1, u64::from(v4) | u64::from(raddr) << 32);
+            }
         }
     }
 
@@ -229,6 +278,24 @@ impl ReplRecord {
             T_BIBDEL => Self::BibDelete { slice, proto: (w0 >> 24) as u8, v4: g(1) as u32, port4: (w0 >> 32) as u16 },
             T_HOME => Self::SubHome { sub: join(g(2), g(1)), slice },
             T_GONE => Self::SubGone { sub: join(g(2), g(1)) },
+            T_HINT => {
+                let w1 = g(1);
+                let h = Self::SessHint {
+                    slice: (w0 >> 8) as u16,
+                    v4: w1 as u32,
+                    port4: (w0 >> 24) as u16,
+                    raddr: (w1 >> 32) as u32,
+                    rport: (w0 >> 40) as u16,
+                };
+                // A zero field never comes from a real session.
+                match h {
+                    Self::SessHint { v4: 0, .. }
+                    | Self::SessHint { port4: 0, .. }
+                    | Self::SessHint { raddr: 0, .. }
+                    | Self::SessHint { rport: 0, .. } => return None,
+                    _ => h,
+                }
+            }
             _ => return None,
         })
     }
@@ -266,20 +333,28 @@ impl Ring {
         true
     }
 
-    fn pop_into(&self, max: usize, out: &mut Vec<ReplRecord>) -> usize {
+    /// Pops up to `max` records. A session hint at or past `hint_cut` (a
+    /// tail read before this call) stops the pop and stays queued, with
+    /// everything after it ([`ReplHub::drain`]).
+    fn pop_into(&self, max: usize, out: &mut Vec<ReplRecord>, hint_cut: u64) -> usize {
         let _c = self.consumer.lock();
         let h = self.head.load(Ordering::Relaxed);
         let t = self.tail.load(Ordering::Acquire);
         let n = (t.wrapping_sub(h)).min(max as u64);
-        for i in 0..n {
-            if let Some(r) =
-                self.slots.get((h.wrapping_add(i) & self.mask) as usize).and_then(|s| ReplRecord::decode(&s.0))
-            {
+        let mut taken = 0;
+        while taken < n {
+            let at = h.wrapping_add(taken);
+            let r = self.slots.get((at & self.mask) as usize).and_then(|s| ReplRecord::decode(&s.0));
+            if matches!(r, Some(ReplRecord::SessHint { .. })) && at.wrapping_sub(hint_cut) < 1 << 63 {
+                break;
+            }
+            if let Some(r) = r {
                 out.push(r);
             }
+            taken += 1;
         }
-        self.head.store(h.wrapping_add(n), Ordering::Release);
-        n as usize
+        self.head.store(h.wrapping_add(taken), Ordering::Release);
+        taken as usize
     }
 
     fn len(&self) -> usize {
@@ -297,6 +372,27 @@ pub struct ReplHub {
     dir_dirty: AtomicBool,
     /// Round-robin start for `drain`.
     next: AtomicU32,
+    /// Reorder scratch of `drain` (single consumer; grows once to the
+    /// largest `max` asked for, then is reused).
+    scratch: Mutex<DrainScratch>,
+    /// Hints dropped by `drain` because their BIB was deleted later in the
+    /// same batch.
+    hints_superseded: AtomicU64,
+    /// Drains that may have left records behind (a ring gave its full
+    /// share, or the limit stopped the round): only these can split a
+    /// `BibCreate` from its hint.
+    drains_truncated: AtomicU64,
+}
+
+/// Reused buffers of [`ReplHub::drain`]'s hint reordering.
+#[derive(Debug, Default)]
+struct DrainScratch {
+    /// Hints of the batch with their drain position.
+    hints: Vec<(usize, ReplRecord)>,
+    /// `(slice, v4, port4, position)` of every TCP `BibDelete` in the batch.
+    dels: Vec<(SliceId, u32, u16, usize)>,
+    /// Per-ring tail read before the pops: the hint cut.
+    cuts: Vec<u64>,
 }
 
 /// One worker's (or the sweeper's) producer end. Owned by one thread:
@@ -322,6 +418,9 @@ impl ReplHub {
             dirty: (0..slices.div_ceil(64).max(1)).map(|_| AtomicU64::new(0)).collect(),
             dir_dirty: AtomicBool::new(false),
             next: AtomicU32::new(0),
+            scratch: Mutex::new(DrainScratch::default()),
+            hints_superseded: AtomicU64::new(0),
+            drains_truncated: AtomicU64::new(0),
         });
         let prods =
             rings.into_iter().map(|ring| ReplProducer { ring, head_cache: Cell::new(0), hub: hub.clone() }).collect();
@@ -330,24 +429,150 @@ impl ReplHub {
 
     /// Moves up to `max` records into `out`, taking a batch from every ring
     /// in turn so one busy worker cannot starve the others. Records from
-    /// one ring keep their order.
+    /// one ring keep their order, except that the batch's session hints
+    /// follow every BIB record of the batch ([`Self::hints_last`]).
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: SC-5 - no allocation beyond `max` records of reused
+    ///   scratch; CP-10 - a hint whose `BibCreate` sits on another ring of
+    ///   the same drain is no longer refused `no_bib` (decision Q1 revised)
     pub fn drain(&self, max: usize, out: &mut Vec<ReplRecord>) -> usize {
+        self.drain_rounds(max, 1, out)
+    }
+
+    /// [`Self::drain`] that repeats the round, up to `rounds` times, while
+    /// the previous round stopped at a ring's share or at `max` (PERF-002):
+    /// a `BibCreate` left behind by a cut round is then taken before the
+    /// batch's hints are reordered behind it, so only a burst of more than
+    /// `rounds × max` records can still split a hint from its BIB. One
+    /// reorder runs over the whole batch. Returns the records moved.
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: SC-5 - at most `rounds × max` records per call; the
+    ///   scratch grows once to that and is reused
+    /// - NIST 800-53: CP-10 - fewer hints refused `no_bib` under load
+    ///   (slices stay hinted)
+    pub fn drain_rounds(&self, max: usize, rounds: usize, out: &mut Vec<ReplRecord>) -> usize {
+        let from = out.len();
+        let mut g = self.scratch.lock();
+        let mut got = 0;
+        let mut cut = false;
+        for _ in 0..rounds.max(1) {
+            let (k, c) = self.drain_rings(max, out, &mut g.cuts);
+            got += k;
+            cut = c;
+            if !c {
+                break;
+            }
+        }
+        if cut {
+            self.drains_truncated.fetch_add(1, Ordering::Relaxed);
+        }
+        self.hints_last(out, from, &mut g);
+        got
+    }
+
+    /// One round over the rings. Every tail is read first (`cuts`), then
+    /// the rings are popped; hints are taken only below their ring's cut.
+    /// A hint below its cut was pushed before the last cut was read, so
+    /// its `BibCreate` (pushed before the hint, on any ring) is below the
+    /// tail that ring's pop reads afterwards: it is in this batch unless
+    /// the share or `max` stopped that ring first.
+    fn drain_rings(&self, max: usize, out: &mut Vec<ReplRecord>, cuts: &mut Vec<u64>) -> (usize, bool) {
         let n = self.rings.len();
         if n == 0 {
-            return 0;
+            return (0, false);
         }
+        cuts.clear();
+        cuts.extend(self.rings.iter().map(|r| r.tail.load(Ordering::Acquire)));
         let start = self.next.fetch_add(1, Ordering::Relaxed) as usize;
         let share = max.div_ceil(n).max(1);
-        let mut got = 0;
+        let (mut got, mut cut) = (0, false);
         for i in 0..n {
             if got >= max {
+                cut = true;
                 break;
             }
             if let Some(r) = self.rings.get((start + i) % n) {
-                got += r.pop_into(share.min(max - got), out);
+                let cap = share.min(max - got);
+                let k = r.pop_into(cap, out, cuts.get((start + i) % n).copied().unwrap_or(0));
+                cut |= k == cap;
+                got += k;
             }
         }
-        got
+        (got, cut)
+    }
+
+    /// Moves the session hints of `out[from..]` behind every other record,
+    /// keeping their relative order, so a hint follows its `BibCreate` even
+    /// when the two came from different rings (SYN and SYN/ACK on different
+    /// workers). Other records keep their drain order. Moving a hint can
+    /// only pass records drained after it; the one such record that
+    /// matters is a `BibDelete` of the hint's BIB (no other record removes a
+    /// shadow BIB): a hint drained before a delete of `(TCP, v4, port4)` in
+    /// the same batch is dropped, because sent after the delete it would
+    /// be refused `no_bib` (gapping the slice), or after a re-create
+    /// attach a remote of the old mapping to the new one. Dropping it is
+    /// what the shadow does anyway: a hint dies with its BIB (counted
+    /// [`Self::hints_superseded`]). A hint drained after the delete (a
+    /// re-created BIB) is kept. With the tail cut of [`Self::drain_rings`]
+    /// the batch holds every `BibCreate` of its hints, except one left in
+    /// its ring because the share or `max` stopped that ring
+    /// ([`Self::drains_truncated`]); that hint is refused `no_bib` and the
+    /// slice resyncs (`mark_gap`, POAM-028).
+    fn hints_last(&self, out: &mut Vec<ReplRecord>, from: usize, scratch: &mut DrainScratch) {
+        let Some(batch) = out.get(from..) else { return };
+        if !batch.iter().any(|r| matches!(r, ReplRecord::SessHint { .. })) {
+            return;
+        }
+        let DrainScratch { hints, dels, .. } = scratch;
+        hints.clear();
+        dels.clear();
+        let mut w = from;
+        for i in from..out.len() {
+            let Some(&r) = out.get(i) else { break };
+            match r {
+                ReplRecord::SessHint { .. } => {
+                    hints.push((i, r));
+                    continue;
+                }
+                ReplRecord::BibDelete { slice, proto: proto::TCP, v4, port4 } => dels.push((slice, v4, port4, i)),
+                _ => {}
+            }
+            if let Some(slot) = out.get_mut(w) {
+                *slot = r;
+            }
+            w += 1;
+        }
+        out.truncate(w);
+        // Last delete position per BIB: the final element of each key run.
+        dels.sort_unstable();
+        for &(pos, h) in hints.iter() {
+            if let ReplRecord::SessHint { slice, v4, port4, .. } = h {
+                let end = dels.partition_point(|d| (d.0, d.1, d.2) <= (slice, v4, port4));
+                let deleted_later = end
+                    .checked_sub(1)
+                    .and_then(|j| dels.get(j))
+                    .is_some_and(|d| (d.0, d.1, d.2) == (slice, v4, port4) && d.3 > pos);
+                if deleted_later {
+                    self.hints_superseded.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    out.push(h);
+                }
+            }
+        }
+    }
+
+    /// Hints dropped by [`Self::drain`] because a later record of the same
+    /// batch deleted their BIB.
+    pub fn hints_superseded(&self) -> u64 {
+        self.hints_superseded.load(Ordering::Relaxed)
+    }
+
+    /// Drains whose last round stopped at a ring's share or at `max`
+    /// (conservative: a ring that held exactly its share counts).
+    pub fn drains_truncated(&self) -> u64 {
+        self.drains_truncated.load(Ordering::Relaxed)
     }
 
     /// Records waiting in all rings.
@@ -582,6 +807,128 @@ pub enum ShadowError {
     Proto,
     /// The shadow BIB store is full.
     Full,
+    /// A session hint for a BIB the shadow does not hold (it was lost, or
+    /// the hint overtook its `BibCreate` from another worker ring). Not a
+    /// peer fault: the replicator marks the slice gapped and resyncs.
+    NoBib,
+    /// A session hint with a zero address or port.
+    Invalid,
+}
+
+/// Remotes kept per shadow TCP BIB (SC-5): a fifth replaces the oldest and
+/// makes the BIB hint-incomplete ([`Hints::lossy`]).
+pub const MAX_HINTS: usize = 4;
+
+/// Session hints of one shadow TCP BIB: remote IPv4 `(address, port)`
+/// pairs with the time each was learned (shadow clock, seconds), oldest
+/// replaced first, duplicates refreshed. Stored inline in [`ShadowBib`]
+/// (44 B, PERF-003): no allocation per hinted BIB.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Hints {
+    addr: [u32; MAX_HINTS],
+    learned_s: [u32; MAX_HINTS],
+    port: [u16; MAX_HINTS],
+    n: u8,
+    next: u8,
+    lossy: bool,
+}
+
+impl Hints {
+    /// Adds `remote` learned at `learned_s` (a duplicate only refreshes its
+    /// time). At [`MAX_HINTS`] the oldest goes and the set is marked
+    /// [`Self::lossy`]; returns whether a remote was evicted. Hints never
+    /// retire on close, so every evicted remote may still be a live session
+    /// (SEC-002).
+    pub fn add(&mut self, remote: (u32, u16), learned_s: u32) -> bool {
+        let n = usize::from(self.n).min(MAX_HINTS);
+        let dup = (0..n).find(|&i| self.addr.get(i) == Some(&remote.0) && self.port.get(i) == Some(&remote.1));
+        if let Some(i) = dup {
+            if let Some(t) = self.learned_s.get_mut(i) {
+                *t = (*t).max(learned_s);
+            }
+            return false;
+        }
+        let i = usize::from(self.next) % MAX_HINTS;
+        let evicted = n == MAX_HINTS;
+        if let (Some(a), Some(p), Some(t)) = (self.addr.get_mut(i), self.port.get_mut(i), self.learned_s.get_mut(i)) {
+            (*a, *p, *t) = (remote.0, remote.1, learned_s);
+        }
+        self.next = ((i + 1) % MAX_HINTS) as u8;
+        self.n = (n + 1).min(MAX_HINTS) as u8;
+        self.lossy |= evicted;
+        evicted
+    }
+
+    /// `(remote, learned_s)` of every hint, oldest slot first.
+    pub fn iter(&self) -> impl Iterator<Item = ((u32, u16), u32)> + '_ {
+        let n = usize::from(self.n).min(MAX_HINTS);
+        self.addr.iter().zip(&self.port).zip(&self.learned_s).take(n).map(|((&a, &p), &t)| ((a, p), t))
+    }
+
+    pub fn len(&self) -> usize {
+        usize::from(self.n).min(MAX_HINTS)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.n == 0
+    }
+
+    /// The set may lack a live session of the BIB (a remote was evicted,
+    /// or an abandoned adoption returned a BIB that was incomplete): the
+    /// adopter allows pickup on this BIB even under strict mode.
+    pub fn lossy(&self) -> bool {
+        self.lossy
+    }
+
+    pub fn mark_lossy(&mut self) {
+        self.lossy = true;
+    }
+}
+
+/// Seconds of a millisecond clock reading, as stored in [`Hints`] (wraps
+/// after 136 years).
+pub fn hint_secs(ms: u64) -> u32 {
+    (ms / 1000) as u32
+}
+
+/// One shadow BIB with its session hints (TCP only; `None` for every
+/// un-hinted BIB). Inline: the hints cost [`SHADOW_BIB_HINT_BYTES`] per
+/// shadow entry, hinted or not, and never allocate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShadowBib {
+    pub bib: WireBib,
+    pub hints: Option<Hints>,
+}
+
+/// What inline [`Hints`] add to every shadow BIB entry
+/// (`plat_common::memory::SHADOW_HINT_BYTES` charges this per
+/// `max_sessions`, with the hash table's worst-case bucket overhead).
+pub const SHADOW_BIB_HINT_BYTES: usize = size_of::<ShadowBib>() - size_of::<WireBib>();
+const _: () = assert!(size_of::<Hints>() == 44);
+const _: () = assert!(SHADOW_BIB_HINT_BYTES == 48);
+// The shadow map bucket grows by the same 48 B (key padding included).
+const _: () =
+    assert!(size_of::<((u8, u32, u16), ShadowBib)>() - size_of::<((u8, u32, u16), WireBib)>() == SHADOW_BIB_HINT_BYTES);
+
+impl ShadowBib {
+    pub fn new(bib: WireBib) -> Self {
+        Self { bib, hints: None }
+    }
+}
+
+/// Session-hint counters of the shadow (SI-4,
+/// `plat_cluster_session_hints_*`).
+#[derive(Debug, Default)]
+pub struct HintStats {
+    pub applied: AtomicU64,
+    pub no_bib: AtomicU64,
+    pub outside_slice: AtomicU64,
+    pub invalid: AtomicU64,
+    /// A snapshot `Sess` record without its `Bib`.
+    pub sess_orphan: AtomicU64,
+    /// A fifth remote replaced a (possibly live) one: the BIB is marked
+    /// hint-incomplete (`plat_cluster_session_hints_evicted_total`).
+    pub evicted: AtomicU64,
 }
 
 /// What a new owner imports on takeover (from [`Shadow::take`]).
@@ -590,6 +937,18 @@ pub struct AdoptInput {
     /// `(sub, block, original allocation time)`.
     pub blocks: Vec<(u128, WireBlock, u64)>,
     pub bibs: Vec<WireBib>,
+    /// Session hints of the TCP BIBs in `bibs` (the hint's BIB is
+    /// `(TCP, v4, port4)`); hints of other BIBs are ignored.
+    pub hints: Vec<WireHint>,
+    /// When each of `hints` was learned (shadow clock, seconds; parallel
+    /// to `hints`, a missing entry means `hint_now_s`).
+    pub hint_learned_s: Vec<u32>,
+    /// `(v4, port4)` of TCP BIBs whose hint set is incomplete (a remote
+    /// was evicted): pickup stays allowed on them.
+    pub hints_lossy: Vec<(u32, u16)>,
+    /// The shadow clock (seconds) when the input was taken: hint ages are
+    /// measured from it.
+    pub hint_now_s: u32,
     /// Reserved with the backup but never seen allocated: held back for
     /// `takeover_quarantine_secs`.
     pub reserved_unseen: Vec<WireBlock>,
@@ -597,6 +956,9 @@ pub struct AdoptInput {
     pub released: Vec<(WireBlock, u64)>,
     /// The shadow was complete (snapshot plus an unbroken stream).
     pub in_sync: bool,
+    /// The primary sent session hints for the slice (`SnapshotEnd.hints`)
+    /// and none was lost since.
+    pub hinted: bool,
     /// Hold back every block that is not adopted (the old owner's state is
     /// not known completely).
     pub hold_unknown: bool,
@@ -613,8 +975,12 @@ pub struct Detached {
     pub released: Vec<(WireBlock, u64)>,
     /// `(proto, v4, port4) -> BIB`: the key already makes the IPv4 side
     /// unique.
-    pub bibs: Map<(u8, u32, u16), WireBib>,
+    pub bibs: Map<(u8, u32, u16), ShadowBib>,
     pub in_sync: bool,
+    /// See [`AdoptInput::hinted`].
+    pub hinted: bool,
+    /// See [`AdoptInput::hint_now_s`].
+    pub hint_now_s: u32,
     pub hold_unknown: bool,
     pub(crate) charge: ShadowCharge,
     /// Where an abandoned adoption returns the state (see
@@ -656,10 +1022,11 @@ impl ShadowHome {
     pub(crate) fn restore(
         self,
         blocks: Map<(u32, u16), (u128, u64)>,
-        bibs: Map<(u8, u32, u16), WireBib>,
-        in_sync: bool,
+        bibs: Map<(u8, u32, u16), ShadowBib>,
+        sync: (bool, bool),
         charge: Option<ShadowCharge>,
     ) {
+        let (in_sync, hinted) = sync;
         let Some(m) = self.slices.get(usize::from(self.slice)) else { return };
         let mut g = m.lock();
         let newer =
@@ -667,9 +1034,18 @@ impl ShadowHome {
         let empty = g.blocks.is_empty() && g.bibs.is_empty() && g.reserved.is_empty() && g.released.is_empty();
         if empty && !newer {
             self.ctr.fetch_add(bibs.len() as u64, Ordering::Relaxed);
-            *g = ShadowSlice { blocks, reserved: self.reserved, released: self.released, bibs, in_sync };
+            *g = ShadowSlice {
+                blocks,
+                reserved: self.reserved,
+                released: self.released,
+                bibs,
+                in_sync,
+                hinted,
+                hint_gap: false,
+            };
         } else {
             g.in_sync = false;
+            g.hinted = false;
         }
         drop(g);
         drop(charge);
@@ -684,6 +1060,8 @@ impl Detached {
             released: Vec::new(),
             bibs: Map::with_hasher(RandomState::new()),
             in_sync: true,
+            hinted: false,
+            hint_now_s: 0,
             hold_unknown: false,
             charge: ShadowCharge { ctr, n: 0 },
             home: None,
@@ -710,8 +1088,12 @@ struct ShadowSlice {
     blocks: Map<(u32, u16), (u128, u64)>,
     reserved: HashSet<(u32, u16), RandomState>,
     released: Map<(u32, u16), u64>,
-    bibs: Map<(u8, u32, u16), WireBib>,
+    bibs: Map<(u8, u32, u16), ShadowBib>,
     in_sync: bool,
+    /// The last snapshot ended with `hints` and no hint was lost since.
+    hinted: bool,
+    /// A hint of the current snapshot found no BIB: it ends un-hinted.
+    hint_gap: bool,
 }
 
 impl ShadowSlice {
@@ -722,6 +1104,8 @@ impl ShadowSlice {
             released: Map::with_hasher(RandomState::new()),
             bibs: Map::with_hasher(RandomState::new()),
             in_sync: false,
+            hinted: false,
+            hint_gap: false,
         }
     }
 }
@@ -749,6 +1133,7 @@ pub struct Shadow {
     /// Per-slice snapshot generation, bumped by every `snapshot_begin`
     /// (a restore after a newer snapshot is dropped, SEC-002).
     gens: Arc<[AtomicU64]>,
+    hint_stats: HintStats,
 }
 
 impl Shadow {
@@ -767,7 +1152,62 @@ impl Shadow {
             bibs: Arc::new(AtomicU64::new(0)),
             max_bibs,
             gens,
+            hint_stats: HintStats::default(),
         }
+    }
+
+    /// Session-hint counters.
+    pub fn hint_stats(&self) -> &HintStats {
+        &self.hint_stats
+    }
+
+    /// Adds one session hint to its shadow TCP BIB.
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: SI-10 - zero fields and addresses outside the slice
+    ///   are refused; SC-5 - at most [`MAX_HINTS`] remotes per BIB, and a
+    ///   hint never creates a BIB; an evicted remote is counted and leaves
+    ///   the BIB hint-incomplete (pickup allowed there, SEC-002)
+    fn apply_hint(
+        &self,
+        slice: SliceId,
+        v4: u32,
+        port4: u16,
+        remote: (u32, u16),
+        now_ms: u64,
+    ) -> Result<(), ShadowError> {
+        let st = &self.hint_stats;
+        if v4 == 0 || port4 == 0 || remote.0 == 0 || remote.1 == 0 {
+            st.invalid.fetch_add(1, Ordering::Relaxed);
+            return Err(ShadowError::Invalid);
+        }
+        if !self.in_slice(slice, v4) {
+            st.outside_slice.fetch_add(1, Ordering::Relaxed);
+            return Err(ShadowError::Range);
+        }
+        let mut g = self.slice(slice)?.lock();
+        let Some(b) = g.bibs.get_mut(&(proto::TCP, v4, port4)) else {
+            // The slice copy now lacks an ESTABLISHED session: not hinted
+            // until the next snapshot (the caller also marks it gapped).
+            // POAM: POAM-028 `ReplHub::drain_rounds` sends a batch's hints
+            // after its BIB records (decision Q1 revised) and repeats cut
+            // rounds (up to 8 in platd), so this is left for a `BibCreate`
+            // still in a ring when the last round stopped at its limit (a
+            // burst over 8 x 4096 records; no early-hint buffer): the slice
+            // loses its hinted state until the resync; counted `no_bib`.
+            g.hinted = false;
+            g.hint_gap = true;
+            drop(g);
+            st.no_bib.fetch_add(1, Ordering::Relaxed);
+            return Err(ShadowError::NoBib);
+        };
+        let evicted = b.hints.get_or_insert_with(Hints::default).add(remote, hint_secs(now_ms));
+        drop(g);
+        if evicted {
+            st.evicted.fetch_add(1, Ordering::Relaxed);
+        }
+        st.applied.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     fn in_slice(&self, slice: SliceId, addr: u32) -> bool {
@@ -819,19 +1259,33 @@ impl Shadow {
                 self.check_bib(slice, &bib)?;
                 let mut g = self.slice(slice)?.lock();
                 let k = (bib.proto, bib.v4, bib.port4);
-                if !g.bibs.contains_key(&k) {
-                    if self.bibs.load(Ordering::Relaxed) >= self.max_bibs {
-                        return Err(ShadowError::Full);
+                match g.bibs.entry(k) {
+                    hash_map::Entry::Occupied(mut e) => {
+                        // A replayed create keeps the hints only for the
+                        // same mapping.
+                        let x = e.get_mut();
+                        if x.bib.v6 != bib.v6 || x.bib.port6 != bib.port6 || x.bib.sub != bib.sub {
+                            x.hints = None;
+                        }
+                        x.bib = bib;
                     }
-                    self.bibs.fetch_add(1, Ordering::Relaxed);
+                    hash_map::Entry::Vacant(e) => {
+                        if self.bibs.load(Ordering::Relaxed) >= self.max_bibs {
+                            return Err(ShadowError::Full);
+                        }
+                        self.bibs.fetch_add(1, Ordering::Relaxed);
+                        e.insert(ShadowBib::new(bib));
+                    }
                 }
-                g.bibs.insert(k, bib);
             }
             ReplRecord::BibDelete { slice, proto, v4, port4 } => {
                 let mut g = self.slice(slice)?.lock();
                 if g.bibs.remove(&(proto, v4, port4)).is_some() {
                     self.bibs.fetch_sub(1, Ordering::Relaxed);
                 }
+            }
+            ReplRecord::SessHint { slice, v4, port4, raddr, rport } => {
+                self.apply_hint(slice, v4, port4, (raddr, rport), now_ms)?
             }
             ReplRecord::SubHome { .. } | ReplRecord::SubGone { .. } => {}
         }
@@ -866,31 +1320,93 @@ impl Shadow {
     }
 
     /// Applies snapshot records. Each record is validated; the first
-    /// invalid one aborts the chunk (the peer is misbehaving).
+    /// invalid one aborts the chunk (the peer is misbehaving). A `Sess`
+    /// without its `Bib` (which the primary exports first, in the same
+    /// chunk sequence) is skipped and counted (`sess_orphan`); the chunk
+    /// goes on, the snapshot ends un-hinted and `Err(NoBib)` is returned
+    /// after the chunk so the caller resyncs. Hints are stamped with time 0
+    /// (tests and the bench; platd uses [`Shadow::snapshot_records_at`]).
     pub fn snapshot_records(&self, slice: SliceId, recs: &[SnapRecord]) -> Result<(), ShadowError> {
+        self.snapshot_records_at(slice, recs, 0)
+    }
+
+    /// [`Shadow::snapshot_records`] at shadow time `now_ms` (the learned
+    /// time of the snapshot's `Sess` records). A snapshot `Bib` replaces
+    /// the BIB's hints with the `Sess` records that follow it, so a
+    /// completed snapshot carries exactly the primary's ESTABLISHED set at
+    /// export, never a merge with older hints (SEC-001).
+    pub fn snapshot_records_at(&self, slice: SliceId, recs: &[SnapRecord], now_ms: u64) -> Result<(), ShadowError> {
+        let mut orphan = false;
         for r in recs {
             match *r {
                 SnapRecord::Block { sub, block, alloc_wall_us } => {
                     self.apply(&ReplRecord::BlockAlloc { slice, sub, block, wall_us: alloc_wall_us }, 0)?
                 }
-                SnapRecord::Bib(bib) => self.apply(&ReplRecord::BibCreate { slice, bib }, 0)?,
+                SnapRecord::Bib(bib) => {
+                    self.apply(&ReplRecord::BibCreate { slice, bib }, 0)?;
+                    let mut g = self.slice(slice)?.lock();
+                    if let Some(x) = g.bibs.get_mut(&(bib.proto, bib.v4, bib.port4)) {
+                        x.hints = None;
+                    }
+                }
+                SnapRecord::Sess(h) => {
+                    if h.proto != PROTO_TCP {
+                        self.hint_stats.invalid.fetch_add(1, Ordering::Relaxed);
+                        return Err(ShadowError::Proto);
+                    }
+                    match self.apply_hint(slice, h.v4, h.port4, (h.raddr, h.rport), now_ms) {
+                        Err(ShadowError::NoBib) => {
+                            // Counted as an orphan, not as a streamed no_bib.
+                            self.hint_stats.no_bib.fetch_sub(1, Ordering::Relaxed);
+                            self.hint_stats.sess_orphan.fetch_add(1, Ordering::Relaxed);
+                            orphan = true;
+                        }
+                        r => r?,
+                    }
+                }
             }
         }
-        Ok(())
+        if orphan { Err(ShadowError::NoBib) } else { Ok(()) }
     }
 
-    /// The snapshot is complete: the slice is in sync from now on.
+    /// The snapshot is complete: the slice is in sync from now on, without
+    /// session hints (tests; platd uses [`Shadow::snapshot_end_hinted`]).
     pub fn snapshot_end(&self, slice: SliceId) -> Result<(), ShadowError> {
-        self.slice(slice)?.lock().in_sync = true;
+        self.snapshot_end_hinted(slice, false)
+    }
+
+    /// The snapshot is complete: the slice is in sync from now on, and
+    /// hinted when the primary sent hints (`SnapshotEnd.hints`) and every
+    /// hint of the snapshot found its BIB.
+    pub fn snapshot_end_hinted(&self, slice: SliceId, hints: bool) -> Result<(), ShadowError> {
+        let mut g = self.slice(slice)?.lock();
+        g.in_sync = true;
+        g.hinted = hints && !g.hint_gap;
         Ok(())
     }
 
-    /// A gap in the stream (sequence jump or overflow): not in sync until
-    /// the next snapshot completes.
+    /// A gap in the stream (sequence jump or overflow): not in sync (and
+    /// not hinted) until the next snapshot completes.
     pub fn mark_gap(&self, slice: SliceId) {
         if let Ok(m) = self.slice(slice) {
-            m.lock().in_sync = false;
+            let mut g = m.lock();
+            g.in_sync = false;
+            g.hinted = false;
         }
+    }
+
+    /// The shadow of `slice` carries every ESTABLISHED TCP session of the
+    /// primary (in sync and hinted).
+    pub fn hinted(&self, slice: SliceId) -> bool {
+        self.slice(slice).is_ok_and(|m| {
+            let g = m.lock();
+            g.in_sync && g.hinted
+        })
+    }
+
+    /// Session hints held for `slice` (tests).
+    pub fn hint_count(&self, slice: SliceId) -> usize {
+        self.slice(slice).map_or(0, |m| m.lock().bibs.values().map(|b| b.hints.as_ref().map_or(0, Hints::len)).sum())
     }
 
     /// Eligible for takeover (snapshot complete, stream unbroken).
@@ -956,6 +1472,8 @@ impl Shadow {
             released,
             bibs: s.bibs,
             in_sync: s.in_sync,
+            hinted: s.in_sync && s.hinted,
+            hint_now_s: hint_secs(now_ms),
             hold_unknown: !s.in_sync,
             charge,
             home: Some(Box::new(home)),
@@ -974,8 +1492,24 @@ impl Shadow {
         let mut blocks: Vec<_> =
             s.blocks.iter().map(|(&(addr, block), &(sub, wall))| (sub, WireBlock { addr, block }, wall)).collect();
         blocks.sort_unstable_by_key(|b| (b.1.addr, b.1.block));
-        let mut bibs: Vec<_> = s.bibs.into_values().collect();
+        let mut hints = Vec::new();
+        let mut hints_lossy = Vec::new();
+        let mut bibs = Vec::with_capacity(s.bibs.len());
+        for x in s.bibs.into_values() {
+            if let Some(h) = &x.hints {
+                for ((raddr, rport), t) in h.iter() {
+                    hints.push((WireHint { proto: PROTO_TCP, v4: x.bib.v4, port4: x.bib.port4, raddr, rport }, t));
+                }
+                if h.lossy() {
+                    hints_lossy.push((x.bib.v4, x.bib.port4));
+                }
+            }
+            bibs.push(x.bib);
+        }
         bibs.sort_unstable_by_key(|b| (b.v4, b.port4, b.proto));
+        hints.sort_unstable_by_key(|(h, _)| (h.v4, h.port4, h.raddr, h.rport));
+        hints_lossy.sort_unstable();
+        let (hints, hint_learned_s) = hints.into_iter().unzip();
         let mut reserved_unseen: Vec<_> = s.reserved.iter().map(|&(addr, block)| WireBlock { addr, block }).collect();
         reserved_unseen.sort_unstable_by_key(|b| (b.addr, b.block));
         let released = s
@@ -986,7 +1520,19 @@ impl Shadow {
                 (age < self.cooldown_ms).then_some((WireBlock { addr, block }, age))
             })
             .collect();
-        AdoptInput { blocks, bibs, reserved_unseen, released, in_sync: s.in_sync, hold_unknown: !s.in_sync }
+        AdoptInput {
+            blocks,
+            bibs,
+            hints,
+            hint_learned_s,
+            hints_lossy,
+            hint_now_s: hint_secs(now_ms),
+            reserved_unseen,
+            released,
+            in_sync: s.in_sync,
+            hinted: s.in_sync && s.hinted,
+            hold_unknown: !s.in_sync,
+        }
     }
 }
 
@@ -1032,6 +1578,8 @@ mod tests {
             ReplRecord::BibDelete { slice: 3, proto: 17, v4: u32::MAX, port4: 65535 },
             ReplRecord::SubHome { sub: u128::MAX, slice: 4095 },
             ReplRecord::SubGone { sub: 1 << 127 },
+            ReplRecord::SessHint { slice: 4095, v4: u32::MAX, port4: 65535, raddr: u32::MAX - 1, rport: 65534 },
+            ReplRecord::SessHint { slice: 0, v4: 1, port4: 1, raddr: 1, rport: 1 },
         ];
         for _ in 0..3 {
             for r in &recs {
@@ -1041,7 +1589,9 @@ mod tests {
             assert_eq!(hub.drain(100, &mut out), recs.len());
             assert_eq!(out, recs, "wraps the ring");
         }
-        assert_eq!(hub.pushed_total(), 18);
+        assert_eq!(hub.pushed_total(), 24);
+        let h = recs[7];
+        assert_eq!(ReplRecord::from_msg(&h.to_msg(5)), Some((h, 5)));
     }
 
     #[test]
@@ -1097,5 +1647,235 @@ mod tests {
         assert_eq!(a.released, vec![(gone, 30_000)]);
         assert_eq!(sh.counts(0), (0, 0));
         sh.apply(&ReplRecord::BibCreate { slice: 0, bib }, 0).unwrap();
+    }
+
+    fn hint_shadow() -> Shadow {
+        let m = SliceMap::new(&[Ipv4Cidr::new([10, 0, 0, 0].into(), 30).unwrap()], 31).unwrap();
+        Shadow::new(m, 1024, 1024 + 2 * 64 - 1, 64, 120_000, 10)
+    }
+
+    fn tcp_bib(port4: u16) -> WireBib {
+        WireBib { sub: 7, proto: 6, v6: 9, port6: 80, v4: 0x0a00_0000, port4, created_wall_us: 6 }
+    }
+
+    fn hint(port4: u16, raddr: u32, rport: u16) -> ReplRecord {
+        ReplRecord::SessHint { slice: 0, v4: 0x0a00_0000, port4, raddr, rport }
+    }
+
+    /// SEC-002: a fifth remote evicts the oldest, is counted and leaves the
+    /// set lossy; a duplicate refreshes its time without evicting.
+    #[test]
+    fn hints_evict_counts_and_marks_lossy() {
+        let mut h = Hints::default();
+        for r in 1..=4u32 {
+            assert!(!h.add((r, 443), r));
+        }
+        assert!(!h.add((2, 443), 9), "duplicate");
+        assert!(!h.lossy());
+        assert!(h.add((5, 443), 10));
+        assert!(h.lossy());
+        let got: Vec<_> = h.iter().collect();
+        assert_eq!(got, vec![((5, 443), 10), ((2, 443), 9), ((3, 443), 3), ((4, 443), 4)]);
+        let sh = hint_shadow();
+        sh.apply(&ReplRecord::BibCreate { slice: 0, bib: tcp_bib(1100) }, 0).unwrap();
+        for r in 1..=5u32 {
+            sh.apply(&hint(1100, r, 443), 0).unwrap();
+        }
+        assert_eq!(sh.hint_stats().evicted.load(Ordering::Relaxed), 1);
+        assert_eq!(sh.take(0, 0).hints_lossy, vec![(0x0a00_0000, 1100)]);
+    }
+
+    /// SEC-001: a snapshot `Bib` replaces the BIB's hints with the `Sess`
+    /// records after it; hints are stamped with the snapshot's time.
+    #[test]
+    fn snapshot_bib_replaces_hints() {
+        let sh = hint_shadow();
+        sh.apply(&ReplRecord::BibCreate { slice: 0, bib: tcp_bib(1100) }, 0).unwrap();
+        sh.apply(&hint(1100, 1, 443), 0).unwrap();
+        sh.apply(&hint(1100, 2, 443), 0).unwrap();
+        let sess = WireHint { proto: 6, v4: 0x0a00_0000, port4: 1100, raddr: 9, rport: 443 };
+        sh.snapshot_records_at(0, &[SnapRecord::Bib(tcp_bib(1100)), SnapRecord::Sess(sess)], 50_000).unwrap();
+        let a = sh.take(0, 60_000);
+        assert_eq!((a.hints, a.hint_learned_s, a.hint_now_s), (vec![sess], vec![50], 60));
+    }
+
+    /// PERF-002: rounds repeat while one was cut, so a `BibCreate` left in
+    /// its ring by a cut round still goes out before its hint.
+    #[test]
+    fn drain_rounds_repeat_until_no_ring_is_cut() {
+        let creates = |p: &ReplProducer| {
+            for port in [1100, 1101, 1102] {
+                assert!(p.push(ReplRecord::BibCreate { slice: 0, bib: tcp_bib(port) }));
+            }
+        };
+        let (hub, prods) = ReplHub::new(2, 8, 4);
+        creates(&prods[0]);
+        assert!(prods[1].push(hint(1102, 7, 443)));
+        let mut out = Vec::new();
+        assert_eq!(hub.drain_rounds(2, 8, &mut out), 4);
+        assert_eq!(out.last(), Some(&hint(1102, 7, 443)), "the hint follows all three creates");
+        assert_eq!(hub.drains_truncated(), 0);
+        // Too few rounds: the last one is still cut, counted.
+        let (hub, prods) = ReplHub::new(2, 8, 4);
+        creates(&prods[0]);
+        assert!(prods[1].push(hint(1102, 7, 443)));
+        out.clear();
+        assert_eq!(hub.drain_rounds(2, 2, &mut out), 3);
+        assert_eq!(hub.drains_truncated(), 1);
+    }
+
+    #[test]
+    fn hint_past_its_tail_cut_stays_queued_with_what_follows() {
+        let (_hub, prods) = ReplHub::new(1, 8, 4);
+        let ring = &prods[0].ring;
+        let create = ReplRecord::BibCreate { slice: 0, bib: tcp_bib(1100) };
+        assert!(prods[0].push(create) && prods[0].push(ReplRecord::SubGone { sub: 2 }));
+        // Pushed after the consumer read its cut (tail 1).
+        assert!(prods[0].push(hint(1100, 5, 6)) && prods[0].push(ReplRecord::SubGone { sub: 3 }));
+        let mut out = Vec::new();
+        assert_eq!(ring.pop_into(8, &mut out, 1), 2, "non-hints past the cut are taken");
+        assert_eq!(out, vec![create, ReplRecord::SubGone { sub: 2 }]);
+        assert_eq!(ring.len(), 2, "the hint and its successor wait for the next drain");
+        out.clear();
+        assert_eq!(ring.pop_into(8, &mut out, 4), 2);
+        assert_eq!(out, vec![hint(1100, 5, 6), ReplRecord::SubGone { sub: 3 }]);
+    }
+
+    #[test]
+    fn drain_sends_hints_after_bib_records_of_other_rings() {
+        let (hub, prods) = ReplHub::new(2, 16, 4);
+        let del = |port4| ReplRecord::BibDelete { slice: 0, proto: 6, v4: 0x0a00_0000, port4 };
+        let create = |port4| ReplRecord::BibCreate { slice: 0, bib: tcp_bib(port4) };
+        // Ring 1 is drained first: its hint precedes ring 0's create.
+        assert!(prods[0].push(create(1100)) && prods[0].push(create(1101)));
+        assert!(prods[1].push(hint(1100, 5, 6)) && prods[1].push(ReplRecord::SubGone { sub: 3 }));
+        assert!(prods[1].push(hint(1101, 5, 7)));
+        hub.next.store(1, Ordering::Relaxed);
+        let mut out = vec![ReplRecord::SubGone { sub: 1 }];
+        assert_eq!(hub.drain(16, &mut out), 5);
+        assert_eq!(
+            out,
+            vec![
+                ReplRecord::SubGone { sub: 1 },
+                ReplRecord::SubGone { sub: 3 },
+                create(1100),
+                create(1101),
+                hint(1100, 5, 6),
+                hint(1101, 5, 7),
+            ]
+        );
+        let sh = hint_shadow();
+        for r in &out[2..] {
+            sh.apply(r, 0).unwrap();
+        }
+        assert_eq!(sh.hint_count(0), 2);
+        // A hint drained before a delete of its BIB is dropped; one after a
+        // delete (the re-created BIB) is kept; a UDP delete is unrelated.
+        assert!(prods[0].push(hint(1100, 5, 8)) && prods[0].push(del(1100)) && prods[0].push(create(1100)));
+        assert!(prods[0].push(hint(1100, 5, 9)) && prods[0].push(hint(1101, 5, 10)));
+        assert!(prods[1].push(ReplRecord::BibDelete { slice: 0, proto: 17, v4: 0x0a00_0000, port4: 1101 }));
+        hub.next.store(0, Ordering::Relaxed);
+        out.clear();
+        assert_eq!(hub.drain(16, &mut out), 6);
+        assert_eq!(
+            out,
+            vec![
+                del(1100),
+                create(1100),
+                ReplRecord::BibDelete { slice: 0, proto: 17, v4: 0x0a00_0000, port4: 1101 },
+                hint(1100, 5, 9),
+                hint(1101, 5, 10),
+            ]
+        );
+        assert_eq!(hub.hints_superseded(), 1);
+    }
+
+    #[test]
+    fn shadow_hints_capped_per_bib_and_dropped_with_bib() {
+        let sh = hint_shadow();
+        sh.apply(&ReplRecord::BibCreate { slice: 0, bib: tcp_bib(1100) }, 0).unwrap();
+        for r in 1..=5u32 {
+            sh.apply(&hint(1100, r, 443), 0).unwrap();
+        }
+        sh.apply(&hint(1100, 5, 443), 0).unwrap();
+        assert_eq!(sh.hint_count(0), MAX_HINTS, "capped, duplicate ignored");
+        let a = sh.take(0, 0);
+        let got: Vec<u32> = a.hints.iter().map(|h| h.raddr).collect();
+        assert_eq!(got, vec![2, 3, 4, 5], "the oldest went");
+        sh.apply(&ReplRecord::BibCreate { slice: 0, bib: tcp_bib(1100) }, 0).unwrap();
+        sh.apply(&hint(1100, 1, 443), 0).unwrap();
+        // A replayed identical create keeps the hints; a delete frees them.
+        sh.apply(&ReplRecord::BibCreate { slice: 0, bib: tcp_bib(1100) }, 0).unwrap();
+        assert_eq!(sh.hint_count(0), 1);
+        sh.apply(&ReplRecord::BibDelete { slice: 0, proto: 6, v4: 0x0a00_0000, port4: 1100 }, 0).unwrap();
+        assert_eq!(sh.hint_count(0), 0);
+        assert_eq!(sh.hint_stats().applied.load(Ordering::Relaxed), 7);
+    }
+
+    #[test]
+    fn shadow_refuses_hints_without_bib_or_outside_slice() {
+        let sh = hint_shadow();
+        sh.snapshot_end_hinted(0, true).unwrap();
+        assert!(sh.hinted(0));
+        assert_eq!(sh.apply(&hint(1100, 1, 443), 0), Err(ShadowError::NoBib));
+        assert!(!sh.hinted(0), "a lost hint clears hinted");
+        // UDP BIB with the same port: still no TCP BIB.
+        sh.apply(&ReplRecord::BibCreate { slice: 0, bib: WireBib { proto: 17, ..tcp_bib(1100) } }, 0).unwrap();
+        assert_eq!(sh.apply(&hint(1100, 1, 443), 0), Err(ShadowError::NoBib));
+        let out = ReplRecord::SessHint { slice: 1, v4: 0x0a00_0000, port4: 1100, raddr: 1, rport: 1 };
+        assert_eq!(sh.apply(&out, 0), Err(ShadowError::Range));
+        assert_eq!(sh.apply(&hint(1100, 0, 443), 0), Err(ShadowError::Invalid));
+        let st = sh.hint_stats();
+        assert_eq!([&st.no_bib, &st.outside_slice, &st.invalid].map(|c| c.load(Ordering::Relaxed)), [2, 1, 1]);
+    }
+
+    #[test]
+    fn snapshot_end_sets_hinted_and_gap_clears_it() {
+        let sh = hint_shadow();
+        sh.snapshot_begin(0).unwrap();
+        sh.snapshot_records(
+            0,
+            &[
+                SnapRecord::Bib(tcp_bib(1100)),
+                SnapRecord::Sess(WireHint { proto: 6, v4: 0x0a00_0000, port4: 1100, raddr: 1, rport: 2 }),
+            ],
+        )
+        .unwrap();
+        sh.snapshot_end_hinted(0, true).unwrap();
+        assert!(sh.hinted(0) && sh.in_sync(0));
+        sh.mark_gap(0);
+        assert!(!sh.hinted(0));
+        // Hints off on the primary: in sync, not hinted.
+        sh.snapshot_begin(0).unwrap();
+        sh.snapshot_end_hinted(0, false).unwrap();
+        assert!(sh.in_sync(0) && !sh.hinted(0));
+        // An orphan Sess: the rest of the chunk applies, the end is un-hinted.
+        sh.snapshot_begin(0).unwrap();
+        let r = sh.snapshot_records(
+            0,
+            &[
+                SnapRecord::Sess(WireHint { proto: 6, v4: 0x0a00_0000, port4: 1101, raddr: 1, rport: 2 }),
+                SnapRecord::Bib(tcp_bib(1100)),
+            ],
+        );
+        assert_eq!(r, Err(ShadowError::NoBib));
+        assert_eq!(sh.counts(0), (0, 1));
+        sh.snapshot_end_hinted(0, true).unwrap();
+        assert!(sh.in_sync(0) && !sh.hinted(0));
+        assert_eq!(sh.hint_stats().sess_orphan.load(Ordering::Relaxed), 1);
+        assert_eq!(sh.hint_stats().no_bib.load(Ordering::Relaxed), 0);
+        // Detach carries the flag.
+        sh.snapshot_begin(0).unwrap();
+        sh.snapshot_end_hinted(0, true).unwrap();
+        assert!(sh.detach(0, 0).hinted);
+    }
+
+    #[test]
+    fn ring_refuses_zero_hint_fields() {
+        let (hub, prods) = ReplHub::new(1, 8, 4);
+        assert!(prods[0].push(ReplRecord::SessHint { slice: 0, v4: 1, port4: 1, raddr: 0, rport: 1 }));
+        let mut out = Vec::new();
+        assert_eq!(hub.drain(10, &mut out), 1);
+        assert!(out.is_empty(), "decoded as nothing");
     }
 }

@@ -74,7 +74,7 @@ POAM-043, with CNSA 2.0 (POAM-042) as the main trigger.
 | # | Hard-coded item | Agility | Later |
 |---|-----------------|---------|-------|
 | A1 | Audit chain SHA-256, `CHAIN_GENESIS` "usg-plat audit chain v2" (`plat-audit/src/logger.rs`, `verify.rs`); fields `plat.audit.batch_sha256`/`chain_sha256` | Partial: the genesis version string is the algorithm identifier; a new hash needs new fields and a schema bump. That `verify-log` refuses an unknown genesis is **not yet tested** (QA item open). | Chain v3 with an explicit algorithm field, together with POAM-003 |
-| A2 | Cluster `Hello.config_digest` `[u8; 32]`, `PROTO_VERSION = 1` (`plat-cluster/src/codec.rs`, `digest.rs`) | Adequate: versioned; mismatches refused | `PROTO_VERSION = 2` with SHA-384 if CNSA applies |
+| A2 | Cluster `Hello.config_digest` `[u8; 32]`, `PROTO_VERSION = 2` (`plat-cluster/src/codec.rs`, `digest.rs`; 2 on `feat/session-hints` for session hints, digest unchanged) | Adequate: versioned; mismatches refused (`qa_hello_with_other_protocol_version_is_refused`) | A further `PROTO_VERSION` bump with SHA-384 if CNSA applies |
 | A3 | `…hash.sha256` audit fields (schema 8) | Adequate: additive ECS field, needs a schema bump | Add `…hash.sha384` if CNSA applies |
 | A4 | XDP object SHA-256 and `CONFIG` digest v3 (`plat-xdp/src/lib.rs`, `load.rs`) | Adequate: version bump; stale pins refused | As A2 |
 | A5 | mTLS allow-list `sha256:` (`plat-tls/src/identity.rs`) | Good: typed prefix, additive | Add `sha384:` if CNSA applies |

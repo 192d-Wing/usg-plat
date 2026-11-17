@@ -11,11 +11,13 @@
 //!    aggregate room, reservations, recent releases, and with
 //!    `hold_unknown` every unknown block of the slice held back;
 //! 3. import blocks, then import BIBs streamed from the replicated map
-//!    (no sort, no copy);
+//!    (no sort, no copy), with the session hints of a hinted TCP BIB
+//!    restored as `Pickup` sessions in the same critical section;
 //! 4. log: `cluster_slice_acquire`, then one `nat_port_block_adopt` per
 //!    imported block, resumable under `refuse_new_bindings`;
-//! 5. activate: the slice's free lists are rebuilt and the slice goes
-//!    Active in one release-store.
+//! 5. activate: the slice's free lists are rebuilt, the slice's TCP pickup
+//!    mode is set (strict after an in-sync, hinted adoption) and the slice
+//!    goes Active in one release-store.
 //!
 //! Imported blocks and BIBs sit in the live tables from phase 3 on, but the
 //! slice is `Adopting`, so no worker uses them: an imported mapping is
@@ -59,8 +61,10 @@ use super::{
     Subscriber, proto_idx,
 };
 use crate::pool::{BlockRef, SliceState};
-use crate::repl::{AdoptInput, Detached, ShadowCharge, ShadowHome};
+use crate::repl::{AdoptInput, Detached, Hints, MAX_HINTS, ShadowBib, ShadowCharge, ShadowHome, hint_secs};
 use crate::shard::{Map, lower_due};
+use crate::state::{ADOPT_LOOSE, Session};
+use crate::tcp::TcpState;
 
 /// Wall time one [`State::adopt_step`] aims for. A constant, not
 /// configuration: with the 100 ms heartbeat default it keeps the control
@@ -83,6 +87,11 @@ pub const BIB_IMPORT_COST: usize = 16;
 /// At one item each, a batch of 1024 cost up to 20 ms on the bench host
 /// (4M BIBs); at 16 the clock is read every 64 of them.
 pub const RELEASE_ITEM_COST: usize = 16;
+/// Items one restored session is charged: a session insert into the BIB's
+/// map plus the ADF index, where the first insert allocates both maps (at
+/// 4 the 4M-BIB bench had p99 steps of 6.6 ms against the 5 ms budget; at
+/// most [`MAX_HINTS`] per BIB, so a hinted BIB costs at most 16 + 64).
+pub const HINT_IMPORT_COST: usize = 16;
 
 /// Where an adoption's records come from.
 #[derive(Debug)]
@@ -151,21 +160,24 @@ impl BlockSrc {
 
 #[derive(Debug)]
 enum BibSrc {
-    Vec(std::vec::IntoIter<WireBib>),
-    Map(hash_map::IntoValues<(u8, u32, u16), WireBib>),
+    /// A materialised input: the BIBs and their hints by BIB key.
+    Vec(std::vec::IntoIter<WireBib>, Map<(u8, u32, u16), Hints>),
+    Map(hash_map::IntoValues<(u8, u32, u16), ShadowBib>),
 }
 
 impl BibSrc {
     fn len(&self) -> usize {
         match self {
-            Self::Vec(it) => it.len(),
+            Self::Vec(it, _) => it.len(),
             Self::Map(it) => it.len(),
         }
     }
 
-    fn next(&mut self) -> Option<WireBib> {
+    fn next(&mut self) -> Option<ShadowBib> {
         match self {
-            Self::Vec(it) => it.next(),
+            Self::Vec(it, h) => {
+                it.next().map(|bib| ShadowBib { hints: h.remove(&(bib.proto, bib.v4, bib.port4)), bib })
+            }
             Self::Map(it) => it.next(),
         }
     }
@@ -212,8 +224,11 @@ pub(super) struct Walk {
     /// The last pass stopped on a full queue.
     pub(super) paused: bool,
     /// When set, the removed BIBs are kept here for the shadow (an abandon
-    /// that returns the state, bounded by the detached BIBs).
-    collect: Option<Map<(u8, u32, u16), WireBib>>,
+    /// that returns the state, bounded by the detached BIBs), each TCP BIB
+    /// with its restored or established sessions as hints.
+    collect: Option<Map<(u8, u32, u16), ShadowBib>>,
+    /// Shadow-clock seconds the collected hints are stamped with.
+    collect_learned_s: u32,
 }
 
 impl Walk {
@@ -295,7 +310,7 @@ struct Abandon {
     draining: bool,
     /// The unread rest of the detached source (replicated BIBs only; never
     /// stale leftovers of this node, SEC-001).
-    back: Map<(u8, u32, u16), WireBib>,
+    back: Map<(u8, u32, u16), ShadowBib>,
 }
 
 /// A slice takeover in progress (see the module docs). Created by
@@ -307,6 +322,11 @@ pub struct Adoption {
     slice: SliceId,
     meta: AdoptMeta,
     in_sync: bool,
+    /// The source carries every ESTABLISHED TCP session of the old owner.
+    hinted: bool,
+    /// `(shadow clock seconds at detach, engine clock ms at begin)`: a
+    /// hint's age is `shadow_s - learned_s` plus the time since begin.
+    hint_ref: (u32, u64),
     hold_unknown: bool,
     phase: Phase,
     /// Position within the current phase.
@@ -400,7 +420,7 @@ impl Adoption {
             if let Some(x) = self.blocks.as_mut().and_then(BlockSrc::next) {
                 self.orig_blocks.push(x);
             } else if let Some(w) = self.bibs.as_mut().and_then(BibSrc::next) {
-                ab.back.insert((w.proto, w.v4, w.port4), w);
+                ab.back.insert((w.bib.proto, w.bib.v4, w.bib.port4), w);
             } else {
                 break;
             }
@@ -449,33 +469,47 @@ impl State {
         }
         c.slices.cidr(s).ok_or(AdoptError::BadSlice)?;
         self.pool.set_slice_state(s, SliceState::Adopting);
-        let (blocks, bibs, reserved_unseen, released, in_sync, hold_unknown, charge, home) = match src {
-            AdoptSource::Input(i) => (
-                BlockSrc::Vec(i.blocks.into_iter()),
-                BibSrc::Vec(i.bibs.into_iter()),
-                i.reserved_unseen,
-                i.released,
-                i.in_sync,
-                i.hold_unknown,
-                None,
-                None,
-            ),
+        self.set_strict_tcp(s, false);
+        let (blocks, bibs, reserved_unseen, released, sync, hold_unknown, charge, home) = match src {
+            AdoptSource::Input(i) => {
+                let mut hints: Map<(u8, u32, u16), Hints> = Map::with_hasher(self.hasher.clone());
+                for (j, h) in i.hints.iter().enumerate() {
+                    let t = i.hint_learned_s.get(j).copied().unwrap_or(i.hint_now_s);
+                    hints.entry((proto::TCP, h.v4, h.port4)).or_default().add((h.raddr, h.rport), t);
+                }
+                for &(v4, port4) in &i.hints_lossy {
+                    hints.entry((proto::TCP, v4, port4)).or_default().mark_lossy();
+                }
+                (
+                    BlockSrc::Vec(i.blocks.into_iter()),
+                    BibSrc::Vec(i.bibs.into_iter(), hints),
+                    i.reserved_unseen,
+                    i.released,
+                    (i.in_sync, i.hinted, i.hint_now_s),
+                    i.hold_unknown,
+                    None,
+                    None,
+                )
+            }
             AdoptSource::Detached(d) => (
                 BlockSrc::Map(d.blocks.into_iter()),
                 BibSrc::Map(d.bibs.into_values()),
                 d.reserved_unseen,
                 d.released,
-                d.in_sync,
+                (d.in_sync, d.hinted, d.hint_now_s),
                 d.hold_unknown,
                 Some(d.charge),
                 d.home,
             ),
         };
+        let (in_sync, hinted, hint_now_s) = sync;
         let h = || self.hasher.clone();
         Ok(Adoption {
             slice: s,
             meta,
             in_sync,
+            hinted: in_sync && hinted,
+            hint_ref: (hint_now_s, self.clock.now_ms()),
             hold_unknown,
             phase: Phase::Stale,
             pos: 0,
@@ -581,6 +615,11 @@ impl State {
         // leftovers are not the shadow's).
         if a.home.is_some() && !stale {
             walk.collect = Some(Map::with_hasher(self.hasher.clone()));
+            // POAM: POAM-028 the restored sessions do not keep their
+            // hint's learned time: they go back stamped with the shadow's
+            // now, so an abandon restarts their TCP_EST age cap.
+            let (shadow_s, begin_ms) = a.hint_ref;
+            walk.collect_learned_s = shadow_s.saturating_add(hint_secs(self.clock.now_ms().saturating_sub(begin_ms)));
         }
         a.abandon = Some(Abandon {
             walk,
@@ -616,7 +655,7 @@ impl State {
         for (sub, w, wall) in std::mem::take(&mut a.orig_blocks) {
             blocks.entry((w.addr, w.block)).or_insert((sub, wall));
         }
-        home.restore(blocks, bibs, a.in_sync, a.charge.take());
+        home.restore(blocks, bibs, (a.in_sync, a.hinted), a.charge.take());
     }
 
     pub(super) fn adopt_run(&self, a: &mut Adoption, b: &mut Budget) -> Result<Step, AdoptError> {
@@ -669,11 +708,17 @@ impl State {
                 }
                 Phase::ImportBlocks => self.import_blocks(a, b),
                 Phase::Reserve => self.reserve_tables(a, b),
-                Phase::ImportBibs => self.import_bibs(a, b, c.tcp_adopt_ms),
+                Phase::ImportBibs => self.import_bibs(a, b, c.tcp_adopt_ms, c.session_hints),
                 Phase::Log => self.adopt_log(a, b, c.slices.cidr(s).ok_or(AdoptError::BadSlice)?)?,
                 Phase::Activate => {
                     let in_use: Vec<BlockRef> = a.adopted.iter().filter(|x| x.imported).map(|x| x.r).collect();
                     self.pool.reset_slice(s, &in_use, &a.held, &a.cooling);
+                    // COMPLIANCE MAPPING:
+                    // - RFC 6146 §3.5.2.2 - only a SYN creates TCP state again
+                    //   once every ESTABLISHED session was restored (in-sync,
+                    //   hinted shadow, hints on here); otherwise the pickup
+                    //   window stays (POAM-028)
+                    self.set_strict_tcp(s, a.in_sync && a.hinted && c.session_hints);
                     // The one store that makes the slice usable, after every
                     // record is queued (AU-12).
                     self.pool.set_slice_state(s, SliceState::Active);
@@ -903,10 +948,12 @@ impl State {
     /// then inserted under `bib6 → bib4` (released), then the port marked
     /// under `subs`. A `k6` or `k4` already present (a duplicate in the
     /// input, or local state) is rejected: first wins.
-    fn import_bibs(&self, a: &mut Adoption, b: &mut Budget, tcp_adopt_ms: u64) {
+    fn import_bibs(&self, a: &mut Adoption, b: &mut Budget, tcp_adopt_ms: u64, hints_on: bool) {
         let s = a.slice;
+        let restore = a.hinted && hints_on;
+        let (shadow_s, begin_ms) = a.hint_ref;
         while !b.out() {
-            let Some(w) = a.bibs.as_mut().and_then(BibSrc::next) else {
+            let Some(ShadowBib { bib: w, hints }) = a.bibs.as_mut().and_then(BibSrc::next) else {
                 // Freeing the drained table (up to the shadow cap) gets a
                 // step of its own too; the iterator is fused.
                 if b.started() {
@@ -942,7 +989,12 @@ impl State {
             let k6 = Key6 { proto: w.proto, addr: w.v6, port: w.port6 };
             let k4 = Key4 { proto: w.proto, addr: w.v4, port: w.port4 };
             let now = self.clock.now_ms();
-            let until = now + if k4.proto == proto::TCP { tcp_adopt_ms } else { self.timeout(k4.proto, None) };
+            // The low bit is the hint-incomplete flag, set below.
+            let until =
+                (now + if k4.proto == proto::TCP { tcp_adopt_ms } else { self.timeout(k4.proto, None) }) & !ADOPT_LOOSE;
+            let hints = hints.filter(|_| restore && k4.proto == proto::TCP);
+            // Shadow-clock "now" for the hints' ages.
+            let hint_now_s = shadow_s.saturating_add(hint_secs(now.saturating_sub(begin_ms)));
             let inserted = {
                 let mut g6 = self.bib6.lock(&k6);
                 let (mut g4, due) = self.bib4.lock_due(&k4);
@@ -966,6 +1018,12 @@ impl State {
                         },
                     );
                     g6.insert(k6, Mapped { k4, idx });
+                    if let (Some(h), Some(bib)) = (hints.as_ref(), g4.get_mut(&k4)) {
+                        if !self.restore_sessions(bib, h, (until, hint_now_s), &mut a.stats) {
+                            bib.adopt_until_ms |= ADOPT_LOOSE;
+                        }
+                        b.spend(HINT_IMPORT_COST * h.len());
+                    }
                     true
                 }
             };
@@ -979,6 +1037,64 @@ impl State {
                 blk.mark(proto_idx(k4.proto), k4.port - self.pool.port_lo(r));
             }
         }
+    }
+
+    /// Restores the hinted sessions of one imported TCP BIB as `Pickup`
+    /// sessions living until `until` (the BIB's pickup window), under the
+    /// `bib4` shard lock the import holds. Only an IPv4-side packet makes
+    /// one ESTABLISHED; the slice is not Active yet, so none is used before
+    /// the adoption's records are queued. `at = (until, shadow now s)`.
+    ///
+    /// A hint learned more than TCP_EST ago is not restored (SEC-001:
+    /// hints never retire on close, so an old one may name a flow that
+    /// ended). Returns false when the set is incomplete (a remote evicted,
+    /// or an old hint dropped): the caller then allows pickup on the BIB,
+    /// so a live flow among the dropped ones is not refused.
+    ///
+    /// COMPLIANCE MAPPING:
+    /// - NIST 800-53: CP-10, SC-5(2) - established TCP flows continue
+    ///   across a takeover
+    /// - NIST 800-53: SC-7, SC-7(5) - each remote passes the destination
+    ///   policy the outbound path applies; ADF/APDF then admit exactly the
+    ///   restored remotes
+    /// - NIST 800-53: SC-5 - node and per-subscriber session caps apply
+    ///   (`admit_session`); a refusal still imports the BIB
+    /// - NIST 800-53: SC-10 - a restored session lives at most
+    ///   `tcp_adopt_secs` unless its IPv4 side speaks; a hint older than
+    ///   TCP_EST is never restored
+    /// - RFC 6146 §3.5.2.2 - documented deviation: the session was created
+    ///   by a SYN on the previous owner, not on this node
+    // POAM: POAM-028 restored sessions run on the pickup window
+    // (`tcp_adopt_secs`), not TCP_EST, until the IPv4 side confirms them;
+    // UDP sessions and held SYNs are not replicated.
+    fn restore_sessions(&self, bib: &mut Bib, h: &Hints, at: (u64, u32), st: &mut AdoptStats) -> bool {
+        let (until, now_s) = at;
+        let max_age_s = self.to.tcp_est / 1000;
+        let mut complete = !h.lossy();
+        for (remote, learned_s) in h.iter().take(MAX_HINTS) {
+            if u64::from(now_s.saturating_sub(learned_s)) > max_age_s {
+                st.sessions_refused.aged += 1;
+                complete = false;
+                continue;
+            }
+            if bib.sessions.contains_key(&remote) {
+                st.sessions_refused.duplicate += 1;
+                continue;
+            }
+            if !self.restore_dest_ok(remote) {
+                st.sessions_refused.policy += 1;
+                continue;
+            }
+            match self.admit_session(bib) {
+                Ok(()) => {
+                    bib.insert_session(remote, Session::new(until, Some(TcpState::Pickup)));
+                    st.sessions_restored += 1;
+                }
+                Err(plat_common::DropReason::SubscriberLimit) => st.sessions_refused.subscriber_limit += 1,
+                Err(_) => st.sessions_refused.session_limit += 1,
+            }
+        }
+        complete
     }
 
     /// Queues `cluster_slice_acquire`, then one `nat_port_block_adopt` per
@@ -1113,9 +1229,10 @@ impl State {
             }
             w.dead_pos += 1;
             let mut rec = None;
-            let x = self.remove_slice_bib(k4, k6, bib_records, st, &mut rec);
+            let learned = w.collect.is_some().then_some(w.collect_learned_s);
+            let x = self.remove_slice_bib(k4, k6, bib_records, st, &mut rec, learned);
             if let (Some(x), Some(c)) = (x, w.collect.as_mut()) {
-                c.insert((x.proto, x.v4, x.port4), x);
+                c.insert((x.bib.proto, x.bib.v4, x.bib.port4), x);
             }
             if let Some(ev) = rec
                 && !self.walk_emit(w.pause_on_full, &mut w.pending, ev)
@@ -1245,7 +1362,10 @@ impl State {
 
     /// Removes one BIB of a slice being given up, with its sessions and
     /// held SYNs (dropped silently: the slice is no longer ours).
-    /// The BIB delete record (session mode) is returned in `rec`.
+    /// The BIB delete record (session mode) is returned in `rec`. With
+    /// `hints` (an abandon returning the state to the shadow, the learned
+    /// time to stamp), a TCP BIB's `Pickup` and ESTABLISHED sessions come
+    /// back as its hints, lossy when the BIB was adopted hint-incomplete.
     fn remove_slice_bib(
         &self,
         k4: Key4,
@@ -1253,7 +1373,8 @@ impl State {
         bib_records: bool,
         st: &mut ReleaseStats,
         rec: &mut Option<Event>,
-    ) -> Option<WireBib> {
+        hints: Option<u32>,
+    ) -> Option<ShadowBib> {
         let removed = {
             let mut g6 = self.bib6.lock(&k6);
             let mut g4 = self.bib4.lock(&k4);
@@ -1274,6 +1395,19 @@ impl State {
             let mut spill = None;
             self.expire_held(k4, &mut bib, self.clock.now_ms(), true, false, &mut spill);
         }
+        let mut kept: Option<Hints> = None;
+        if let Some(t) = hints
+            && k4.proto == proto::TCP
+        {
+            for (remote, x) in bib.sessions.iter() {
+                if matches!(x.tcp, Some(TcpState::Pickup | TcpState::Established)) {
+                    kept.get_or_insert_with(Hints::default).add(*remote, t);
+                }
+            }
+            if bib.adopt_until_ms & ADOPT_LOOSE != 0 {
+                kept.get_or_insert_with(Hints::default).mark_lossy();
+            }
+        }
         let n = bib.sessions.len() as u64;
         self.sessions.fetch_sub(n, Ordering::Relaxed);
         bib.sub_sessions.fetch_sub(n as u32, Ordering::Relaxed);
@@ -1291,14 +1425,17 @@ impl State {
                 held_secs: (wall.saturating_sub(bib.created_wall_us) / 1_000_000) as u32,
             });
         }
-        Some(WireBib {
-            sub: bib.sub,
-            proto: k4.proto,
-            v6: k6.addr,
-            port6: k6.port,
-            v4: k4.addr,
-            port4: k4.port,
-            created_wall_us: bib.created_wall_us,
+        Some(ShadowBib {
+            bib: WireBib {
+                sub: bib.sub,
+                proto: k4.proto,
+                v6: k6.addr,
+                port6: k6.port,
+                v4: k4.addr,
+                port4: k4.port,
+                created_wall_us: bib.created_wall_us,
+            },
+            hints: kept,
         })
     }
 }
@@ -1334,6 +1471,7 @@ mod tests {
             steering: SteeringMode::Drop,
             directory: Arc::new(Directory::new(16, 1000)),
             tcp_adopt_secs: 300,
+            session_hints: false,
             quarantine_secs: 600,
             reserve_ahead: 2,
         };

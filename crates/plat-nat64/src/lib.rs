@@ -49,9 +49,12 @@ pub use held::{HeldSynExpiry, SynMeta};
 pub use mirror::ModelMirror;
 pub use mirror::{Mirror, MirrorEntry, MirrorFail, MirrorKeys, NoMirror};
 pub use pool::{AllocFail, SliceState};
-pub use repl::{AdoptInput, Detached, Directory, Home, ReplHub, ReplProducer, ReplRecord, Shadow, ShadowError};
+pub use repl::{
+    AdoptInput, Detached, Directory, HintStats, Hints, Home, MAX_HINTS, ReplHub, ReplProducer, ReplRecord, Shadow,
+    ShadowBib, ShadowError,
+};
 pub use state::{
     ADOPT_BATCH, ADOPT_STEP_BUDGET, ADOPT_STEP_MAX_ITEMS, AdoptError, AdoptMeta, AdoptSource, AdoptStats, Adoption,
-    ClusterSetup, ExportCursor, MAX_REPL_RING_BYTES, RELEASE_STEP_BUDGET, Release, ReleaseStats, ReleaseStep,
-    SliceReleasing, Step, check_ring_memory,
+    ClusterSetup, ExportCursor, HINT_IMPORT_COST, MAX_REPL_RING_BYTES, RELEASE_STEP_BUDGET, Release, ReleaseStats,
+    ReleaseStep, RestoreRefused, SessionOpts, SliceReleasing, Step, check_ring_memory,
 };

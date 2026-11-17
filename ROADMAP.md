@@ -42,7 +42,9 @@ Ordered by value for the effort, with what each needs.
    `feat/chunked-adoption`); chunked Active-slice release done (POAM-048
    closed, `feat/chunked-release`). Left:
    VM trials of the new election on a three-data-member bed (WU-A5), and
-   session pickup (POAM-028).
+   the session residuals of POAM-028 (Partial: TCP session hints on
+   `feat/session-hints`, unreleased; UDP hints and VM re-run of F1/F5/F12
+   left).
 
 Done since the last update:
 
@@ -119,7 +121,10 @@ Done since the last update:
   Linux/glibc (up to 47 ms single frees on the macOS host); avoid one
   `bib4` scan per released slice.
 - POAM-007 (2): VM trials of the new election (WU-A5).
-- POAM-028: sessions are not replicated (TCP pickup window after takeover).
+- POAM-028 (Partial): TCP session hints done in-process (`feat/session-hints`);
+  left: UDP/QUIC hints (`"tcp_udp"`), held SYNs, restored sessions on the
+  `tcp_adopt_secs` window instead of TCP_EST, truncated-drain gap, VM
+  re-run of F1/F5/F12, Linux `perf stat` of the legacy bench.
 - POAM-029 to POAM-033: subscriber-home directory, leader-coordinated
   graceful shutdown, one-sided peer-address pinning, single trust domain,
   operator socket serves one client at a time.
